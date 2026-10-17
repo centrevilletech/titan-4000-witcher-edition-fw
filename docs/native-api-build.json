@@ -1,0 +1,14 @@
+{
+  "component": "titan-api",
+  "sha256": "194cfb5ce33cd58beef4c73206028f2089fafc3a3086fc151a56d9c768ba73ec",
+  "source_repository": "https://github.com/theedgemile/titan-4000-ops",
+  "source_commit": "cb4bab095951cf03d16f71b78e432776b101c3f3",
+  "source_directory": "backend",
+  "target": "armv7-unknown-linux-musleabi",
+  "rustc": "1.99.0 (b940084d7 2026-09-28)",
+  "zig": "0.14.1",
+  "cargo_lock_sha256": "fb1fc9397950c8e2a215f8862a11444915fc779144808e60b5d5f6ae7e2e2030",
+  "command": "cargo zigbuild --locked --release --target armv7-unknown-linux-musleabi -p titan-api",
+  "validation": "166 unit tests and 9 integration tests passed; one preexisting ignored test; clippy all-targets with warnings denied passed",
+  "hardware_validation": "Not yet flashed; host regression tests and ARM cross-build only."
+}

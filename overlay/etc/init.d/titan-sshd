@@ -1,0 +1,150 @@
+#!/bin/sh
+# shellcheck disable=SC2046,SC2015
+# Key-only shell service control for the ACTIVE filesystem.
+#
+#   boot       mount the persistent volume, then keep the listener running
+#   start      the same on a running unit
+#   stop       stop the listener; sessions already open stay connected
+#   restart | status
+#   mount      mount the persistent volume only (the web service uses it too)
+#
+# Independent of the web service and of the vendor shell daemons: it starts
+# without the configuration cache, and nothing here signals another service.
+# Flash is written only below /mnt/titan-api; NVRAM and firmware banks never.
+set -u
+umask 077
+bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
+runtime=/tmp/titan-sshd
+log=/tmp/titan-sshd-boot.log
+ram_copy=/tmp/titan-sshd-control.sh
+lock=/tmp/titan-data.lock
+config=/etc/titan-api.conf
+installed=/etc/titan-sshd
+# The vendor mounts its own volume of this flash partition at /mnt; the mount
+# point for ours is a directory on that volume.
+vendor_mount=/mnt
+state=/mnt/titan-api
+volume=data
+ubi=/sys/class/ubi
+mounts=/proc/mounts
+
+[ "$(id -u)" = 0 ] || { echo 'Service control requires root.' >&2; exit 77; }
+
+# The shell keeps the script it is running open, which would pin this file in
+# flash for as long as the service runs. Long-lived commands run from RAM.
+case "${1:-}" in
+ boot|supervise)
+  if [ "${TITAN_CONTROL_COPY:-}" != 1 ] && cp "$0" "$ram_copy" 2> /dev/null; then
+   TITAN_CONTROL_COPY=1 exec /bin/sh "$ram_copy" "$@"
+  fi;;
+esac
+
+note() {
+ # Wall-clock time is not set early in boot; uptime orders the entries.
+ echo "$(cut -d' ' -f1 /proc/uptime) $*" >> "$log"
+ echo "$*"
+}
+private_file() {
+ [ -f "$1" ] && [ ! -L "$1" ] || return 1
+ set -- $(ls -ldn "$1")
+ [ "$3" = 0 ] || return 1
+ case "$1" in -rw-------|-rwx------) ;; *) return 1;; esac
+}
+mounted() { grep -q " $state ubifs " "$mounts"; }
+volume_exists() {
+ for entry in "$ubi"/ubi1_*; do
+  [ "$(cat "$entry/name" 2> /dev/null)" = "$volume" ] && return 0
+ done
+ return 1
+}
+mount_state() { /bin/sh /etc/init.d/witcher-state mount; }
+
+owned() {
+ # $1 PID, $2 the command line that identifies it; a recycled PID never matches.
+ case "$1" in ''|*[!0-9]*) return 1;; esac
+ [ "$1" -gt 1 ] && [ -r "/proc/$1/cmdline" ] || return 1
+ case "$(tr '\000' ' ' < "/proc/$1/cmdline")" in *"$2"*) return 0;; esac
+ return 1
+}
+supervisor() {
+ pid=$(cat "$runtime/supervisor.pid" 2> /dev/null)
+ owned "$pid" "$ram_copy supervise" && echo "$pid"
+}
+listener() {
+ pid=$(cat "$runtime/listener.pid" 2> /dev/null)
+ owned "$pid" "$runtime/titan-sshd listen" && echo "$pid"
+}
+stop() {
+ [ -d "$runtime" ] || return 0
+ : > "$runtime/stopped"
+ pid=$(supervisor) && kill "$pid" 2> /dev/null
+ # The listener only stops accepting; each session is its own process.
+ pid=$(listener) && kill "$pid" 2> /dev/null
+ waited=0
+ while [ -n "$(listener)" ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
+ pid=$(listener) && kill -9 "$pid" 2> /dev/null
+ rm -f "$runtime/supervisor.pid"
+ return 0
+}
+start() {
+ [ -z "$(supervisor)" ] || { echo 'Shell service is already running.'; return 0; }
+ [ -f "$bundle/titan-sshd" ] && [ -x "$bundle/titan-sshd" ] || { note 'Shell service binary is missing.'; return 1; }
+ mount_state || note 'Starting without persistent state: temporary host key, installed keys only.'
+ if [ ! -e "$runtime" ]; then mkdir "$runtime" || return 1; fi
+ [ -d "$runtime" ] && [ ! -L "$runtime" ] || { note "$runtime is not a directory."; return 1; }
+ chmod 700 "$runtime"
+ # Copy through a fresh file: a listener that is still running keeps its own.
+ rm -f "$runtime/titan-sshd.new"
+ (set -C; cat "$bundle/titan-sshd" > "$runtime/titan-sshd.new") && chmod 700 "$runtime/titan-sshd.new" \
+  && mv -f "$runtime/titan-sshd.new" "$runtime/titan-sshd" || { note 'Shell service binary could not be staged.'; return 1; }
+ cp "$0" "$ram_copy" 2> /dev/null || [ "${TITAN_CONTROL_COPY:-}" = 1 ] || { note 'Control script could not be staged.'; return 1; }
+ rm -f "$runtime/stopped"
+ TITAN_CONTROL_COPY=1 /bin/sh "$ram_copy" supervise > /dev/null 2>&1 < /dev/null &
+ waited=0
+ while [ -z "$(listener)" ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+ if [ -n "$(listener)" ]; then note 'Shell service is listening.'; return 0; fi
+ # Without a seed the listener waits for kernel entropy; that is not a failure.
+ if [ -n "$(supervisor)" ]; then note 'Shell service started; not listening yet.'; return 0; fi
+ note 'Shell service did not start.'
+ return 1
+}
+
+case "${1:-}" in
+ boot|start) [ "$#" = 1 ] || exit 64; start;;
+ stop) [ "$#" = 1 ] || exit 64; stop;;
+ restart) [ "$#" = 1 ] || exit 64; stop; start;;
+ mount) [ "$#" = 1 ] || exit 64; mount_state;;
+ status)
+  [ "$#" = 1 ] || exit 64
+  if mounted; then echo "persistent volume mounted at $state"; else echo 'persistent volume not mounted'; fi
+  if [ -n "$(listener)" ]; then
+   echo 'shell service listening'
+   result=0
+  else
+   echo 'shell service stopped'
+   result=1
+  fi
+  [ ! -x "$runtime/titan-sshd" ] || TITAN_SSH_STATE=$state/ssh TITAN_SSH_RUNTIME=$runtime \
+   TITAN_SSH_BASE_KEYS=$installed/authorized_keys "$runtime/titan-sshd" status
+  exit "$result";;
+ supervise)
+  [ "$#" = 1 ] || exit 64
+  # Trusted shell syntax: port and interface policy for this unit.
+  if private_file "$config"; then
+   # shellcheck source=/dev/null
+   . "$config"
+  fi
+  export TITAN_SSH_STATE="$state/ssh" TITAN_SSH_RUNTIME="$runtime"
+  export TITAN_SSH_BASE_KEYS="$installed/authorized_keys" TITAN_SSH_FALLBACK_SEED="$installed/seed"
+  [ -z "${TITAN_SSH_PORT:-}" ] || export TITAN_SSH_PORT
+  [ -z "${TITAN_SSH_DENY_INTERFACES:-}" ] || export TITAN_SSH_DENY_INTERFACES
+  echo $$ > "$runtime/supervisor.pid"
+  while [ ! -e "$runtime/stopped" ]; do
+   "$runtime/titan-sshd" listen > /dev/null 2>&1 < /dev/null
+   result=$?
+   [ ! -e "$runtime/stopped" ] || break
+   note "Listener exited with status $result; starting it again."
+   sleep 5
+  done;;
+ *) echo 'Usage: titan-sshd boot|start|stop|restart|status|mount' >&2; exit 64;;
+esac

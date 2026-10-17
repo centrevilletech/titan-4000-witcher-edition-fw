@@ -1,0 +1,283 @@
+#!/bin/sh
+# Native web service control for the ACTIVE filesystem.
+#
+#   boot           wait for the native configuration cache, then take over 80/443
+#   native         stop the vendor web server and start the native service now
+#   vendor         stop the native service and bring the vendor web server back
+#   guard SECONDS  restore the vendor web server after SECONDS unless disarmed
+#   disarm         cancel a pending guard
+#   stop | status | restart
+#
+# Exactly one web server is left running on every path: a native start that is
+# not healthy falls back to the vendor server. The vendor enable flags are only
+# changed in the native RAM cache; this script never commits configuration, never
+# writes flash, and never touches firmware banks.
+set -u
+umask 077
+bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
+launcher=$bundle/start-titan-api.sh
+nvram=$bundle/titan-nvram
+log=/tmp/titan-api-boot.log
+lock=/tmp/titan-api-control.lock
+guard_pid=/tmp/titan-api-guard.pid
+keep=/tmp/titan-api-keep-native
+ram_copy=/tmp/titan-api-control.sh
+# An operator can force the vendor UI across reboots without remounting the rootfs.
+vendor_marker=/mnt/titan-api/use-vendor-ui
+vendor_server=/usr/sbin/httpd
+vendor_root=/usr/www
+vendor_socket=/tmp/.socket_web
+vendor_cache=/tmp/nvram.cfg
+# The vendor server shells out to tools that are only on the boot-time PATH.
+vendor_path=/bin:/sbin:/usr/bin:/usr/sbin:/usr:/usr/lte:/usr/gps
+health_url=http://127.0.0.1/api/v1/health
+# Owns the persistent volume that holds the boot seed and the vendor marker.
+shell_control=/etc/init.d/titan-sshd
+state_control=/etc/init.d/witcher-state
+setup_pid=/tmp/witcher-setup.pid
+boot_pid=/tmp/witcher-web-boot.pid
+
+[ "$(id -u)" = 0 ] || { echo 'Service control requires root.' >&2; exit 77; }
+
+# The shell keeps the script it is running open. A long-lived boot takeover or
+# guard timer started from flash would pin that file, and a later reinstall could
+# then not return the root filesystem to read-only. Run those from a RAM copy.
+case "${1:-}" in
+ boot|guard-wait)
+  if [ "${TITAN_CONTROL_COPY:-}" != 1 ] && cp "$0" "$ram_copy" 2> /dev/null; then
+   TITAN_CONTROL_COPY=1 exec /bin/sh "$ram_copy" "$@"
+  fi;;
+esac
+
+note() {
+ # Wall-clock time is not set early in boot; uptime orders the entries.
+ echo "$(cut -d' ' -f1 /proc/uptime) $*" >> "$log"
+ echo "$*"
+}
+flag() { printf '%s' "$2" | "$nvram" set 0 "$1"; }
+cache_ready() {
+ # rcinit creates the shared configuration cache. Never call the native library
+ # before it exists, so this script cannot be the one that initialises it.
+ [ -s "$vendor_cache" ] || return 1
+ # No APN/attach/modem serial is required to reach setup. Authentication reads
+ # the existing password from this cache when the operator submits the form.
+ return 0
+}
+vendor_pids() {
+ for candidate in $(pidof "${vendor_server##*/}" 2> /dev/null); do
+  [ "$(readlink "/proc/$candidate/exe" 2> /dev/null)" = "$vendor_server" ] && echo "$candidate"
+ done
+ return 0
+}
+stop_vendor() {
+ # With both flags at zero neither rcinit nor the vendor monitor starts it again.
+ if ! flag http_enable 0 || ! flag https_enable 0; then note 'Cannot clear the vendor web server flags.'; return 1; fi
+ waited=0
+ while pids=$(vendor_pids) && [ -n "$pids" ]; do
+  [ "$waited" -lt 8 ] || { note 'Vendor web server did not stop.'; return 1; }
+  # shellcheck disable=SC2086
+  if [ "$waited" -lt 5 ]; then kill $pids 2> /dev/null; else kill -9 $pids 2> /dev/null; fi
+  sleep 1
+  waited=$((waited + 1))
+ done
+ # The vendor server leaves its SAS IPC socket path behind. Remove it only when
+ # no process is bound to it, so the native broker can take over that source.
+ if [ -S "$vendor_socket" ] && ! grep -q " $vendor_socket\$" /proc/net/unix; then rm -f "$vendor_socket"; fi
+ return 0
+}
+start_vendor() {
+ /bin/sh /etc/init.d/witcher-recovery-files || { note 'Factory recovery files could not be mounted.'; return 1; }
+ flag http_enable 1 || note 'Cannot set http_enable.'
+ flag https_enable 0 || note 'Cannot set https_enable.'
+ [ -z "$(vendor_pids)" ] || return 0
+ (cd / && PATH=$vendor_path "$vendor_server" -h "$vendor_root" > /dev/null 2>&1 < /dev/null &)
+ sleep 2
+ [ -n "$(vendor_pids)" ] || { note 'Vendor web server did not start.'; return 1; }
+ return 0
+}
+healthy() {
+ /bin/sh "$launcher" status > /dev/null 2>&1 || return 1
+ case "$(wget -q -T 5 -O - "$health_url" 2> /dev/null)" in
+  *'"service":"titan-api"'*) return 0;;
+ esac
+ return 1
+}
+stop_setup() {
+ pid=$(cat "$setup_pid" 2>/dev/null)
+ case "$pid" in ''|*[!0-9]*) return 0;; esac
+ [ "$pid" -gt 1 ] || return 0
+ case "$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+  "$bundle/witcher-firstboot setup"*) kill "$pid" 2>/dev/null || :;;
+ esac
+ rm -f "$setup_pid"
+}
+stop_boot() {
+ pid=$(cat "$boot_pid" 2>/dev/null)
+ case "$pid" in ''|*[!0-9]*) return 0;; esac
+ [ "$pid" -gt 1 ] && [ "$pid" != "$$" ] || return 0
+ case "$(tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null)" in
+  *"$ram_copy boot"*) kill "$pid" 2>/dev/null || :;;
+  *) return 0;;
+ esac
+ waited=0
+ while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 5 ]; do sleep 1; waited=$((waited+1)); done
+ rm -f "$boot_pid"
+}
+take_over() {
+ attempt=1
+ while [ "$attempt" -le 3 ]; do
+  if stop_vendor && /bin/sh "$launcher" start production >> "$log" 2>&1; then
+   sleep 1
+   if healthy; then note "Native web service active (attempt $attempt)."; return 0; fi
+  fi
+  note "Native start attempt $attempt failed."
+  /bin/sh "$launcher" stop >> "$log" 2>&1
+  attempt=$((attempt + 1))
+  sleep 5
+ done
+ note 'Native web service is not healthy; restoring the vendor web server.'
+ start_vendor
+ return 1
+}
+use_vendor() {
+ /bin/sh "$launcher" stop >> "$log" 2>&1 || note 'Native service did not stop cleanly.'
+ start_vendor
+}
+unlock() { rm -rf "$lock"; trap - EXIT HUP INT TERM; }
+locked() {
+ # mkdir is atomic; a lock whose owner is gone is taken over once.
+ if ! mkdir "$lock" 2> /dev/null; then
+  owner=$(cat "$lock/pid" 2> /dev/null)
+  case "$owner" in ''|*[!0-9]*) owner=0;; esac
+  if [ "$owner" -gt 1 ] && kill -0 "$owner" 2> /dev/null; then
+   echo 'Another web service change is in progress.' >&2
+   return 75
+  fi
+  rm -rf "$lock"
+  mkdir "$lock" 2> /dev/null || return 75
+ fi
+ echo $$ > "$lock/pid"
+ trap 'rm -rf "$lock"' EXIT
+ trap 'exit 1' HUP INT TERM
+}
+disarm() {
+ [ -e "$guard_pid" ] || return 0
+ armed=$(cat "$guard_pid")
+ case "$armed" in ''|*[!0-9]*) armed=0;; esac
+ if [ "$armed" -gt 1 ] && [ -r "/proc/$armed/cmdline" ]; then
+  # Only this script runs with that argument; a recycled PID would not match.
+  case "$(tr '\000' ' ' < "/proc/$armed/cmdline")" in *' guard-wait '*) kill "$armed" 2> /dev/null;; esac
+ fi
+ rm -f "$guard_pid"
+}
+
+case "${1:-}" in
+ boot)
+  [ "$#" = 1 ] || exit 64
+  locked || exit $?
+  echo $$ > "$boot_pid"
+  # Wait for the configuration cache, not LTE attachment or modem identity.
+  waited=0
+  until cache_ready; do
+   if [ "$waited" -ge 300 ]; then
+    # Without the cache nothing here may touch the enable flags either.
+    note 'Configuration cache is not ready; vendor web server left as it is.'
+    exit 1
+   fi
+   sleep 5
+   waited=$((waited + 5))
+  done
+  # These RAM flags make the factory fallback reachable too. Our access rules
+  # take precedence over inherited restrictions; no NVRAM commit is necessary.
+  for setting in remote_management remote_mgt_https https_wan_enable; do
+   flag "$setting" 1 || note "Cannot enable $setting in the vendor cache."
+  done
+  flag web_wl_filter 0 || note 'Cannot clear vendor web source filtering.'
+  # The shell service normally mounts it first; this start must not race ahead.
+  if ! /bin/sh "$state_control" mount >> "$log" 2>&1; then
+   note 'Persistent state is unavailable; keeping factory desktop recovery.'
+   start_vendor
+   exit 1
+  fi
+  if [ -e "$vendor_marker" ]; then
+   note "Vendor web server kept: $vendor_marker exists."
+   start_vendor
+   exit $?
+  fi
+  if [ ! -e /mnt/titan-api/seed ] && [ ! -L /mnt/titan-api/seed ]; then
+   note 'Preparing per-unit entropy for automatic HTTPS startup.'
+   if "$bundle/witcher-firstboot" bootstrap >> "$log" 2>&1; then
+    note 'Autonomous entropy ready; starting the HTTPS login.'
+   else
+    note 'Autonomous entropy failed; trusted-network browser setup remains available.'
+   fi
+  fi
+  if [ ! -f /mnt/titan-api/seed ]; then
+   stop_vendor || { start_vendor; exit 1; }
+   # Recovery must be able to select the factory interface during setup.
+   unlock
+   "$bundle/witcher-firstboot" setup >> "$log" 2>&1 &
+   pid=$!
+   echo "$pid" > "$setup_pid"
+   wait "$pid"
+   result=$?
+   rm -f "$setup_pid"
+   locked || exit $?
+   if [ "$result" != 0 ] || [ -e "$vendor_marker" ]; then
+    note 'Setup stopped; restoring factory desktop recovery.'
+    start_vendor
+    exit 1
+   fi
+  fi
+  take_over || exit 1
+  unlock
+  # rcinit may still act on enable flags it read before the takeover.
+  while :; do
+   sleep 10
+   [ ! -e "$vendor_marker" ] || exit 0
+   if ! healthy; then
+    locked || exit $?
+    note 'Native service stopped; restoring factory desktop recovery.'
+    use_vendor
+    exit 1
+   fi
+   late=$(vendor_pids)
+   [ -z "$late" ] || { note "Stopping late vendor web server: $late"; stop_vendor; }
+  done
+  ;;
+ native|restart)
+  [ "$#" = 1 ] || exit 64
+  stop_setup; stop_boot; locked || exit $?
+  /bin/sh "$launcher" stop >> "$log" 2>&1
+  unlock
+  exec /bin/sh "$0" boot;;
+ vendor) [ "$#" = 1 ] || exit 64; stop_setup; stop_boot; locked || exit $?; disarm; use_vendor;;
+ stop) [ "$#" = 1 ] || exit 64; locked || exit $?; /bin/sh "$launcher" stop;;
+ status)
+  [ "$#" = 1 ] || exit 64
+  /bin/sh "$launcher" status
+  result=$?
+  if [ -n "$(vendor_pids)" ]; then echo 'vendor web server running'; else echo 'vendor web server stopped'; fi
+  if [ -e "$guard_pid" ]; then echo "guard armed (PID $(cat "$guard_pid"))"; fi
+  exit "$result";;
+ guard)
+  [ "$#" = 2 ] || exit 64
+  case "$2" in ''|*[!0-9]*) exit 64;; esac
+  [ "$2" -ge 60 ] && [ "$2" -le 86400 ] || exit 64
+  disarm
+  rm -f "$keep"
+  # A named interpreter keeps this timer identifiable in /proc for disarm.
+  /bin/sh "$0" guard-wait "$2" > /dev/null 2>&1 < /dev/null &
+  echo $! > "$guard_pid"
+  echo "Vendor web server will be restored in $2 seconds unless disarmed.";;
+ guard-wait)
+  [ "$#" = 2 ] || exit 64
+  sleep "$2"
+  [ ! -e "$keep" ] || exit 0
+  rm -f "$guard_pid"
+  locked || exit $?
+  note 'Guard expired; restoring the vendor web server.'
+  use_vendor;;
+ disarm) [ "$#" = 1 ] || exit 64; disarm; : > "$keep"; echo 'Guard disarmed.';;
+ *) echo 'Usage: titan-api boot|native|vendor|guard SECONDS|disarm|stop|status|restart' >&2; exit 64;;
+esac

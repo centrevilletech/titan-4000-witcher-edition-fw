@@ -1,0 +1,37 @@
+# Build scratch and unpacked vendor blobs — never commit the stock firmware.
+_work/
+out/
+*.ubifs
+*.ubi
+02_rootfs.ubi
+# Stock vendor images are inputs, not ours to redistribute in the clear.
+# CI retrieves the documented vendor source and verifies its pinned hash.
+GTCGR_TITAN4K_V1.6.0P0_R3882-4172-CBRS.prg
+GTCISP_*.PRG
+*.cookie
+*.log
+__pycache__/
+# Playwright for docs/screenshots/capture.mjs.
+node_modules/
+
+# Firmware downloads belong only in a qualified Release, never the source tree.
+*.prg
+*.PRG
+
+web/dist/
+web/dist-device/
+web/test-results/
+
+userspace/target/
+
+# Local credentials and audit backups must never enter public source.
+.env
+.env.*
+!.env.example
+*.key
+id_rsa
+id_ed25519
+*.cookie*
+*.bundle
+*.pcap
+*.pcapng

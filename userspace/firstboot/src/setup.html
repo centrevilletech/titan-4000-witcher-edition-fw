@@ -1,0 +1,47 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Witcher setup</title>
+<style>body{background:#10151b;color:#edf2f7;font:17px system-ui;margin:8vh auto;padding:24px;max-width:540px}h1{font-size:30px}p{line-height:1.6;color:#b9c5d0}input,button{font:inherit;padding:13px;box-sizing:border-box;width:100%;margin:8px 0}button{background:#d0eb83;border:0;cursor:pointer}a{color:#d0eb83}#message{white-space:pre-wrap}</style>
+<h1>Witcher v{{VERSION}}</h1><p id="intro"></p>
+<form id="setup"><label for="password">Device administrator password</label><input id="password" type="password" autocomplete="current-password" required maxlength="256"><button id="submit">Finish setup</button><button id="factory" type="button" hidden>Open factory desktop recovery</button></form>
+<p id="message" role="status"></p><p><a id="recovery">Recovery options</a></p>
+<script>
+const mode='{{MODE}}',form=document.querySelector('form'),message=document.querySelector('#message'),button=document.querySelector('#submit'),factory=document.querySelector('#factory');
+const recovery=document.querySelector('#recovery');recovery.href=`http://${location.hostname}:8081/`;
+document.querySelector('#intro').textContent=mode==='setup'?'Enter the administrator password you used before the upgrade. You can connect through Ethernet or your protected remote management network. Witcher will finish setting up this unit and open the panel.':'Recovery remains available here when the Witcher panel cannot start. Use the device administrator password to select the factory desktop interface or retry Witcher. Use a trusted LAN or protected management network for this HTTP page.';
+if(mode==='recovery'){button.textContent='Retry Witcher';factory.hidden=false;recovery.textContent='Open the device interface';recovery.href=`http://${location.hostname}/`;}
+async function jsonRequest(path,options={},timeout=5000){
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeout);
+ try{const response=await fetch(path,{...options,signal:controller.signal});const body=await response.json();return {ok:response.ok,body};}
+ finally{clearTimeout(timer);}
+}
+async function configure(action){
+ if(button.disabled)return;
+ const passwordField=document.querySelector('#password');
+ const password=passwordField.value;if(!password){form.reportValidity();return;}
+ passwordField.disabled=true;button.disabled=factory.disabled=true;message.textContent='Working…';
+ try{
+  const input={password,action};
+  if(action==='setup'){
+   if(!globalThis.crypto?.getRandomValues)throw Error('This browser cannot complete setup. Use a current desktop browser.');
+   const random=crypto.getRandomValues(new Uint8Array(64));input.seed=Array.from(random,b=>b.toString(16).padStart(2,'0')).join('');random.fill(0);
+  }
+  const response=await jsonRequest('/configure',{method:'POST',headers:{'Content-Type':'application/json','X-Witcher-Setup':'1'},body:JSON.stringify(input)},30000);
+  delete input.seed;const result=response.body;if(!response.ok)throw Error(result.message);
+  document.querySelector('#password').value='';message.textContent=result.message;
+  if(action==='setup'){
+   const deadline=Date.now()+180000;
+   while(Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,2000));
+    try{
+     const health=await jsonRequest('/api/v1/health',{cache:'no-store'},Math.max(1,Math.min(5000,deadline-Date.now())));if(!health.ok)continue;
+     const status=health.body;if(status.service!=='titan-api')continue;
+     const login=await jsonRequest('/api/v1/session',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password})},Math.max(1,Math.min(15000,deadline-Date.now())));
+     if(login.ok){location.replace('/ui/');return;}
+    }catch{}
+   }
+   throw Error('Setup was saved, but the panel has not answered yet. Open Recovery options below.');
+  }
+ }catch(error){message.textContent=error.message;}finally{passwordField.disabled=false;button.disabled=factory.disabled=false;}
+}
+form.addEventListener('submit',event=>{event.preventDefault();configure(mode==='setup'?'setup':'native');});
+factory.addEventListener('click',()=>configure('vendor'));
+</script></html>

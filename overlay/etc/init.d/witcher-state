@@ -1,0 +1,57 @@
+#!/bin/sh
+# Allocate only unused space on the already attached vendor user UBI device.
+# Never format a partition, resize a volume, or modify the boot selector.
+set -eu
+umask 077
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+state=/mnt/titan-api
+sys=/sys/class/ubi
+mounts=/proc/mounts
+lock=/tmp/witcher-state.lock
+[ "$(id -u)" = 0 ] || exit 77
+[ "${1:-}" = mount ] && [ "$#" = 1 ] || exit 64
+
+mounted() { awk -v point="$state" '$2==point && $3=="ubifs" && $1=="ubi1:data" && index(","$4",", ",rw,") { found=1 } END { exit !found }' "$mounts"; }
+fail() { echo "Witcher state: $*" >&2; exit 1; }
+waited=0
+until mkdir "$lock" 2>/dev/null; do
+ [ "$waited" -lt 30 ] || fail 'storage is busy; existing state was left untouched'
+ sleep 1; waited=$((waited+1))
+done
+trap 'rmdir "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
+waited=0
+until awk '$2=="/mnt" && $3=="ubifs" && ($1=="ubi1:cbrs" || $1=="ubi1_0" || $1=="/dev/ubi1_0") && index(","$4",", ",rw,") { found=1 } END { exit !found }' "$mounts"; do
+ [ "$waited" -lt 90 ] || fail 'vendor storage did not mount'
+ sleep 2; waited=$((waited+2))
+done
+[ "$(cat "$sys/ubi1/mtd_num")" = 20 ] || fail 'unexpected UBI partition'
+grep -Eq '^mtd20: [0-9a-fA-F]+ [0-9a-fA-F]+ "user"$' /proc/mtd || fail 'partition is not user storage'
+[ "$(cat "$sys/ubi1_0/name")" = cbrs ] || fail 'vendor volume identity changed'
+[ ! -L "$state" ] || fail 'state path is a symlink'
+if ! mounted; then
+ # Do not hide data from an older directory-based installation.
+ [ ! -e "$state" ] || { [ -d "$state" ] && [ -z "$(ls -A "$state")" ]; } || fail 'existing unmounted files need recovery'
+ found=
+ for entry in "$sys"/ubi1_*; do
+  [ "$(cat "$entry/name" 2>/dev/null)" != data ] || found=$entry
+ done
+ if [ -z "$found" ]; then
+  available=$(cat "$sys/ubi1/avail_eraseblocks")
+  size=$(cat "$sys/ubi1/eraseblock_size")
+  case "$available:$size" in *[!0-9:]*|:*|*:) fail 'invalid free-space metadata';; esac
+  [ "$size" -gt 0 ] && [ "$available" -gt $(((16777216+size-1)/size+4)) ] || fail 'not enough unallocated space'
+  ubimkvol /dev/ubi1 -N data -s 16MiB || fail 'could not create state volume'
+ fi
+ mkdir -p "$state"
+ mount -t ubifs ubi1:data "$state" || fail 'could not mount state volume'
+fi
+chown 0:0 "$state"
+chmod 700 "$state"
+for name in ssh tls; do
+ [ ! -L "$state/$name" ] || fail 'state subdirectory is a symlink'
+ mkdir -p "$state/$name"
+ chown 0:0 "$state/$name"
+ chmod 700 "$state/$name"
+done
+sync

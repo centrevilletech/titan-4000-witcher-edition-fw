@@ -1,0 +1,63 @@
+#!/bin/sh
+# Management is available on every assigned IPv4 address, regardless of legacy
+# WAN restrictions, APN count or NAT mode. Authentication remains in the services.
+# Modify only our chains and jumps; never flush vendor tables or forwarding rules.
+set -eu
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+case "${1:-}" in all|80|8081) ;; *) exit 64;; esac
+lock=/tmp/witcher-management-access.lock
+waited=0
+until mkdir "$lock" 2>/dev/null; do
+ [ "$waited" -lt 10 ] || exit 75
+ sleep 1; waited=$((waited+1))
+done
+trap 'rmdir "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
+iptables=/bin/iptables
+restore=/bin/iptables-restore
+ebtables=/usr/bin/ebtables
+# The factory kernel has no xt_addrtype module. Match assigned addresses with
+# ordinary destination rules instead; the boot supervisor refreshes this list.
+addresses=$(ip -o -4 addr show | awk '{split($4,a,"/"); print a[1]}' | sort -u)
+# Restore only our chains atomically; packets outside these ports return to
+# the unchanged vendor policy. NAT ACCEPT reserves only locally addressed ports.
+{
+ echo '*filter'
+ echo ':WITCHER_IN - [0:0]'
+ echo ':WITCHER_OUT - [0:0]'
+ echo '-F WITCHER_IN'
+ echo '-F WITCHER_OUT'
+ for port in 80 443 8081 2222; do
+  echo "-A WITCHER_IN -p tcp --dport $port -j ACCEPT"
+  echo "-A WITCHER_OUT -p tcp --sport $port -j ACCEPT"
+ done
+ echo COMMIT
+ echo '*nat'
+ echo ':WITCHER_LOCAL - [0:0]'
+ echo '-F WITCHER_LOCAL'
+ for address in $addresses; do
+  for port in 80 443 8081 2222; do
+   echo "-A WITCHER_LOCAL -d $address/32 -p tcp --dport $port -j ACCEPT"
+  done
+ done
+ echo COMMIT
+} | "$restore" --noflush
+# Prepend again only when vendor changes displace/remove our first jump.
+# Do not delete numbered rules: a concurrent vendor update could change indices.
+for chain in INPUT OUTPUT; do
+ case "$chain" in INPUT) target=WITCHER_IN;; OUTPUT) target=WITCHER_OUT;; esac
+ first=$("$iptables" -S "$chain" | sed -n '/^-A /{p;q;}')
+ [ "$first" = "-A $chain -p tcp -j $target" ] || "$iptables" -I "$chain" 1 -p tcp -j "$target"
+done
+first=$("$iptables" -t nat -S PREROUTING | sed -n '/^-A /{p;q;}')
+[ "$first" = '-A PREROUTING -p tcp -j WITCHER_LOCAL' ] || \
+ "$iptables" -t nat -I PREROUTING 1 -p tcp -j WITCHER_LOCAL
+# Bridge INPUT/OUTPUT rules can otherwise block a NAT LAN or passthrough client
+# before iptables. Add exact management-port accepts; FORWARD is untouched.
+for chain in INPUT OUTPUT; do
+ case "$chain" in INPUT) match=--ip-dport;; OUTPUT) match=--ip-sport;; esac
+ for port in 80 443 8081 2222; do
+  "$ebtables" -D "$chain" -p IPv4 --ip-proto 6 "$match" "$port" -j ACCEPT 2>/dev/null || :
+  "$ebtables" -I "$chain" 1 -p IPv4 --ip-proto 6 "$match" "$port" -j ACCEPT
+ done
+done

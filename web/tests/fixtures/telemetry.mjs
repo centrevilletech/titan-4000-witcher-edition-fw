@@ -1,0 +1,6 @@
+export const telemetry={serial:'GLOBAL-TEST',model:'Titan 4000',firmware:'V1.6.0.P0.4172',mac:'02:00:00:00:00:01',mode:'NAT / Router',name:'Titan 4000',mgmt:'192.0.2.1',customer:'198.51.100.2',customerV6:'',band:'48',earfcn:'55990',pci:190,rsrp:-84.2,chains:[-84.2,-85.1],sinr:18.6,rsrq:-9.1,attached:true,session:120,plmn:'00101',ethernet:1000,ipType:'IPv4',registration:'Registered',grant:'Authorized',cbsdId:'',grantId:'',sasError:'OK'};
+export const sample=({radio,...overrides}={})=>({sequence:1,age_ms:0,stale:false,telemetry:{...telemetry,chains:[...telemetry.chains],...(radio?{radio}:{})},...overrides});
+// Broker watch blocks (spec 2.1). A sample without radio is a legacy backend.
+export const signalBlock=({seq,reading,age_ms=0,reading_age_ms=0,rsrp=[-84.2,-85.1],rsrq=[-9.1,-9.4],rssi=[-60.0,-61.0]})=>({seq,reading,sampled_unix_ms:Date.now()-age_ms,age_ms,reading_age_ms,rsrp,rsrq,rssi,period_ms:250});
+export const qualityBlock=({seq,age_ms=0,cinr=[18.6,18.6],sinr=19})=>({seq,sampled_unix_ms:Date.now()-age_ms,age_ms,cinr,sinr,sinr_step_db:1});
+export const radioBlock=({signal,quality,...rest}={})=>({signal,quality,active_chains:2,neighbours:[],enb_id:10220,cell_id:12,tac:10,eci:2616332,...rest});

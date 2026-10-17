@@ -1,0 +1,209 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: Source and browser tests
+    # Every job runs on a disposable GitHub-hosted runner, so no PR can reach
+    # a self-hosted machine by editing this file.
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:24.04
+      # Packet tests isolate mounts, processes and networking. Docker's default
+      # AppArmor profile denies mount even with SYS_ADMIN; relax this job only.
+      options: --cap-add NET_ADMIN --cap-add SYS_ADMIN --security-opt apparmor=unconfined
+    steps:
+      - name: Install native test tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential python3 git ca-certificates curl iproute2 iptables ebtables util-linux procps
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Start with fresh checkout metadata
+        # clean/reset does not remove cached PR refs or obsolete tags. These
+        # would contaminate the full-history audit on a reused runner.
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/.git"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - name: Scan tracked source with pinned Gitleaks
+        run: |
+          set -euo pipefail
+          audit=$(mktemp -d)
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz -o "$audit/gitleaks.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $audit/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$audit/gitleaks.tar.gz" -C "$audit" gitleaks
+          mkdir "$audit/source"
+          git archive HEAD | tar -x -C "$audit/source"
+          "$audit/gitleaks" dir --redact=100 --no-banner "$audit/source"
+      - name: Credential regression and tracked-source audit
+        run: |
+          python3 scripts/test-credentials.py
+          python3 scripts/audit-secrets.py
+          python3 scripts/audit-secrets.py --history
+      - name: Metadata regression and script syntax
+        run: |
+          python3 scripts/test-rootfs-metadata.py
+          python3 scripts/test-firstboot.py
+          python3 -m compileall -q scripts
+          bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
+          for script in overlay/etc/init.d/* overlay/usr/lib/titan-api/*.sh; do sh -n "$script"; done
+          git diff --check
+      - name: Keeper and protocol tests
+        run: cargo test --locked --workspace --manifest-path userspace/Cargo.toml
+      - name: Management reachability across network modes
+        run: |
+          cargo build --locked --manifest-path userspace/Cargo.toml -p witcher-firstboot
+          unshare -n python3 scripts/test-management-network.py
+      - name: IPv4 recovery packet integration
+        run: |
+          cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
+          python3 scripts/test-ipv4-recovery-network.py
+      - name: UI dependencies
+        run: npm ci --prefix web --no-audit --no-fund
+      - name: Install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: UI unit and browser integration tests
+        run: |
+          npm run test:json --prefix web
+          npm run test:preview --prefix web
+          npm run test:rust-device --prefix web
+          npm run build:rust-device --prefix web
+          npm run test:version --prefix web
+          npm run test:firstboot --prefix web
+      - name: Release naming
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$REF_TYPE" = tag ]; then
+            test "$REF_NAME" = "v$(cat VERSION)"
+          fi
+
+  prg:
+    name: Build and verify firmware
+    # PRs run public tests only. Packaging and its private denylist are trusted.
+    if: github.event_name != 'pull_request'
+    needs: tests
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - name: Install checkout tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates curl
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Start with fresh checkout metadata
+        run: rm -rf -- "${GITHUB_WORKSPACE:?}/.git"
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          targets: armv7-unknown-linux-musleabi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: UI dependencies
+        run: npm ci --prefix web --no-audit --no-fund
+
+      - name: Install pack tools
+        run: |
+          set -euo pipefail
+          PACK_WORK=$(mktemp -d "$RUNNER_TEMP/witcher-pack.XXXXXX")
+          echo "PACK_WORK=$PACK_WORK" >> "$GITHUB_ENV"
+          apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config \
+            zlib1g-dev liblzo2-dev uuid-dev fakeroot \
+            python3-pip python3-venv python3-lzo ca-certificates curl bzip2 qemu-user
+          python3 -m venv --system-site-packages "$PACK_WORK/ubi-venv"
+          "$PACK_WORK/ubi-venv/bin/pip" install ubi_reader==0.8.16 ziglang==0.14.1
+          echo "$PACK_WORK/ubi-venv/bin" >> "$GITHUB_PATH"
+          curl -fsSL -o "$PACK_WORK/mtd-utils-2.3.1.tar.bz2" \
+            https://infraroot.at/pub/mtd/mtd-utils-2.3.1.tar.bz2
+          tar -xjf "$PACK_WORK/mtd-utils-2.3.1.tar.bz2" -C "$PACK_WORK"
+          cd "$PACK_WORK/mtd-utils-2.3.1"
+          ./configure --prefix="$PACK_WORK/mtd-tools" --with-lzo
+          make -j"$(nproc)"
+          make install
+          "$PACK_WORK/mtd-tools/sbin/mkfs.ubifs" -V
+          "$PACK_WORK/mtd-tools/sbin/ubinize" -V
+          echo "$PACK_WORK/mtd-tools/sbin" >> "$GITHUB_PATH"
+
+      - name: Fetch the stock image
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --max-time 180 \
+            https://theedgemile.com/wp-content/uploads/2026/05/GTCGR_TITAN4K_V1.6.0P0_R3882-4172-CBRS.prg \
+            -o "$PACK_WORK/stock.prg"
+          echo "ec18547470302cec65529c501f06971075a06516f7c10f03b8573e18138ea04a  $PACK_WORK/stock.prg" \
+            | sha256sum -c
+
+      - name: Build and verify
+        env:
+          WITCHER_CREDENTIAL_DENYLIST_JSON: ${{ secrets.LEGACY_CREDENTIAL_DENYLIST }}
+          WITCHER_REQUIRE_CREDENTIAL_DENYLIST: '1'
+        run: |
+          set -euo pipefail
+          python3 scripts/test-rootfs-metadata.py
+          python3 scripts/audit-secrets.py
+          python3 scripts/audit-secrets.py --history
+          mkdir -p out
+          firmware="out/witcher-v$(cat VERSION).prg"
+          scripts/build-firmware.sh "$PACK_WORK/stock.prg" -o "$firmware" 2>&1 | tee out/build.log
+          qemu-arm userspace/target/armv7-unknown-linux-musleabi/release/witcher-firstboot --version \
+            | grep -Fx "Witcher v$(cat VERSION)"
+          WITCHER_VERIFY_TLS=1 python3 scripts/verify-firmware.py "$PACK_WORK/stock.prg" "$firmware" | tee out/verification.txt
+          sha256sum "$firmware" | tee out/witcher.sha256
+
+      - name: Upload verification reports only
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: witcher-v1-verification
+          path: |
+            out/verification.txt
+            out/build.log
+            out/witcher.sha256
+          retention-days: 14
+
+      - name: Retain verified candidate for explicitly requested bench release
+        if: ${{ success() && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: witcher-test-candidate
+          path: out/*.prg
+          retention-days: 7
+
+      # Packaging success is not a first-boot or stock-upgrade qualification.
+      # Release candidates are published manually from the exact verified bytes.
+      # A passing build does not establish a hardware boot or automatic rollback.
+
+      - name: Clean packaging tools and stock download
+        if: ${{ always() && env.PACK_WORK != '' }}
+        run: rm -rf -- "${PACK_WORK:?}"

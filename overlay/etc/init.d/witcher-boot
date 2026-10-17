@@ -1,0 +1,31 @@
+#!/bin/sh
+# The recovery listener is independent of the native panel and persistent state.
+set -u
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr:/usr/lte:/usr/gps
+bundle=/usr/lib/titan-api
+[ "${1:-}" = boot ] || exit 64
+if [ "${WITCHER_BOOT_COPY:-}" != 1 ]; then
+ cp "$0" /tmp/witcher-boot.sh || exit 1
+ WITCHER_BOOT_COPY=1 exec /bin/sh /tmp/witcher-boot.sh boot
+fi
+# An inherited pipe must never keep rcS waiting for these long-lived services.
+# Vendor startup and re-attachments can rebuild their tables. Keep management
+# available independently of panel startup, APN provisioning and saved flags.
+(
+ while :; do
+  /bin/sh /etc/init.d/witcher-management-access all >> /tmp/witcher-management.log 2>&1
+  sleep 10
+ done
+) </dev/null >/dev/null 2>&1 &
+# This supervisor waits for kernel entropy if needed. It does not wait for TLS
+# generation or native web health; existing enrolled keys remain usable.
+/bin/sh /etc/init.d/titan-sshd boot </dev/null >> /tmp/titan-sshd-boot.log 2>&1 &
+# IPv4 repair and IPv6 delegation must survive a failed web/TLS startup.
+/bin/sh /etc/init.d/titan-pd-keeper start </dev/null >> /tmp/titan-pd-keeper-boot.log 2>&1 &
+(
+ while :; do
+  "$bundle/witcher-firstboot" recovery >> /tmp/witcher-recovery.log 2>&1
+  sleep 5
+ done
+) </dev/null >/dev/null 2>&1 &
+/bin/sh /etc/init.d/titan-api boot </dev/null >> /tmp/titan-api-boot.log 2>&1

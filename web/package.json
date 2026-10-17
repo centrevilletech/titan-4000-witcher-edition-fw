@@ -1,0 +1,31 @@
+{
+  "name": "titan-witcher-walkthrough",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4180",
+    "build": "vite build",
+    "serve": "node server.mjs",
+    "test": "npm run test:json && npm run test:preview && npm run test:rust-device",
+    "build:device": "vite build --mode device",
+    "build:rust-device": "vite build --mode rust-device",
+    "test:json": "node --test tests/json-client.test.mjs tests/settings-model.test.mjs tests/firmware-reconnect.test.mjs tests/align-*.test.mjs",
+    "test:rust-device": "node tests/rust-device.mjs && node tests/rust-settings.mjs && node tests/dashboard.mjs && node tests/firmware-flow.mjs",
+    "test:preview": "node tests/preview-suite.mjs",
+    "test:version": "node tests/version.mjs",
+    "test:firstboot": "node tests/firstboot.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "tailwindcss": "^4.3.3",
+    "vite": "^8.3.2"
+  },
+  "dependencies": {
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@fontsource/ibm-plex-sans": "^5.3.0",
+    "@noble/hashes": "^2.4.0",
+    "lucide": "^1.49.0"
+  }
+}

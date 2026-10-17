@@ -1,0 +1,10 @@
+# Appended at end of /etc/sysconfig/board.conf (after vendor=0 rcinit).
+# Starts the passthrough overlay once at boot; PDN up/down is handled from
+# pdn_interface_ready.sh which lted already invokes.
+if [ -x /etc/sysconfig/script/passthru-fix.sh ]; then
+	/etc/sysconfig/script/passthru-fix.sh start &
+fi
+# Start recovery independently, then provision and start the native services.
+if [ -x /etc/init.d/witcher-boot ]; then
+/bin/sh /etc/init.d/witcher-boot boot > /dev/null 2>&1 < /dev/null &
+fi

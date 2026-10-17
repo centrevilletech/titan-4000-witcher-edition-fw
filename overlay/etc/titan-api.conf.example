@@ -1,0 +1,14 @@
+# /etc/titan-api.conf: root:root, mode 0600. Fill in the actual target identity.
+# This optional override is not needed for first boot. Never put seeds here.
+TITAN_EXPECTED_MAC=''
+TITAN_EXPECTED_SERIAL=''
+# Defaults: TLS identity under /mnt/titan-api/tls/current and SAS IPC source 4, which
+# production owns because the vendor web server is stopped.
+#TITAN_TLS_CERT='/mnt/titan-api/tls/current/cert.pem'
+#TITAN_TLS_KEY='/mnt/titan-api/tls/current/key.pem'
+# Explicitly enable only after the native remote-update path is qualified.
+TITAN_AUTO_UPDATES=0
+# Shell service (titan-sshd). Defaults: port 2222, connections that arrive on the
+# customer bearer are refused. install.sh keeps these two lines across upgrades.
+#TITAN_SSH_PORT=2222
+#TITAN_SSH_DENY_INTERFACES='lte0pdn1'

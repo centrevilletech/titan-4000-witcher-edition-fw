@@ -1,0 +1,6 @@
+Jitterentropy library v3.7.0
+https://github.com/smuellerDD/jitterentropy-library
+Commit e783cf1c450bce4d72f95c9f9c84546a6094976a
+Vendored source and headers are unmodified. Distributed under LICENSE.bsd.
+Compile at -O0 without LTO. Witcher uses OSR 3, forced health tests and no
+internal timer fallback. A passing runtime health test is not a certification.

@@ -1,0 +1,15 @@
+#!/bin/sh
+# Preserve the factory desktop updater without expanding the PRG partition.
+set -eu
+archive=/usr/lib/titan-api/vendor-desktop.tar.gz
+runtime=/tmp/witcher-vendor
+if awk '$2=="/usr/www" { found=1 } END { exit !found }' /proc/mounts; then exit 0; fi
+if [ ! -d "$runtime" ]; then
+ temporary=$runtime.new-$$
+ mkdir "$temporary"
+ trap 'rm -rf "$temporary"' EXIT
+ tar -xzf "$archive" -C "$temporary"
+ [ -f "$temporary/login.asp" ] && [ -f "$temporary/Upgrade.asp" ]
+ mv "$temporary" "$runtime"
+fi
+mount -o bind "$runtime" /usr/www

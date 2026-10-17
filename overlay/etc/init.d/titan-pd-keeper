@@ -1,0 +1,126 @@
+#!/bin/sh
+# shellcheck disable=SC2046,SC2015
+# Prefix-keeper control for the ACTIVE filesystem.
+#
+#   boot       mount the persistent volume, then keep the keeper running
+#   start      the same on a running unit
+#   stop       stop the keeper
+#   restart | status
+#
+# Independent of the web service. It never re-attaches LTE, reboots the unit,
+# or touches SAS. Flash is written only below /mnt/titan-api.
+set -u
+umask 077
+bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
+runtime=/tmp/titan-pd-keeper
+log=/tmp/titan-pd-keeper-boot.log
+ram_copy=/tmp/titan-pd-keeper-control.sh
+lock=/tmp/titan-data.lock
+# The vendor mounts its own volume of this flash partition at /mnt; the mount
+# point for ours is a directory on that volume.
+vendor_mount=/mnt
+state=/mnt/titan-api
+volume=data
+ubi=/sys/class/ubi
+mounts=/proc/mounts
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+[ "$(id -u)" = 0 ] || { echo 'Service control requires root.' >&2; exit 77; }
+
+# The shell keeps the script it is running open, which would pin this file in
+# flash for as long as the service runs. Long-lived commands run from RAM.
+case "${1:-}" in
+ boot|supervise)
+  if [ "${TITAN_CONTROL_COPY:-}" != 1 ] && cp "$0" "$ram_copy" 2> /dev/null; then
+   TITAN_CONTROL_COPY=1 exec /bin/sh "$ram_copy" "$@"
+  fi;;
+esac
+
+note() {
+ echo "$(cut -d' ' -f1 /proc/uptime) $*" >> "$log"
+ echo "$*"
+}
+mounted() { grep -q " $state ubifs " "$mounts"; }
+volume_exists() {
+ for entry in "$ubi"/ubi1_*; do
+  [ "$(cat "$entry/name" 2> /dev/null)" = "$volume" ] && return 0
+ done
+ return 1
+}
+mount_state() { /bin/sh /etc/init.d/witcher-state mount; }
+
+owned() {
+ case "$1" in ''|*[!0-9]*) return 1;; esac
+ [ "$1" -gt 1 ] && [ -r "/proc/$1/cmdline" ] || return 1
+ case "$(tr '\000' ' ' < "/proc/$1/cmdline")" in *"$2"*) return 0;; esac
+ return 1
+}
+supervisor() {
+ pid=$(cat "$runtime/supervisor.pid" 2> /dev/null)
+ owned "$pid" "$ram_copy supervise" && echo "$pid"
+}
+keeper() {
+ pid=$(cat "$runtime/keeper.pid" 2> /dev/null)
+ owned "$pid" "$runtime/titan-pd-keeper run" && echo "$pid"
+}
+stop() {
+ [ -d "$runtime" ] || return 0
+ : > "$runtime/stopped"
+ pid=$(supervisor) && kill "$pid" 2> /dev/null
+ pid=$(keeper) && kill "$pid" 2> /dev/null
+ waited=0
+ while [ -n "$(keeper)" ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
+ pid=$(keeper) && kill -9 "$pid" 2> /dev/null
+ rm -f "$runtime/supervisor.pid" "$runtime/keeper.pid"
+ return 0
+}
+start() {
+ [ -z "$(supervisor)" ] || { echo 'Prefix keeper is already running.'; return 0; }
+ [ -f "$bundle/titan-pd-keeper" ] && [ -x "$bundle/titan-pd-keeper" ] || { note 'Prefix keeper binary is missing.'; return 1; }
+ if mount_state; then
+  export TITAN_PD_STATE="$state/pd"
+ else
+  export TITAN_PD_STATE=/tmp/titan-pd-state
+  note 'Starting without the persistent volume; keeper state stays in /tmp.'
+ fi
+ if [ ! -e "$runtime" ]; then mkdir "$runtime" || return 1; fi
+ [ -d "$runtime" ] && [ ! -L "$runtime" ] || { note "$runtime is not a directory."; return 1; }
+ chmod 700 "$runtime"
+ rm -f "$runtime/titan-pd-keeper.new"
+ (set -C; cat "$bundle/titan-pd-keeper" > "$runtime/titan-pd-keeper.new") && chmod 700 "$runtime/titan-pd-keeper.new" \
+  && mv -f "$runtime/titan-pd-keeper.new" "$runtime/titan-pd-keeper" || { note 'Prefix keeper binary could not be staged.'; return 1; }
+ cp "$0" "$ram_copy" 2> /dev/null || [ "${TITAN_CONTROL_COPY:-}" = 1 ] || { note 'Control script could not be staged.'; return 1; }
+ rm -f "$runtime/stopped"
+ TITAN_CONTROL_COPY=1 /bin/sh "$ram_copy" supervise > /dev/null 2>&1 < /dev/null &
+ waited=0
+ while [ -z "$(keeper)" ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+ if [ -n "$(keeper)" ]; then note 'Prefix keeper is running.'; return 0; fi
+ note 'Prefix keeper did not start.'
+ return 1
+}
+
+case "${1:-}" in
+ boot|start) [ "$#" = 1 ] || exit 64; start;;
+ stop) [ "$#" = 1 ] || exit 64; stop;;
+ restart) [ "$#" = 1 ] || exit 64; stop; start;;
+ status)
+  [ "$#" = 1 ] || exit 64
+  if mounted; then echo "persistent volume mounted at $state"; else echo 'persistent volume not mounted'; fi
+  if [ -n "$(keeper)" ]; then echo 'prefix keeper running'; exit 0; fi
+  echo 'prefix keeper stopped'
+  exit 1;;
+ supervise)
+  [ "$#" = 1 ] || exit 64
+  export TITAN_PD_RUNTIME="$runtime"
+  if mounted; then export TITAN_PD_STATE="$state/pd"; else export TITAN_PD_STATE=/tmp/titan-pd-state; fi
+  echo $$ > "$runtime/supervisor.pid"
+  while [ ! -e "$runtime/stopped" ]; do
+   "$runtime/titan-pd-keeper" run > /dev/null 2>&1 < /dev/null &
+   echo $! > "$runtime/keeper.pid"
+   wait "$!" || true
+   [ ! -e "$runtime/stopped" ] || break
+   note "Prefix keeper exited; starting it again."
+   sleep 5
+  done;;
+ *) echo 'Usage: titan-pd-keeper boot|start|stop|restart|status' >&2; exit 64;;
+esac

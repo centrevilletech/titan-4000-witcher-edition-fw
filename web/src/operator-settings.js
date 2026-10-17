@@ -1,0 +1,63 @@
+// Form inventory comes from the extracted desktop firmware pages. All effects are simulated.
+export const operatorDefaults = {
+ pciMode:'Automatic', pciStrict:false, pciRescan:'0', pciTargets:[{pci:'190'}],
+ sasUserId:'demo-operator', sasUrl:'https://sas.example.com/v1.2', sasRegistrationMode:'Single-step',
+ sasIndoor:false, sasCpiRegistered:true, sasTestMode:false, sasMaxEirp:'23', sasAntHeight:'8',
+ sasAzimuth:'180', sasLatitude:'33.0000', sasLongitude:'-87.0000', sasGpsHeight:'120',
+ sasLocalCrl:false, sasCpiMethod:'Device setup', sasCpiHeight:'8', sasCpiHeightType:'AGL',
+ sasCpiLatitude:'33.0000', sasCpiLongitude:'-87.0000', sasCpiAzimuth:'180', sasDowntilt:'0',
+ sasCpiEnvironment:'Outdoor', sasCpiId:'DEMO-CPI-001', sasCpiName:'Demo installer',
+ sasCpiKeyFormat:'P12', sasCertFormat:'P12'
+};
+export function renderCellLock(h) {
+ const {config,state,select,toggle,button,note,actions,esc,pill}=h;
+ const draft=state.lockDraft || config;
+ const preferred=draft.pciMode==='Preferred list';
+ return `<section class="card card-pad"><div class="card-head"><div><h2>PCI / cell lock</h2><p class="muted text-xs mt-2">Choose the cells the Titan may attach to.</p></div>${pill(config.pciMode==='Automatic'?'Unlocked':config.pciMode==='Automatic + lock'?'Auto-lock':config.pciStrict?'Locked':'Preferred',config.pciMode==='Automatic'?'neutral':'green')}</div>
+ <form data-form="cell-lock">
+ <div class="form-grid">${select('Connection method','pciMode',draft.pciMode,['Automatic','Automatic + lock','Preferred list'])}<label class="field">Rescan interval (minutes)<input type="number" name="pciRescan" value="${esc(draft.pciRescan)}" min="0" max="65535" step="1" required><small>0 disables periodic rescanning. Otherwise use 15–65535 minutes.</small></label></div>
+ <div class="mt-5">${note(draft.pciMode==='Automatic'?'The radio selects a cell automatically. No preferred-cell restriction is applied.':draft.pciMode==='Automatic + lock'?'The radio selects a cell automatically, then locks after attaching.':'Add the PCI values the Titan should use. No EARFCN is required.')}</div>
+ ${preferred?`${toggle('Lock to preferred cells','pciStrict',draft.pciStrict,'Restrict attachment to this list. Turn off to use the list as a preference.')}
+ <div class="cell-lock-list mt-5"><div class="lock-list-head"><span>PCI <small>0–503</small></span><span></span></div>${draft.pciTargets.map((t,i)=>`<div class="lock-row"><label class="sr-only" for="pci-${i}">PCI ${i+1}</label><input id="pci-${i}" name="lockPci" type="number" min="0" max="503" step="1" required value="${esc(t.pci)}"><button type="button" class="icon-button" data-lock-remove="${i}" aria-label="Remove cell ${i+1}">×</button></div>`).join('')}</div>
+ <div class="flex flex-wrap gap-2 mt-4">${button('Add cell','lock-add','Plus','btn-small')}${button('Use serving cell','lock-current','Crosshair','btn-small')}</div>`:''}
+ ${actions('Apply cell selection')}</form></section>
+ <section class="card card-pad mt-4"><div class="card-head"><h2>Saved configuration</h2><span class="muted text-xs">Demo readback</span></div><dl class="definition !border-0 !p-0 !m-0"><div><dt>Selection mode</dt><dd>${esc(config.pciMode)}</dd></div><div><dt>Restriction</dt><dd>${config.pciMode==='Preferred list'?(config.pciStrict?'Preferred cells only':'Preference, fallback allowed'):config.pciMode==='Automatic + lock'?'Lock after attachment':'None'}</dd></div></dl>${config.pciMode==='Preferred list'?`<div class="table-wrap mt-5"><table><thead><tr><th>PCI</th></tr></thead><tbody>${config.pciTargets.map(t=>`<tr><td class="code">${esc(t.pci)}</td></tr>`).join('')}</tbody></table></div>`:''}<p class="muted text-xs mt-5">Saved settings are separate from the serving cell. In this walkthrough the simulated radio stays on its scenario cell.</p></section>`;
+}
+export function readCellLock(form, config) {
+ const data=new FormData(form);
+ return {pciMode:data.get('pciMode'),pciRescan:data.get('pciRescan'),pciStrict:data.has('pciStrict'),pciTargets:data.has('lockPci')?data.getAll('lockPci').map(pci=>({pci})):config.pciTargets};
+}
+export function validateCellLock(value) {
+ if(!Number.isInteger(Number(value.pciRescan))||(Number(value.pciRescan)!==0&&(Number(value.pciRescan)<15||Number(value.pciRescan)>65535)))return 'Rescan interval must be 0 (disabled) or 15–65535 minutes.';
+ if(value.pciMode!=='Preferred list')return '';
+ if(!value.pciTargets.length)return 'Add at least one preferred cell.';
+ const seen=new Set();
+ for(const t of value.pciTargets){
+  if(!/^\d+$/.test(t.pci)||Number(t.pci)>503)return 'PCI must be an integer from 0 to 503.';
+  const key=String(Number(t.pci));
+  if(seen.has(key))return 'Remove duplicate PCI entries.';
+  seen.add(key);
+ }
+ return '';
+}
+export function renderSas(h) {
+ const {config,state,field,select,toggle,button,pill,note,actions,esc,tabs}=h;
+ const num=(label,name,min,max,step='any',help='')=>`<label class="field">${label}<input type="number" aria-label="${esc(label)}" name="${name}" min="${min}" max="${max}" step="${step}" value="${esc(config[name])}" required>${help?`<small>${help}</small>`:''}</label>`;
+ const file=(label,name,accept,required=true)=>`<label class="field">${label}<input type="file" aria-label="${esc(label)}" name="${name}" accept="${accept}" ${required?'required':''}></label>`;
+ const area=(label,name)=>`<label class="field">${label}<textarea aria-label="${esc(label)}" name="${name}" rows="3" required spellcheck="false">${esc(state.cpiPayload?.[name]||'')}</textarea></label>`;
+ const tab=state.tabs.sas||'configuration';
+ let content='';
+ const summary=`<section class="card card-pad sas-summary"><div class="card-head"><h2>CBSD status</h2><span class="muted text-xs">Simulated device</span></div><dl class="definition !border-0 !p-0 !m-0"><div><dt>CBSD serial</dt><dd class="code">WITCHER-001</dd></div><div><dt>Category</dt><dd>B <span class="muted">(example)</span></dd></div><div><dt>FCC ID</dt><dd>Not read in preview</dd></div><div><dt>Registration</dt><dd>${pill(state.sasRegistration,state.sasRegistration==='Registered'?'green':'amber')}</dd></div><div><dt>Grant</dt><dd>${pill(state.sasGrant,state.sasGrant==='Authorized'?'green':'amber')}</dd></div></dl><div class="section-actions">${button('Simulate registration','sas-register','RefreshCw')}${button('Deregister','sas-deregister','LogOut')}${button('Relinquish grant','sas-relinquish','RotateCcw')}</div></section>`;
+ if(tab==='configuration')content=`<section class="card card-pad"><h2 class="mb-6">SAS registration</h2><form data-form="sas-configuration"><div class="form-grid">${field('User ID','sasUserId',config.sasUserId)}${field('SAS URL','sasUrl',config.sasUrl,'url')}${select('Registration mode','sasRegistrationMode',config.sasRegistrationMode,['Single-step','Multi-step'])}${num('Maximum EIRP (dBm/MHz)','sasMaxEirp',0,37,1,'Vendor range: 0–37 dBm/MHz.')}</div>${toggle('Indoor deployment','sasIndoor',config.sasIndoor,'Installation is indoors.')}${toggle('CPI registered','sasCpiRegistered',config.sasCpiRegistered,'Registration uses CPI installation data.')}${toggle('Test mode','sasTestMode',config.sasTestMode,'Vendor test-mode setting; simulated only in this walkthrough.')}${actions('Save SAS settings')}</form></section>`;
+ if(tab==='installation')content=`<section class="card card-pad"><h2 class="mb-6">Antenna & GPS</h2><form data-form="sas-installation"><div class="form-grid">${num('Antenna height (m)','sasAntHeight',0,10000)}${num('Antenna azimuth (°)','sasAzimuth',0,359,1)}${num('GPS latitude (°)','sasLatitude',-90,90)}${num('GPS longitude (°)','sasLongitude',-180,180)}${num('GPS height (m)','sasGpsHeight',-10000,100000)}</div>${actions('Save installation')}</form></section>`;
+ if(tab==='cpi')content=`<section class="card card-pad"><div class="card-head"><h2>CPI installation data</h2>${button('Clear CPI','sas-clear-cpi','Trash2','btn-small')}</div><dl class="definition !border-0 !pt-0 !mt-0 mb-6"><div><dt>Antenna gain</dt><dd>Hardware value / not read</dd></div><div><dt>Antenna beamwidth</dt><dd>Hardware value / not read</dd></div><div><dt>Installation time</dt><dd>${esc(state.cpiInstalledAt||'No demo installation saved')}</dd></div></dl><form data-form="sas-cpi">${select('Calculation method','sasCpiMethod',state.cpiMethod||config.sasCpiMethod,['Device setup','Encrypted data'])}<div class="mt-6">${(state.cpiMethod||config.sasCpiMethod)==='Encrypted data'?`<div class="form-grid">${area('Protected header','cpiProtectedHeader')}${area('Encoded CPI signed data','cpiEncodedData')}<div class="md:col-span-2">${area('Digital signature','cpiSignature')}</div></div>`:`<div class="form-grid">${num('CPI latitude (°)','sasCpiLatitude',-90,90)}${num('CPI longitude (°)','sasCpiLongitude',-180,180)}${num('Height (m)','sasCpiHeight',-10000,100000)}${select('Height type','sasCpiHeightType',config.sasCpiHeightType,['AGL','AMSL'])}${num('CPI antenna azimuth (°)','sasCpiAzimuth',0,359,1)}${num('Antenna downtilt (°)','sasDowntilt',-90,90)}${select('Deployment environment','sasCpiEnvironment',config.sasCpiEnvironment,['Outdoor','Indoor'])}${select('CPI key format','sasCpiKeyFormat',config.sasCpiKeyFormat,['P12','PEM / DER / TXT'])}${field('CPI ID','sasCpiId',config.sasCpiId)}${field('CPI name','sasCpiName',config.sasCpiName)}${file('CPI key file','cpiKey','.p12,.pem,.der,.txt',false)}<label class="field">Key encryption password<input type="password" aria-label="Key encryption password" name="cpiKeyPassword" autocomplete="off"><small>Dummy values only. Passwords and keys are not stored.</small></label></div>`}</div><div class="mt-5">${note('CPI data in this preview is illustrative. Saving does not sign or validate an installation. File contents and passwords are not read, stored, or uploaded.')}</div>${actions('Save CPI data')}</form></section>`;
+ if(tab==='certificates')content=`<section class="card card-pad"><div class="card-head"><h2>Installed certificates</h2>${button('Restore CA certificate','sas-restore-ca','RotateCcw','btn-small')}</div><div class="table-wrap"><table><thead><tr><th>Type</th><th>Certificate</th><th>Status</th></tr></thead><tbody>${state.sasCertificates.map(c=>`<tr><td>${esc(c.type)}</td><td>${esc(c.name)}</td><td>Simulated / not validated</td></tr>`).join('')}</tbody></table></div></section><section class="card card-pad mt-4"><h2 class="mb-6">Load CBRS certificate</h2><form data-form="sas-certificate">${select('Certificate format','sasCertFormat',state.certFormat||config.sasCertFormat,['P12','PEM / DER / KEY'])}<div class="form-grid mt-6">${(state.certFormat||config.sasCertFormat)==='P12'?`${file('Certificate file (.p12)','certBundle','.p12')}<label class="field">Encryption password<input type="password" aria-label="Encryption password" name="certPassword" autocomplete="off"><small>Dummy values only. Not stored.</small></label>`:`${file('SAS CA certificate','certCa','.cer,.pem,.der')}${file('CBSD certificate','certCbsd','.cer,.pem,.der')}${file('CBSD private key','certKey','.key')}`}</div><div class="mt-5">${note('Choose dummy files to test the flow. Only filenames are shown; file contents are not read or uploaded.')}</div>${actions('Simulate certificate load')}</form></section><section class="card card-pad mt-4"><h2>Certificate revocation list</h2><form data-form="sas-crl">${toggle('Use local CRL file','sasLocalCrl',config.sasLocalCrl,'Use a locally supplied certificate revocation list.')}<div class="mt-5">${file('CRL file','crlFile','.crl',false)}</div><p class="muted text-xs mt-3">${esc(state.crlName||'No demo CRL selected')}</p>${actions('Save CRL settings')}</form></section>`;
+ return `${summary}${tabs('sas',[['configuration','Registration'],['installation','Antenna & GPS'],['cpi','CPI'],['certificates','Certificates & CRL']])}<div data-tab-panel="sas">${content}</div>`;
+}
+export function validateSas(kind,data) {
+ const ranges={sasMaxEirp:[0,37],sasAntHeight:[0,10000],sasAzimuth:[0,359],sasLatitude:[-90,90],sasLongitude:[-180,180],sasGpsHeight:[-10000,100000],sasCpiLatitude:[-90,90],sasCpiLongitude:[-180,180],sasCpiHeight:[-10000,100000],sasCpiAzimuth:[0,359],sasDowntilt:[-90,90]};
+ for(const [name,[min,max]]of Object.entries(ranges))if(name in data&&(!String(data[name]).trim()||!Number.isFinite(Number(data[name]))||Number(data[name])<min||Number(data[name])>max))return 'Check the numeric ranges shown for the installation fields.';
+ if('sasMaxEirp'in data&&!Number.isInteger(Number(data.sasMaxEirp)))return 'Maximum EIRP must be a whole number from 0 to 37.';
+ if(kind==='sas-configuration'){try{if(new URL(data.sasUrl).protocol!=='https:')return 'Enter an HTTPS SAS URL.';}catch{return 'Enter a valid HTTPS SAS URL.';}}
+ return '';
+}
