@@ -7,6 +7,8 @@
 //! up the bearer. IPv4 passthrough repair runs in the same process even when
 //! prefix delegation is off. Management IPv6 is brought up on lte0pdn0 from
 //! the modem's assigned interface identifier, including when delegation is off.
+//! In passthrough it also puts back the vendor SNAT rule for the unit's own
+//! SAS traffic when a vendor firewall restart removes it.
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -26,6 +28,7 @@ use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Peer};
 use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
+use titan_pd_model::sas_nat::{self, Action as SasAction};
 
 use crate::log;
 
@@ -71,6 +74,8 @@ struct Keeper {
     last_dhcp_probe: u64,
     ipv4_watch: ipv4_health::Watch,
     last_ipv4_check: u64,
+    sas_watch: sas_nat::Watch,
+    last_sas_check: Option<u64>,
     dhcp_child: Option<std::process::Child>,
     last_flood: u64,
     serve_retry_at: u64,
@@ -139,6 +144,8 @@ impl Keeper {
             last_dhcp_probe: 0,
             ipv4_watch: ipv4_health::Watch::default(),
             last_ipv4_check: 0,
+            sas_watch: sas_nat::Watch::default(),
+            last_sas_check: None,
             dhcp_child: None,
             last_flood: 0,
             serve_retry_at: 0,
@@ -168,6 +175,7 @@ impl Keeper {
         self.passthrough = passthrough_now();
         if !self.passthrough {
             self.ipv4_watch.reset();
+            self.sas_watch.reset();
             if self.serving {
                 self.stop_serving("left IP passthrough");
             }
@@ -189,6 +197,7 @@ impl Keeper {
         self.drain();
         self.maintain_ipv4();
         self.maintain_ipv4_link();
+        self.maintain_sas_nat();
 
         let loaded = config::load_config(&state_dir().join("config.json"));
         let config = match loaded {
@@ -830,6 +839,48 @@ impl Keeper {
         }
     }
 
+    /// Keep the vendor SNAT rule for the unit's own SAS traffic. A vendor
+    /// firewall restart after a handover removes it, and in this build nothing
+    /// else puts it back. Restores only after two missing checks in a row.
+    fn maintain_sas_nat(&mut self) {
+        if self
+            .last_sas_check
+            .is_some_and(|last| self.now.saturating_sub(last) < sas_nat::INTERVAL)
+        {
+            return;
+        }
+        self.last_sas_check = Some(self.now);
+        let snat = sas_nat::needed(
+            &command_stdout("nvram_get", &["0", "lan_management_ipaddr"]),
+            &command_stdout("nvram_get", &["0", "pdn_data_ipaddr"]),
+            &command_stdout("ip", &["route"]),
+        );
+        let present = snat.and_then(|snat| {
+            sas_nat::present(
+                &command_stdout("iptables", &["-t", "nat", "-S", "POSTROUTING"]),
+                snat,
+            )
+        });
+        let SasAction::Restore(snat) = self.sas_watch.observe(self.now, snat, present) else {
+            return;
+        };
+        self.note(&format!(
+            "SAS NAT rule missing twice after a vendor firewall restart; restoring SNAT from {} to {} so the SAS client can reach the SAS",
+            snat.local, snat.bearer
+        ));
+        for (program, args) in sas_nat::restore_commands(snat) {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = run_status(program, &args) {
+                self.note(&format!(
+                    "SAS NAT restore failed; retrying in {} s: {err}",
+                    sas_nat::RETRY
+                ));
+                return;
+            }
+        }
+        self.note("SAS NAT rule restored");
+    }
+
     fn hold_sysctl(&mut self) {
         for path in [
             "/proc/sys/net/ipv6/conf/all/send_redirects",
@@ -1019,6 +1070,7 @@ impl Keeper {
             "DHCPv6",
             "udhcpd",
             "IPv4 router answered",
+            "SAS NAT",
         ]
         .iter()
         .any(|part| line.contains(part));

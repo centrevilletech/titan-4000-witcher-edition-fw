@@ -3,6 +3,8 @@
 
 Requires root namespace capabilities. PHY action is a recording stub: this
 proves packet detection/escalation, not a physical Titan cable disconnect.
+The SAS NAT repair runs against recording iptables and kern stubs: this proves
+the keeper's decision and commands, not the vendor NAT path itself.
 """
 import os
 import json
@@ -27,7 +29,7 @@ def main():
         if os.geteuid() != 0:
             raise SystemExit('Run as root; this test creates isolated mount/network/PID namespaces.')
         subprocess.run(['unshare', '--mount', '--net', '--pid', '--fork', '--mount-proc',
-                        sys.executable, __file__, '--inner'], check=True, timeout=210)
+                        sys.executable, __file__, '--inner'], check=True, timeout=300)
         return
     run('mount', '--make-rprivate', '/')
     run('mount', '-t', 'tmpfs', 'tmpfs', '/tmp')
@@ -56,7 +58,14 @@ def main():
         p=Path(path);p.write_text('#!/bin/sh\n'+text+'\n');p.chmod(0o755)
     exe('/tmp/bin/ip', 'if [ "$1" = route ]; then cat /tmp/routes; else exec /tmp/bin/real-ip "$@"; fi')
     exe('/tmp/bin/ps', 'exec /tmp/bin/real-ps -eo pid,args')
-    exe('/tmp/bin/nvram_get', 'echo 1')
+    exe('/tmp/bin/nvram_get', 'case "$2" in router_disable) echo "nvram_get success: 1";; lan_management_ipaddr) echo "nvram_get success: 10.1.1.1";; pdn_data_ipaddr) echo "nvram_get success: 172.20.64.152";; *) echo "nvram_get success: ";; esac')
+    # The vendor SAS SNAT rule lives in a file. A flush is the file going empty.
+    sas_rule='-A POSTROUTING -s 10.1.1.1/32 -j SNAT --to-source 172.20.64.152'
+    exe('/tmp/bin/iptables', 'if [ "$*" = "-t nat -S POSTROUTING" ]; then echo "-P POSTROUTING ACCEPT"; cat /tmp/nat-rules; exit 0; fi\n'
+        'echo "iptables $*" >> /tmp/sas-actions\n'
+        'if [ "$*" = "-t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152" ]; then echo "'+sas_rule+'" >> /tmp/nat-rules; exit 0; fi\nexit 1')
+    exe('/tmp/bin/kern', 'echo "kern $*" >> /tmp/sas-actions')
+    Path('/tmp/nat-rules').write_text(sas_rule+'\n')
     exe('/tmp/bin/ebtables', 'exit 0')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
     exe('/usr/sbin/udhcpd', 'echo start >> /tmp/dhcp-starts; while :; do sleep 30; done')
@@ -90,6 +99,20 @@ def main():
         wait_for(lambda:'automatic recovery is armed' in log(),25)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
         assert not Path('/tmp/phy-actions').exists()
+        # The vendor rule is present, so the keeper leaves the nat table alone.
+        assert not Path('/tmp/sas-actions').exists(), Path('/tmp/sas-actions').read_text()
+        # A vendor firewall restart flushes it. Two missed checks restore it,
+        # in rcinit's order, and nothing more runs once it is back.
+        Path('/tmp/nat-rules').write_text('')
+        restored=['kern natq act 0','iptables -t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152']
+        wait_for(lambda:Path('/tmp/sas-actions').exists() and len(Path('/tmp/sas-actions').read_text().splitlines())>=2,40)
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
+        assert 'SAS NAT rule restored' in log()
+        until=time.monotonic()+25
+        wait_for(lambda:time.monotonic()>=until,30)
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
+        assert not Path('/tmp/phy-actions').exists()
+        print('PASS: flushed SAS SNAT rule restored once, with natq bridge mode first, and left alone after.',flush=True)
         # A missing DHCP process is restored without bouncing the port.
         server.terminate();server.wait(timeout=3)
         wait_for(lambda:Path('/tmp/dhcp-starts').read_text().count('start')>=2,20)

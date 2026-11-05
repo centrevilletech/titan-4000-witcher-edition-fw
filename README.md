@@ -95,6 +95,11 @@ Ethernet renegotiation. Recovery is bounded and does not reboot the Titan or
 reset LTE. A router that still answers ARP while its internet forwarding is
 broken needs a different diagnostic.
 
+In passthrough the keeper also keeps the vendor NAT rule that lets the Titan's
+own SAS client reach the SAS. A vendor firewall restart after an LTE handover
+removes it, and the Block Channel patch removes the vendor's way of putting it
+back. See [SAS reachability in passthrough](docs/cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
+
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
 

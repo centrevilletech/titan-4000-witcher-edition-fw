@@ -2,7 +2,7 @@
 //!
 //! The keeper process speaks on the wire. This crate is the part that can be
 //! tested on a host: prefix cuts, DHCPv6 replies, router advertisements, when
-//! to escalate, and the IPv4 passthrough repairs.
+//! to escalate, the IPv4 passthrough repairs, and the SAS NAT rule.
 
 pub mod config;
 pub mod dhcpv6;
@@ -13,6 +13,7 @@ pub mod ipv4_health;
 pub mod mgmt;
 pub mod prefix;
 pub mod ra;
+pub mod sas_nat;
 
 pub use config::{Config, Report, load_config, shown_choice, store_config};
 pub use prefix::Block;
