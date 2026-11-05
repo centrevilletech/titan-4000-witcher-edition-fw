@@ -5,6 +5,10 @@ maintenance even when IPv6 delegation is off. It repairs the DHCP offer,
 restarts a missing customer DHCP server, and discards the old lease when the
 bearer address changes. DHCP changes have a 15-second cooldown.
 
+In passthrough it also restores the vendor SNAT rule for the unit's own SAS
+traffic when a vendor firewall restart removes it. See
+[SAS reachability in passthrough](cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
+
 The local reachability monitor is enabled automatically in passthrough:
 
 1. It requires Ethernet and the customer LTE interface to have carrier, the
