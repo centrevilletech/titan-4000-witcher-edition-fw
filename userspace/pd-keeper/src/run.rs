@@ -1332,6 +1332,11 @@ impl Keeper {
                     "ue-mgmt ipv6: closing lte0pdn0 to further router advertisements (accept_ra=0)",
                 );
             }
+            if matches!(step, Step::DropKeptDefault(_)) {
+                self.note(
+                    "ue-mgmt ipv6: removing the permanent default so the kernel can take the advertisement",
+                );
+            }
             if let Err(err) = self.apply_mgmt(step) {
                 self.note(&format!("ue-mgmt ipv6: {err}"));
             }
@@ -1377,6 +1382,24 @@ impl Keeper {
                     Err(err) if err.contains("exists") => Ok(()),
                     other => other,
                 }
+            }
+            Step::DropKeptDefault(metric) => {
+                let metric = metric.to_string();
+                run_status(
+                    "ip",
+                    &[
+                        "-6",
+                        "route",
+                        "del",
+                        "default",
+                        "via",
+                        "fe80::1",
+                        "dev",
+                        mgmt::MGMT_DEV,
+                        "metric",
+                        &metric,
+                    ],
+                )
             }
             Step::Solicit(addr) => solicit_mgmt(addr),
             Step::PreferManagementDefault => run_status(

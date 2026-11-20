@@ -149,6 +149,10 @@ def main():
             # is opened again so the vendor stack can form the address.
             run(ip, '-6', 'addr', 'del', mgmt_global+'/64', 'dev', 'lte0pdn0')
             wait_for(lambda:accept_ra()=='2' and 'ue-mgmt has no global' in log(),40)
+            # The permanent default is removed first. With it in place the
+            # vendor kernel rejects every advertisement.
+            wait_for(lambda:not any('default via fe80::1' in line and 'metric 1024' in line for line in mgmt_routes().splitlines()),20)
+            assert 'removing the permanent default' in log()
             run(ip, '-6', 'addr', 'add', mgmt_global+'/64', 'dev', 'lte0pdn0', 'nodad')
             wait_for(lambda:accept_ra()=='0',40)
             print('PASS: lost management global reopened the bearer; it closed again once the address was back.',flush=True)

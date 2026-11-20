@@ -1,7 +1,7 @@
 # The deaf-unit fault: cause, guard, freeze and watchdog
 
 The freeze and the watchdog are in v1.0.2. The external-device guard and the
-customer bearer discovery are in v1.0.3, with a timing fix in v1.0.4. All live
+customer bearer discovery are in v1.0.3, with fixes in v1.0.4 and v1.0.5. All live
 in the network keeper (`titan-pd-keeper`).
 
 ## The fault
@@ -80,9 +80,16 @@ keeper sets `accept_ra` to 0 on `lte0pdn0` and replaces the learned default
 route with one that does not expire. While the bearer is closed the fault
 cannot start. When the global is lost (a re-attach, or the SDK timer), the
 keeper opens the bearer again and solicits, so the vendor stack forms the
-address as it does at boot, and the guard clears the side effect. Putting the
-old address back by hand does not work: the modem and driver only pass a
-prefix the vendor stack has formed.
+address as it does at boot, and the guard clears the side effect. After a
+re-attach, putting the old address back by hand does not work: the modem and
+driver only pass a prefix the vendor stack has formed.
+
+Since v1.0.5 the keeper removes its permanent default before it solicits. The
+kernel adds a learned default at the same metric before it reads the prefix.
+With the permanent route in the way it logs
+`RA: ndisc_router_discovery failed to add default route` and drops the whole
+advertisement. On v1.0.3 and v1.0.4 a management global that was lost without
+a re-attach never came back (IPv4 and the customer were not affected).
 
 **Customer bearer (since v1.0.3).** The keeper finds the customer bearer from
 the bridge (`/sys/class/net/br0/brif`), then from the vendor's

@@ -19,9 +19,16 @@
 //! When the global is lost (a re-attach, or the vendor SDK's own lifetime
 //! timer flushing the address one router lifetime after setup), the keeper
 //! opens the bearer again and solicits, so the vendor stack forms the address
-//! the way it does at boot. Putting the old address back by hand does not
-//! work: the modem and driver only pass a prefix the vendor stack has formed.
-//! The external-device guard in `extdev` clears the side effect.
+//! the way it does at boot. After a re-attach, putting the old address back by
+//! hand does not work: the modem and driver only pass a prefix the vendor stack
+//! has formed. The external-device guard in `extdev` clears the side effect.
+//!
+//! Before it solicits, the keeper removes its own permanent default. The
+//! kernel adds a learned default at the same metric before it looks at the
+//! prefix, and with the permanent one in the way it logs `RA:
+//! ndisc_router_discovery failed to add default route` and drops the whole
+//! advertisement. v1.0.3 left the route there, and a global lost without a
+//! re-attach never came back (bench, 2026-11-20).
 
 use std::net::Ipv6Addr;
 
@@ -66,6 +73,9 @@ pub enum Step {
     /// Replace the learned default at this metric, which would lapse with the
     /// core's router lifetime, by the same route with no expiry.
     KeepLearnedDefault(u32),
+    /// Remove the keeper's own permanent default at this metric, so the
+    /// kernel can take an advertisement again.
+    DropKeptDefault(u32),
     AddLinkLocal(Ipv6Addr),
     Solicit(Ipv6Addr),
     /// Unit-originated IPv6 has to leave on the management bearer. Metric 1
@@ -137,11 +147,33 @@ pub fn plan(iid: Iid, addrs: &str, accept_ra: &str, routes: &str) -> Vec<Step> {
     if accept != "2" {
         steps.push(Step::AcceptAdvertisements);
     }
+    if let Some(metric) = kept_default_metric(routes) {
+        steps.push(Step::DropKeptDefault(metric));
+    }
     if !has_local {
         steps.push(Step::AddLinkLocal(local));
     }
     steps.push(Step::Solicit(local));
     steps
+}
+
+/// Metric of the keeper's permanent default on `lte0pdn0`: via `fe80::1`, no
+/// expiry, and not the preferred one (metric below 20).
+pub fn kept_default_metric(routes: &str) -> Option<u32> {
+    routes.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"default") || words.contains(&"expires") {
+            return None;
+        }
+        let on_mgmt = words
+            .windows(2)
+            .any(|pair| pair[0] == "dev" && pair[1] == MGMT_DEV);
+        let via_core = words
+            .windows(2)
+            .any(|pair| pair[0] == "via" && pair[1] == "fe80::1");
+        let metric = metric_of(line).unwrap_or(1024);
+        (on_mgmt && via_core && metric >= 20).then_some(metric)
+    })
 }
 
 /// The management global formed from `iid`, if the interface holds one.
@@ -380,6 +412,34 @@ default via fe80::1 dev lte0pdn0  metric 1024
                 Step::Solicit("fe80::200:5eff:fe40:1".parse().unwrap()),
             ]
         );
+    }
+
+    #[test]
+    fn the_permanent_default_goes_before_a_lost_global_is_solicited() {
+        // Seen on the bench: with this route in place the kernel rejects every
+        // advertisement and the global never returns.
+        let iid = assigned_iid(DMESG).unwrap();
+        let routes = "\
+default via fe80::1 dev lte0pdn0  metric 1
+default via fe80::1 dev lte0pdn2  metric 20
+default via fe80::1 dev lte0pdn0  metric 1024
+";
+        let steps = plan(iid, MAC_ONLY, "0\n", routes);
+        assert_eq!(
+            steps,
+            vec![
+                Step::AcceptAdvertisements,
+                Step::DropKeptDefault(1024),
+                Step::AddLinkLocal("fe80::200:5eff:fe40:1".parse().unwrap()),
+                Step::Solicit("fe80::200:5eff:fe40:1".parse().unwrap()),
+            ]
+        );
+        // The preferred default, the customer bearer's and a learned one stay.
+        assert_eq!(kept_default_metric("default via fe80::1 dev lte0pdn0  metric 1\n"), None);
+        assert_eq!(kept_default_metric("default via fe80::1 dev lte0pdn2  metric 1024\n"), None);
+        assert_eq!(kept_default_metric(LEARNED), None);
+        // While the global is up the route is what keeps management IPv6 routed.
+        assert!(plan(iid, UP, "0", routes).is_empty());
     }
 
     #[test]
