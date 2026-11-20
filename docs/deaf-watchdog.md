@@ -1,7 +1,7 @@
 # The deaf-unit fault: cause, guard, freeze and watchdog
 
 The freeze and the watchdog are in v1.0.2. The external-device guard and the
-customer bearer discovery are in v1.0.3, with fixes in v1.0.4 and v1.0.5. All live
+customer bearer discovery are in v1.0.3, with fixes in v1.0.4 to v1.0.6. All live
 in the network keeper (`titan-pd-keeper`).
 
 ## The fault
@@ -63,7 +63,8 @@ ip link set dev lte0pdn0 address <the interface's own MAC>   # unit hears again
 **External-device guard (since v1.0.3, timing fixed in v1.0.4).** The keeper
 follows the kernel log (the vendor image has no `/dev/kmsg`, so it makes the
 node in RAM). In passthrough, when the external device stays set on a bearer
-other than the customer one for 3 seconds, it runs the repair and logs
+other than the customer one for 3 seconds (1 second once the bridge has been
+up for 10 seconds, since v1.0.6), it runs the repair and logs
 `external device guard: ...`. It runs the same repair on the first silent round
 of the watchdog.
 
