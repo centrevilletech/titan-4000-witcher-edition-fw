@@ -8,7 +8,10 @@
 //! prefix delegation is off. Management IPv6 is brought up on lte0pdn0 from
 //! the modem's assigned interface identifier, including when delegation is off.
 //! In passthrough it also puts back the vendor SNAT rule for the unit's own
-//! SAS traffic when a vendor firewall restart removes it.
+//! SAS traffic when a vendor firewall restart removes it. Once management IPv6
+//! is up it stops the kernel from processing any further advertisement on
+//! lte0pdn0, and in every mode it reboots a unit that stays attached but hears
+//! nothing through the core.
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -20,6 +23,7 @@ use std::time::Duration;
 
 use std::os::unix::process::CommandExt;
 use titan_pd_model::config::{self, Config, Report};
+use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
 use titan_pd_model::filter;
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
@@ -42,6 +46,11 @@ const FLOOD_INTERVAL: u64 = 30;
 const DHCP_COOLDOWN: u64 = 15;
 const MGMT_EVERY: u64 = 10;
 const MGMT_LOG_EVERY: u64 = 60;
+/// The management global learned this boot. In RAM, so a restarted keeper
+/// still knows it and a reboot forgets it.
+const MGMT_LEARNED: &str = "/tmp/titan-pd-mgmt-global";
+/// A plain `reboot` that has not ended this process after this long is forced.
+const REBOOT_FORCE_AFTER: u64 = 45;
 
 const SO_MARK: libc::c_int = 36;
 const PACKET_OUTGOING: u8 = 4;
@@ -100,6 +109,19 @@ struct Keeper {
     last_mgmt: u64,
     last_mgmt_log: u64,
     mgmt_up_logged: bool,
+    mgmt_learned: Option<Ipv6Addr>,
+    mgmt_default_tries: u8,
+    deaf_watch: deaf::Watch,
+    deaf_probe: Option<DeafProbe>,
+    deaf_secs: u64,
+    last_deaf_round: Option<u64>,
+    reboot_asked_at: Option<u64>,
+}
+
+/// One round of pings, collected on later ticks so the wire loop keeps running.
+struct DeafProbe {
+    children: Vec<std::process::Child>,
+    started: u64,
 }
 
 pub fn serve() -> Result<(), String> {
@@ -167,10 +189,18 @@ impl Keeper {
             last_mgmt: 0,
             last_mgmt_log: 0,
             mgmt_up_logged: false,
+            mgmt_learned: None,
+            mgmt_default_tries: 0,
+            deaf_watch: deaf::Watch::default(),
+            deaf_probe: None,
+            deaf_secs: deaf::DEAF_SECS,
+            last_deaf_round: None,
+            reboot_asked_at: None,
         }
     }
 
     fn tick(&mut self) -> Result<(), String> {
+        self.maintain_deaf_watchdog();
         self.maintain_mgmt_v6();
         self.passthrough = passthrough_now();
         if !self.passthrough {
@@ -881,6 +911,123 @@ impl Keeper {
         self.note("SAS NAT rule restored");
     }
 
+    /// Reboot a unit that stays attached but hears nothing through the core.
+    /// Runs in NAT and in passthrough. See `titan_pd_model::deaf`.
+    fn maintain_deaf_watchdog(&mut self) {
+        if let Some(asked) = self.reboot_asked_at {
+            if self.now.saturating_sub(asked) >= REBOOT_FORCE_AFTER {
+                self.reboot_asked_at = Some(self.now);
+                log("deaf watchdog: the reboot did not happen; forcing it");
+                let _ = Command::new(reboot_program()).arg("-f").status();
+            }
+            return;
+        }
+        if let Some(mut probe) = self.deaf_probe.take() {
+            let mut heard = false;
+            let mut running = false;
+            for child in probe.children.iter_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => heard |= status.success(),
+                    Ok(None) => running = true,
+                    Err(_) => {}
+                }
+            }
+            let timed_out = self.now.saturating_sub(probe.started) >= deaf::PROBE_TIMEOUT;
+            if !heard && running && !timed_out {
+                self.deaf_probe = Some(probe);
+                return;
+            }
+            for child in probe.children.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.deaf_round(Some(heard));
+            return;
+        }
+        if self
+            .last_deaf_round
+            .is_some_and(|last| self.now.saturating_sub(last) < deaf::PROBE_EVERY)
+        {
+            return;
+        }
+        self.last_deaf_round = Some(self.now);
+        let settings = deaf::parse_settings(&read_file(
+            &state_dir().join("watchdog.conf").to_string_lossy(),
+        ));
+        self.deaf_secs = settings.deaf_secs;
+        if !settings.enabled {
+            self.deaf_round(None);
+            return;
+        }
+        let targets = deaf::targets(
+            &settings,
+            &command_stdout("nvram_get", &["0", "wan_get_dns"]),
+        );
+        let children: Vec<std::process::Child> = targets
+            .iter()
+            .filter_map(|target| {
+                let program = if target.is_ipv6() { "ping6" } else { "ping" };
+                let address = target.to_string();
+                Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
+                    .args(["-c", "1", "-W", "4", address.as_str()])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .ok()
+            })
+            .collect();
+        if children.is_empty() {
+            self.deaf_round(None);
+            return;
+        }
+        self.deaf_probe = Some(DeafProbe {
+            children,
+            started: self.now,
+        });
+    }
+
+    fn deaf_round(&mut self, heard: Option<bool>) {
+        // The modem state only matters for a silent round.
+        let attached = heard != Some(false)
+            || deaf::attached(&command_stdout(
+                "nvram_get",
+                &["0", "sqns_connection_mediaState"],
+            ));
+        let path = state_dir().join("watchdog-strikes.txt");
+        let strikes = deaf::parse_strikes(&read_file(&path.to_string_lossy()));
+        match self
+            .deaf_watch
+            .observe(self.now, attached, heard, self.deaf_secs, strikes)
+        {
+            DeafAction::Hold => {}
+            DeafAction::Armed => self.note(&format!(
+                "deaf watchdog armed: a target answered through the core; {} s of silence while attached will reboot the unit",
+                deaf::required_silence(self.deaf_secs, strikes)
+            )),
+            DeafAction::Silent => {
+                self.note("deaf watchdog: attached, but no target answered this round")
+            }
+            DeafAction::Recovered { silent_for } => self.note(&format!(
+                "deaf watchdog: answers are back after {silent_for} s of silence"
+            )),
+            DeafAction::ClearStrikes => {
+                let _ = fs::write(&path, deaf::format_strikes(0));
+                self.note("deaf watchdog: an hour of answers; earlier reboots are forgotten");
+            }
+            DeafAction::Reboot { silent_for } => {
+                let _ = fs::write(&path, deaf::format_strikes(strikes.saturating_add(1)));
+                self.note(&format!(
+                    "deaf watchdog: attached but nothing heard through the core for {silent_for} s; rebooting (reboot {} in a row)",
+                    strikes.saturating_add(1)
+                ));
+                unsafe { libc::sync() };
+                self.reboot_asked_at = Some(self.now);
+                let _ = Command::new(reboot_program()).status();
+            }
+        }
+    }
+
     fn hold_sysctl(&mut self) {
         for path in [
             "/proc/sys/net/ipv6/conf/all/send_redirects",
@@ -915,6 +1062,10 @@ impl Keeper {
         if !carrier_up(mgmt::MGMT_DEV) {
             return;
         }
+        // An IPv4-only bearer: the modem turns IPv6 off here, and no address can be added.
+        if read_file("/proc/sys/net/ipv6/conf/lte0pdn0/disable_ipv6").trim() == "1" {
+            return;
+        }
         let dmesg = command_stdout("dmesg", &[]);
         let iid = match mgmt::assigned_iid(&dmesg).or_else(|| cached_mgmt_iid()) {
             Some(iid) => iid,
@@ -930,7 +1081,19 @@ impl Keeper {
         let accept = read_file("/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra");
         let routes = command_stdout("ip", &["-6", "route", "show"]);
         let up = mgmt::global_up(iid, &addrs);
-        let steps = mgmt::plan(iid, &addrs, &accept, &routes);
+        if let Some(global) = mgmt::global_of(iid, &addrs) {
+            if self.mgmt_learned != Some(global) {
+                self.mgmt_learned = Some(global);
+                let _ = fs::write(MGMT_LEARNED, format!("{global}\n"));
+            }
+        } else if self.mgmt_learned.is_none() {
+            self.mgmt_learned = read_file(MGMT_LEARNED).trim().parse().ok();
+        }
+        let known = mgmt::Known {
+            learned: self.mgmt_learned,
+            passthrough: passthrough_now(),
+        };
+        let steps = mgmt::plan(iid, &addrs, &accept, &routes, known);
         if up && !self.mgmt_up_logged {
             self.note(&format!(
                 "ue-mgmt ipv6 is up ({})",
@@ -940,18 +1103,39 @@ impl Keeper {
         }
         if up {
             self.scrub_mgmt_off_lan(&addrs);
+            if !steps.iter().any(|step| matches!(step, Step::KeepLearnedDefault(_))) {
+                self.mgmt_default_tries = 0;
+            }
         }
         if !up {
             self.mgmt_up_logged = false;
             if self.now.saturating_sub(self.last_mgmt_log) >= MGMT_LOG_EVERY {
-                self.note(&format!(
-                    "ue-mgmt has no global; soliciting from {} so the assigned prefix can come up",
-                    iid.link_local()
-                ));
+                let restoring = steps.iter().find_map(|step| match step {
+                    Step::RestoreGlobal(global) => Some(*global),
+                    _ => None,
+                });
+                match restoring {
+                    Some(global) => self.note(&format!(
+                        "ue-mgmt lost its global in IP passthrough; putting {global} back without a new advertisement through the kernel"
+                    )),
+                    None => self.note(&format!(
+                        "ue-mgmt has no global; soliciting from {} so the assigned prefix can come up",
+                        iid.link_local()
+                    )),
+                }
                 self.last_mgmt_log = self.now;
             }
         }
         for step in steps {
+            match &step {
+                Step::IgnoreAdvertisements => self.note(
+                    "ue-mgmt ipv6: refusing further router advertisements on lte0pdn0 (accept_ra=0); a second one wedges a passthrough unit",
+                ),
+                Step::KeepLearnedDefault(_) => {
+                    self.mgmt_default_tries = self.mgmt_default_tries.saturating_add(1);
+                }
+                _ => {}
+            }
             if let Err(err) = self.apply_mgmt(step) {
                 self.note(&format!("ue-mgmt ipv6: {err}"));
             }
@@ -963,6 +1147,51 @@ impl Keeper {
             Step::AcceptAdvertisements => {
                 fs::write("/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra", "2\n")
                     .map_err(|err| format!("accept_ra: {err}"))
+            }
+            Step::IgnoreAdvertisements => {
+                fs::write("/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra", "0\n")
+                    .map_err(|err| format!("accept_ra: {err}"))
+            }
+            Step::KeepLearnedDefault(metric) => {
+                // Adding the route the kernel already holds fails with "File
+                // exists", and on the way the kernel clears the expiry of the
+                // one it holds. That changes nothing else and sends no route
+                // event. If the expiry is still there on a later pass, replace
+                // the route outright.
+                let metric = metric.to_string();
+                let verb = if self.mgmt_default_tries <= 1 {
+                    "add"
+                } else {
+                    "replace"
+                };
+                match run_status(
+                    "ip",
+                    &[
+                        "-6",
+                        "route",
+                        verb,
+                        "default",
+                        "via",
+                        "fe80::1",
+                        "dev",
+                        mgmt::MGMT_DEV,
+                        "metric",
+                        &metric,
+                    ],
+                ) {
+                    Err(err) if err.contains("exists") => Ok(()),
+                    other => other,
+                }
+            }
+            Step::RestoreGlobal(global) => {
+                let spec = format!("{global}/64");
+                match run_status(
+                    "ip",
+                    &["-6", "addr", "add", &spec, "dev", mgmt::MGMT_DEV, "nodad"],
+                ) {
+                    Err(err) if err.contains("exists") => Ok(()),
+                    other => other,
+                }
             }
             Step::AddLinkLocal(addr) => {
                 let spec = format!("{addr}/64");
@@ -1071,6 +1300,9 @@ impl Keeper {
             "udhcpd",
             "IPv4 router answered",
             "SAS NAT",
+            "deaf watchdog",
+            "further router advertisements",
+            "without a new advertisement",
         ]
         .iter()
         .any(|part| line.contains(part));
@@ -1705,6 +1937,10 @@ fn interface_index(dev: &str) -> Option<i32> {
 
 fn carrier_up(dev: &str) -> bool {
     read_file(&format!("/sys/class/net/{dev}/carrier")).trim() == "1"
+}
+
+fn reboot_program() -> String {
+    std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
 }
 
 fn passthrough_now() -> bool {

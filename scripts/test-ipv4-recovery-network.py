@@ -5,6 +5,8 @@ Requires root namespace capabilities. PHY action is a recording stub: this
 proves packet detection/escalation, not a physical Titan cable disconnect.
 The SAS NAT repair runs against recording iptables and kern stubs: this proves
 the keeper's decision and commands, not the vendor NAT path itself.
+The management advertisement freeze runs against a dummy lte0pdn0 and the real
+kernel. The deaf watchdog runs against ping, modem-state and reboot stubs.
 """
 import os
 import json
@@ -29,7 +31,7 @@ def main():
         if os.geteuid() != 0:
             raise SystemExit('Run as root; this test creates isolated mount/network/PID namespaces.')
         subprocess.run(['unshare', '--mount', '--net', '--pid', '--fork', '--mount-proc',
-                        sys.executable, __file__, '--inner'], check=True, timeout=300)
+                        sys.executable, __file__, '--inner'], check=True, timeout=480)
         return
     run('mount', '--make-rprivate', '/')
     run('mount', '-t', 'tmpfs', 'tmpfs', '/tmp')
@@ -58,7 +60,34 @@ def main():
         p=Path(path);p.write_text('#!/bin/sh\n'+text+'\n');p.chmod(0o755)
     exe('/tmp/bin/ip', 'if [ "$1" = route ]; then cat /tmp/routes; else exec /tmp/bin/real-ip "$@"; fi')
     exe('/tmp/bin/ps', 'exec /tmp/bin/real-ps -eo pid,args')
-    exe('/tmp/bin/nvram_get', 'case "$2" in router_disable) echo "nvram_get success: 1";; lan_management_ipaddr) echo "nvram_get success: 10.1.1.1";; pdn_data_ipaddr) echo "nvram_get success: 172.20.64.152";; *) echo "nvram_get success: ";; esac')
+    exe('/tmp/bin/nvram_get', 'case "$2" in router_disable) echo "nvram_get success: 1";; lan_management_ipaddr) echo "nvram_get success: 10.1.1.1";; pdn_data_ipaddr) echo "nvram_get success: 172.20.64.152";; wan_get_dns) echo "nvram_get success: 192.0.2.53 0.0.0.0";; sqns_connection_mediaState) echo "nvram_get success: ATTACHED";; *) echo "nvram_get success: ";; esac')
+    # Deaf watchdog fixtures: a target answers while /tmp/ping-ok exists, and a reboot is only recorded.
+    exe('/tmp/bin/ping', 'echo "$*" >> /tmp/ping-calls; [ -e /tmp/ping-ok ]')
+    exe('/tmp/bin/reboot', 'echo "reboot $*" >> /tmp/reboot-actions')
+    Path('/tmp/ping-ok').write_text('')
+    Path('/tmp/pd').mkdir()
+    Path('/tmp/pd/watchdog.conf').write_text('deaf_secs=120\n')
+    # Management bearer fixture: the global is up, the kernel still accepts
+    # advertisements, and the learned default route is about to expire.
+    mgmt_global='2001:db8:e0:97:200:5eff:fe40:1'
+    mgmt_ready=False
+    try:
+        run(ip, 'link', 'add', 'lte0pdn0', 'type', 'dummy')
+        run(ip, 'link', 'set', 'lte0pdn0', 'up')
+        Path('/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra').write_text('2\n')
+        run(ip, '-6', 'addr', 'add', 'fe80::200:5eff:fe40:1/64', 'dev', 'lte0pdn0', 'nodad')
+        run(ip, '-6', 'addr', 'add', mgmt_global+'/64', 'dev', 'lte0pdn0', 'nodad')
+        run(ip, '-6', 'route', 'add', 'default', 'via', 'fe80::1', 'dev', 'lte0pdn0', 'metric', '1024', 'expires', '600')
+        Path('/tmp/pd/mgmt-iid.txt').write_text('200:5eff:fe40:1\n')
+        mgmt_ready=True
+    except (subprocess.CalledProcessError, OSError) as err:
+        print('SKIP: this kernel namespace has no usable IPv6; management freeze not exercised:', err, flush=True)
+    def mgmt_routes():
+        return subprocess.check_output([ip, '-6', 'route', 'show', 'dev', 'lte0pdn0']).decode()
+    def mgmt_addrs():
+        return subprocess.check_output([ip, '-6', 'addr', 'show', 'dev', 'lte0pdn0']).decode()
+    def accept_ra():
+        return Path('/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra').read_text().strip()
     # The vendor SAS SNAT rule lives in a file. A flush is the file going empty.
     sas_rule='-A POSTROUTING -s 10.1.1.1/32 -j SNAT --to-source 172.20.64.152'
     exe('/tmp/bin/iptables', 'if [ "$*" = "-t nat -S POSTROUTING" ]; then echo "-P POSTROUTING ACCEPT"; cat /tmp/nat-rules; exit 0; fi\n'
@@ -98,6 +127,30 @@ def main():
     try:
         wait_for(lambda:'automatic recovery is armed' in log(),25)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
+        # The deaf watchdog arms on the first answer, then the target goes quiet
+        # while the modem stays attached. The reboot is checked at the end.
+        wait_for(lambda:'deaf watchdog armed' in log(),45)
+        assert not Path('/tmp/reboot-actions').exists()
+        Path('/tmp/ping-ok').unlink()
+        silent_from=time.monotonic()
+        print('PASS: deaf watchdog armed only after a target answered.',flush=True)
+        if mgmt_ready:
+            # One advertisement was taken. The keeper closes the bearer to more
+            # and takes the expiry off the learned default.
+            wait_for(lambda:accept_ra()=='0' and 'expires' not in mgmt_routes(),40)
+            assert 'refusing further router advertisements' in log()
+            assert 'default via fe80::1' in mgmt_routes()
+            print('PASS: management bearer closed to further advertisements; learned default no longer expires.',flush=True)
+            # Passthrough, global lost: it comes back without the kernel being reopened.
+            run(ip, '-6', 'addr', 'del', mgmt_global+'/64', 'dev', 'lte0pdn0')
+            opened=[]
+            def restored():
+                opened.append(accept_ra())
+                return mgmt_global in mgmt_addrs()
+            wait_for(restored,40)
+            assert set(opened)=={'0'}, opened
+            assert 'without a new advertisement' in log()
+            print('PASS: lost management global restored in passthrough with accept_ra held at 0.',flush=True)
         assert not Path('/tmp/phy-actions').exists()
         # The vendor rule is present, so the keeper leaves the nat table alone.
         assert not Path('/tmp/sas-actions').exists(), Path('/tmp/sas-actions').read_text()
@@ -113,6 +166,9 @@ def main():
         assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
         assert not Path('/tmp/phy-actions').exists()
         print('PASS: flushed SAS SNAT rule restored once, with natq bridge mode first, and left alone after.',flush=True)
+        if time.monotonic()-silent_from<110:
+            assert not Path('/tmp/reboot-actions').exists(), 'the deaf watchdog fired before its wait'
+            print('PASS: deaf watchdog held through the first %d s of silence.'%(time.monotonic()-silent_from),flush=True)
         # A missing DHCP process is restored without bouncing the port.
         server.terminate();server.wait(timeout=3)
         wait_for(lambda:Path('/tmp/dhcp-starts').read_text().count('start')>=2,20)
@@ -139,6 +195,14 @@ def main():
         assert Path('/tmp/phy-actions').read_text().splitlines()==['-r eth0']
         assert 'link_drops=1' in Path('/tmp/pd/budget.txt').read_text()
         print('PASS: one recorded PHY renegotiation and persisted shared budget after continued failure.',flush=True)
+        # The target has been silent since `silent_from` with the modem attached.
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),200)
+        waited=time.monotonic()-silent_from
+        assert waited>=115, waited
+        assert Path('/tmp/reboot-actions').read_text().splitlines()[0]=='reboot ', Path('/tmp/reboot-actions').read_text()
+        assert 'rebooting (reboot 1 in a row)' in log()
+        assert Path('/tmp/pd/watchdog-strikes.txt').read_text()=='strikes=1\n'
+        print('PASS: deaf watchdog rebooted once after %d s of silence while attached.'%waited,flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
