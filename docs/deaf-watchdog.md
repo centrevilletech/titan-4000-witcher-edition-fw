@@ -59,6 +59,10 @@ If the global is lost later (a re-attach flushes it):
 A keeper on an IPv4-only bearer (`disable_ipv6` is 1 on `lte0pdn0`) now does
 nothing here. Before v1.0.2 it retried and logged an error every 10 seconds.
 
+To check the freeze on a unit, run `titan-pd-keeper solicit-mgmt` over SSH.
+It sends one router solicitation on `lte0pdn0`. The core answers, and
+`/tmp/rcinit.log` must not gain an `IPV6 RA signal received !` line.
+
 ## The watchdog
 
 The freeze closes the one trigger that is proven. The watchdog is for

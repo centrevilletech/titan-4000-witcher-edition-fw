@@ -2071,6 +2071,18 @@ fn read_mac(dev: &str) -> Result<[u8; 6], String> {
     Ok(mac)
 }
 
+/// Diagnostic: one router solicitation on the management bearer, from the
+/// core-assigned link-local. Changes no setting.
+pub fn solicit_once() -> Result<Ipv6Addr, String> {
+    let dmesg = command_stdout("dmesg", &[]);
+    let iid = mgmt::assigned_iid(&dmesg)
+        .or_else(cached_mgmt_iid)
+        .ok_or("the modem has not reported an interface identifier for lte0pdn0")?;
+    let source = iid.link_local();
+    solicit_mgmt(source)?;
+    Ok(source)
+}
+
 fn solicit_mgmt(src: Ipv6Addr) -> Result<(), String> {
     let mac = read_mac(mgmt::MGMT_DEV)?;
     let ifindex = interface_index(mgmt::MGMT_DEV).ok_or("lte0pdn0 has no interface index")?;
