@@ -46,7 +46,7 @@ const DEFAULT_BEARER: &str = "lte0pdn1";
 /// How often the vendor mode is asked when the bridge has no LTE port.
 const MODE_EVERY: u64 = 5;
 /// Kernel log records read per tick, so a long backlog cannot stall the loop.
-const KMSG_PER_TICK: usize = 256;
+const KMSG_PER_TICK: usize = 1024;
 const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
@@ -179,10 +179,12 @@ impl KernelLog {
         })
     }
 
-    /// Complete lines that have arrived since the last call.
-    fn lines(&mut self) -> Vec<String> {
+    /// Complete lines that have arrived since the last call, and whether the
+    /// log was read to its end. At start the backlog takes a few ticks.
+    fn lines(&mut self) -> (Vec<String>, bool) {
         let mut lines = Vec::new();
         let mut buf = [0u8; 4096];
+        let mut drained = false;
         for _ in 0..KMSG_PER_TICK {
             let read = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
             if read > 0 {
