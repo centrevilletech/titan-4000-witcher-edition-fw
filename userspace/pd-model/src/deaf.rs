@@ -9,7 +9,11 @@
 //! Guards against rebooting for the wrong reason:
 //! - It arms only after a target has answered in this boot. A target that never
 //!   answers, or a core that is down when the unit boots, cannot cause a reboot.
-//! - Time spent detached does not count. A radio drop is not this fault.
+//! - Time spent detached does not count, and neither do the first `SETTLE`
+//!   seconds after an attach. A radio drop is not this fault, and a unit needs
+//!   about a minute after a re-attach before its pings answer again.
+//! - On the first silent round in IP passthrough the keeper first tries the
+//!   repair in `extdev`, which needs no reboot.
 //! - Each reboot that did not help doubles the wait before the next one, up to
 //!   `MAX_WAIT`. An hour of answers clears the count.
 use std::net::IpAddr;
@@ -26,6 +30,8 @@ pub const MAX_WAIT: u64 = 6 * 3600;
 /// Answers for this long after arming clear the strike count.
 pub const CLEAR_AFTER: u64 = 3600;
 const MAX_TARGETS: usize = 4;
+/// Silence in the first seconds after an attach is the bearer settling.
+pub const SETTLE: u64 = 90;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -151,6 +157,7 @@ pub enum Action {
 pub struct Watch {
     armed_at: Option<u64>,
     silent_since: Option<u64>,
+    attached_since: Option<u64>,
     cleared: bool,
 }
 
@@ -159,9 +166,10 @@ impl Watch {
         self.armed_at.is_some()
     }
 
-    /// One finished probe round. `heard` is `None` when no probe could run
-    /// (no targets, or the watchdog is off); that is neither an answer nor
-    /// silence. `strikes` is the stored count from earlier boots.
+    /// One finished probe round. `attached` is the modem state sampled for
+    /// this round. `heard` is `None` when no probe could run (no targets, or
+    /// the watchdog is off); that is neither an answer nor silence. `strikes`
+    /// is the stored count from earlier boots.
     pub fn observe(
         &mut self,
         now: u64,
@@ -170,6 +178,11 @@ impl Watch {
         deaf_secs: u64,
         strikes: u32,
     ) -> Action {
+        if attached {
+            self.attached_since.get_or_insert(now);
+        } else {
+            self.attached_since = None;
+        }
         let Some(heard) = heard else {
             self.silent_since = None;
             return Action::Hold;
@@ -196,8 +209,13 @@ impl Watch {
         if self.armed_at.is_none() {
             return Action::Hold;
         }
-        if !attached {
+        let Some(attached_since) = self.attached_since else {
             // The radio is down. Silence is expected and is not this fault.
+            self.silent_since = None;
+            return Action::Hold;
+        };
+        if now.saturating_sub(attached_since) < SETTLE {
+            // Just attached. The bearer has not had time to answer yet.
             self.silent_since = None;
             return Action::Hold;
         }
@@ -280,6 +298,41 @@ mod tests {
         // Attached again and still silent: the wait starts now, not at the detach.
         let seen = rounds(&mut watch, 7230, 7230 + DEAF_SECS - PROBE_EVERY, true, false);
         assert_eq!(seen, vec![Action::Silent]);
+    }
+
+    #[test]
+    fn silence_right_after_an_attach_is_the_bearer_settling() {
+        let mut watch = Watch::default();
+        rounds(&mut watch, 0, 60, true, true);
+        // Detached for a while, then attached again and silent.
+        assert!(rounds(&mut watch, 90, 300, false, false).is_empty());
+        assert_eq!(watch.observe(330, true, Some(false), DEAF_SECS, 0), Action::Hold);
+        assert_eq!(watch.observe(360, true, Some(false), DEAF_SECS, 0), Action::Hold);
+        assert_eq!(watch.observe(390, true, Some(false), DEAF_SECS, 0), Action::Hold);
+        // 90 s after the attach was first seen, silence starts to count.
+        assert_eq!(
+            watch.observe(420, true, Some(false), DEAF_SECS, 0),
+            Action::Silent
+        );
+        assert_eq!(
+            watch.observe(420 + DEAF_SECS, true, Some(false), DEAF_SECS, 0),
+            Action::Reboot {
+                silent_for: DEAF_SECS
+            }
+        );
+        // A detach seen in between starts the whole wait again.
+        let mut watch = Watch::default();
+        rounds(&mut watch, 0, 120, true, true);
+        assert_eq!(
+            watch.observe(150, true, Some(false), DEAF_SECS, 0),
+            Action::Silent
+        );
+        assert_eq!(watch.observe(180, false, Some(false), DEAF_SECS, 0), Action::Hold);
+        assert_eq!(watch.observe(210, true, Some(false), DEAF_SECS, 0), Action::Hold);
+        assert_eq!(
+            watch.observe(210 + SETTLE, true, Some(false), DEAF_SECS, 0),
+            Action::Silent
+        );
     }
 
     #[test]

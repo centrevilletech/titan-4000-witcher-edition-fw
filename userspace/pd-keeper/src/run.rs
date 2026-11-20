@@ -10,7 +10,9 @@
 //! In passthrough it also puts back the vendor SNAT rule for the unit's own
 //! SAS traffic when a vendor firewall restart removes it. Once management IPv6
 //! is up it stops the kernel from processing any further advertisement on
-//! lte0pdn0, and in every mode it reboots a unit that stays attached but hears
+//! lte0pdn0. In passthrough it follows the kernel log and undoes the vendor
+//! kernel making a management bearer its external device, which is what makes
+//! a unit deaf. In every mode it reboots a unit that stays attached but hears
 //! nothing through the core.
 
 use std::fs;
@@ -25,6 +27,7 @@ use std::os::unix::process::CommandExt;
 use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
+use titan_pd_model::extdev::{self, Action as ExtAction};
 use titan_pd_model::filter;
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
 use titan_pd_model::ipv4::{self, Ipv4Plan};
@@ -38,7 +41,12 @@ use crate::log;
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
-const BEARER: &str = "lte0pdn1";
+/// The customer bearer when neither the bridge nor the vendor names one.
+const DEFAULT_BEARER: &str = "lte0pdn1";
+/// How often the vendor mode is asked when the bridge has no LTE port.
+const MODE_EVERY: u64 = 5;
+/// Kernel log records read per tick, so a long backlog cannot stall the loop.
+const KMSG_PER_TICK: usize = 256;
 const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
@@ -46,11 +54,10 @@ const FLOOD_INTERVAL: u64 = 30;
 const DHCP_COOLDOWN: u64 = 15;
 const MGMT_EVERY: u64 = 10;
 const MGMT_LOG_EVERY: u64 = 60;
-/// The management global learned this boot. In RAM, so a restarted keeper
-/// still knows it and a reboot forgets it.
-const MGMT_LEARNED: &str = "/tmp/titan-pd-mgmt-global";
 /// A plain `reboot` that has not ended this process after this long is forced.
 const REBOOT_FORCE_AFTER: u64 = 45;
+/// After the forced attempt also fails, go back to watching.
+const REBOOT_GIVE_UP_AFTER: u64 = 120;
 
 const SO_MARK: libc::c_int = 36;
 const PACKET_OUTGOING: u8 = 4;
@@ -109,19 +116,100 @@ struct Keeper {
     last_mgmt: u64,
     last_mgmt_log: u64,
     mgmt_up_logged: bool,
-    mgmt_learned: Option<Ipv6Addr>,
-    mgmt_default_tries: u8,
     deaf_watch: deaf::Watch,
     deaf_probe: Option<DeafProbe>,
     deaf_secs: u64,
     last_deaf_round: Option<u64>,
     reboot_asked_at: Option<u64>,
+    reboot_forced: bool,
+    /// The bearer bridged to the customer port, or the vendor's data bearer.
+    bearer: String,
+    mode_checked: Option<u64>,
+    kernel_log: Option<KernelLog>,
+    ext_watch: extdev::Watch,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
 struct DeafProbe {
     children: Vec<std::process::Child>,
     started: u64,
+}
+
+/// The kernel log, read without blocking. `/dev/kmsg` hands out one record per
+/// read, starting with the oldest one still held, so the first ticks replay
+/// what happened before the keeper started.
+struct KernelLog {
+    fd: libc::c_int,
+    pending: Vec<u8>,
+}
+
+impl KernelLog {
+    fn open() -> Option<Self> {
+        if let Ok(path) = std::env::var("TITAN_KMSG") {
+            return Self::open_path(&path);
+        }
+        Self::open_path("/dev/kmsg").or_else(|| {
+            // The vendor image ships no /dev/kmsg node. Character device 1,11
+            // is the kernel log on Linux, so make one in RAM.
+            let node = "/tmp/titan-kmsg";
+            let name = std::ffi::CString::new(node).ok()?;
+            let device: libc::dev_t = (1 << 8) | 11;
+            unsafe { libc::mknod(name.as_ptr(), libc::S_IFCHR | 0o600, device) };
+            Self::open_path(node)
+        })
+    }
+
+    fn open_path(path: &str) -> Option<Self> {
+        let path = std::ffi::CString::new(path).ok()?;
+        let fd = unsafe {
+            libc::open(
+                path.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        (fd >= 0).then(|| Self {
+            fd,
+            pending: Vec::new(),
+        })
+    }
+
+    /// Complete lines that have arrived since the last call.
+    fn lines(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut buf = [0u8; 4096];
+        for _ in 0..KMSG_PER_TICK {
+            let read = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if read > 0 {
+                self.pending.extend_from_slice(&buf[..read as usize]);
+                while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = self.pending.drain(..=end).collect();
+                    lines.push(String::from_utf8_lossy(&line).trim_end().to_owned());
+                }
+                if self.pending.len() > 16 * 1024 {
+                    self.pending.clear();
+                }
+                continue;
+            }
+            if read == 0 {
+                break;
+            }
+            match io::Error::last_os_error().raw_os_error() {
+                // Records were overwritten before they were read. The next read resumes.
+                Some(libc::EPIPE) | Some(libc::EINTR) => continue,
+                _ => break,
+            }
+        }
+        lines
+    }
+}
+
+impl Drop for KernelLog {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe { libc::close(self.fd) };
+            self.fd = -1;
+        }
+    }
 }
 
 pub fn serve() -> Result<(), String> {
@@ -189,20 +277,24 @@ impl Keeper {
             last_mgmt: 0,
             last_mgmt_log: 0,
             mgmt_up_logged: false,
-            mgmt_learned: None,
-            mgmt_default_tries: 0,
             deaf_watch: deaf::Watch::default(),
             deaf_probe: None,
             deaf_secs: deaf::DEAF_SECS,
             last_deaf_round: None,
             reboot_asked_at: None,
+            reboot_forced: false,
+            bearer: DEFAULT_BEARER.to_owned(),
+            mode_checked: None,
+            kernel_log: KernelLog::open(),
+            ext_watch: extdev::Watch::default(),
         }
     }
 
     fn tick(&mut self) -> Result<(), String> {
+        self.refresh_mode();
+        self.maintain_external_dev();
         self.maintain_deaf_watchdog();
         self.maintain_mgmt_v6();
-        self.passthrough = passthrough_now();
         if !self.passthrough {
             self.ipv4_watch.reset();
             self.sas_watch.reset();
@@ -271,9 +363,10 @@ impl Keeper {
             return Ok(());
         };
 
+        let bearer = self.bearer.clone();
         let live = global_prefix(&command_stdout(
             "ip",
-            &["-6", "addr", "show", "dev", BEARER],
+            &["-6", "addr", "show", "dev", &bearer],
         ));
         let pinned = match ensure_pin(&config, live) {
             Ok(block) => block,
@@ -321,7 +414,7 @@ impl Keeper {
         }
 
         let carrier = carrier_up(CUSTOMER);
-        let lte = live.is_some() && carrier_up(BEARER);
+        let lte = live.is_some() && carrier_up(&bearer);
         if !self.serving && self.now >= self.serve_retry_at {
             if let Err(err) = self.start_serving(block) {
                 self.serve_retry_at = self.now + SERVE_RETRY;
@@ -712,8 +805,8 @@ impl Keeper {
         if self.now.saturating_sub(self.last_flood) >= FLOOD_INTERVAL {
             let first = self.last_flood == 0;
             let mut failed = None;
-            for line in ipv4::flood_commands() {
-                if let Err(err) = ebtables(line) {
+            for line in ipv4::flood_commands(&self.bearer) {
+                if let Err(err) = ebtables(&line) {
                     failed = Some(err);
                 }
             }
@@ -734,8 +827,9 @@ impl Keeper {
         if !cooldown {
             return;
         }
-        let plan =
-            ipv4::plan_maintenance(&conf, &routes, &lease, discover, cooldown).or_else(|| {
+        let bearer = self.bearer.clone();
+        let plan = ipv4::plan_maintenance(&conf, &routes, &lease, discover, cooldown, &bearer)
+            .or_else(|| {
                 if self.now.saturating_sub(self.last_dhcp_probe) < 5 {
                     return None;
                 }
@@ -786,9 +880,10 @@ impl Keeper {
             return;
         }
         self.last_ipv4_check = self.now;
+        let bearer = self.bearer.clone();
         let conf_text = read_file("/tmp/udhcpd.conf");
         let peer = (|| {
-            if !carrier_up(CUSTOMER) || !carrier_up(BEARER) {
+            if !carrier_up(CUSTOMER) || !carrier_up(&bearer) {
                 return None;
             }
             let conf = ipv4::parse_conf(&conf_text)?;
@@ -911,14 +1006,92 @@ impl Keeper {
         self.note("SAS NAT rule restored");
     }
 
+    /// Which bearer carries the customer, and whether it is bridged to the
+    /// LAN port. The bridge answers both without a fork. Only when it has no
+    /// LTE port is the vendor asked, and then at most every `MODE_EVERY` s.
+    fn refresh_mode(&mut self) {
+        let ports: Vec<String> = fs::read_dir("/sys/class/net/br0/brif")
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(port) = extdev::bridged_bearer(ports.iter().map(String::as_str)) {
+            self.bearer = port;
+            self.passthrough = true;
+            self.mode_checked = None;
+            return;
+        }
+        if self
+            .mode_checked
+            .is_some_and(|last| self.now.saturating_sub(last) < MODE_EVERY)
+        {
+            return;
+        }
+        self.mode_checked = Some(self.now);
+        let mode = command_stdout("nvram_get", &["0", "router_disable"]);
+        self.passthrough = mode.rsplit(':').next().unwrap_or("").trim() == "1";
+        let named = command_stdout("nvram_get", &["0", "pdn_data_ifname"]);
+        let named = named.rsplit(':').next().unwrap_or("").trim();
+        if extdev::is_lte_bearer(named) {
+            self.bearer = named.to_owned();
+        }
+    }
+
+    /// Follow the kernel log for the vendor kernel's external device, and in
+    /// passthrough undo it being left on a management bearer. See
+    /// `titan_pd_model::extdev`.
+    fn maintain_external_dev(&mut self) {
+        let lines = match self.kernel_log.as_mut() {
+            Some(log) => log.lines(),
+            None => return,
+        };
+        for line in lines {
+            if let Some(event) = extdev::parse(&line) {
+                self.ext_watch.note(self.now, event);
+            }
+        }
+        let customer = self.bearer.clone();
+        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, self.passthrough, &customer)
+        {
+            self.note(&format!(
+                "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
+            ));
+            self.repair_external_dev(&dev);
+        }
+    }
+
+    /// `kern netif extdev <dev> down`, then the bearer's own MAC. Both leave a
+    /// healthy unit unchanged.
+    fn repair_external_dev(&mut self, dev: &str) {
+        let Some(mac) = interface_mac(dev) else {
+            self.note(&format!("external device guard: {dev} has no MAC to restore"));
+            return;
+        };
+        for (program, args) in extdev::repair_commands(dev, &ipv4::mac_text(mac)) {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            if let Err(err) = run_status(program, &args) {
+                self.note(&format!("external device guard: {err}"));
+            }
+        }
+    }
+
     /// Reboot a unit that stays attached but hears nothing through the core.
     /// Runs in NAT and in passthrough. See `titan_pd_model::deaf`.
     fn maintain_deaf_watchdog(&mut self) {
         if let Some(asked) = self.reboot_asked_at {
-            if self.now.saturating_sub(asked) >= REBOOT_FORCE_AFTER {
-                self.reboot_asked_at = Some(self.now);
+            let waited = self.now.saturating_sub(asked);
+            if !self.reboot_forced && waited >= REBOOT_FORCE_AFTER {
+                self.reboot_forced = true;
                 log("deaf watchdog: the reboot did not happen; forcing it");
                 let _ = Command::new(reboot_program()).arg("-f").status();
+            } else if self.reboot_forced && waited >= REBOOT_GIVE_UP_AFTER {
+                self.reboot_asked_at = None;
+                self.reboot_forced = false;
+                self.deaf_watch = deaf::Watch::default();
+                log("deaf watchdog: the forced reboot did not happen either; watching again");
             }
             return;
         }
@@ -959,10 +1132,12 @@ impl Keeper {
             self.deaf_round(None);
             return;
         }
-        let targets = deaf::targets(
-            &settings,
-            &command_stdout("nvram_get", &["0", "wan_get_dns"]),
-        );
+        let bearer_dns = if settings.targets.is_empty() {
+            command_stdout("nvram_get", &["0", "wan_get_dns"])
+        } else {
+            String::new()
+        };
+        let targets = deaf::targets(&settings, &bearer_dns);
         let children: Vec<std::process::Child> = targets
             .iter()
             .filter_map(|target| {
@@ -988,12 +1163,10 @@ impl Keeper {
     }
 
     fn deaf_round(&mut self, heard: Option<bool>) {
-        // The modem state only matters for a silent round.
-        let attached = heard != Some(false)
-            || deaf::attached(&command_stdout(
-                "nvram_get",
-                &["0", "sqns_connection_mediaState"],
-            ));
+        let attached = deaf::attached(&command_stdout(
+            "nvram_get",
+            &["0", "sqns_connection_mediaState"],
+        ));
         let path = state_dir().join("watchdog-strikes.txt");
         let strikes = deaf::parse_strikes(&read_file(&path.to_string_lossy()));
         match self
@@ -1006,24 +1179,37 @@ impl Keeper {
                 deaf::required_silence(self.deaf_secs, strikes)
             )),
             DeafAction::Silent => {
-                self.note("deaf watchdog: attached, but no target answered this round")
+                self.note("deaf watchdog: attached, but no target answered this round");
+                if self.passthrough {
+                    // The known cause of a deaf passthrough unit needs no reboot.
+                    self.note(
+                        "deaf watchdog: trying the passthrough repair first (external device and management MAC)",
+                    );
+                    self.repair_external_dev(mgmt::MGMT_DEV);
+                }
             }
             DeafAction::Recovered { silent_for } => self.note(&format!(
                 "deaf watchdog: answers are back after {silent_for} s of silence"
             )),
             DeafAction::ClearStrikes => {
-                let _ = fs::write(&path, deaf::format_strikes(0));
-                self.note("deaf watchdog: an hour of answers; earlier reboots are forgotten");
+                if store_strikes(&path, 0) {
+                    self.note("deaf watchdog: an hour of answers; earlier reboots are forgotten");
+                }
             }
             DeafAction::Reboot { silent_for } => {
-                let _ = fs::write(&path, deaf::format_strikes(strikes.saturating_add(1)));
+                store_strikes(&path, strikes.saturating_add(1));
                 self.note(&format!(
                     "deaf watchdog: attached but nothing heard through the core for {silent_for} s; rebooting (reboot {} in a row)",
                     strikes.saturating_add(1)
                 ));
                 unsafe { libc::sync() };
                 self.reboot_asked_at = Some(self.now);
-                let _ = Command::new(reboot_program()).status();
+                self.reboot_forced = false;
+                let _ = Command::new(reboot_program())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
             }
         }
     }
@@ -1081,19 +1267,7 @@ impl Keeper {
         let accept = read_file("/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra");
         let routes = command_stdout("ip", &["-6", "route", "show"]);
         let up = mgmt::global_up(iid, &addrs);
-        if let Some(global) = mgmt::global_of(iid, &addrs) {
-            if self.mgmt_learned != Some(global) {
-                self.mgmt_learned = Some(global);
-                let _ = fs::write(MGMT_LEARNED, format!("{global}\n"));
-            }
-        } else if self.mgmt_learned.is_none() {
-            self.mgmt_learned = read_file(MGMT_LEARNED).trim().parse().ok();
-        }
-        let known = mgmt::Known {
-            learned: self.mgmt_learned,
-            passthrough: passthrough_now(),
-        };
-        let steps = mgmt::plan(iid, &addrs, &accept, &routes, known);
+        let steps = mgmt::plan(iid, &addrs, &accept, &routes);
         if up && !self.mgmt_up_logged {
             self.note(&format!(
                 "ue-mgmt ipv6 is up ({})",
@@ -1103,38 +1277,22 @@ impl Keeper {
         }
         if up {
             self.scrub_mgmt_off_lan(&addrs);
-            if !steps.iter().any(|step| matches!(step, Step::KeepLearnedDefault(_))) {
-                self.mgmt_default_tries = 0;
-            }
         }
         if !up {
             self.mgmt_up_logged = false;
             if self.now.saturating_sub(self.last_mgmt_log) >= MGMT_LOG_EVERY {
-                let restoring = steps.iter().find_map(|step| match step {
-                    Step::RestoreGlobal(global) => Some(*global),
-                    _ => None,
-                });
-                match restoring {
-                    Some(global) => self.note(&format!(
-                        "ue-mgmt lost its global in IP passthrough; putting {global} back without a new advertisement through the kernel"
-                    )),
-                    None => self.note(&format!(
-                        "ue-mgmt has no global; soliciting from {} so the assigned prefix can come up",
-                        iid.link_local()
-                    )),
-                }
+                self.note(&format!(
+                    "ue-mgmt has no global; soliciting from {} so the assigned prefix can come up",
+                    iid.link_local()
+                ));
                 self.last_mgmt_log = self.now;
             }
         }
         for step in steps {
-            match &step {
-                Step::IgnoreAdvertisements => self.note(
-                    "ue-mgmt ipv6: refusing further router advertisements on lte0pdn0 (accept_ra=0); a second one wedges a passthrough unit",
-                ),
-                Step::KeepLearnedDefault(_) => {
-                    self.mgmt_default_tries = self.mgmt_default_tries.saturating_add(1);
-                }
-                _ => {}
+            if step == Step::IgnoreAdvertisements {
+                self.note(
+                    "ue-mgmt ipv6: closing lte0pdn0 to further router advertisements (accept_ra=0)",
+                );
             }
             if let Err(err) = self.apply_mgmt(step) {
                 self.note(&format!("ue-mgmt ipv6: {err}"));
@@ -1153,23 +1311,15 @@ impl Keeper {
                     .map_err(|err| format!("accept_ra: {err}"))
             }
             Step::KeepLearnedDefault(metric) => {
-                // Adding the route the kernel already holds fails with "File
-                // exists", and on the way the kernel clears the expiry of the
-                // one it holds. That changes nothing else and sends no route
-                // event. If the expiry is still there on a later pass, replace
-                // the route outright.
+                // `replace` turns the learned route into a plain one with no
+                // expiry. On this kernel a duplicate `add` leaves the expiry.
                 let metric = metric.to_string();
-                let verb = if self.mgmt_default_tries <= 1 {
-                    "add"
-                } else {
-                    "replace"
-                };
-                match run_status(
+                run_status(
                     "ip",
                     &[
                         "-6",
                         "route",
-                        verb,
+                        "replace",
                         "default",
                         "via",
                         "fe80::1",
@@ -1178,20 +1328,7 @@ impl Keeper {
                         "metric",
                         &metric,
                     ],
-                ) {
-                    Err(err) if err.contains("exists") => Ok(()),
-                    other => other,
-                }
-            }
-            Step::RestoreGlobal(global) => {
-                let spec = format!("{global}/64");
-                match run_status(
-                    "ip",
-                    &["-6", "addr", "add", &spec, "dev", mgmt::MGMT_DEV, "nodad"],
-                ) {
-                    Err(err) if err.contains("exists") => Ok(()),
-                    other => other,
-                }
+                )
             }
             Step::AddLinkLocal(addr) => {
                 let spec = format!("{addr}/64");
@@ -1943,12 +2080,11 @@ fn reboot_program() -> String {
     std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
 }
 
-fn passthrough_now() -> bool {
-    if std::path::Path::new(&format!("/sys/class/net/br0/brif/{BEARER}")).exists() {
-        return true;
-    }
-    let output = command_stdout("nvram_get", &["0", "router_disable"]);
-    output.rsplit(':').next().unwrap_or("").trim() == "1"
+/// Write the strike count through a temporary file, so a power cut cannot
+/// leave a torn record.
+fn store_strikes(path: &std::path::Path, strikes: u32) -> bool {
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, deaf::format_strikes(strikes)).is_ok() && fs::rename(&temp, path).is_ok()
 }
 
 fn published_detail(existing: &str, argument: &str) -> String {
