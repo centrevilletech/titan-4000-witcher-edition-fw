@@ -3,6 +3,9 @@
 //! `run` is the supervised process. `guard` and `confirm` are the self-revert
 //! pair for a setting change that re-attaches LTE: the guard puts the old
 //! setting back if confirm has not recorded that management returned.
+//! `solicit-mgmt` is a diagnostic: it sends one router solicitation on the
+//! management bearer, to check that the answer no longer reaches the vendor
+//! stack once the keeper has closed the bearer to advertisements.
 
 use std::env;
 use std::fs;
@@ -33,6 +36,18 @@ fn main() {
         Some("confirm") => std::process::exit(confirm(&args.collect::<Vec<_>>())),
         Some("filter-probe") => std::process::exit(filter_probe()),
         Some("filter-undo") => std::process::exit(filter_undo(&args.collect::<Vec<_>>())),
+        Some("solicit-mgmt") => match run::solicit_once() {
+            Ok(source) => {
+                let _ = writeln!(
+                    std::io::stdout(),
+                    "router solicitation sent on lte0pdn0 from {source}"
+                );
+            }
+            Err(err) => {
+                eprintln!("solicit-mgmt: {err}");
+                std::process::exit(1);
+            }
+        },
         Some("status") => {
             let _ = writeln!(
                 std::io::stdout(),
@@ -41,7 +56,9 @@ fn main() {
             );
         }
         _ => {
-            eprintln!("usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|status");
+            eprintln!(
+                "usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|solicit-mgmt|status"
+            );
             std::process::exit(64);
         }
     }

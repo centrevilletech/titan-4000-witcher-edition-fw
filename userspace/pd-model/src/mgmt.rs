@@ -8,6 +8,20 @@
 //! comes up. Installing the assigned link-local and soliciting from it is
 //! enough: the kernel accepts the advertisement, and the modem learns the
 //! prefix on `lte0pdn0`.
+//!
+//! The kernel takes one advertisement on this bearer, then no more. The vendor
+//! stack hears of every advertisement the kernel processes (`RTM_NEWPREFIX`
+//! to the LTE daemon, then a signal to `rcinit`), rebuilds the IPv6 firewall
+//! and resets the hardware bridge. At bearer setup that is how IPv6 comes up.
+//! A later one in IP passthrough leaves the unit attached but deaf on every
+//! bearer until a reboot. Units in the field went deaf one router lifetime
+//! after bearer setup, which is when the learned default route expires. So
+//! once the global is up the keeper sets `accept_ra` to 0 and takes the expiry
+//! off the learned default. If the global is lost later in IP passthrough it
+//! puts the learned address back itself. It still solicits, because the modem
+//! has to see an advertisement on the bearer, but the kernel does not act on
+//! the answer. Outside passthrough a lost global is solicited through the
+//! kernel as before.
 
 use std::net::Ipv6Addr;
 
@@ -47,8 +61,15 @@ impl Iid {
 pub enum Step {
     /// Forwarding is on, so accept_ra must be 2 or Linux stops taking advertisements.
     AcceptAdvertisements,
+    /// The global is up. Linux must not process another advertisement this boot.
+    IgnoreAdvertisements,
+    /// Take the expiry off the learned default (the route at this metric),
+    /// which would otherwise lapse with the core's router lifetime.
+    KeepLearnedDefault(u32),
     AddLinkLocal(Ipv6Addr),
     Solicit(Ipv6Addr),
+    /// Put back the global learned earlier this boot, without a new advertisement.
+    RestoreGlobal(Ipv6Addr),
     /// Unit-originated IPv6 has to leave on the management bearer. Metric 1
     /// beats the customer-bearer default (metric 20). Bridged customer frames
     /// do not use this route.
@@ -93,24 +114,84 @@ pub fn parse_iid(text: &str) -> Option<Iid> {
     Some(Iid(bytes))
 }
 
-/// What to do on one pass. Empty means the management global is up and preferred.
-pub fn plan(iid: Iid, addrs: &str, accept_ra: &str, routes: &str) -> Vec<Step> {
+/// What the keeper knows beyond the interface state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Known {
+    /// The management global learned earlier this boot, if any.
+    pub learned: Option<Ipv6Addr>,
+    /// The customer bearer is bridged to the LAN port.
+    pub passthrough: bool,
+}
+
+/// What to do on one pass. Empty means the management global is up, preferred
+/// and closed to further advertisements.
+pub fn plan(iid: Iid, addrs: &str, accept_ra: &str, routes: &str, known: Known) -> Vec<Step> {
     let mut steps = Vec::new();
-    if accept_ra.trim() != "2" {
-        steps.push(Step::AcceptAdvertisements);
-    }
+    let accept = accept_ra.trim();
     let local = iid.link_local();
-    if !addrs_of(addrs).any(|addr| addr == local) {
-        steps.push(Step::AddLinkLocal(local));
-    }
-    if !global_up(iid, addrs) {
-        steps.push(Step::Solicit(local));
+    let has_local = addrs_of(addrs).any(|addr| addr == local);
+    if global_up(iid, addrs) {
+        if accept != "0" {
+            steps.push(Step::IgnoreAdvertisements);
+        }
+        if !has_local {
+            steps.push(Step::AddLinkLocal(local));
+        }
+        if let Some(metric) = learned_default_metric(routes) {
+            steps.push(Step::KeepLearnedDefault(metric));
+        }
+        if !management_default_preferred(routes) {
+            steps.push(Step::PreferManagementDefault);
+        }
         return steps;
     }
-    if !management_default_preferred(routes) {
-        steps.push(Step::PreferManagementDefault);
+    if let (Some(global), true) = (known.learned, known.passthrough) {
+        // A second advertisement through the kernel wedges a passthrough unit.
+        if accept != "0" {
+            steps.push(Step::IgnoreAdvertisements);
+        }
+        if !has_local {
+            steps.push(Step::AddLinkLocal(local));
+        }
+        steps.push(Step::Solicit(local));
+        if iid.matches(global) {
+            steps.push(Step::RestoreGlobal(global));
+        }
+        return steps;
     }
+    if accept != "2" {
+        steps.push(Step::AcceptAdvertisements);
+    }
+    if !has_local {
+        steps.push(Step::AddLinkLocal(local));
+    }
+    steps.push(Step::Solicit(local));
     steps
+}
+
+/// The management global formed from `iid`, if the interface holds one.
+pub fn global_of(iid: Iid, addrs: &str) -> Option<Ipv6Addr> {
+    addrs_of(addrs).find(|addr| !is_link_local(*addr) && iid.matches(*addr))
+}
+
+/// True while the kernel still holds an advertisement-learned default on
+/// `lte0pdn0` that will expire.
+pub fn learned_default_expires(routes: &str) -> bool {
+    learned_default_metric(routes).is_some()
+}
+
+/// Metric of the expiring learned default on `lte0pdn0`.
+pub fn learned_default_metric(routes: &str) -> Option<u32> {
+    routes.lines().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if words.first() != Some(&"default") || !words.contains(&"expires") {
+            return None;
+        }
+        let on_mgmt = words
+            .windows(2)
+            .any(|pair| pair[0] == "dev" && pair[1] == MGMT_DEV);
+        on_mgmt.then(|| metric_of(line).unwrap_or(1024))
+    })
 }
 
 pub fn global_up(iid: Iid, addrs: &str) -> bool {
@@ -247,6 +328,7 @@ ndisc_send_rs(lte0pdn1) fe80::200:5eff:fe40:3->ff02::2
             MAC_ONLY,
             "1\n",
             "default via fe80::1 dev lte0pdn1 metric 20\n",
+            Known::default(),
         );
         assert_eq!(
             steps,
@@ -265,15 +347,118 @@ ndisc_send_rs(lte0pdn1) fe80::200:5eff:fe40:3->ff02::2
 default via fe80::1 dev lte0pdn0 metric 1
 default via fe80::1 dev lte0pdn1 metric 20
 ";
-        assert!(plan(iid, UP, "2", routes).is_empty());
+        assert!(plan(iid, UP, "0", routes, Known::default()).is_empty());
         assert!(global_up(iid, UP));
     }
 
     #[test]
     fn an_up_bearer_whose_default_still_prefers_the_customer_pdn_is_corrected() {
         let iid = assigned_iid(DMESG).unwrap();
-        let steps = plan(iid, UP, "2", "default via fe80::1 dev lte0pdn1 metric 20\n");
+        let steps = plan(
+            iid,
+            UP,
+            "0",
+            "default via fe80::1 dev lte0pdn1 metric 20\n",
+            Known::default(),
+        );
         assert_eq!(steps, vec![Step::PreferManagementDefault]);
+    }
+
+    const LEARNED: &str = "\
+default via fe80::1 dev lte0pdn0  metric 1
+default via fe80::1 dev lte0pdn2  metric 20
+default via fe80::1 dev lte0pdn0  proto ra  metric 1024  expires 53723sec
+";
+
+    #[test]
+    fn once_the_global_is_up_further_advertisements_are_refused() {
+        let iid = assigned_iid(DMESG).unwrap();
+        let steps = plan(iid, UP, "2\n", LEARNED, Known::default());
+        assert_eq!(
+            steps,
+            vec![Step::IgnoreAdvertisements, Step::KeepLearnedDefault(1024)]
+        );
+        assert_eq!(learned_default_metric(LEARNED), Some(1024));
+    }
+
+    #[test]
+    fn a_default_with_no_expiry_is_not_replaced_again() {
+        let iid = assigned_iid(DMESG).unwrap();
+        let routes = "\
+default via fe80::1 dev lte0pdn0  metric 1
+default via fe80::1 dev lte0pdn0  metric 1024
+";
+        assert!(plan(iid, UP, "0", routes, Known::default()).is_empty());
+        assert!(!learned_default_expires(routes));
+    }
+
+    #[test]
+    fn an_expiring_default_on_another_bearer_is_left_alone() {
+        let routes = "default via fe80::1 dev lte0pdn1  proto ra  metric 1024  expires 60sec\n";
+        assert!(!learned_default_expires(routes));
+    }
+
+    #[test]
+    fn a_passthrough_unit_that_loses_its_global_never_asks_the_kernel_again() {
+        let iid = assigned_iid(DMESG).unwrap();
+        let global: Ipv6Addr = "2001:db8:e0:97:200:5eff:fe40:1".parse().unwrap();
+        let known = Known {
+            learned: Some(global),
+            passthrough: true,
+        };
+        let steps = plan(iid, MAC_ONLY, "0\n", "", known);
+        assert_eq!(
+            steps,
+            vec![
+                Step::AddLinkLocal("fe80::200:5eff:fe40:1".parse().unwrap()),
+                Step::Solicit("fe80::200:5eff:fe40:1".parse().unwrap()),
+                Step::RestoreGlobal(global),
+            ]
+        );
+        assert!(!steps.contains(&Step::AcceptAdvertisements));
+        // Something reopened the sysctl: it is closed again before soliciting.
+        let reopened = plan(iid, MAC_ONLY, "2\n", "", known);
+        assert_eq!(reopened[0], Step::IgnoreAdvertisements);
+        assert!(!reopened.contains(&Step::AcceptAdvertisements));
+    }
+
+    #[test]
+    fn a_nat_unit_that_loses_its_global_solicits_as_before() {
+        let iid = assigned_iid(DMESG).unwrap();
+        let known = Known {
+            learned: Some("2001:db8:e0:97:200:5eff:fe40:1".parse().unwrap()),
+            passthrough: false,
+        };
+        let steps = plan(iid, MAC_ONLY, "0\n", "", known);
+        assert_eq!(
+            steps,
+            vec![
+                Step::AcceptAdvertisements,
+                Step::AddLinkLocal("fe80::200:5eff:fe40:1".parse().unwrap()),
+                Step::Solicit("fe80::200:5eff:fe40:1".parse().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_learned_address_from_another_identifier_is_not_restored() {
+        let iid = assigned_iid(DMESG).unwrap();
+        let known = Known {
+            learned: Some("2001:db8:e0:97:200:5eff:fe40:9".parse().unwrap()),
+            passthrough: true,
+        };
+        let steps = plan(iid, MAC_ONLY, "0\n", "", known);
+        assert!(!steps.iter().any(|step| matches!(step, Step::RestoreGlobal(_))));
+    }
+
+    #[test]
+    fn the_learned_global_is_read_from_the_interface() {
+        let iid = assigned_iid(DMESG).unwrap();
+        assert_eq!(
+            global_of(iid, UP),
+            Some("2001:db8:e0:97:200:5eff:fe40:1".parse().unwrap())
+        );
+        assert_eq!(global_of(iid, MAC_ONLY), None);
     }
 
     #[test]

@@ -100,6 +100,12 @@ own SAS client reach the SAS. A vendor firewall restart after an LTE handover
 removes it, and the Block Channel patch removes the vendor's way of putting it
 back. See [SAS reachability in passthrough](docs/cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
 
+With IPv6 on the management bearer, the keeper lets Linux process one router
+advertisement there and then no more. A second one in passthrough left units
+attached but deaf until a power cycle. In every mode a watchdog reboots a unit
+that stays attached but hears nothing through the core for five minutes. See
+[the deaf-unit watchdog](docs/deaf-watchdog.md).
+
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
 

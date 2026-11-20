@@ -33,6 +33,13 @@ that validation in their own core; Witcher cannot establish it automatically.
 Other prefix layouts or overlapping bearer allocations are not covered by
 this design.
 
+## Management bearer advertisements
+
+The keeper lets Linux process one router advertisement on the management
+bearer and then closes it (`accept_ra=0`, learned default route kept without
+its expiry). A second advertisement processed in passthrough leaves the unit
+attached but deaf. See [the deaf-unit watchdog](deaf-watchdog.md).
+
 ## Validation
 
 Check the downstream router's WAN address, delegated prefix, LAN router
