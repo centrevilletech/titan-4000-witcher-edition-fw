@@ -53,7 +53,7 @@ const SERVE_RETRY: u64 = 60;
 const FLOOD_INTERVAL: u64 = 30;
 const DHCP_COOLDOWN: u64 = 15;
 /// Seconds the IPv4 check keeps its router through an unreadable lease file.
-const PEER_HOLD: u64 = 3;
+const PEER_HOLD: u64 = 8;
 const MGMT_EVERY: u64 = 10;
 const MGMT_LOG_EVERY: u64 = 60;
 /// A plain `reboot` that has not ended this process after this long is forced.
@@ -129,6 +129,8 @@ struct Keeper {
     mode_checked: Option<u64>,
     /// The customer bearer is a port of the LAN bridge right now.
     bridged: bool,
+    /// Since when, without a break.
+    bridged_since: Option<u64>,
     /// The last router the IPv4 check could name, and when.
     ipv4_peer: Option<(Peer, u64)>,
     kernel_log: Option<KernelLog>,
@@ -299,6 +301,7 @@ impl Keeper {
             bearer: DEFAULT_BEARER.to_owned(),
             mode_checked: None,
             bridged: false,
+            bridged_since: None,
             ipv4_peer: None,
             kernel_log: KernelLog::open(),
             ext_watch: extdev::Watch::default(),
@@ -931,10 +934,11 @@ impl Keeper {
                 local_mac,
             })
         })();
-        // udhcpd rewrites its lease file at every renewal, and for about a
-        // second the file holds no lease. Without this the check started over
-        // at each renewal and could not count three misses on a router that
-        // renews every 30 s.
+        // The vendor's Wi-Fi udhcpd shares the customer server's lease file
+        // and writes its own empty list over it every 30 s. The customer
+        // server writes the lease back within its 5 s `auto_time`. Without
+        // this hold the check started over every 30 s and could not count
+        // three misses.
         let peer = match peer {
             Some(peer) => {
                 self.ipv4_peer = Some((peer, self.now));
@@ -1057,10 +1061,14 @@ impl Keeper {
             self.bearer = port;
             self.passthrough = true;
             self.bridged = true;
+            if self.bridged_since.is_none() {
+                self.bridged_since = Some(self.now);
+            }
             self.mode_checked = None;
             return;
         }
         self.bridged = false;
+        self.bridged_since = None;
         if self
             .mode_checked
             .is_some_and(|last| self.now.saturating_sub(last) < MODE_EVERY)
@@ -1092,8 +1100,12 @@ impl Keeper {
         }
         // `bridged` is how the keeper knows the vendor's bearer setup is over.
         let ready = self.passthrough && self.bridged && drained;
+        let settled = self
+            .bridged_since
+            .is_some_and(|since| self.now.saturating_sub(since) >= extdev::SETTLE);
         let customer = self.bearer.clone();
-        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, ready, &customer) {
+        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, ready, settled, &customer)
+        {
             self.note(&format!(
                 "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
             ));
