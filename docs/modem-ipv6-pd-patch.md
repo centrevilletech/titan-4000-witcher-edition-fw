@@ -37,8 +37,11 @@ this design.
 
 The keeper lets Linux process one router advertisement on the management
 bearer and then closes it (`accept_ra=0`, learned default route kept without
-its expiry). A second advertisement processed in passthrough leaves the unit
-attached but deaf. See [the deaf-unit watchdog](deaf-watchdog.md).
+its expiry). A prefix processed there later makes the vendor kernel treat the
+management bearer as its external device, which stops customer IPv4 and then
+makes the unit deaf. The keeper's guard undoes that. The simplest safe layout
+is a management APN on IPv4 and a dual-stack customer APN. See
+[the deaf-unit fault](deaf-watchdog.md).
 
 ## Validation
 

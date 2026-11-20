@@ -6,7 +6,9 @@ proves packet detection/escalation, not a physical Titan cable disconnect.
 The SAS NAT repair runs against recording iptables and kern stubs: this proves
 the keeper's decision and commands, not the vendor NAT path itself.
 The management advertisement freeze runs against a dummy lte0pdn0 and the real
-kernel. The deaf watchdog runs against ping, modem-state and reboot stubs.
+kernel. The external-device guard reads a file standing in for the kernel log
+and runs a recording `kern` stub. The deaf watchdog runs against ping,
+modem-state and reboot stubs.
 """
 import os
 import json
@@ -93,7 +95,9 @@ def main():
     exe('/tmp/bin/iptables', 'if [ "$*" = "-t nat -S POSTROUTING" ]; then echo "-P POSTROUTING ACCEPT"; cat /tmp/nat-rules; exit 0; fi\n'
         'echo "iptables $*" >> /tmp/sas-actions\n'
         'if [ "$*" = "-t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152" ]; then echo "'+sas_rule+'" >> /tmp/nat-rules; exit 0; fi\nexit 1')
-    exe('/tmp/bin/kern', 'echo "kern $*" >> /tmp/sas-actions')
+    # `kern netif extdev <dev> down` prints external_dev=NULL to the kernel log on a Titan.
+    exe('/tmp/bin/kern', 'if [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; else echo "kern $*" >> /tmp/sas-actions; fi')
+    Path('/tmp/kmsg').write_text('6,1,1,-;booting\n')
     Path('/tmp/nat-rules').write_text(sas_rule+'\n')
     exe('/tmp/bin/ebtables', 'exit 0')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
@@ -107,7 +111,7 @@ def main():
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -138,19 +142,34 @@ def main():
             # One advertisement was taken. The keeper closes the bearer to more
             # and takes the expiry off the learned default.
             wait_for(lambda:accept_ra()=='0' and 'expires' not in mgmt_routes(),40)
-            assert 'refusing further router advertisements' in log()
-            assert 'default via fe80::1' in mgmt_routes()
-            print('PASS: management bearer closed to further advertisements; learned default no longer expires.',flush=True)
-            # Passthrough, global lost: it comes back without the kernel being reopened.
+            assert 'closing lte0pdn0 to further router advertisements' in log()
+            assert any('default via fe80::1' in line and 'metric 1024' in line for line in mgmt_routes().splitlines()), mgmt_routes()
+            print('PASS: management bearer closed to further advertisements; learned default kept without its expiry.',flush=True)
+            # Global lost (a re-attach, or the vendor lifetime timer): the bearer
+            # is opened again so the vendor stack can form the address.
             run(ip, '-6', 'addr', 'del', mgmt_global+'/64', 'dev', 'lte0pdn0')
-            opened=[]
-            def restored():
-                opened.append(accept_ra())
-                return mgmt_global in mgmt_addrs()
-            wait_for(restored,40)
-            assert set(opened)=={'0'}, opened
-            assert 'without a new advertisement' in log()
-            print('PASS: lost management global restored in passthrough with accept_ra held at 0.',flush=True)
+            wait_for(lambda:accept_ra()=='2' and 'ue-mgmt has no global' in log(),40)
+            run(ip, '-6', 'addr', 'add', mgmt_global+'/64', 'dev', 'lte0pdn0', 'nodad')
+            wait_for(lambda:accept_ra()=='0',40)
+            print('PASS: lost management global reopened the bearer; it closed again once the address was back.',flush=True)
+            # The vendor kernel leaves the management bearer as its external
+            # device. In passthrough the guard clears it and restores the MAC.
+            mac_before=Path('/sys/class/net/lte0pdn0/address').read_text()
+            with open('/tmp/kmsg','a') as kmsg:
+                kmsg.write('6,100,1,-;set external_dev: lte0pdn0 ipv6 mask=50\n')
+            guard='external device guard: the vendor kernel left lte0pdn0'
+            wait_for(lambda:guard in log() and Path('/tmp/extdev-actions').exists() and 'kern netif extdev lte0pdn0 down' in Path('/tmp/extdev-actions').read_text(),20)
+            assert Path('/sys/class/net/lte0pdn0/address').read_text()==mac_before
+            until=time.monotonic()+15
+            wait_for(lambda:time.monotonic()>=until,20)
+            assert log().count(guard)==1, log()
+            # A bearer setup that clears it by itself is left alone.
+            with open('/tmp/kmsg','a') as kmsg:
+                kmsg.write('6,101,3,-;set external_dev: lte0pdn0 ipv4 mask=50\n4,102,3,-;external_dev=NULL\n')
+            until=time.monotonic()+6
+            wait_for(lambda:time.monotonic()>=until,10)
+            assert log().count(guard)==1, log()
+            print('PASS: external device left on the management bearer was cleared once; a setup that clears it itself was left alone.',flush=True)
         assert not Path('/tmp/phy-actions').exists()
         # The vendor rule is present, so the keeper leaves the nat table alone.
         assert not Path('/tmp/sas-actions').exists(), Path('/tmp/sas-actions').read_text()

@@ -183,6 +183,7 @@ pub fn plan_maintenance(
     lease: &[u8],
     discover: Option<[u8; 6]>,
     cooldown_elapsed: bool,
+    bearer_dev: &str,
 ) -> Option<Ipv4Plan> {
     let conf = parse_conf(conf_text)?;
     let bearer = host_route_on(routes, "br0");
@@ -201,7 +202,7 @@ pub fn plan_maintenance(
         reason: String::new(),
     };
     if let Some(bearer) = bearer {
-        let gateway = default_via(routes, "lte0pdn1")
+        let gateway = default_via(routes, bearer_dev)
             .filter(|gateway| usable_gateway(*gateway, bearer))
             .or_else(|| usable_gateway(conf.router, bearer).then_some(conf.router));
         if let Some(gateway) = gateway {
@@ -321,14 +322,18 @@ pub fn offers_lan(conf: &DhcpConf) -> bool {
 }
 
 /// BusyBox ebtables on this firmware rejects a protocol name (`udp`) and
-/// accepts the number. 17 is UDP. These rules never match lte0pdn0.
-pub fn flood_commands() -> &'static [&'static str] {
-    &[
-        "-D FORWARD -o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 67 -j DROP",
-        "-A FORWARD -o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 67 -j DROP",
-        "-D FORWARD -o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 68 -j DROP",
-        "-A FORWARD -o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 68 -j DROP",
-    ]
+/// accepts the number. 17 is UDP. `bearer` is the customer bearer, which is
+/// never lte0pdn0.
+pub fn flood_commands(bearer: &str) -> Vec<String> {
+    let mut rules = Vec::new();
+    for port in ["67", "68"] {
+        for verb in ["-D", "-A"] {
+            rules.push(format!(
+                "{verb} FORWARD -o {bearer} -p IPv4 --ip-proto 17 --ip-dport {port} -j DROP"
+            ));
+        }
+    }
+    rules
 }
 
 #[cfg(test)]
@@ -408,7 +413,9 @@ option lease 120
         let mut bare = [0u8; 36];
         bare[8..14].copy_from_slice(&[0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d]);
         assert_eq!(lease_mac(&bare), Some([0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d]));
-        let rules = flood_commands().join("\n");
+        let rules = flood_commands("lte0pdn2").join("\n");
+        assert!(rules.contains("-o lte0pdn2 "));
+        assert!(!rules.contains("lte0pdn1"));
         assert!(rules.contains("--ip-proto 17"));
         assert!(rules.contains("dport 67"));
         assert!(!rules.contains("ip-protocol"));
@@ -432,7 +439,7 @@ option dns 100.126.0.49
 default via 172.20.64.151 dev lte0pdn1
 172.20.64.152 dev br0 scope link
 ";
-        let plan = plan_maintenance(conf, routes, &[], None, true).unwrap();
+        let plan = plan_maintenance(conf, routes, &[], None, true, "lte0pdn1").unwrap();
         let rewritten = plan.rewrite.unwrap();
         assert!(rewritten.contains("option dns 100.126.0.49"));
         assert!(rewritten.contains("remaining yes"));
@@ -441,7 +448,7 @@ default via 172.20.64.151 dev lte0pdn1
         let mut lease = [0u8; 44];
         lease[16..22].copy_from_slice(&[0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d]);
         let again =
-            plan_maintenance(conf, routes, &lease, Some([0x02, 0, 0, 0, 0, 1]), true).unwrap();
+            plan_maintenance(conf, routes, &lease, Some([0x02, 0, 0, 0, 0, 1]), true, "lte0pdn1").unwrap();
         assert!(again.clear_lease);
         assert!(again.reason.contains("02:00:00:00:00:01"));
         let same = plan_maintenance(
@@ -450,11 +457,12 @@ default via 172.20.64.151 dev lte0pdn1
             &lease,
             Some([0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d]),
             true,
+            "lte0pdn1",
         )
         .unwrap();
         assert!(!same.clear_lease);
         let quiet =
-            plan_maintenance(conf, routes, &lease, Some([0x02, 0, 0, 0, 0, 1]), false).unwrap();
+            plan_maintenance(conf, routes, &lease, Some([0x02, 0, 0, 0, 0, 1]), false, "lte0pdn1").unwrap();
         assert!(!quiet.clear_lease, "a lease clear waits out the cooldown");
         let early = "start 10.1.1.100\nend 10.1.1.200\ninterface br0\noption subnet 255.255.255.0\noption router 10.1.1.1\noption lease 86400\n";
         let stopped = plan_maintenance(
@@ -463,6 +471,7 @@ default via 172.20.64.151 dev lte0pdn1
             &[],
             None,
             true,
+            "lte0pdn1",
         )
         .unwrap();
         assert!(stopped.stop_lan_offer);
@@ -484,7 +493,7 @@ default via 172.20.64.151 dev lte0pdn1
     #[test]
     fn a_new_bearer_clears_the_previous_address_lease() {
         let routes = "172.20.64.153 dev br0 scope link\ndefault via 172.20.64.151 dev lte0pdn1\n";
-        let plan = plan_maintenance(CONF, routes, &[], None, true).unwrap();
+        let plan = plan_maintenance(CONF, routes, &[], None, true, "lte0pdn1").unwrap();
         assert!(plan.clear_lease);
         assert!(plan.rewrite.unwrap().contains("start 172.20.64.153"));
     }
