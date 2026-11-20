@@ -1,8 +1,8 @@
 # The deaf-unit fault: cause, guard, freeze and watchdog
 
 The freeze and the watchdog are in v1.0.2. The external-device guard and the
-customer bearer discovery are in v1.0.3. All live in the network keeper
-(`titan-pd-keeper`).
+customer bearer discovery are in v1.0.3, with a timing fix in v1.0.4. All live
+in the network keeper (`titan-pd-keeper`).
 
 ## The fault
 
@@ -28,8 +28,7 @@ path. In IP passthrough `rcinit` ends bearer setup with
 
 Whenever Linux processes a router advertisement prefix on the management
 bearer, the kernel sets the external device again
-(`set external_dev: lte0pdn0 ipv6 mask=50`). At bearer setup `rcinit` clears it
-afterwards. Later nothing does. Then:
+(`set external_dev: lte0pdn0 ipv6 mask=50`). Later nothing clears it. Then:
 
 1. **Customer IPv4 through the bridge stops at once.** Customer IPv6 keeps
    working.
@@ -61,12 +60,20 @@ ip link set dev lte0pdn0 address <the interface's own MAC>   # unit hears again
 
 ## What the keeper does
 
-**External-device guard (since v1.0.3).** The keeper follows the kernel log
-(the vendor image has no `/dev/kmsg`, so it makes the node in RAM). In
-passthrough, when the external device stays set on a bearer other than the
-customer one for 2 seconds, it runs the repair and logs
+**External-device guard (since v1.0.3, timing fixed in v1.0.4).** The keeper
+follows the kernel log (the vendor image has no `/dev/kmsg`, so it makes the
+node in RAM). In passthrough, when the external device stays set on a bearer
+other than the customer one for 3 seconds, it runs the repair and logs
 `external device guard: ...`. It runs the same repair on the first silent round
 of the watchdog.
+
+The 3 seconds count only while the customer bearer is a port of the LAN bridge
+and the keeper has read the kernel log to its end. At every attach the kernel
+sets the external device first, and `rcinit` clears it when it puts the customer
+bearer into the bridge, 10 to 20 seconds later. On a detach the bearer leaves
+the bridge. v1.0.3 counted from the `set` line and so ran the repair in the
+middle of every bearer setup (two boots and one re-attach on the bench, no harm
+seen). v1.0.4 waits for the bridge.
 
 **Advertisement freeze (since v1.0.2).** Once the management global is up, the
 keeper sets `accept_ra` to 0 on `lte0pdn0` and replaces the learned default

@@ -158,6 +158,13 @@ def main():
             with open('/tmp/kmsg','a') as kmsg:
                 kmsg.write('6,100,1,-;set external_dev: lte0pdn0 ipv6 mask=50\n')
             guard='external device guard: the vendor kernel left lte0pdn0'
+            # Until the customer bearer is a port of the bridge, the vendor's
+            # own bearer setup is still running and the guard waits.
+            until=time.monotonic()+8
+            wait_for(lambda:time.monotonic()>=until,12)
+            assert guard not in log(), log()
+            assert not Path('/tmp/extdev-actions').exists()
+            run(ip, 'link', 'set', 'lte0pdn1', 'master', 'br0')
             wait_for(lambda:guard in log() and Path('/tmp/extdev-actions').exists() and 'kern netif extdev lte0pdn0 down' in Path('/tmp/extdev-actions').read_text(),20)
             assert Path('/sys/class/net/lte0pdn0/address').read_text()==mac_before
             until=time.monotonic()+15
@@ -169,7 +176,8 @@ def main():
             until=time.monotonic()+6
             wait_for(lambda:time.monotonic()>=until,10)
             assert log().count(guard)==1, log()
-            print('PASS: external device left on the management bearer was cleared once; a setup that clears it itself was left alone.',flush=True)
+            run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
+            print('PASS: external device guard waited for the bridge, cleared the management bearer once, and left alone a setup that clears it itself.',flush=True)
         assert not Path('/tmp/phy-actions').exists()
         # The vendor rule is present, so the keeper leaves the nat table alone.
         assert not Path('/tmp/sas-actions').exists(), Path('/tmp/sas-actions').read_text()
