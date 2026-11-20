@@ -52,6 +52,8 @@ const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
 const FLOOD_INTERVAL: u64 = 30;
 const DHCP_COOLDOWN: u64 = 15;
+/// Seconds the IPv4 check keeps its router through an unreadable lease file.
+const PEER_HOLD: u64 = 3;
 const MGMT_EVERY: u64 = 10;
 const MGMT_LOG_EVERY: u64 = 60;
 /// A plain `reboot` that has not ended this process after this long is forced.
@@ -125,6 +127,10 @@ struct Keeper {
     /// The bearer bridged to the customer port, or the vendor's data bearer.
     bearer: String,
     mode_checked: Option<u64>,
+    /// The customer bearer is a port of the LAN bridge right now.
+    bridged: bool,
+    /// The last router the IPv4 check could name, and when.
+    ipv4_peer: Option<(Peer, u64)>,
     kernel_log: Option<KernelLog>,
     ext_watch: extdev::Watch,
 }
@@ -191,15 +197,20 @@ impl KernelLog {
                 continue;
             }
             if read == 0 {
+                drained = true;
                 break;
             }
             match io::Error::last_os_error().raw_os_error() {
                 // Records were overwritten before they were read. The next read resumes.
                 Some(libc::EPIPE) | Some(libc::EINTR) => continue,
-                _ => break,
+                // Nothing more for now (EAGAIN), or a log that cannot be read.
+                _ => {
+                    drained = true;
+                    break;
+                }
             }
         }
-        lines
+        (lines, drained)
     }
 }
 
@@ -285,6 +296,8 @@ impl Keeper {
             reboot_forced: false,
             bearer: DEFAULT_BEARER.to_owned(),
             mode_checked: None,
+            bridged: false,
+            ipv4_peer: None,
             kernel_log: KernelLog::open(),
             ext_watch: extdev::Watch::default(),
         }
@@ -297,6 +310,7 @@ impl Keeper {
         self.maintain_mgmt_v6();
         if !self.passthrough {
             self.ipv4_watch.reset();
+            self.ipv4_peer = None;
             self.sas_watch.reset();
             if self.serving {
                 self.stop_serving("left IP passthrough");
@@ -882,8 +896,9 @@ impl Keeper {
         self.last_ipv4_check = self.now;
         let bearer = self.bearer.clone();
         let conf_text = read_file("/tmp/udhcpd.conf");
+        let links_up = carrier_up(CUSTOMER) && carrier_up(&bearer);
         let peer = (|| {
-            if !carrier_up(CUSTOMER) || !carrier_up(&bearer) {
+            if !links_up {
                 return None;
             }
             let conf = ipv4::parse_conf(&conf_text)?;
@@ -914,6 +929,24 @@ impl Keeper {
                 local_mac,
             })
         })();
+        // udhcpd rewrites its lease file at every renewal, and for about a
+        // second the file holds no lease. Without this the check started over
+        // at each renewal and could not count three misses on a router that
+        // renews every 30 s.
+        let peer = match peer {
+            Some(peer) => {
+                self.ipv4_peer = Some((peer, self.now));
+                Some(peer)
+            }
+            None if links_up => self
+                .ipv4_peer
+                .filter(|(_, seen)| self.now.saturating_sub(*seen) <= PEER_HOLD)
+                .map(|(peer, _)| peer),
+            None => {
+                self.ipv4_peer = None;
+                None
+            }
+        };
         match self.ipv4_watch.tick(self.now, peer) {
             Ipv4Action::Hold => {}
             Ipv4Action::Probe(peer) => {
@@ -1021,9 +1054,11 @@ impl Keeper {
         if let Some(port) = extdev::bridged_bearer(ports.iter().map(String::as_str)) {
             self.bearer = port;
             self.passthrough = true;
+            self.bridged = true;
             self.mode_checked = None;
             return;
         }
+        self.bridged = false;
         if self
             .mode_checked
             .is_some_and(|last| self.now.saturating_sub(last) < MODE_EVERY)
@@ -1044,18 +1079,19 @@ impl Keeper {
     /// passthrough undo it being left on a management bearer. See
     /// `titan_pd_model::extdev`.
     fn maintain_external_dev(&mut self) {
-        let lines = match self.kernel_log.as_mut() {
+        let (lines, drained) = match self.kernel_log.as_mut() {
             Some(log) => log.lines(),
             None => return,
         };
         for line in lines {
             if let Some(event) = extdev::parse(&line) {
-                self.ext_watch.note(self.now, event);
+                self.ext_watch.note(event);
             }
         }
+        // `bridged` is how the keeper knows the vendor's bearer setup is over.
+        let ready = self.passthrough && self.bridged && drained;
         let customer = self.bearer.clone();
-        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, self.passthrough, &customer)
-        {
+        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, ready, &customer) {
             self.note(&format!(
                 "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
             ));

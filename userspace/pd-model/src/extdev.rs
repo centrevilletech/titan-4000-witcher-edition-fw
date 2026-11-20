@@ -10,8 +10,8 @@
 //!
 //! Whenever Linux processes a router advertisement prefix (or an IPv4 address
 //! change) on the management bearer, the kernel sets the external device again:
-//! `set external_dev: lte0pdn0 ipv6 mask=50`. At bearer setup `rcinit` clears
-//! it afterwards. Later nothing does, and two things follow:
+//! `set external_dev: lte0pdn0 ipv6 mask=50`. Later nothing clears it, and two
+//! things follow:
 //!
 //! 1. Customer IPv4 through the bridge stops at once.
 //! 2. At the next DHCP or ARP from the customer router, the LTE driver stores
@@ -24,11 +24,20 @@
 //! bearer's MAC to itself, which makes the driver store its own address again.
 //! Both commands change nothing on a healthy unit.
 //!
-//! The keeper follows the kernel log. When the external device stays set in
-//! passthrough for `GRACE` seconds, it repairs.
+//! The keeper follows the kernel log. When the external device stays set for
+//! `GRACE` seconds while the customer bearer is a port of the LAN bridge, it
+//! repairs.
+//!
+//! The bridge is the test for "bearer setup is over". At every attach the
+//! kernel sets the external device first, and `rcinit` clears it only when it
+//! puts the customer bearer into the bridge, 10 to 20 seconds later (measured
+//! on two boots and one re-attach, 2026-11-20). On a detach the bearer leaves
+//! the bridge again. A guard that counted from the `set` line fired in the
+//! middle of that setup every time.
 
-/// Seconds the vendor's own bearer setup gets to clear the external device.
-pub const GRACE: u64 = 2;
+/// Seconds the external device may stay set once the keeper is ready to act.
+/// `rcinit` clears it 0.1 to 0.2 s after the bridge port appears.
+pub const GRACE: u64 = 3;
 /// At most one repair per this many seconds.
 pub const RETRY: u64 = 10;
 
@@ -82,21 +91,26 @@ pub enum Action {
 #[derive(Default)]
 pub struct Watch {
     dev: Option<String>,
-    since: u64,
+    /// The first tick at which the keeper was ready and saw `dev` set.
+    since: Option<u64>,
     retry_at: u64,
 }
 
 impl Watch {
-    /// Feed one event, in log order.
-    pub fn note(&mut self, now: u64, event: Event) {
+    /// Feed one event, in log order. The time an old line was read says
+    /// nothing about when it happened, so events carry no time.
+    pub fn note(&mut self, event: Event) {
         match event {
             Event::Set(dev) => {
                 if self.dev.as_deref() != Some(dev.as_str()) {
-                    self.since = now;
+                    self.since = None;
                 }
                 self.dev = Some(dev);
             }
-            Event::Cleared => self.dev = None,
+            Event::Cleared => {
+                self.dev = None;
+                self.since = None;
+            }
         }
     }
 
@@ -105,16 +119,20 @@ impl Watch {
         self.dev.as_deref()
     }
 
-    /// Once per tick. `customer` is the bearer bridged to the LAN port. The
-    /// keeper never touches that one: its stored MAC has to be the router's.
-    pub fn decide(&mut self, now: u64, passthrough: bool, customer: &str) -> Action {
+    /// Once per tick. `ready` means all of: IP passthrough, the customer
+    /// bearer is a port of the LAN bridge, and the kernel log has been read to
+    /// its end. `customer` is that bearer. The keeper never touches it: its
+    /// stored MAC has to be the router's.
+    pub fn decide(&mut self, now: u64, ready: bool, customer: &str) -> Action {
         let Some(dev) = self.dev.clone() else {
             return Action::Hold;
         };
-        if !passthrough || dev == customer {
+        if !ready || dev == customer {
+            self.since = None;
             return Action::Hold;
         }
-        if now.saturating_sub(self.since) < GRACE || now < self.retry_at {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_sub(since) < GRACE || now < self.retry_at {
             return Action::Hold;
         }
         self.retry_at = now + RETRY;
@@ -176,22 +194,45 @@ mod tests {
     }
 
     #[test]
-    fn bearer_setup_that_clears_it_in_time_is_left_alone() {
+    fn bearer_setup_is_left_alone_until_the_bridge_is_built() {
+        // Measured on a re-attach: set at attach, bridge port 17 s later,
+        // the vendor's own clear 0.1 s after that.
         let mut watch = Watch::default();
-        watch.note(100, Event::Set("lte0pdn0".into()));
-        assert_eq!(watch.decide(100, true, "lte0pdn2"), Action::Hold);
-        assert_eq!(watch.decide(101, true, "lte0pdn2"), Action::Hold);
-        watch.note(101, Event::Cleared);
-        assert_eq!(watch.decide(110, true, "lte0pdn2"), Action::Hold);
+        watch.note(Event::Set("lte0pdn0".into()));
+        for now in 100..117 {
+            assert_eq!(watch.decide(now, false, "lte0pdn2"), Action::Hold);
+        }
+        // The bridge port is there. The count starts now, not at the set line.
+        assert_eq!(watch.decide(117, true, "lte0pdn2"), Action::Hold);
+        watch.note(Event::Cleared);
+        assert_eq!(watch.decide(118, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(watch.decide(500, true, "lte0pdn2"), Action::Hold);
         assert_eq!(watch.external(), None);
+    }
+
+    #[test]
+    fn old_lines_replayed_at_start_do_not_count_as_waiting_time() {
+        let mut watch = Watch::default();
+        // Read while still behind in the log: not ready.
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(50, false, "lte0pdn2"), Action::Hold);
+        assert_eq!(watch.decide(90, false, "lte0pdn2"), Action::Hold);
+        // Caught up and still set: the full grace runs from here.
+        assert_eq!(watch.decide(91, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(watch.decide(91 + GRACE - 1, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(
+            watch.decide(91 + GRACE, true, "lte0pdn2"),
+            Action::Repair("lte0pdn0".into())
+        );
     }
 
     #[test]
     fn an_external_device_left_set_in_passthrough_is_repaired_once_per_retry() {
         let mut watch = Watch::default();
-        watch.note(100, Event::Set("lte0pdn0".into()));
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(100, true, "lte0pdn2"), Action::Hold);
         // The same device set again (the IPv4 line after the IPv6 one) keeps the first time.
-        watch.note(101, Event::Set("lte0pdn0".into()));
+        watch.note(Event::Set("lte0pdn0".into()));
         assert_eq!(watch.decide(101, true, "lte0pdn2"), Action::Hold);
         assert_eq!(
             watch.decide(100 + GRACE, true, "lte0pdn2"),
@@ -199,10 +240,11 @@ mod tests {
         );
         assert_eq!(watch.decide(100 + GRACE + 1, true, "lte0pdn2"), Action::Hold);
         // The repair command's own log line clears the state.
-        watch.note(100 + GRACE + 1, Event::Cleared);
+        watch.note(Event::Cleared);
         assert_eq!(watch.decide(500, true, "lte0pdn2"), Action::Hold);
         // If the log line never came, it tries again after the retry time.
-        watch.note(600, Event::Set("lte0pdn0".into()));
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(600, true, "lte0pdn2"), Action::Hold);
         assert_eq!(
             watch.decide(600 + GRACE, true, "lte0pdn2"),
             Action::Repair("lte0pdn0".into())
@@ -215,13 +257,31 @@ mod tests {
     }
 
     #[test]
+    fn a_detach_in_the_middle_of_the_grace_starts_the_count_again() {
+        let mut watch = Watch::default();
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(100, true, "lte0pdn2"), Action::Hold);
+        // The customer bearer left the bridge.
+        assert_eq!(watch.decide(101, false, "lte0pdn2"), Action::Hold);
+        assert_eq!(watch.decide(100 + GRACE, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(
+            watch.decide(100 + 2 * GRACE, true, "lte0pdn2"),
+            Action::Repair("lte0pdn0".into())
+        );
+    }
+
+    #[test]
     fn nat_mode_and_the_customer_bearer_are_never_touched() {
         let mut watch = Watch::default();
-        watch.note(100, Event::Set("lte0pdn0".into()));
-        assert_eq!(watch.decide(900, false, "lte0pdn2"), Action::Hold);
+        watch.note(Event::Set("lte0pdn0".into()));
+        for now in 100..900 {
+            assert_eq!(watch.decide(now, false, "lte0pdn2"), Action::Hold);
+        }
         let mut watch = Watch::default();
-        watch.note(100, Event::Set("lte0pdn2".into()));
-        assert_eq!(watch.decide(900, true, "lte0pdn2"), Action::Hold);
+        watch.note(Event::Set("lte0pdn2".into()));
+        for now in 100..900 {
+            assert_eq!(watch.decide(now, true, "lte0pdn2"), Action::Hold);
+        }
     }
 
     #[test]
