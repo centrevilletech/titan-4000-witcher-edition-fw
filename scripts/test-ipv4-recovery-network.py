@@ -144,11 +144,14 @@ def main():
         # own ARP, and the unit forwards it. It never forwards IPv6 in
         # passthrough, so a rise is the symptom. The keeper sends the router's
         # own ARP request out the bearer.
-        bearer_cap=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806));bearer_cap.bind(('lte0pdn1',0));bearer_cap.setblocking(False)
+        # Outgoing frames reach only all-protocol packet sockets.
+        bearer_cap=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));bearer_cap.bind(('lte0pdn1',0));bearer_cap.setblocking(False)
         bearer_frames=[]
         def bearer_arp():
             try:
-                while True: bearer_frames.append(bearer_cap.recv(2048)[:42])
+                while True:
+                    frame=bearer_cap.recv(2048)
+                    if frame[12:14]==b'\x08\x06': bearer_frames.append(frame[:42])
             except BlockingIOError: pass
             return bearer_frames
         correction=b'\xff'*6+peer_mac+bytes.fromhex('08060001080006040001')+peer_mac+bytes([172,20,64,152])+bytes(6)+bytes([172,20,64,151])
