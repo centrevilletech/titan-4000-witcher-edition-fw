@@ -13,7 +13,9 @@
 //! lte0pdn0. In passthrough it follows the kernel log and undoes the vendor
 //! kernel making a management bearer its external device, which is what makes
 //! a unit deaf. In every mode it reboots a unit that stays attached but hears
-//! nothing through the core.
+//! nothing through the core. In passthrough it also puts the LTE driver's
+//! downlink MAC back on the router when the unit starts forwarding IPv6 (see
+//! `titan_pd_model::driver_mac`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -27,6 +29,7 @@ use std::os::unix::process::CommandExt;
 use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
+use titan_pd_model::driver_mac::{self, Action as DriverAction};
 use titan_pd_model::extdev::{self, Action as ExtAction};
 use titan_pd_model::filter;
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
@@ -135,6 +138,12 @@ struct Keeper {
     ipv4_peer: Option<(Peer, u64)>,
     kernel_log: Option<KernelLog>,
     ext_watch: extdev::Watch,
+    /// The DHCP gateway handed to the router, read with the IPv4 peer.
+    ipv4_gateway: Option<std::net::Ipv4Addr>,
+    driver_watch: driver_mac::Watch,
+    /// Corrections since the last log line, and when that line was written.
+    driver_fixes: u32,
+    driver_logged_at: Option<u64>,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
@@ -305,6 +314,10 @@ impl Keeper {
             ipv4_peer: None,
             kernel_log: KernelLog::open(),
             ext_watch: extdev::Watch::default(),
+            ipv4_gateway: None,
+            driver_watch: driver_mac::Watch::default(),
+            driver_fixes: 0,
+            driver_logged_at: None,
         }
     }
 
@@ -317,6 +330,7 @@ impl Keeper {
             self.ipv4_watch.reset();
             self.ipv4_peer = None;
             self.sas_watch.reset();
+            self.driver_watch.reset();
             if self.serving {
                 self.stop_serving("left IP passthrough");
             }
@@ -338,6 +352,7 @@ impl Keeper {
         self.drain();
         self.maintain_ipv4();
         self.maintain_ipv4_link();
+        self.maintain_driver_mac();
         self.maintain_sas_nat();
 
         let loaded = config::load_config(&state_dir().join("config.json"));
@@ -902,6 +917,7 @@ impl Keeper {
         let bearer = self.bearer.clone();
         let conf_text = read_file("/tmp/udhcpd.conf");
         let links_up = carrier_up(CUSTOMER) && carrier_up(&bearer);
+        let mut gateway = None;
         let peer = (|| {
             if !links_up {
                 return None;
@@ -927,6 +943,7 @@ impl Keeper {
                 &command_stdout("ip", &["-4", "-o", "addr", "show", "dev", BRIDGE]),
                 bearer,
             )?;
+            gateway = Some(conf.router);
             Some(Peer {
                 address: bearer,
                 mac,
@@ -942,6 +959,7 @@ impl Keeper {
         let peer = match peer {
             Some(peer) => {
                 self.ipv4_peer = Some((peer, self.now));
+                self.ipv4_gateway = gateway;
                 Some(peer)
             }
             None if links_up => self
@@ -1000,6 +1018,59 @@ impl Keeper {
                     );
                 }
             }
+        }
+    }
+
+    /// In passthrough the unit forwards no IPv6. When it starts to, the LTE
+    /// driver is sending the router's downlink to the unit, and the router's
+    /// own ARP request, sent out the bearer, puts the driver back. See
+    /// `titan_pd_model::driver_mac`.
+    fn maintain_driver_mac(&mut self) {
+        let path = std::env::var("TITAN_SNMP6").unwrap_or_else(|_| "/proc/net/snmp6".into());
+        let count = driver_mac::forwarded(&read_file(&path));
+        let peer = self
+            .ipv4_peer
+            .filter(|(_, seen)| self.now.saturating_sub(*seen) <= PEER_HOLD)
+            .map(|(peer, _)| peer);
+        let gateway = self.ipv4_gateway;
+        let ready = self.passthrough && self.bridged && peer.is_some() && gateway.is_some();
+        match self.driver_watch.tick(self.now, count, ready) {
+            DriverAction::Hold => {}
+            DriverAction::Correct => {
+                let (Some(peer), Some(gateway)) = (peer, gateway) else {
+                    return;
+                };
+                let frame = driver_mac::correction(peer.mac, peer.address, gateway);
+                let bearer = self.bearer.clone();
+                let sent = interface_index(&bearer)
+                    .ok_or_else(|| format!("{bearer} is unavailable"))
+                    .and_then(|index| send_marked_frame(index, &frame));
+                match sent {
+                    Ok(()) => {
+                        self.driver_fixes += 1;
+                        // keeper.log is on flash: one line a minute at most.
+                        if self
+                            .driver_logged_at
+                            .is_none_or(|at| self.now.saturating_sub(at) >= 60)
+                        {
+                            self.note(&format!(
+                                "the unit was forwarding the router's IPv6, so the LTE driver had the wrong downlink MAC; sent the router's ARP ({} {}) out {bearer} to put it back ({} time(s) since the last note)",
+                                ipv4::mac_text(peer.mac),
+                                peer.address,
+                                self.driver_fixes
+                            ));
+                            self.driver_fixes = 0;
+                            self.driver_logged_at = Some(self.now);
+                        }
+                    }
+                    Err(err) => self.note(&format!("LTE driver MAC correction could not be sent: {err}")),
+                }
+            }
+            DriverAction::GiveUp => self.note(&format!(
+                "the unit keeps forwarding IPv6 after {} corrections; something else routes through it. Pausing the LTE driver MAC correction for {} s",
+                driver_mac::TRIES,
+                driver_mac::PAUSE
+            )),
         }
     }
 

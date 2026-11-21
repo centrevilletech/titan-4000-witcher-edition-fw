@@ -8,7 +8,8 @@ the keeper's decision and commands, not the vendor NAT path itself.
 The management advertisement freeze runs against a dummy lte0pdn0 and the real
 kernel. The external-device guard reads a file standing in for the kernel log
 and runs a recording `kern` stub. The deaf watchdog runs against ping,
-modem-state and reboot stubs.
+modem-state and reboot stubs. The LTE driver MAC correction reads a file
+standing in for /proc/net/snmp6 and is checked on the wire of a dummy bearer.
 """
 import os
 import json
@@ -98,6 +99,7 @@ def main():
     # `kern netif extdev <dev> down` prints external_dev=NULL to the kernel log on a Titan.
     exe('/tmp/bin/kern', 'if [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; else echo "kern $*" >> /tmp/sas-actions; fi')
     Path('/tmp/kmsg').write_text('6,1,1,-;booting\n')
+    Path('/tmp/snmp6').write_text('Ip6InReceives 1\nIp6OutForwDatagrams 0\n')
     Path('/tmp/nat-rules').write_text(sas_rule+'\n')
     exe('/tmp/bin/ebtables', 'exit 0')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
@@ -111,7 +113,7 @@ def main():
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -138,6 +140,31 @@ def main():
         Path('/tmp/ping-ok').unlink()
         silent_from=time.monotonic()
         print('PASS: deaf watchdog armed only after a target answered.',flush=True)
+        # The LTE driver sends the router's IPv6 to the unit after the unit's
+        # own ARP, and the unit forwards it. It never forwards IPv6 in
+        # passthrough, so a rise is the symptom. The keeper sends the router's
+        # own ARP request out the bearer.
+        bearer_cap=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(0x0806));bearer_cap.bind(('lte0pdn1',0));bearer_cap.setblocking(False)
+        bearer_frames=[]
+        def bearer_arp():
+            try:
+                while True: bearer_frames.append(bearer_cap.recv(2048)[:42])
+            except BlockingIOError: pass
+            return bearer_frames
+        correction=b'\xff'*6+peer_mac+bytes.fromhex('08060001080006040001')+peer_mac+bytes([172,20,64,152])+bytes(6)+bytes([172,20,64,151])
+        run(ip, 'link', 'set', 'lte0pdn1', 'master', 'br0')
+        until=time.monotonic()+6
+        wait_for(lambda:time.monotonic()>=until,10)
+        assert correction not in bearer_arp(), 'corrected with no forwarding'
+        assert 'wrong downlink MAC' not in log()
+        Path('/tmp/snmp6').write_text('Ip6InReceives 9\nIp6OutForwDatagrams 12\n')
+        wait_for(lambda:correction in bearer_arp() and 'wrong downlink MAC' in log(),10)
+        sent=bearer_arp().count(correction)
+        until=time.monotonic()+4
+        wait_for(lambda:time.monotonic()>=until,8)
+        assert bearer_arp().count(correction)==sent, 'corrected again with no new forwarding'
+        run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
+        print('PASS: forwarded IPv6 in passthrough sent the router\'s ARP out the bearer once, and nothing more while quiet.',flush=True)
         if mgmt_ready:
             # One advertisement was taken. The keeper closes the bearer to more
             # and takes the expiry off the learned default.
