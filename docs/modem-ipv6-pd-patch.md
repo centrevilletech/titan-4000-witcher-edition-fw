@@ -43,6 +43,23 @@ makes the unit deaf. The keeper's guard undoes that. The simplest safe layout
 is a management APN on IPv4 and a dual-stack customer APN. See
 [the deaf-unit fault](deaf-watchdog.md).
 
+## Downlink MAC after a handover
+
+The LTE driver writes a destination MAC on each downlink IPv6 frame of the
+customer bearer, and it learns that MAC from the ARP requests it answers on the
+bearer. About a minute after a handover the vendor restarts its firewall, and
+the unit itself then ARPs for the SAS host from its own MAC. The driver starts
+sending the customer's IPv6 to the unit, which forwards it nowhere, until the
+router's next ARP. IPv4 keeps working. On a bench unit this cost 3 to 30 s of
+IPv6 each time, and up to 2 minutes in the field.
+
+In passthrough the unit forwards no IPv6 of its own, so a rise in the kernel's
+`Ip6OutForwDatagrams` is the symptom. The keeper then sends the router's own
+ARP request (router MAC, router address, DHCP gateway) out the customer bearer,
+at most once every 2 s. If forwarding goes on after 8 corrections, something
+else routes through the unit, and the keeper pauses for 2 minutes. See
+`userspace/pd-model/src/driver_mac.rs`.
+
 ## Validation
 
 Check the downstream router's WAN address, delegated prefix, LAN router
