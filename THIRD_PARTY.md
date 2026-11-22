@@ -41,6 +41,18 @@ components. See [GNU GPLv3 section 6](https://www.gnu.org/licenses/gpl-3.0.html#
 for distribution of covered object code. This inventory is not a complete
 firmware SBOM or a claim that all distribution obligations are satisfied.
 
+## Modem module copy and modem firmware
+
+The build patches vendor binaries from the stock image, as it does for
+`gdmlte.ko` and `cbrs_fsm`. For the [boot-time modem firmware loader](docs/tk-boot-loader.md)
+it also writes a second copy of the vendor `modem.ko` with one 4-byte
+instruction changed. The stock `modem.ko` stays in the image unchanged.
+
+Neither this repository nor the image carries modem firmware (`tk`) bytes,
+stock or patched. The image keeps the stock modem payload byte for byte. An
+operator stages any patched modem firmware on a unit by hand. Do not publish
+such images: they are modified vendor firmware.
+
 ## Images and screenshots
 
 The screenshots are generated from the current UI with synthetic fixtures;

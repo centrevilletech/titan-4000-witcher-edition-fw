@@ -2,8 +2,10 @@
 # Build a Witcher-edition Titan 4000 .prg from a stock vendor .prg.
 #
 # Produces: stock kernel + stock tk (byte-identical) + a rebuilt UBIFS rootfs
-# carrying (a) the passthrough/SSH overlay and (b) the one-byte gdmlte.ko IPv6-PD
-# modem patch. See README.md for prerequisites.
+# carrying (a) the passthrough/SSH overlay, (b) the one-byte gdmlte.ko IPv6-PD
+# modem patch and (c) the boot-time tk loader: a gated copy of modem.ko (the
+# stock module stays in place) and a hook around start_lte.sh's modprobe. No
+# modem firmware bytes are added. See README.md for prerequisites.
 #
 # Usage: scripts/build-firmware.sh /path/to/STOCK.prg [-o out.prg]
 set -euo pipefail
@@ -85,6 +87,11 @@ echo ">> patching cbrs_fsm (disable local SAS enforcement: radio-block + firewal
 CB="$WORK/rootfs/usr/sbin/cbrs_fsm"
 python3 "$HERE/scripts/patch-cbrs_fsm.py" "$CB" -o "$CB.patched"
 mv "$CB.patched" "$CB"
+
+echo ">> boot-time tk loader: gated modem.ko copy (stock module untouched) and start_lte.sh hook"
+MK="$WORK/rootfs/lib/modules/3.10.0-uc0/extra/modem.ko"
+python3 "$HERE/scripts/patch-modem-ko.py" "$MK" -o "$WORK/rootfs/usr/lib/titan-api/tk/modem-tkfs.ko"
+python3 "$HERE/scripts/hook-start-lte.py" "$WORK/rootfs/etc/sysconfig/script/start_lte.sh"
 
 echo ">> restoring stock modes after extraction and patching"
 python3 "$HERE/scripts/restore-rootfs-modes.py" "$WORK/fa/02_rootfs.ubi" "$WORK/rootfs"

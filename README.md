@@ -153,6 +153,7 @@ components this repository builds from source.
 - [Image format and flashing](docs/image-format.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
+- [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
 
 ## Learn LTE and build something
 

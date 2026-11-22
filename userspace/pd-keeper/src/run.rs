@@ -17,7 +17,9 @@
 //! downlink MAC back on the router when the unit starts forwarding IPv6 (see
 //! `titan_pd_model::driver_mac`). In every mode it stops the Ethernet MAC from
 //! sending 802.3x PAUSE frames to the customer router (see
-//! `titan_pd_model::ethernet`).
+//! `titan_pd_model::ethernet`). On a boot that loaded a staged modem firmware
+//! image it confirms the boot, or puts stock firmware back (see
+//! `titan_pd_model::tk_boot`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -42,6 +44,7 @@ use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
 use titan_pd_model::sas_nat::{self, Action as SasAction};
+use titan_pd_model::tk_boot::{self, Action as TkAction};
 
 use crate::log;
 
@@ -160,6 +163,12 @@ struct Keeper {
     flow_logged: bool,
     flow_failed_logged: bool,
     flow_stock_logged: bool,
+    /// The boot hook's status was read.
+    tk_checked: bool,
+    /// Pending confirm for a boot that loaded a staged modem firmware image.
+    tk_confirm: Option<tk_boot::Confirm>,
+    tk_probe: Option<DeafProbe>,
+    tk_last_round: Option<u64>,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
@@ -343,6 +352,10 @@ impl Keeper {
             flow_logged: false,
             flow_failed_logged: false,
             flow_stock_logged: false,
+            tk_checked: false,
+            tk_confirm: None,
+            tk_probe: None,
+            tk_last_round: None,
         }
     }
 
@@ -351,6 +364,7 @@ impl Keeper {
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
+        self.maintain_tk_confirm();
         self.maintain_mgmt_v6();
         if !self.passthrough {
             self.packet = None;
@@ -1387,13 +1401,13 @@ impl Keeper {
             let waited = self.now.saturating_sub(asked);
             if !self.reboot_forced && waited >= REBOOT_FORCE_AFTER {
                 self.reboot_forced = true;
-                log("deaf watchdog: the reboot did not happen; forcing it");
+                log("watchdog reboot did not happen; forcing it");
                 let _ = Command::new(reboot_program()).arg("-f").status();
             } else if self.reboot_forced && waited >= REBOOT_GIVE_UP_AFTER {
                 self.reboot_asked_at = None;
                 self.reboot_forced = false;
                 self.deaf_watch = deaf::Watch::default();
-                log("deaf watchdog: the forced reboot did not happen either; watching again");
+                log("the forced watchdog reboot did not happen either; watching again");
             }
             return;
         }
@@ -1440,20 +1454,7 @@ impl Keeper {
             String::new()
         };
         let targets = deaf::targets(&settings, &bearer_dns);
-        let children: Vec<std::process::Child> = targets
-            .iter()
-            .filter_map(|target| {
-                let program = if target.is_ipv6() { "ping6" } else { "ping" };
-                let address = target.to_string();
-                Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
-                    .args(["-c", "1", "-W", "4", address.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok()
-            })
-            .collect();
+        let children = spawn_pings(&targets);
         if children.is_empty() {
             self.deaf_round(None);
             return;
@@ -1509,16 +1510,154 @@ impl Keeper {
                     "deaf watchdog: attached but nothing heard through the core for {silent_for} s; rebooting (reboot {} in a row)",
                     strikes.saturating_add(1)
                 ));
-                unsafe { libc::sync() };
-                self.reboot_asked_at = Some(self.now);
-                self.reboot_forced = false;
-                let _ = Command::new(reboot_program())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
+                self.request_reboot();
             }
         }
+    }
+
+    /// A watchdog reboot. `maintain_deaf_watchdog` forces it if it does not
+    /// happen.
+    fn request_reboot(&mut self) {
+        unsafe { libc::sync() };
+        self.reboot_asked_at = Some(self.now);
+        self.reboot_forced = false;
+        let _ = Command::new(reboot_program())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    /// Runs in NAT and in passthrough. See `titan_pd_model::tk_boot`. Nothing
+    /// arms unless the boot hook staged a modem firmware image this boot.
+    fn maintain_tk_confirm(&mut self) {
+        if !self.tk_checked {
+            self.tk_checked = true;
+            let status = tk_boot::parse_status(&read_file(&tk_status_path()));
+            if let Some(line) = tk_boot::describe(&status) {
+                self.note(&line);
+            }
+            let decided = fs::metadata(tk_result_path()).is_ok();
+            self.tk_confirm = tk_boot::Confirm::arm(&status, self.now, decided);
+            let left = self
+                .tk_confirm
+                .as_ref()
+                .map(|confirm| confirm.deadline.saturating_sub(self.now));
+            if let Some(left) = left {
+                self.note(&format!(
+                    "tk boot confirm armed: without a management answer through the core in {left} s the keeper quarantines this image and reboots onto stock modem firmware"
+                ));
+            }
+        }
+        if self.tk_confirm.is_none() || self.reboot_asked_at.is_some() {
+            return;
+        }
+        if let Some(mut probe) = self.tk_probe.take() {
+            let mut heard = false;
+            let mut running = false;
+            for child in probe.children.iter_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => heard |= status.success(),
+                    Ok(None) => running = true,
+                    Err(_) => {}
+                }
+            }
+            let timed_out = self.now.saturating_sub(probe.started) >= tk_boot::PROBE_TIMEOUT;
+            if !heard && running && !timed_out {
+                self.tk_probe = Some(probe);
+                return;
+            }
+            for child in probe.children.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.tk_round(Some(heard));
+            return;
+        }
+        if self
+            .tk_last_round
+            .is_some_and(|last| self.now.saturating_sub(last) < tk_boot::PROBE_EVERY)
+        {
+            return;
+        }
+        self.tk_last_round = Some(self.now);
+        let children = spawn_pings(&tk_targets());
+        if children.is_empty() {
+            self.tk_round(None);
+            return;
+        }
+        self.tk_probe = Some(DeafProbe {
+            children,
+            started: self.now,
+        });
+    }
+
+    fn tk_round(&mut self, heard: Option<bool>) {
+        let Some(mut confirm) = self.tk_confirm.take() else {
+            return;
+        };
+        match confirm.observe(self.now, mgmt_address_up(), heard) {
+            TkAction::Hold => self.tk_confirm = Some(confirm),
+            TkAction::Confirmed => self.tk_confirmed(&confirm.sha),
+            TkAction::Rollback => self.tk_rollback(&confirm.sha),
+        }
+    }
+
+    fn tk_confirmed(&mut self, sha: &str) {
+        let _ = fs::write(tk_result_path(), format!("confirmed={sha}\n"));
+        let short = tk_boot::short(sha);
+        let Some(dir) = tk_dir() else {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core, but the persistent volume is not mounted; its strike stays counted"
+            ));
+            return;
+        };
+        let cleared = write_atomic(&dir.join("strikes"), tk_boot::format_strikes(0).as_bytes());
+        let _ = write_atomic(&dir.join("confirmed"), format!("sha256={sha}\n").as_bytes());
+        if cleared {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core; strikes cleared"
+            ));
+        } else {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core, but the strike count could not be cleared"
+            ));
+        }
+    }
+
+    /// Quarantine the image and reboot onto stock firmware, but only once a
+    /// read-back shows the boot hook will refuse it: a reboot without that
+    /// record could load the same image again.
+    fn tk_rollback(&mut self, sha: &str) {
+        let _ = fs::write(tk_result_path(), format!("rollback={sha}\n"));
+        let short = tk_boot::short(sha);
+        let secs = tk_boot::CONFIRM_SECS;
+        let Some(dir) = tk_dir() else {
+            self.note(&format!(
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}, but the persistent volume is not mounted; not rebooting"
+            ));
+            return;
+        };
+        let quarantine = dir.join("quarantine");
+        let strikes = dir.join("strikes");
+        let listed = tk_boot::add_quarantine(&read_file(&quarantine.to_string_lossy()), sha);
+        let _ = write_atomic(&quarantine, listed.as_bytes());
+        let _ = write_atomic(&strikes, tk_boot::format_strikes(tk_boot::STRIKE_LIMIT).as_bytes());
+        let recorded = tk_boot::refused(
+            tk_boot::parse_strikes(&read_file(&strikes.to_string_lossy())),
+            &tk_boot::parse_quarantine(&read_file(&quarantine.to_string_lossy())),
+            sha,
+        );
+        if !recorded {
+            self.note(&format!(
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}, and the quarantine could not be recorded; not rebooting"
+            ));
+            return;
+        }
+        self.note(&format!(
+            "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; quarantined it, rebooting onto stock modem firmware"
+        ));
+        self.request_reboot();
     }
 
     fn hold_sysctl(&mut self) {
@@ -2496,6 +2635,88 @@ fn carrier_up(dev: &str) -> bool {
 
 fn reboot_program() -> String {
     std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
+}
+
+/// One ping to each target, collected on later ticks.
+fn spawn_pings(targets: &[std::net::IpAddr]) -> Vec<std::process::Child> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            let program = if target.is_ipv6() { "ping6" } else { "ping" };
+            let address = target.to_string();
+            Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
+                .args(["-c", "1", "-W", "4", address.as_str()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        })
+        .collect()
+}
+
+fn tk_status_path() -> String {
+    std::env::var("TITAN_TK_STATUS").unwrap_or_else(|_| "/var/run/witcher-tk.status".into())
+}
+
+/// Written once a keeper process confirmed or rolled back this boot.
+fn tk_result_path() -> String {
+    std::env::var("TITAN_TK_RESULT").unwrap_or_else(|_| "/var/run/witcher-tk.result".into())
+}
+
+/// The boot hook's files on the persistent volume, only while it is mounted.
+fn tk_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("TITAN_TK_DIR") {
+        return Some(PathBuf::from(path));
+    }
+    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/tk"))
+}
+
+/// The tk config's own targets, else the deaf watchdog's.
+fn tk_targets() -> Vec<std::net::IpAddr> {
+    let config = tk_dir()
+        .map(|dir| read_file(&dir.join("config").to_string_lossy()))
+        .unwrap_or_default();
+    let own = tk_boot::parse_targets(&config);
+    if !own.is_empty() {
+        return own;
+    }
+    let settings = deaf::parse_settings(&read_file(
+        &state_dir().join("watchdog.conf").to_string_lossy(),
+    ));
+    let bearer_dns = if settings.targets.is_empty() {
+        command_stdout("nvram_get", &["0", "wan_get_dns"])
+    } else {
+        String::new()
+    };
+    deaf::targets(&settings, &bearer_dns)
+}
+
+/// The management bearer has an IPv4 or global IPv6 address.
+fn mgmt_address_up() -> bool {
+    carrier_up(mgmt::MGMT_DEV)
+        && command_stdout("ip", &["addr", "show", "dev", mgmt::MGMT_DEV])
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("inet ") || (line.starts_with("inet6 ") && line.contains("scope global")))
+}
+
+/// Write through a synced temporary file, then sync the directory, so a power
+/// cut leaves the old record or the new one.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    let temp = path.with_extension("tmp");
+    let written = (|| -> io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    written.is_ok()
 }
 
 /// Write the strike count through a temporary file, so a power cut cannot
