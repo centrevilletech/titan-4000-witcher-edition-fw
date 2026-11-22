@@ -44,6 +44,9 @@ pub fn always(line: &str) -> bool {
         "further router advertisements",
         "without a new advertisement",
         "vendor ping watchdog",
+        "CBRS gate closed",
+        "CBRS gate open",
+        "CBRS gate rules put back",
     ]
     .iter()
     .any(|part| line.contains(part))
@@ -149,6 +152,16 @@ mod tests {
         assert!(always("vendor ping watchdog: turned off in RAM for this boot"));
         assert!(!always("periodic router advertisement"));
         assert!(!always("router solicitation"));
+        // Every CBRS gate change is on record, even two re-attaches a few
+        // seconds apart. A failure repeated every second is not.
+        for line in [
+            "CBRS gate closed: no SAS grant (cbrs_mode_grant=0, cbrs_grant_state=0); dropping customer IPv6 to and from LTE",
+            "CBRS gate open: SAS grant held; customer IPv6 may forward",
+            "CBRS gate rules put back: a vendor firewall restart removed 4 of 4",
+        ] {
+            assert!(always(line), "{line}");
+        }
+        assert!(!always("CBRS gate: ip6tables -I FORWARD 1 -o lte0pdn+ -j DROP failed: not found"));
     }
 
     #[test]

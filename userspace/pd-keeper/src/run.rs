@@ -17,7 +17,9 @@
 //! downlink MAC back on the router when the unit starts forwarding IPv6 (see
 //! `titan_pd_model::driver_mac`). In every mode it stops the Ethernet MAC from
 //! sending 802.3x PAUSE frames to the customer router (see
-//! `titan_pd_model::ethernet`).
+//! `titan_pd_model::ethernet`). In every mode it drops customer IPv6 to and
+//! from LTE while the unit holds no SAS grant, which the vendor does for IPv4
+//! only (see `titan_pd_model::cbrs_gate`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -28,6 +30,7 @@ use std::thread;
 use std::time::Duration;
 
 use std::os::unix::process::CommandExt;
+use titan_pd_model::cbrs_gate::{self, Step as GateStep, Tool as GateTool};
 use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
@@ -188,6 +191,8 @@ struct Keeper {
     flow_logged: bool,
     flow_failed_logged: bool,
     flow_stock_logged: bool,
+    /// Customer IPv6 while there is no SAS grant (see `titan_pd_model::cbrs_gate`).
+    cbrs_gate: cbrs_gate::Watch,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
@@ -384,11 +389,14 @@ impl Keeper {
             flow_logged: false,
             flow_failed_logged: false,
             flow_stock_logged: false,
+            cbrs_gate: cbrs_gate::Watch::default(),
         }
     }
 
     fn tick(&mut self) -> Result<(), String> {
         self.refresh_mode();
+        // First, and in every mode: nothing below may delay it.
+        self.maintain_cbrs_gate();
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
@@ -1377,6 +1385,45 @@ impl Keeper {
             .any(|line| sas_nat::firewall_restart(line))
         {
             self.sas_watch.burst(self.now);
+        }
+    }
+
+    /// Drop customer IPv6 to and from LTE while the unit holds no SAS grant.
+    /// The vendor stops only IPv4 then, and bridged IPv6 never reaches
+    /// ip6tables. Reads the grant every second; while the gate is closed it
+    /// also puts back rules a vendor firewall restart flushed. See
+    /// `titan_pd_model::cbrs_gate`.
+    fn maintain_cbrs_gate(&mut self) {
+        if !self.cbrs_gate.due(self.now) {
+            return;
+        }
+        let cache = fs::read(nvram_cache()).ok();
+        let gate = cbrs_gate::decide(cache.as_deref());
+        let (step, line) = self.cbrs_gate.observe(self.now, &gate);
+        let changed = line.is_some();
+        if let Some(line) = line {
+            self.note(&line);
+        }
+        let failed = match step {
+            GateStep::Hold => return,
+            GateStep::Close => {
+                let (added, failed) = cbrs_gate::close(&mut gate_command);
+                if added > 0 && !changed {
+                    self.note(&format!(
+                        "CBRS gate rules put back: a vendor firewall restart removed {added} of {}",
+                        cbrs_gate::RULES.len()
+                    ));
+                }
+                failed
+            }
+            GateStep::Open => {
+                let (cleanup, failed) = cbrs_gate::open(&mut gate_command);
+                self.cbrs_gate.cleaned(self.now, cleanup);
+                failed
+            }
+        };
+        for err in failed {
+            self.note(&format!("CBRS gate: {err}"));
         }
     }
 
@@ -2721,6 +2768,29 @@ fn published_detail(existing: &str, argument: &str) -> String {
     } else {
         argument.to_owned()
     }
+}
+
+/// One ebtables or ip6tables command for the CBRS gate: its output when it
+/// exits 0.
+fn gate_command(tool: GateTool, args: &[&str]) -> Result<String, String> {
+    let program = match tool {
+        GateTool::Ebtables => {
+            std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into())
+        }
+        GateTool::Ip6tables => {
+            std::env::var("TITAN_IP6TABLES").unwrap_or_else(|_| "ip6tables".into())
+        }
+    };
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let err = err.trim();
+    Err(if err.is_empty() { output.status.to_string() } else { err.to_owned() })
 }
 
 fn ebtables(args: &str) -> Result<(), String> {

@@ -17,6 +17,10 @@ configuration cache and a recording `titan-nvram` stub. The keeper's RAM log
 and RAM status copy are checked against the flash files in the state directory.
 A file stands in for rcinit's log, and an empty lease file for the vendor Wi-Fi
 DHCP server's write over the shared lease file.
+The CBRS gate reads the SAS grant keys from that same cache file and edits two
+files standing in for the ebtables and ip6tables FORWARD chains, through stubs
+that print them the way the unit's tools do: this proves the keeper's
+decisions and commands, not the kernel tables.
 """
 import errno
 import os
@@ -78,9 +82,10 @@ def main():
     Path('/tmp/ping-ok').write_text('')
     # The vendor ping watchdog is on in the RAM cache. The stub records each
     # write and updates the cache, as the vendor library does.
-    Path('/tmp/nvram-cache').write_text('detection_interval=3\ndetection_enable=1\n')
+    # The SAS grant is held (Witcher's own test: both keys).
+    Path('/tmp/nvram-cache').write_text('detection_interval=3\ndetection_enable=1\ncbrs_mode_grant=1\ncbrs_grant_state=2\n')
     exe('/tmp/bin/titan-nvram', 'value=$(cat); echo "$1 $2 $3 $value" >> /tmp/nvram-actions\n'
-        'if [ "$1 $3" = "set detection_enable" ]; then printf "detection_interval=3\\ndetection_enable=%s\\n" "$value" > /tmp/nvram-cache; fi')
+        'if [ "$1 $3" = "set detection_enable" ]; then sed -i "s/^detection_enable=.*/detection_enable=$value/" /tmp/nvram-cache; fi')
     Path('/tmp/pd').mkdir()
     Path('/tmp/pd/watchdog.conf').write_text('deaf_secs=120\n')
     # Management bearer fixture: the global is up, the kernel still accepts
@@ -117,7 +122,23 @@ def main():
     Path('/tmp/kmsg').write_text('6,1,1,-;booting\n')
     Path('/tmp/snmp6').write_text('Ip6InReceives 1\nIp6OutForwDatagrams 0\n')
     Path('/tmp/nat-rules').write_text(sas_rule+'\n')
-    exe('/tmp/bin/ebtables', 'exit 0')
+    # Both FORWARD chains, one rule a line. Listings match ebtables v2.0.10-4
+    # (`-L`: no chain name, a space at the end) and ip6tables (`-S`). A delete
+    # of a rule that is not there fails, as on the unit.
+    chain_stub = ('f=$1; shift; echo "$*" >> $f.calls\n'
+        'case "$1 $2" in\n'
+        '"-L FORWARD") printf "Bridge table: filter\\n\\nBridge chain: FORWARD, entries: %s, policy: ACCEPT\\n" "$(wc -l < $f)"; sed "s/\\$/ /" $f;;\n'
+        '"-S FORWARD") echo "-P FORWARD ACCEPT"; sed "s/^/-A FORWARD /" $f;;\n'
+        '"-I FORWARD") shift 3; { echo "$*"; cat $f; } > $f.new; mv $f.new $f;;\n'
+        '"-A FORWARD") shift 2; echo "$*" >> $f;;\n'
+        '"-D FORWARD") shift 2; n=$(grep -n -x -F -- "$*" $f | head -n 1 | cut -d: -f1); [ -n "$n" ] || exit 1; sed -i "${n}d" $f;;\n'
+        '*) exit 1;;\n'
+        'esac')
+    exe('/tmp/bin/chain-stub', chain_stub)
+    for name in ('ebt', 'ip6'):
+        Path('/tmp/'+name+'-forward').write_text('')
+    exe('/tmp/bin/ebtables', 'exec /tmp/bin/chain-stub /tmp/ebt-forward "$@"')
+    exe('/tmp/bin/ip6tables', 'exec /tmp/bin/chain-stub /tmp/ip6-forward "$@"')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
     exe('/usr/sbin/udhcpd', 'echo start >> /tmp/dhcp-starts; while :; do sleep 30; done')
     peer = json.loads(subprocess.check_output([ip, '-n', 'witcher-peer', '-j', '-4', 'addr', 'show', 'router0']))[0]
@@ -136,7 +157,7 @@ def main():
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -180,6 +201,66 @@ def main():
         assert nvram_actions()==['set 0 detection_enable 0'], nvram_actions()
         assert 'detection_enable=0' in Path('/tmp/nvram-cache').read_text()
         print('PASS: vendor ping watchdog turned off in the RAM cache, with no commit.',flush=True)
+        # CBRS gate. With the grant held the keeper opens it and leaves both
+        # FORWARD chains without a drop rule.
+        def chain(name):
+            return Path('/tmp/'+name+'-forward').read_text().splitlines()
+        def gate_rules():
+            return [line for name in ('ebt','ip6') for line in chain(name) if 'lte0pdn+' in line]
+        def set_grant(lines):
+            kept=[line for line in Path('/tmp/nvram-cache').read_text().splitlines()
+                  if not line.startswith(('cbrs_mode_grant=','cbrs_grant_state='))]
+            Path('/tmp/nvram-cache.new').write_text('\n'.join(kept+lines)+'\n')
+            Path('/tmp/nvram-cache.new').replace('/tmp/nvram-cache')
+        wait_for(lambda:'CBRS gate open: SAS grant held' in log(),10)
+        assert gate_rules()==[], gate_rules()
+        # Transmit expiry with Witcher's Block Channel patch: the mode key stays
+        # 1 and the grant state drops to 1. Customer IPv6 stops both ways,
+        # bridged and routed, ahead of every other rule.
+        set_grant(['cbrs_mode_grant=1','cbrs_grant_state=1'])
+        lost=time.monotonic()
+        wait_for(lambda:len(gate_rules())==4,10)
+        took=time.monotonic()-lost
+        assert took<3, took
+        assert set(chain('ebt')[:2])=={'-p IPv6 -i lte0pdn+ -j DROP','-p IPv6 -o lte0pdn+ -j DROP'}, chain('ebt')
+        assert set(chain('ip6')[:2])=={'-i lte0pdn+ -j DROP','-o lte0pdn+ -j DROP'}, chain('ip6')
+        assert 'CBRS gate closed: no SAS grant (cbrs_mode_grant=1, cbrs_grant_state=1)' in log(), log()
+        print('PASS: CBRS gate closed %.1f s after the grant state dropped: IPv6 drops in both chains, both ways.'%took,flush=True)
+        # A vendor firewall restart flushes both tables and restores its own
+        # IPv6 rule. The drops come back within seconds, ahead of it, and are
+        # not added twice.
+        Path('/tmp/ebt-forward').write_text('')
+        Path('/tmp/ip6-forward').write_text('-m rt --rt-type 0 -j DROP\n')
+        flushed=time.monotonic()
+        wait_for(lambda:len(gate_rules())==4,10)
+        took=time.monotonic()-flushed
+        assert took<3, took
+        assert chain('ip6')[-1]=='-m rt --rt-type 0 -j DROP', chain('ip6')
+        wait_for(lambda:'CBRS gate rules put back' in log(),5)
+        until=time.monotonic()+3
+        wait_for(lambda:time.monotonic()>=until,5)
+        assert len(gate_rules())==4, gate_rules()
+        print('PASS: CBRS gate rules put back %.1f s after a vendor flush, once.'%took,flush=True)
+        # The grant comes back: every drop goes, the vendor's rule stays.
+        set_grant(['cbrs_mode_grant=1','cbrs_grant_state=2'])
+        back=time.monotonic()
+        wait_for(lambda:gate_rules()==[],10)
+        took=time.monotonic()-back
+        assert took<3, took
+        assert chain('ip6')==['-m rt --rt-type 0 -j DROP'], chain('ip6')
+        assert log().count('CBRS gate open: SAS grant held')==2, log()
+        print('PASS: CBRS gate opened %.1f s after the grant came back; only its own rules removed.'%took,flush=True)
+        # Grant keys missing (never set, or a torn read): closed, but only once
+        # a read at least a second later agrees.
+        set_grant([])
+        gone=time.monotonic()
+        wait_for(lambda:len(gate_rules())==4,10)
+        took=time.monotonic()-gone
+        assert 1<=took<5, took
+        assert 'CBRS gate closed: no SAS grant (cbrs_mode_grant=unset, cbrs_grant_state=unset)' in log(), log()
+        set_grant(['cbrs_mode_grant=1','cbrs_grant_state=2'])
+        wait_for(lambda:gate_rules()==[],10)
+        print('PASS: CBRS gate failed closed %.1f s after the grant keys went missing, and opened again.'%took,flush=True)
         wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
         # The vendor Wi-Fi DHCP server writes its empty list over the shared

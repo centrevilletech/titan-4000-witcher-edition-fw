@@ -100,6 +100,12 @@ own SAS client reach the SAS. A vendor firewall restart after an LTE handover
 removes it, and the Block Channel patch removes the vendor's way of putting it
 back. See [SAS reachability in passthrough](docs/cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
 
+Without a SAS grant the vendor blocks only customer IPv4. In passthrough the
+customer's IPv6 crosses the bridge, which skips ip6tables, so it kept flowing.
+Since v1.0.14 the keeper drops customer IPv6 to and from LTE whenever the unit
+has no grant, in every mode, and puts the rules back after each vendor
+firewall restart. See [Customer IPv6 without a SAS grant](docs/cbrs-sas-enforcement.md#customer-ipv6-without-a-sas-grant).
+
 A passthrough unit could stay attached but go deaf: the vendor kernel made the
 management bearer its external device, and the LTE driver then addressed
 management traffic to the customer router. The keeper watches the kernel log
