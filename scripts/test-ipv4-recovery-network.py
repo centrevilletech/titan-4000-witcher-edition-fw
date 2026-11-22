@@ -13,6 +13,7 @@ standing in for /proc/net/snmp6 and is checked on the wire of a dummy bearer.
 The 802.3x flow control change runs a recording `kern eth` stub that prints
 the kernel's report: this proves when the keeper runs it, not the register.
 """
+import errno
 import os
 import json
 from pathlib import Path
@@ -132,6 +133,9 @@ def main():
                     frame=capture.recv(2048)
                     if frame[12:14]==b'\x08\x06': packets.append(frame.hex())
             except BlockingIOError: pass
+            except OSError as err:
+                # Taking eth0 down reports ENETDOWN once on a bound packet socket.
+                if err.errno!=errno.ENETDOWN: raise
             if keeper.poll() is not None: raise AssertionError('keeper exited: '+log())
             if predicate(): return
             time.sleep(.25)
