@@ -43,6 +43,65 @@ pub fn host_route_on(routes: &str, dev: &str) -> Option<Ipv4Addr> {
     None
 }
 
+/// These offers need a modem-assigned address. The legacy LAN and private
+/// recovery paths also handle half-configured vendor offers during startup.
+pub fn needs_assignment(addr: Ipv4Addr) -> bool {
+    !is_lan(addr) && !is_customer_ipv4(addr) && !addr.is_unspecified()
+}
+
+/// One vendor snapshot, one data role, one customer-facing bridge. Do not
+/// trust a stale public route, a second LTE bridge port or the management PDN.
+pub fn data_assignment(snapshot: &[u8], ports: &[String], bearer_dev: &str) -> Option<Ipv4Addr> {
+    fn field<'a>(snapshot: &'a [u8], key: &[u8]) -> Option<&'a str> {
+        let mut matches = snapshot.split(|&b| b == 0).filter_map(|row| row.strip_prefix(key));
+        let first = std::str::from_utf8(matches.next()?).ok()?;
+        matches.next().is_none().then_some(first)
+    }
+    let data_dev = field(snapshot, b"pdn_data_ifname=")?;
+    let management_dev = field(snapshot, b"pdn_manage_ifname=")?;
+    let data: Ipv4Addr = field(snapshot, b"pdn_data_ipaddr=")?.parse().ok()?;
+    let management: Ipv4Addr = field(snapshot, b"pdn_manage_ipaddr=")?.parse().ok()?;
+    let lte_name = crate::extdev::is_lte_bearer;
+    if !lte_name(data_dev) || !lte_name(management_dev) || management_dev == data_dev
+        || data == management || management.is_unspecified() || data_dev != bearer_dev
+        || !ports.iter().any(|p| p == "eth0")
+        || !ports.iter().any(|p| p == data_dev)
+        || ports.iter().filter(|p| lte_name(p)).count() != 1
+    {
+        return None;
+    }
+    Some(data)
+}
+
+/// Only accept an existing, single-address offer with a corroborated on-link
+/// route and gateway. Keep the release's private/LAN recovery for those offers.
+pub fn offer_route(conf: &DhcpConf, routes: &str, assigned: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    if !needs_assignment(conf.start) {
+        return host_route_on(routes, "br0");
+    }
+    let data = assigned?;
+    let first = data.octets()[0];
+    let gw_first = conf.router.octets()[0];
+    let mask = u32::from(conf.mask);
+    if !(conf.interface == "br0" || conf.interface == "br0:9")
+        || conf.start != data || conf.end != data || first == 0 || first >= 224
+        || data.is_link_local() || !conf.remaining_yes || conf.lease == 0 || conf.max_leases == 0
+        || !usable_gateway(conf.router, data) || gw_first == 0 || gw_first >= 224
+        || conf.router.is_link_local() || mask.leading_ones() + mask.trailing_zeros() != 32
+        || !same_subnet(data, conf.router, conf.mask)
+    {
+        return None;
+    }
+    let direct = routes.lines().any(|row| {
+        let mut cols = row.split_whitespace();
+        let Some(dest) = cols.next() else { return false };
+        let dest = dest.strip_suffix("/32").unwrap_or(dest);
+        dest.parse::<Ipv4Addr>() == Ok(data) && cols.next() == Some("dev")
+            && cols.next() == Some("br0") && !row.split_whitespace().any(|w| w == "linkdown")
+    });
+    direct.then_some(data)
+}
+
 pub fn default_via(routes: &str, dev: &str) -> Option<Ipv4Addr> {
     for line in routes.lines() {
         let parts: Vec<_> = line.split_whitespace().collect();
@@ -185,8 +244,23 @@ pub fn plan_maintenance(
     cooldown_elapsed: bool,
     bearer_dev: &str,
 ) -> Option<Ipv4Plan> {
+    plan_with_assignment(conf_text, routes, lease, discover, cooldown_elapsed, bearer_dev, None)
+}
+
+pub fn plan_with_assignment(
+    conf_text: &str,
+    routes: &str,
+    lease: &[u8],
+    discover: Option<[u8; 6]>,
+    cooldown_elapsed: bool,
+    bearer_dev: &str,
+    assigned: Option<Ipv4Addr>,
+) -> Option<Ipv4Plan> {
     let conf = parse_conf(conf_text)?;
-    let bearer = host_route_on(routes, "br0");
+    let bearer = offer_route(&conf, routes, assigned);
+    // An offer outside the qualified pools is never rewritten here. Without
+    // modem evidence only the 1.0.7 new-router lease release below applies.
+    let external = needs_assignment(conf.start);
     if offers_lan(&conf) && bearer.is_none() {
         return Some(Ipv4Plan {
             stop_lan_offer: true,
@@ -201,7 +275,7 @@ pub fn plan_maintenance(
         clear_lease: false,
         reason: String::new(),
     };
-    if let Some(bearer) = bearer {
+    if let Some(bearer) = bearer.filter(|_| !external) {
         let gateway = default_via(routes, bearer_dev)
             .filter(|gateway| usable_gateway(*gateway, bearer))
             .or_else(|| usable_gateway(conf.router, bearer).then_some(conf.router));
@@ -241,6 +315,15 @@ pub fn plan_maintenance(
 /// Restart a missing customer DHCP daemon only with an already-correct offer
 /// and a live bearer route. Silence, no LTE, and a Wi-Fi config are not faults.
 pub fn restart_missing_server(conf_text: &str, routes: &str, running: bool) -> Option<Ipv4Plan> {
+    restart_with_assignment(conf_text, routes, running, None)
+}
+
+pub fn restart_with_assignment(
+    conf_text: &str,
+    routes: &str,
+    running: bool,
+    assigned: Option<Ipv4Addr>,
+) -> Option<Ipv4Plan> {
     if running {
         return None;
     }
@@ -248,13 +331,14 @@ pub fn restart_missing_server(conf_text: &str, routes: &str, running: bool) -> O
     if conf.interface != "br0" && conf.interface != "br0:9" {
         return None;
     }
-    let bearer = host_route_on(routes, "br0")?;
-    if !usable_gateway(conf.router, bearer) || needs_repair(&conf, bearer, conf.router) {
+    let bearer = offer_route(&conf, routes, assigned)?;
+    let external = needs_assignment(conf.start);
+    if !usable_gateway(conf.router, bearer) || (!external && needs_repair(&conf, bearer, conf.router)) {
         return None;
     }
     Some(Ipv4Plan {
         stop_lan_offer: false,
-        rewrite: Some(render_conf(&conf)),
+        rewrite: Some(if external { conf_text.to_owned() } else { render_conf(&conf) }),
         clear_lease: false,
         reason: "customer DHCP daemon is absent; restoring the current bearer offer".into(),
     })
@@ -497,4 +581,75 @@ default via 172.20.64.151 dev lte0pdn1
         assert!(plan.clear_lease);
         assert!(plan.rewrite.unwrap().contains("start 172.20.64.153"));
     }
+    const ASSIGNED: &[u8] = b"pdn_manage_ifname=lte0pdn0\0pdn_data_ifname=lte0pdn2\0pdn_manage_ipaddr=198.18.0.9\0pdn_data_ipaddr=192.0.2.114\0";
+    const PUBLIC_ROUTES: &str = "198.51.100.46 dev br0 scope link\n192.0.2.114 dev br0 scope link\n";
+    const PUBLIC_CONF: &str = "start 192.0.2.114\nend 192.0.2.114\nmax_leases 8\ninterface br0:9\nremaining yes\noption subnet 255.255.255.252\noption router 192.0.2.113\noption lease 120\noption domain lab.invalid\n";
+
+    #[test]
+    fn public_lease_recovery_uses_the_modem_and_preserves_the_offer_verbatim() {
+        let ports = ["eth0".to_owned(), "lte0pdn2".to_owned()];
+        let data = data_assignment(ASSIGNED, &ports, "lte0pdn2");
+        let offer = parse_conf(PUBLIC_CONF).unwrap();
+        assert_eq!(data, Some(Ipv4Addr::new(192, 0, 2, 114)));
+        assert_eq!(offer_route(&offer, PUBLIC_ROUTES, data), data);
+        assert!(host_route_on(PUBLIC_ROUTES, "br0").is_none());
+        let stale = format!("172.20.64.9 dev br0 scope link\n{PUBLIC_ROUTES}");
+        assert_eq!(offer_route(&offer, &stale, data), data);
+        let restored = restart_with_assignment(PUBLIC_CONF, &stale, false, data).unwrap();
+        assert_eq!(restored.rewrite.as_deref(), Some(PUBLIC_CONF));
+        assert!(!restored.clear_lease && !restored.stop_lan_offer);
+        assert!(restart_with_assignment(PUBLIC_CONF, PUBLIC_ROUTES, true, data).is_none());
+        assert!(plan_with_assignment(PUBLIC_CONF, &stale, &[], None, true, "lte0pdn2", data).is_none());
+        let explicit = PUBLIC_ROUTES.replace(".114 dev", ".114/32 dev");
+        assert_eq!(offer_route(&offer, &explicit, data), data);
+    }
+
+    #[test]
+    fn outside_the_old_pool_mismatched_evidence_disarms_both_paths() {
+        let data = Some(Ipv4Addr::new(192, 0, 2, 114));
+        let offer = parse_conf(PUBLIC_CONF).unwrap();
+        for routes in [
+            "198.51.100.46 dev br0 scope link",
+            "192.0.2.114/24 dev br0 scope link",
+            "192.0.2.114 via 192.0.2.1 dev br0",
+            "192.0.2.114 dev br0 scope link linkdown",
+            "192.0.2.114 dev lte0pdn0 scope link",
+        ] {
+            assert_eq!(offer_route(&offer, routes, data), None, "{routes}");
+            assert!(restart_with_assignment(PUBLIC_CONF, routes, false, data).is_none());
+        }
+        for text in [
+            PUBLIC_CONF.replace("end 192.0.2.114", "end 192.0.2.115"),
+            PUBLIC_CONF.replace("192.0.2.113", "192.0.2.1"),
+            PUBLIC_CONF.replace("192.0.2.113", "192.0.2.114"),
+            PUBLIC_CONF.replace("255.255.255.252", "255.0.255.0"),
+            PUBLIC_CONF.replace("br0:9", "ra0"),
+            PUBLIC_CONF.replace("remaining yes", "remaining no"),
+        ] {
+            assert!(restart_with_assignment(&text, PUBLIC_ROUTES, false, data).is_none(), "{text}");
+        }
+        assert!(offer_route(&offer, PUBLIC_ROUTES, None).is_none());
+        assert!(offer_route(&offer, PUBLIC_ROUTES, Some(Ipv4Addr::new(198,51,100,46))).is_none());
+    }
+
+    #[test]
+    fn missing_duplicate_or_unbridged_pdn_roles_are_ineligible() {
+        let ports = ["eth0".to_owned(), "lte0pdn2".to_owned()];
+        let base = std::str::from_utf8(ASSIGNED).unwrap();
+        for snapshot in [
+            base.replace("pdn_data_ipaddr=", "unrelated="),
+            base.replace("lte0pdn0", "lte0pdn2"),
+            base.replace("198.18.0.9", "192.0.2.114"),
+            base.replace("lte0pdn2", "eth0"),
+            format!("{base}pdn_data_ipaddr=192.0.2.115\0"),
+        ] {
+            assert!(data_assignment(snapshot.as_bytes(), &ports, "lte0pdn2").is_none());
+        }
+        assert!(data_assignment(ASSIGNED, &ports, "lte0pdn1").is_none());
+        assert!(data_assignment(ASSIGNED, &ports[1..], "lte0pdn2").is_none());
+        let mut ambiguous = ports.to_vec();
+        ambiguous.push("lte0pdn0".into());
+        assert!(data_assignment(ASSIGNED, &ambiguous, "lte0pdn2").is_none());
+    }
+
 }

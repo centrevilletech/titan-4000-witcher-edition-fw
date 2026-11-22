@@ -95,6 +95,8 @@ struct Keeper {
     last_dhcp_probe: u64,
     ipv4_watch: ipv4_health::Watch,
     last_ipv4_check: u64,
+    // Read the dynamic PDN snapshot at most once per second per bearer.
+    assigned_at: Option<(u64, String, Option<std::net::Ipv4Addr>)>,
     sas_watch: sas_nat::Watch,
     last_sas_check: Option<u64>,
     dhcp_child: Option<std::process::Child>,
@@ -278,6 +280,7 @@ impl Keeper {
             last_dhcp_probe: 0,
             ipv4_watch: ipv4_health::Watch::default(),
             last_ipv4_check: 0,
+            assigned_at: None,
             sas_watch: sas_nat::Watch::default(),
             last_sas_check: None,
             dhcp_child: None,
@@ -829,6 +832,28 @@ impl Keeper {
         config.pinned_block().ok().flatten()
     }
 
+    fn assigned_address(&mut self, external: bool) -> Option<std::net::Ipv4Addr> {
+        if !external || !self.bridged || !self.passthrough {
+            self.assigned_at = None;
+            return None;
+        }
+        if let Some((at, dev, addr)) = &self.assigned_at {
+            if *at == self.now && dev == &self.bearer {
+                return *addr;
+            }
+        }
+        let read = || {
+            let snapshot = fs::read("/tmp/nvram.cfg").ok()?;
+            let ports = fs::read_dir("/sys/class/net/br0/brif").ok()?
+                .map(|entry| entry.ok()?.file_name().into_string().ok())
+                .collect::<Option<Vec<_>>>()?;
+            ipv4::data_assignment(&snapshot, &ports, &self.bearer)
+        };
+        let addr = read();
+        self.assigned_at = Some((self.now, self.bearer.clone(), addr));
+        addr
+    }
+
     fn maintain_ipv4(&mut self) {
         // Reap a daemon that exited on its own before considering a restart.
         if let Some(child) = &mut self.dhcp_child {
@@ -862,18 +887,49 @@ impl Keeper {
             return;
         }
         let bearer = self.bearer.clone();
-        let plan = ipv4::plan_maintenance(&conf, &routes, &lease, discover, cooldown, &bearer)
+        let external = ipv4::parse_conf(&conf).is_some_and(|offer| ipv4::needs_assignment(offer.start));
+        let assigned = self.assigned_address(external);
+        let plan = ipv4::plan_with_assignment(&conf, &routes, &lease, discover, cooldown, &bearer, assigned)
             .or_else(|| {
                 if self.now.saturating_sub(self.last_dhcp_probe) < 5 {
                     return None;
                 }
                 self.last_dhcp_probe = self.now;
                 let running = !customer_dhcp_pids(&command_stdout("ps", &[])).is_empty();
-                ipv4::restart_missing_server(&conf, &routes, running)
+                ipv4::restart_with_assignment(&conf, &routes, running, assigned)
             });
         let Some(plan) = plan else {
             return;
         };
+        // A validated external offer already exists on disk. Start the missing
+        // server on that exact file without rewriting it or stopping another PID.
+        if external && !plan.clear_lease && plan.rewrite.is_some() {
+            if self.dhcp_child.is_some() || read_file("/tmp/udhcpd.conf") != conf {
+                return;
+            }
+            self.assigned_at = None;
+            let current = self.assigned_address(true);
+            let current_routes = command_stdout("ip", &["route"]);
+            if current != assigned
+                || ipv4::restart_with_assignment(&conf, &current_routes, false, current).is_none()
+            {
+                return;
+            }
+            let Ok(ps) = Command::new("ps").output() else { return };
+            let listing = String::from_utf8_lossy(&ps.stdout);
+            if !ps.status.success() || listing.trim().is_empty() || !customer_dhcp_pids(&listing).is_empty() {
+                return;
+            }
+            self.last_dhcp_restart = self.now;
+            match spawn_udhcpd() {
+                Ok(child) => {
+                    self.dhcp_child = Some(child);
+                    self.note("udhcpd restarted on the unchanged offer for the assigned data PDN");
+                }
+                Err(err) => self.note(&format!("udhcpd did not restart for the assigned data PDN: {err}")),
+            }
+            return;
+        }
         // While the bearer route is absent the stock server offers a LAN
         // address. Killing it on every 200 ms tick fills the log and the
         // process table.
@@ -918,6 +974,8 @@ impl Keeper {
         let conf_text = read_file("/tmp/udhcpd.conf");
         let links_up = carrier_up(CUSTOMER) && carrier_up(&bearer);
         let mut gateway = None;
+        let mut hold_previous = self.ipv4_peer
+            .is_none_or(|(peer, _)| !ipv4::needs_assignment(peer.address));
         let peer = (|| {
             if !links_up {
                 return None;
@@ -926,7 +984,16 @@ impl Keeper {
             if (conf.interface != "br0:9" && conf.interface != BRIDGE) || !conf.remaining_yes {
                 return None;
             }
-            let bearer = ipv4::host_route_on(&command_stdout("ip", &["route"]), BRIDGE)?;
+            let external = ipv4::needs_assignment(conf.start);
+            let assigned = self.assigned_address(external);
+            let routes = command_stdout("ip", &["route"]);
+            let route = ipv4::offer_route(&conf, &routes, assigned);
+            if external {
+                hold_previous = route.is_some()
+                    && self.ipv4_peer.is_some_and(|(peer, _)| Some(peer.address) == route)
+                    && self.ipv4_gateway == Some(conf.router);
+            }
+            let bearer = route?;
             if conf.start != bearer
                 || conf.end != bearer
                 || !ipv4::usable_gateway(conf.router, bearer)
@@ -962,16 +1029,20 @@ impl Keeper {
                 self.ipv4_gateway = gateway;
                 Some(peer)
             }
-            None if links_up => self
+            None if links_up && hold_previous => self
                 .ipv4_peer
                 .filter(|(_, seen)| self.now.saturating_sub(*seen) <= PEER_HOLD)
                 .map(|(peer, _)| peer),
             None => {
                 self.ipv4_peer = None;
+                self.ipv4_gateway = None;
                 None
             }
         };
-        match self.ipv4_watch.tick(self.now, peer) {
+        // The DHCP lease and gateway can arm the existing driver-MAC repair.
+        // Public APNs have not qualified the separate Ethernet PHY recovery.
+        let phy_peer = peer.filter(|p| !ipv4::needs_assignment(p.address));
+        match self.ipv4_watch.tick(self.now, phy_peer) {
             Ipv4Action::Hold => {}
             Ipv4Action::Probe(peer) => {
                 let result = interface_index(CUSTOMER)
