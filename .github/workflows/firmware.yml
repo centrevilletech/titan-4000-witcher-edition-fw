@@ -67,6 +67,7 @@ jobs:
           python3 scripts/test-rootfs-metadata.py
           python3 scripts/test-firstboot.py
           python3 scripts/test-bridge-trial.py
+          python3 scripts/test-patch-pdn.py
           (cd device/sqm/payload && sha256sum -c ../SHA256SUMS)
           bash -n device/sqm/source/rebuild.sh
           python3 -m compileall -q scripts
@@ -145,7 +146,9 @@ jobs:
             zlib1g-dev liblzo2-dev uuid-dev fakeroot \
             python3-pip python3-venv python3-lzo ca-certificates curl bzip2 qemu-user
           python3 -m venv --system-site-packages "$PACK_WORK/ubi-venv"
-          "$PACK_WORK/ubi-venv/bin/pip" install ubi_reader==0.8.16 ziglang==0.14.1
+          # unicorn and pyelftools: verify-firmware.py runs the packed rcinit and
+          # ucid PDN code in an emulator (scripts/emulate-pdn-paths.py).
+          "$PACK_WORK/ubi-venv/bin/pip" install ubi_reader==0.8.16 ziglang==0.14.1 unicorn==2.1.1 pyelftools==0.31
           echo "$PACK_WORK/ubi-venv/bin" >> "$GITHUB_PATH"
           curl -fsSL -o "$PACK_WORK/mtd-utils-2.3.1.tar.bz2" \
             https://infraroot.at/pub/mtd/mtd-utils-2.3.1.tar.bz2

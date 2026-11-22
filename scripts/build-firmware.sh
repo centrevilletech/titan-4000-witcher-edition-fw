@@ -2,8 +2,9 @@
 # Build a Witcher-edition Titan 4000 .prg from a stock vendor .prg.
 #
 # Produces: stock kernel + stock tk (byte-identical) + a rebuilt UBIFS rootfs
-# carrying (a) the passthrough/SSH overlay and (b) the one-byte gdmlte.ko IPv6-PD
-# modem patch. See README.md for prerequisites.
+# carrying (a) the passthrough/SSH overlay, (b) the one-byte gdmlte.ko IPv6-PD
+# modem patch and (c) the pinned cbrs_fsm, rcinit and ucid patches. See
+# README.md for prerequisites.
 #
 # Usage: scripts/build-firmware.sh /path/to/STOCK.prg [-o out.prg]
 set -euo pipefail
@@ -72,6 +73,15 @@ text=text.replace(needle, '\t\t/bin/sh /etc/init.d/witcher-recovery-files\n'+nee
 p.write_text(text)
 PY
 rm -rf "$WORK/rootfs/etc/sysconfig/audio/sample"
+# Before the strip steps: patch-rcinit.py pins the stock 4172 rcinit. The
+# strips change only .rodata strings elsewhere in the file.
+echo ">> patching rcinit and ucid (no fixed stalls on a PDN bounce, no NAT firewall restart on a carrier change)"
+RC="$WORK/rootfs/usr/sbin/rcinit"
+python3 "$HERE/scripts/patch-rcinit.py" "$RC" -o "$RC.patched"
+mv "$RC.patched" "$RC"
+UC="$WORK/rootfs/usr/sbin/ucid"
+python3 "$HERE/scripts/patch-ucid.py" "$UC" -o "$UC.patched"
+mv "$UC.patched" "$UC"
 echo ">> locking the stock root account"
 python3 "$HERE/scripts/strip-root-password.py" "$WORK/rootfs"
 python3 "$HERE/scripts/strip-vendor-host-keys.py" "$WORK/rootfs/usr/sbin/rcinit"
