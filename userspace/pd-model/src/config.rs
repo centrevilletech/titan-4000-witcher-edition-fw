@@ -51,6 +51,70 @@ pub struct Pending {
     pub not_before: u64,
 }
 
+/// The web service writes `pending.json` with `not_before` 15 s ahead, then
+/// starts the guard. A keeper that starts in that gap must not revert. A same-boot
+/// wait longer than this can only come from a clock step, so it is not honoured.
+pub const PENDING_ARM_SECS: u64 = 60;
+
+/// What a starting keeper does with a `pending.json` left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Recovery {
+    /// A guard owns it, or is about to.
+    Wait,
+    /// Management came back before the guard was lost. Keep the new setting,
+    /// as the guard would have.
+    Keep,
+    /// Put the previous IP family back.
+    Revert,
+}
+
+/// Decide without trusting the wall clock across a reboot. The Titan has no
+/// battery clock: it boots at 2013-06-20 and NTP corrects it about a minute
+/// later, after the keeper has started. `not_before` is wall time from the web
+/// service, so after a reboot it always looks far in the future.
+///
+/// - No guard survives a reboot, so on the keeper's first start in a boot the
+///   change is reverted (unless it was confirmed) whatever the clock says.
+/// - On a later start in the same boot, `not_before` still covers the short gap
+///   before the guard starts, but never more than `PENDING_ARM_SECS`.
+pub fn recovery(
+    guard_running: bool,
+    confirmed: bool,
+    first_start_this_boot: bool,
+    wall_now: u64,
+    not_before: u64,
+) -> Recovery {
+    if guard_running {
+        return Recovery::Wait;
+    }
+    if confirmed {
+        return Recovery::Keep;
+    }
+    if first_start_this_boot {
+        return Recovery::Revert;
+    }
+    match not_before.checked_sub(wall_now) {
+        Some(ahead) if ahead > 0 && ahead <= PENDING_ARM_SECS => Recovery::Wait,
+        _ => Recovery::Revert,
+    }
+}
+
+/// `marker` is what the keeper left in its RAM directory on an earlier start
+/// (gone after a reboot), and `boot_id` is `/proc/sys/kernel/random/boot_id`.
+/// A marker from another boot (a RAM directory that somehow survived) does not
+/// count. An unreadable boot id falls back to the marker alone.
+pub fn first_start(marker: Option<&str>, boot_id: &str) -> bool {
+    match marker {
+        None => true,
+        Some(seen) => !boot_id.trim().is_empty() && seen.trim() != boot_id.trim(),
+    }
+}
+
+/// `confirm-<token>` holds the token once management came back and held.
+pub fn confirmed(token: &str, confirm_file: &str) -> bool {
+    !token.is_empty() && confirm_file.trim() == token
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub enabled: bool,
@@ -221,5 +285,75 @@ mod tests {
         assert_eq!(shown_choice(Some(&loaded)), "1");
         fs::write(&path, b"{").unwrap();
         assert!(load_config(&path).is_err());
+    }
+
+    // Wall times from a bench log: the keeper starts at 2013-06-20 and NTP
+    // corrects the clock about a minute later.
+    const BOOT_CLOCK: u64 = 1_371_736_806;
+    const REAL_CLOCK: u64 = 1_795_195_592;
+
+    #[test]
+    fn a_cold_boot_reverts_although_the_clock_reads_2013() {
+        // The change was saved just before the reboot, so not_before is 2026.
+        let not_before = REAL_CLOCK + 15;
+        assert_eq!(
+            recovery(false, false, true, BOOT_CLOCK, not_before),
+            Recovery::Revert
+        );
+        // The old wall-clock test skipped it: 2013 < 2026.
+        assert!(BOOT_CLOCK < not_before);
+    }
+
+    #[test]
+    fn a_confirmed_change_is_kept_after_a_reboot() {
+        assert_eq!(
+            recovery(false, true, true, BOOT_CLOCK, REAL_CLOCK + 15),
+            Recovery::Keep
+        );
+        assert!(confirmed("abc123", "abc123\n"));
+        assert!(!confirmed("abc123", ""));
+        assert!(!confirmed("abc123", "abc124"));
+        assert!(!confirmed("", ""));
+    }
+
+    #[test]
+    fn a_running_guard_always_wins() {
+        for first in [true, false] {
+            assert_eq!(
+                recovery(true, false, first, BOOT_CLOCK, REAL_CLOCK),
+                Recovery::Wait
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_in_the_same_boot_honours_only_the_short_arming_gap() {
+        let now = REAL_CLOCK;
+        // Inside the 15 s gap before the guard starts.
+        assert_eq!(recovery(false, false, false, now, now + 15), Recovery::Wait);
+        assert_eq!(recovery(false, false, false, now, now + 1), Recovery::Wait);
+        // Past it.
+        assert_eq!(recovery(false, false, false, now, now), Recovery::Revert);
+        assert_eq!(recovery(false, false, false, now + 400, now), Recovery::Revert);
+        // A backward clock step cannot stretch the wait.
+        assert_eq!(
+            recovery(false, false, false, now, now + PENDING_ARM_SECS + 1),
+            Recovery::Revert
+        );
+        assert_eq!(
+            recovery(false, false, false, BOOT_CLOCK, REAL_CLOCK),
+            Recovery::Revert
+        );
+    }
+
+    #[test]
+    fn the_boot_marker_tells_a_first_start() {
+        let id = "3f1c2b8e-0d4a-4c55-9e61-1a2b3c4d5e6f\n";
+        assert!(first_start(None, id));
+        assert!(!first_start(Some(id.trim()), id));
+        assert!(first_start(Some("another-boot"), id));
+        // Without a boot id the marker alone decides.
+        assert!(!first_start(Some("seen"), ""));
+        assert!(first_start(None, ""));
     }
 }

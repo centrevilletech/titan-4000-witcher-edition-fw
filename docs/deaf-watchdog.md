@@ -143,6 +143,20 @@ target=2001:db8::1
 
 Up to four targets. Without the file the watchdog is on with the defaults.
 
+### The vendor ping watchdog
+
+The stock firmware has its own ping watchdog in `ucid` (nvram
+`detection_enable`, the vendor's Ping Watch page). It reboots the unit after
+about 110 s without its ping target and has no backoff, so two setting saves in
+a row can reboot a unit. Since v1.0.12, while this watchdog is on, the keeper
+sets `detection_enable` to 0 in the vendor's RAM cache. `ucid` reads that cache
+every 15 s. The keeper never commits it, so the saved setting stays as it was,
+and a unit flashed back to stock keeps its vendor watchdog. The check repeats
+each round and does nothing once the value is 0.
+
+To run the vendor watchdog instead, set `enabled=0` in `watchdog.conf`. The
+keeper then leaves `detection_enable` alone.
+
 ### Log lines
 
 In `/mnt/titan-api/pd/keeper.log`:
@@ -151,6 +165,7 @@ In `/mnt/titan-api/pd/keeper.log`:
 - `deaf watchdog: attached, but no target answered this round`
 - `deaf watchdog: answers are back after N s of silence`
 - `deaf watchdog: attached but nothing heard through the core for N s; rebooting (reboot K in a row)`
+- `vendor ping watchdog: turned off in RAM for this boot (detection_enable was 1); ...`
 
 ## Limits
 
@@ -159,7 +174,8 @@ In `/mnt/titan-api/pd/keeper.log`:
 - A watchdog reboot was tested with its targets silenced, not against a real
   wedge. A vendor ping watchdog (`detection_enable` in nvram) does clear a
   wedged unit with `kern reboot`. It also reboots a unit after about 110
-  seconds without its ping target, with no backoff. Run one or the other.
+  seconds without its ping target, with no backoff. Run one or the other:
+  since v1.0.12 the keeper turns the vendor one off in RAM while this one is on.
 - The passthrough driver serves one LAN device. It learns one host MAC.
 - The unit tests cover the decisions. The packet integration test covers the
   freeze on a dummy bearer, the guard against a file standing in for the

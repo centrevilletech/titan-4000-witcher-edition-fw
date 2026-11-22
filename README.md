@@ -113,6 +113,11 @@ the customer router. The vendor driver turns them on although the link agrees
 on none, and each one can stop the router's upload for 33 ms. See
 [Ethernet flow control](docs/ethernet-flow-control.md).
 
+The keeper writes to flash only when something changes. Routine lines, such as
+each periodic router advertisement, go to a log in RAM, and the status file is
+rewritten on flash at most once a minute. Witcher's logs in `/tmp` stay under
+about 80 KB each. See [Long runs](docs/long-runs.md).
+
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
 
@@ -153,6 +158,7 @@ components this repository builds from source.
 - [Image format and flashing](docs/image-format.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
+- [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 
 ## Learn LTE and build something
 

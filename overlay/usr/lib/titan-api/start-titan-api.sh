@@ -209,6 +209,7 @@ export TITAN_LISTEN TITAN_TLS_LISTEN TITAN_TLS_CERT TITAN_TLS_KEY TITAN_BROKER T
 [ -z "${TITAN_SSH_PORT:-}" ] || export TITAN_SSH_PORT
 # Never force Secure globally: HTTP-only LAN clients still need functional sessions.
 unset TITAN_SECURE_COOKIE
+# Emptied here, then opened for append, so witcher-boot can cap them in place.
 for service in api broker collector routes; do
  logfile=$runtime/$service.log
  if [ -e "$logfile" ]; then private_file "$logfile" || exit 77; fi
@@ -221,9 +222,9 @@ trap 'exit 1' HUP INT TERM
 # This kernel has no binfmt_script: a bare script path is interpreted inside the
 # forked shell and keeps the launcher's command line. Name the interpreter so
 # /proc/PID/cmdline identifies each service.
-/bin/sh "$runtime/collect.sh" "$TITAN_HELPER" > "$runtime/collector.log" 2>&1 < /dev/null &
+/bin/sh "$runtime/collect.sh" "$TITAN_HELPER" >> "$runtime/collector.log" 2>&1 < /dev/null &
 echo $! > "$runtime/collector.pid"
-"$runtime/titan-api" --device-broker > "$runtime/broker.log" 2>&1 < /dev/null &
+"$runtime/titan-api" --device-broker >> "$runtime/broker.log" 2>&1 < /dev/null &
 echo $! > "$runtime/broker.pid"
 attempts=0
 while [ ! -S "$TITAN_BROKER" ]; do
@@ -233,10 +234,10 @@ while [ ! -S "$TITAN_BROKER" ]; do
 done
 if [ "$profile" = production ]; then
  # Networking must be ready before the boot hook invokes this launcher.
- /bin/sh "$runtime/start-titan-api.sh" restore-routes-loop > "$runtime/routes.log" 2>&1 < /dev/null &
+ /bin/sh "$runtime/start-titan-api.sh" restore-routes-loop >> "$runtime/routes.log" 2>&1 < /dev/null &
  echo $! > "$runtime/routes.pid"
 fi
-"$runtime/titan-api" > "$runtime/api.log" 2>&1 < /dev/null &
+"$runtime/titan-api" >> "$runtime/api.log" 2>&1 < /dev/null &
 echo $! > "$runtime/api.pid"
 sleep 1
 for service in api broker collector; do process_owned "$service" "$(cat "$runtime/$service.pid")" || { echo "$service failed; inspect its private log." >&2; exit 1; }; done
