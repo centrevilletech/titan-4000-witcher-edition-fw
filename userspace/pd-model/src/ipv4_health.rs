@@ -2,6 +2,11 @@
 //! A peer must first answer our ARP checks. Three missed replies trigger DHCP
 //! repair; three more trigger one PHY renegotiation. Another renegotiation
 //! requires a new successful baseline. The caller owns the shared port budget.
+//!
+//! A router that stops answering ARP can still be sending traffic, for
+//! example when it filters ARP from the bridge address. Renegotiating that
+//! link would cut working service, so the caller first asks `Activity`
+//! whether frames are still arriving from the router.
 use std::net::Ipv4Addr;
 
 pub const INTERVAL: u64 = 10;
@@ -151,6 +156,73 @@ pub fn leased_mac(bytes: &[u8], address: Ipv4Addr, now: u64) -> Option<[u8; 6]> 
     found
 }
 
+/// Frames per second from the router that mean the link carries traffic. An
+/// idle or hung router's own housekeeping (router solicitations, neighbor
+/// discovery, DHCP retries) stays well under this.
+pub const BUSY_PER_SEC: u64 = 5;
+/// The rate is measured over at least this many seconds...
+const MIN_WINDOW: u64 = 5;
+/// ...and at most this many, so it describes the last few probes.
+const MAX_WINDOW: u64 = 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Traffic {
+    /// Fewer frames than `BUSY_PER_SEC` arrived.
+    Quiet,
+    /// The router sent `frames` frames in `secs` seconds.
+    Busy { frames: u64, secs: u64 },
+    /// No usable count. Treated as busy: never cut a link on a guess.
+    Unknown,
+}
+
+/// The customer port's receive counter (`rx_packets`), sampled with each ARP
+/// probe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Activity {
+    samples: [Option<(u64, u64)>; 2],
+}
+
+impl Activity {
+    pub fn sample(&mut self, now: u64, rx_packets: Option<u64>) {
+        if let Some(count) = rx_packets {
+            self.samples = [self.samples[1], Some((now, count))];
+        }
+    }
+
+    pub fn traffic(&self, now: u64, rx_packets: Option<u64>) -> Traffic {
+        let Some(count) = rx_packets else {
+            return Traffic::Unknown;
+        };
+        // The newest sample old enough to measure a rate from.
+        let base = self
+            .samples
+            .iter()
+            .flatten()
+            .filter(|(at, _)| now.saturating_sub(*at) >= MIN_WINDOW)
+            .max_by_key(|(at, _)| *at);
+        let Some(&(at, before)) = base else {
+            return Traffic::Unknown;
+        };
+        let secs = now - at;
+        if secs > MAX_WINDOW {
+            return Traffic::Unknown;
+        }
+        // The kernel's counter is 32 bits wide on this CPU and can wrap.
+        let frames = if count >= before {
+            count - before
+        } else if before <= u64::from(u32::MAX) {
+            count + (1 << 32) - before
+        } else {
+            return Traffic::Unknown;
+        };
+        if frames >= BUSY_PER_SEC * secs {
+            Traffic::Busy { frames, secs }
+        } else {
+            Traffic::Quiet
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +357,44 @@ mod tests {
         e[13] = 9;
         b.extend(e);
         assert_eq!(leased_mac(&b, peer().address, 101), None);
+    }
+
+    #[test]
+    fn a_link_carrying_traffic_is_busy_and_a_quiet_one_is_not() {
+        let mut a = Activity::default();
+        // Probes at 100 and 110; the renegotiation is decided at 113.
+        a.sample(100, Some(5_000));
+        a.sample(110, Some(5_030));
+        // 13 s back to the probe at 100: 64 frames is under 5 a second.
+        assert_eq!(a.traffic(113, Some(5_064)), Traffic::Quiet);
+        assert_eq!(a.traffic(113, Some(5_065)), Traffic::Busy { frames: 65, secs: 13 });
+        // A router passing customer traffic sends hundreds a second.
+        assert_eq!(a.traffic(113, Some(9_000)), Traffic::Busy { frames: 4_000, secs: 13 });
+        // At 116 the probe at 110 is old enough and is the newer base.
+        assert_eq!(a.traffic(116, Some(5_030)), Traffic::Quiet);
+        assert_eq!(a.traffic(116, Some(5_060)), Traffic::Busy { frames: 30, secs: 6 });
+    }
+
+    #[test]
+    fn the_counter_wraps_at_32_bits() {
+        let mut a = Activity::default();
+        a.sample(100, Some(u64::from(u32::MAX) - 9));
+        assert_eq!(a.traffic(110, Some(10)), Traffic::Quiet);
+        assert_eq!(a.traffic(110, Some(500)), Traffic::Busy { frames: 510, secs: 10 });
+    }
+
+    #[test]
+    fn no_usable_count_is_never_a_quiet_link() {
+        let mut a = Activity::default();
+        assert_eq!(a.traffic(100, Some(1)), Traffic::Unknown, "no sample yet");
+        a.sample(100, Some(1));
+        assert_eq!(a.traffic(103, Some(1)), Traffic::Unknown, "window too short");
+        assert_eq!(a.traffic(110, None), Traffic::Unknown, "unreadable counter");
+        assert_eq!(a.traffic(161, Some(1)), Traffic::Unknown, "sample too old");
+        a.sample(120, None);
+        assert_eq!(a.traffic(130, Some(1)), Traffic::Quiet, "a failed read keeps the old samples");
+        let mut big = Activity::default();
+        big.sample(100, Some(u64::from(u32::MAX) + 7));
+        assert_eq!(big.traffic(110, Some(3)), Traffic::Unknown, "a counter that went backwards");
     }
 }

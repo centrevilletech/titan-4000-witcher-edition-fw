@@ -59,7 +59,7 @@ pub enum Event {
 
 /// The message of one kernel log line. `/dev/kmsg` records carry a
 /// `level,sequence,time,flags;` prefix. `dmesg` output does not.
-fn message(line: &str) -> &str {
+pub(crate) fn message(line: &str) -> &str {
     if let Some((head, rest)) = line.split_once(';') {
         let looks_like_prefix = head.contains(',')
             && head

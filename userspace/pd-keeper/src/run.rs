@@ -15,7 +15,9 @@
 //! a unit deaf. In every mode it reboots a unit that stays attached but hears
 //! nothing through the core. In passthrough it also puts the LTE driver's
 //! downlink MAC back on the router when the unit starts forwarding IPv6 (see
-//! `titan_pd_model::driver_mac`).
+//! `titan_pd_model::driver_mac`). In every mode it stops the Ethernet MAC from
+//! sending 802.3x PAUSE frames to the customer router (see
+//! `titan_pd_model::ethernet`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -30,11 +32,12 @@ use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
 use titan_pd_model::driver_mac::{self, Action as DriverAction};
+use titan_pd_model::ethernet;
 use titan_pd_model::extdev::{self, Action as ExtAction};
 use titan_pd_model::filter;
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
 use titan_pd_model::ipv4::{self, Ipv4Plan};
-use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Peer};
+use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Peer, Traffic};
 use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
@@ -54,7 +57,6 @@ const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
 const FLOOD_INTERVAL: u64 = 30;
-const DHCP_COOLDOWN: u64 = 15;
 /// Seconds the IPv4 check keeps its router through an unreadable lease file.
 const PEER_HOLD: u64 = 8;
 const MGMT_EVERY: u64 = 10;
@@ -91,9 +93,11 @@ struct Keeper {
     now: u64,
     last_ra: u64,
     last_router: u64,
-    last_dhcp_restart: u64,
+    dhcp_gate: ipv4::DhcpGate,
     last_dhcp_probe: u64,
     ipv4_watch: ipv4_health::Watch,
+    /// The customer port's receive counter at recent ARP probes.
+    eth_rx: ipv4_health::Activity,
     last_ipv4_check: u64,
     // Read the dynamic PDN snapshot at most once per second per bearer.
     assigned_at: Option<(u64, String, Option<std::net::Ipv4Addr>)>,
@@ -146,6 +150,16 @@ struct Keeper {
     /// Corrections since the last log line, and when that line was written.
     driver_fixes: u32,
     driver_logged_at: Option<u64>,
+    flow_watch: ethernet::Watch,
+    flow_checked: Option<u64>,
+    /// The kernel log was read to its end once, so a flow control report
+    /// read after that was printed after the keeper's own command.
+    kmsg_drained: bool,
+    /// `kern eth -fc` ran and its report has not been read yet.
+    flow_pending: bool,
+    flow_logged: bool,
+    flow_failed_logged: bool,
+    flow_stock_logged: bool,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
@@ -276,9 +290,10 @@ impl Keeper {
             now: 0,
             last_ra: 0,
             last_router: 0,
-            last_dhcp_restart: 0,
+            dhcp_gate: ipv4::DhcpGate::default(),
             last_dhcp_probe: 0,
             ipv4_watch: ipv4_health::Watch::default(),
+            eth_rx: ipv4_health::Activity::default(),
             last_ipv4_check: 0,
             assigned_at: None,
             sas_watch: sas_nat::Watch::default(),
@@ -321,12 +336,20 @@ impl Keeper {
             driver_watch: driver_mac::Watch::default(),
             driver_fixes: 0,
             driver_logged_at: None,
+            flow_watch: ethernet::Watch::default(),
+            flow_checked: None,
+            kmsg_drained: false,
+            flow_pending: false,
+            flow_logged: false,
+            flow_failed_logged: false,
+            flow_stock_logged: false,
         }
     }
 
     fn tick(&mut self) -> Result<(), String> {
         self.refresh_mode();
         self.maintain_external_dev();
+        self.maintain_flow_control();
         self.maintain_deaf_watchdog();
         self.maintain_mgmt_v6();
         if !self.passthrough {
@@ -884,10 +907,12 @@ impl Keeper {
         let conf = read_file("/tmp/udhcpd.conf");
         let lease = fs::read("/tmp/udhcpd.leases").unwrap_or_default();
         let discover = self.discover.take();
-        let cooldown = self.now.saturating_sub(self.last_dhcp_restart) >= DHCP_COOLDOWN;
-        // All DHCP mutations share the cooldown, including repeated vendor
-        // rewrites. Do not turn a broken server into a process/restart storm.
-        if !cooldown {
+        // Every DHCP change waits out a cooldown, including repeated vendor
+        // rewrites, so a broken server cannot become a restart storm. Stopping
+        // a LAN offer has its own clock: it must not delay the offer for a
+        // bearer that comes back a few seconds later.
+        let cooldown = self.dhcp_gate.restart_ready(self.now);
+        if !self.dhcp_gate.any_ready(self.now) {
             return;
         }
         let bearer = self.bearer.clone();
@@ -895,7 +920,7 @@ impl Keeper {
         let assigned = self.assigned_address(external);
         let plan = ipv4::plan_with_assignment(&conf, routes, &lease, discover, cooldown, &bearer, assigned)
             .or_else(|| {
-                if self.now.saturating_sub(self.last_dhcp_probe) < 5 {
+                if !cooldown || self.now.saturating_sub(self.last_dhcp_probe) < 5 {
                     return None;
                 }
                 self.last_dhcp_probe = self.now;
@@ -905,6 +930,9 @@ impl Keeper {
         let Some(plan) = plan else {
             return;
         };
+        if !self.dhcp_gate.allows(self.now, &plan) {
+            return;
+        }
         // A validated external offer already exists on disk. Start the missing
         // server on that exact file without rewriting it or stopping another PID.
         if external && !plan.clear_lease && plan.rewrite.is_some() {
@@ -924,7 +952,7 @@ impl Keeper {
             if !ps.status.success() || listing.trim().is_empty() || !customer_dhcp_pids(&listing).is_empty() {
                 return;
             }
-            self.last_dhcp_restart = self.now;
+            self.dhcp_gate.record(self.now, &plan);
             match spawn_udhcpd() {
                 Ok(child) => {
                     self.dhcp_child = Some(child);
@@ -944,7 +972,7 @@ impl Keeper {
         self.note(&plan.reason);
         if plan.stop_lan_offer {
             stop_customer_udhcpd();
-            self.last_dhcp_restart = self.now;
+            self.dhcp_gate.record(self.now, plan);
             return;
         }
         if let Some(text) = &plan.rewrite {
@@ -965,7 +993,7 @@ impl Keeper {
                 }
                 Err(err) => self.note(&format!("udhcpd did not restart: {err}")),
             }
-            self.last_dhcp_restart = self.now;
+            self.dhcp_gate.record(self.now, plan);
         }
     }
 
@@ -1045,6 +1073,7 @@ impl Keeper {
         match self.ipv4_watch.tick(self.now, phy_peer) {
             Ipv4Action::Hold => {}
             Ipv4Action::Probe(peer) => {
+                self.eth_rx.sample(self.now, rx_packets(CUSTOMER));
                 let result = interface_index(CUSTOMER)
                     .ok_or_else(|| "eth0 is unavailable".to_owned())
                     .and_then(|index| send_marked_frame(index, &ipv4_health::probe(peer)));
@@ -1057,7 +1086,7 @@ impl Keeper {
             }
             Ipv4Action::RepairDhcp => {
                 self.note("IPv4 router missed three local ARP checks with LTE and Ethernet up; repairing DHCP first");
-                if self.now.saturating_sub(self.last_dhcp_restart) >= DHCP_COOLDOWN {
+                if self.dhcp_gate.restart_ready(self.now) {
                     self.apply_ipv4(&Ipv4Plan {
                         stop_lan_offer: false,
                         rewrite: Some(conf_text),
@@ -1069,6 +1098,19 @@ impl Keeper {
                 }
             }
             Ipv4Action::Renegotiate => {
+                // Checked before the budget is spent: a router that stopped
+                // answering ARP but still sends traffic keeps its link.
+                match self.eth_rx.traffic(self.now, rx_packets(CUSTOMER)) {
+                    Traffic::Quiet => {}
+                    Traffic::Busy { frames, secs } => {
+                        self.note(&format!("IPv4 Ethernet renegotiation skipped: the router sent {frames} frames in the last {secs} s, so the link is carrying traffic"));
+                        return;
+                    }
+                    Traffic::Unknown => {
+                        self.note("IPv4 Ethernet renegotiation skipped: the eth0 receive counter could not be measured, and a link is never cut on a guess");
+                        return;
+                    }
+                }
                 let decision = self.health.request_link_recovery(self.now);
                 // Persist before touching the link; a supervisor restart must
                 // not erase the shared IPv4/IPv6 action budget.
@@ -1147,11 +1189,13 @@ impl Keeper {
 
     /// Keep the vendor SNAT rule for the unit's own SAS traffic. A vendor
     /// firewall restart after a handover removes it, and in this build nothing
-    /// else puts it back. Restores only after two missing checks in a row.
+    /// else puts it back. Restores only after two missing checks in a row,
+    /// checked every 10 s, or every second for 30 s after a PDN comes up.
     fn maintain_sas_nat(&mut self, routes: &str) {
+        let interval = self.sas_watch.interval(self.now);
         if self
             .last_sas_check
-            .is_some_and(|last| self.now.saturating_sub(last) < sas_nat::INTERVAL)
+            .is_some_and(|last| self.now.saturating_sub(last) < interval)
         {
             return;
         }
@@ -1167,11 +1211,17 @@ impl Keeper {
                 snat,
             )
         });
+        let burst = self.sas_watch.bursting(self.now);
         let SasAction::Restore(snat) = self.sas_watch.observe(self.now, snat, present) else {
             return;
         };
+        let when = if burst {
+            "missing for 2 s right after a PDN came up"
+        } else {
+            "missing twice after a vendor firewall restart"
+        };
         self.note(&format!(
-            "SAS NAT rule missing twice after a vendor firewall restart; restoring SNAT from {} to {} so the SAS client can reach the SAS",
+            "SAS NAT rule {when}; restoring SNAT from {} to {} so the SAS client can reach the SAS",
             snat.local, snat.bearer
         ));
         for (program, args) in sas_nat::restore_commands(snat) {
@@ -1205,6 +1255,9 @@ impl Keeper {
             self.bridged = true;
             if self.bridged_since.is_none() {
                 self.bridged_since = Some(self.now);
+                // The vendor adds the SAS SNAT rule during this setup and its
+                // firewall restarts can drop it again. Check it every second.
+                self.sas_watch.burst(self.now);
             }
             self.mode_checked = None;
             return;
@@ -1239,7 +1292,14 @@ impl Keeper {
             if let Some(event) = extdev::parse(&line) {
                 self.ext_watch.note(event);
             }
+            if sas_nat::pdn_up(&line).is_some() {
+                self.sas_watch.burst(self.now);
+            }
+            if let Some(efc) = ethernet::efc(&line) {
+                self.flow_report(efc);
+            }
         }
+        self.kmsg_drained |= drained;
         // `bridged` is how the keeper knows the vendor's bearer setup is over.
         let ready = self.passthrough && self.bridged && drained;
         let settled = self
@@ -1251,6 +1311,55 @@ impl Keeper {
                 "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
             ));
             self.repair_external_dev(&dev);
+        }
+    }
+
+    /// Clear 802.3x hardware flow control on eth0 when the keeper starts and
+    /// each time eth0 gets its carrier back. See `titan_pd_model::ethernet`.
+    fn maintain_flow_control(&mut self) {
+        if self.flow_checked == Some(self.now) {
+            return;
+        }
+        // Wait for the kernel log backlog, so an old report is not taken for
+        // the answer to this command. Without a kernel log, go ahead.
+        if self.kernel_log.is_some() && !self.kmsg_drained {
+            return;
+        }
+        self.flow_checked = Some(self.now);
+        if !self.flow_watch.tick(carrier_up(CUSTOMER)) {
+            return;
+        }
+        if ethernet::stock_requested(&read_file(&state_dir().join("ethernet.conf").to_string_lossy())) {
+            if !self.flow_stock_logged {
+                self.note("ethernet.conf asks for flow_control=stock; leaving the vendor's 802.3x setting on eth0");
+                self.flow_stock_logged = true;
+            }
+            return;
+        }
+        match run_status(ethernet::PROGRAM, &ethernet::DISABLE) {
+            Ok(()) => self.flow_pending = self.kernel_log.is_some(),
+            Err(err) => {
+                if !self.flow_failed_logged {
+                    self.note(&format!("could not turn off 802.3x PAUSE on eth0; trying again when eth0 next comes up: {err}"));
+                    self.flow_failed_logged = true;
+                }
+            }
+        }
+    }
+
+    /// The kernel's flow control report. One line per outcome per run, since
+    /// keeper.log is on flash.
+    fn flow_report(&mut self, efc: bool) {
+        if !self.flow_pending {
+            return;
+        }
+        self.flow_pending = false;
+        if !efc && !self.flow_logged {
+            self.note("eth0 no longer sends 802.3x PAUSE frames to the router (kern eth -fc; the kernel reports efc=0). The keeper does this again each time eth0 comes back up");
+            self.flow_logged = true;
+        } else if efc && !self.flow_failed_logged {
+            self.note("kern eth -fc ran but the kernel still reports efc=1 on eth0; leaving it");
+            self.flow_failed_logged = true;
         }
     }
 
@@ -2368,6 +2477,14 @@ fn interface_mac(dev: &str) -> Option<[u8; 6]> {
 
 fn interface_index(dev: &str) -> Option<i32> {
     read_file(&format!("/sys/class/net/{dev}/ifindex"))
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Frames received on `dev` since boot. `None` when the counter is unreadable.
+fn rx_packets(dev: &str) -> Option<u64> {
+    read_file(&format!("/sys/class/net/{dev}/statistics/rx_packets"))
         .trim()
         .parse()
         .ok()

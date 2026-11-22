@@ -236,6 +236,56 @@ pub struct Ipv4Plan {
     pub reason: String,
 }
 
+/// Seconds between two changes of the same kind to the customer DHCP server.
+pub const DHCP_COOLDOWN: u64 = 15;
+
+/// Rate limits for the customer DHCP server.
+///
+/// Stopping the vendor's LAN offer and starting the server for the bearer
+/// have separate clocks. Up to v1.0.10 they shared one: when the bearer
+/// dropped, the keeper stopped the LAN offer, and when the bearer came back
+/// one to fourteen seconds later the offer for it waited out the rest of the
+/// 15 s. The customer router had no DHCP server right when the bearer
+/// returned. Each kind keeps its own 15 s limit, so neither can loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DhcpGate {
+    /// Last rewrite, lease clear or server start.
+    pub last_restart: u64,
+    /// Last stop of a LAN offer.
+    pub last_lan_stop: u64,
+}
+
+impl DhcpGate {
+    pub fn restart_ready(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_restart) >= DHCP_COOLDOWN
+    }
+
+    pub fn lan_stop_ready(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_lan_stop) >= DHCP_COOLDOWN
+    }
+
+    /// Whether either kind of change may run now.
+    pub fn any_ready(&self, now: u64) -> bool {
+        self.restart_ready(now) || self.lan_stop_ready(now)
+    }
+
+    pub fn allows(&self, now: u64, plan: &Ipv4Plan) -> bool {
+        if plan.stop_lan_offer {
+            self.lan_stop_ready(now)
+        } else {
+            self.restart_ready(now)
+        }
+    }
+
+    pub fn record(&mut self, now: u64, plan: &Ipv4Plan) {
+        if plan.stop_lan_offer {
+            self.last_lan_stop = now;
+        } else if plan.rewrite.is_some() || plan.clear_lease {
+            self.last_restart = now;
+        }
+    }
+}
+
 pub fn plan_maintenance(
     conf_text: &str,
     routes: &str,
@@ -580,6 +630,44 @@ default via 172.20.64.151 dev lte0pdn1
         let plan = plan_maintenance(CONF, routes, &[], None, true, "lte0pdn1").unwrap();
         assert!(plan.clear_lease);
         assert!(plan.rewrite.unwrap().contains("start 172.20.64.153"));
+    }
+
+    #[test]
+    fn stopping_a_lan_offer_does_not_delay_the_bearer_offer() {
+        let lan = "start 10.1.1.100\nend 10.1.1.200\ninterface br0\noption subnet 255.255.255.0\noption router 10.1.1.1\noption lease 86400\n";
+        let no_bearer = "10.1.1.0/24 dev br0 proto kernel scope link\n";
+        let bearer = host_route_on(ROUTES, "br0").unwrap();
+        let mut gate = DhcpGate::default();
+        // The bearer drops at 100 and the vendor offers a LAN address.
+        let stop =
+            plan_maintenance(lan, no_bearer, &[], None, gate.restart_ready(100), "lte0pdn0").unwrap();
+        assert!(stop.stop_lan_offer);
+        assert!(gate.allows(100, &stop));
+        gate.record(100, &stop);
+        assert_eq!(gate.last_restart, 0, "a stop is not a restart");
+        // The bearer is back at 102. Up to v1.0.10 this waited until 115.
+        assert!(gate.restart_ready(102));
+        let offer =
+            plan_maintenance(lan, ROUTES, &[], None, gate.restart_ready(102), "lte0pdn0").unwrap();
+        assert!(!offer.stop_lan_offer);
+        assert!(offer.rewrite.as_deref().is_some_and(|text| text.contains(&format!("start {bearer}\n"))));
+        assert!(gate.allows(102, &offer));
+        gate.record(102, &offer);
+        assert_eq!(gate.last_lan_stop, 100, "a restart is not a stop");
+        // Each kind still waits 15 s for its own next change.
+        assert!(!gate.allows(114, &stop));
+        assert!(gate.allows(115, &stop));
+        assert!(!gate.allows(116, &offer));
+        assert!(gate.allows(117, &offer));
+        assert!(gate.any_ready(115));
+        assert!(!gate.any_ready(114));
+        // A plan that changes nothing moves neither clock.
+        let mut idle = gate;
+        idle.record(
+            200,
+            &Ipv4Plan { stop_lan_offer: false, rewrite: None, clear_lease: false, reason: String::new() },
+        );
+        assert_eq!(idle, gate);
     }
     const ASSIGNED: &[u8] = b"pdn_manage_ifname=lte0pdn0\0pdn_data_ifname=lte0pdn2\0pdn_manage_ipaddr=198.18.0.9\0pdn_data_ipaddr=192.0.2.114\0";
     const PUBLIC_ROUTES: &str = "198.51.100.46 dev br0 scope link\n192.0.2.114 dev br0 scope link\n";

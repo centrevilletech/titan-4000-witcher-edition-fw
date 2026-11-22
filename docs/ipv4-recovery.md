@@ -5,6 +5,15 @@ maintenance even when IPv6 delegation is off. It repairs the DHCP offer,
 restarts a missing customer DHCP server, and discards the old lease when the
 bearer address changes. DHCP changes have a 15-second cooldown.
 
+Since v1.0.11, stopping the vendor's LAN offer and starting the server for
+the bearer have separate 15-second clocks. While the bearer is down the stock
+server offers a LAN address, and the keeper stops it. Up to v1.0.10 that stop
+also started the shared cooldown, so when the bearer came back one to
+fourteen seconds later its offer waited out the rest of the 15 s, and the
+customer router had no DHCP server right when the bearer returned. Now the
+offer for the bearer goes out on the next tick. Each kind still waits 15 s for
+its own next change.
+
 In passthrough it also restores the vendor SNAT rule for the unit's own SAS
 traffic when a vendor firewall restart removes it. See
 [SAS reachability in passthrough](cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
@@ -23,6 +32,14 @@ The local reachability monitor is enabled automatically in passthrough:
    trigger one `mii-tool -r eth0` PHY renegotiation, which briefly interrupts
    Ethernet. Ordinary traffic silence and failed internet pings are not
    failure signals.
+   Since v1.0.11 the renegotiation also needs a quiet port. The keeper reads
+   `eth0`'s `rx_packets` at each ARP probe. If the router sent 5 or more
+   frames a second since the probe before last (about 13 s), the link is
+   carrying traffic and the keeper skips the renegotiation, logs it, and
+   spends nothing from the shared limit. An unreadable counter also skips it.
+   An idle or hung router's own housekeeping stays well under that rate. The
+   IPv6 delegation recovery's renegotiation is unchanged: it is meant for a
+   router that still passes IPv4.
 4. A new successful ARP baseline is required before another IPv4
    renegotiation. IPv4 and IPv6 share a limit of three renegotiations in a
    one-hour monotonic-clock window. The action count is saved atomically and
