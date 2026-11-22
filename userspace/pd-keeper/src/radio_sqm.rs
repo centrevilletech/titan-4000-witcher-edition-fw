@@ -1,11 +1,64 @@
 //! CAKE occupies the customer bearer root and the keeper's ordinary-traffic
 //! Ethernet band. Reserve explicit handles so cleanup can recognize each slot.
+//!
+//! The rootfs has no room for the tools, so they are not in the image. An
+//! operator stages `tc` and `sch_cake.ko` from the repository's
+//! `device/sqm/payload` in `/mnt/titan-api/sqm`. Only bytes matching the
+//! digests built into the keeper are copied into the keeper's private runtime
+//! directory and used from there.
 use serde_json::{Value, json};
-use std::{io, path::Path, process::Command};
+use std::{
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    path::Path,
+    process::Command,
+};
+use titan_pd_model::sha256;
 
-const DIR: &str = "/usr/lib/witcher-sqm";
+const STAGED: &str = "/mnt/titan-api/sqm";
+const DIR: &str = "/tmp/titan-pd-keeper/sqm";
+const MANIFEST: &str = include_str!("../../../device/sqm/SHA256SUMS");
 const UP: &str = "lte0pdn2";
 const DOWN: &str = "eth0";
+
+/// Copy the staged tools into the private runtime directory once their bytes
+/// match the pinned digests. A copy already there is checked again first.
+fn stage() -> io::Result<()> {
+    let dir = Path::new(DIR);
+    if !dir.is_dir() {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir)
+            .or_else(|e| if dir.is_dir() { Ok(()) } else { Err(e) })?;
+    }
+    for (name, mode) in [("tc", 0o700), ("sch_cake.ko", 0o600)] {
+        let want = sha256::pinned(MANIFEST, name)
+            .ok_or_else(|| io::Error::other("SQM manifest incomplete"))?;
+        let dest = dir.join(name);
+        if fs::read(&dest).is_ok_and(|b| sha256::hex(&sha256::digest(&b)) == want) {
+            continue;
+        }
+        let bytes = fs::read(Path::new(STAGED).join(name)).map_err(|_| {
+            io::Error::other(format!("SQM payload {name} is not staged in {STAGED}"))
+        })?;
+        if sha256::hex(&sha256::digest(&bytes)) != want {
+            return Err(io::Error::other(format!("SQM payload {name} digest mismatch")));
+        }
+        let tmp = dir.join(format!(".{name}.{}", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, &dest)?;
+    }
+    Ok(())
+}
+
 fn tc(args: &[&str]) -> io::Result<Vec<u8>> {
     let out = Command::new(format!("{DIR}/tc")).args(args).output()?;
     if !out.status.success() {
@@ -102,6 +155,12 @@ fn plan(dev: &str, q: &[Value], rate: Option<u32>) -> io::Result<Option<Vec<Stri
     Ok(Some(str_args(&args)))
 }
 pub fn reconcile(rates: Option<(u32, u32)>) -> io::Result<()> {
+    if rates.is_some() {
+        stage()?;
+    } else if !Path::new(DIR).join("tc").exists() {
+        // The tools were never staged on this boot, so no CAKE of ours exists.
+        return Ok(());
+    }
     if rates.is_some()
         && !Path::new("/sys/module/sch_cake").exists()
         && !Command::new("insmod")

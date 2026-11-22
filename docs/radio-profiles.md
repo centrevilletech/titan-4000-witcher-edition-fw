@@ -129,12 +129,26 @@ in RAM. The keeper's ordinary packet loop runs independently of modem I/O.
 
 ## Smart queue management
 
+The SQM tools are not in the image (the rootfs has no room). Stage them once
+per unit on the persistent volume before saving a profile with `sqm`:
+
+```sh
+# From a checkout, over the enrolled operator SSH login.
+ssh <unit> 'mkdir -p /mnt/titan-api/sqm && chmod 700 /mnt/titan-api/sqm'
+scp device/sqm/payload/tc device/sqm/payload/sch_cake.ko <unit>:/mnt/titan-api/sqm/
+```
+
+The keeper copies them into its private runtime directory only when their
+bytes match the digests in `device/sqm/SHA256SUMS`, built into the keeper.
+A missing or different file fails the `sqm` action, and the profile reverts to
+stock. Removal works without them.
+
 Upload uses the root on lte0pdn2. Download requires the existing prio root
 and blackhole on eth0 and grafts only onto band 1:2. Checks restore a lost
 CAKE leaf within 30 s after the keeper rebuilds the filter. Cleanup restores a
 FIFO there because deleting a child in Linux 3.10 prio installs a discarding
 leaf. The CAKE handles are ca01: and ca02:. The restored FIFO uses ca03:. The
-fq_codel module is packaged for qualification. The v1 applier uses CAKE.
+fq_codel module is in the payload for qualification. The v1 applier uses CAKE.
 
 On the bench (fixed rates, 2026-11-22), CAKE held ping under load near idle:
 during download p50 292 to 43 ms, during upload 103 to 32 ms. A fixed rate
@@ -144,7 +158,8 @@ costs speed when the radio rate moves: download 113 to 97 Mbps, upload 14 to
 ## Qualification plan
 
 1. Run the locked Rust workspace tests and the firmware build and verifier.
-   Check the target module vermagic and use the packaged tc on the target.
+   Stage the SQM tools, check the module vermagic and run the staged tc on
+   the target.
 2. Cold-boot an empty profile and record normal attach, modem log routing,
    Ethernet filters and module list. Verify operator get/set/status and
    denial from the panel UID. Reject unknown fields, unknown or removed kinds,

@@ -97,12 +97,6 @@ def main():
     check('254 device nodes', len(nodes)==254)
     check('ownership all uid/gid 500', set(uid)=={500} and set(gid)=={500})
     check('passthru-fix.sh present', os.path.exists(os.path.join(d,'etc/sysconfig/script/passthru-fix.sh')))
-    sqm_manifest=Path(__file__).resolve().parent.parent/'device/sqm/SHA256SUMS'
-    for row in sqm_manifest.read_text().splitlines():
-        expected, name=row.split()
-        path=Path(d)/'usr/lib/witcher-sqm'/name
-        check(f'SQM {name} digest', path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest()==expected)
-    check('SQM tc executable', is_exec('usr/lib/witcher-sqm/tc'))
     keeper=os.path.join(d,'usr/lib/titan-api/titan-pd-keeper')
     check('titan-pd-keeper present', os.path.isfile(keeper) and is_exec('usr/lib/titan-api/titan-pd-keeper'))
     if os.path.isfile(keeper):

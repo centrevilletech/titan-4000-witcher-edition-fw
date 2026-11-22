@@ -61,7 +61,9 @@ Read [component provenance and licensing](../THIRD_PARTY.md) before distributing
 an image. The root GPL grant does not supply missing vendor redistribution
 rights or corresponding source for bundled binaries.
 
-The image also installs a private static tc and two scheduler modules. The
-builder checks their pinned SHA-256 digests before packing. The verifier
-checks the extracted files. See [radio profiles and SQM](radio-profiles.md)
-for activation and qualification.
+The rootfs is at its size limit: v1.0.9 packed with 0 bytes to spare. The SQM
+tools (a static tc and two scheduler modules, about 720 KB) therefore stay out
+of the image. They live in `device/sqm/payload` with pinned SHA-256 digests,
+and an operator stages them on a unit's persistent volume. See
+[radio profiles and SQM](radio-profiles.md). Any change that grows the rootfs
+needs space freed first; the build fails with `UBI size wrong` otherwise.

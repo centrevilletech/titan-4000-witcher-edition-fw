@@ -50,10 +50,6 @@ if [ -d "$HERE/overlay/usr" ]; then
   mkdir -p "$WORK/rootfs/usr"
   cp -a "$HERE/overlay/usr/." "$WORK/rootfs/usr/"
 fi
-# The tools stay private to the keeper. Preserve the vendor tc for its scripts.
-( cd "$WORK/rootfs/usr/lib/witcher-sqm" && sha256sum -c "$HERE/device/sqm/SHA256SUMS" )
-chmod 755 "$WORK/rootfs/usr/lib/witcher-sqm" "$WORK/rootfs/usr/lib/witcher-sqm/tc"
-chmod 644 "$WORK/rootfs/usr/lib/witcher-sqm/"*.ko
 echo ">> building versioned web UI from source"
 "$HERE/scripts/build-ui.sh" "$WORK/rootfs/usr/lib/titan-api/ui"
 "$HERE/scripts/build-firstboot.sh" "$WORK/rootfs/usr/lib/titan-api/witcher-firstboot"

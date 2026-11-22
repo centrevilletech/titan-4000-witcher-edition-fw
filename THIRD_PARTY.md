@@ -50,9 +50,10 @@ Copyright 2026 Centreville Tech, LLC; distributed under the project GPLv3 terms.
 
 ## Smart queue management
 
-The image carries iproute2 5.19.0 `tc` linked statically with musl from Zig
-0.14.1, Linux 3.10 fq_codel, and the out-of-tree CAKE scheduler at commit
-`53ff94d4b58071307084d47a7937afbe71e40070`. CAKE uses GPL-2.0 or BSD-3-Clause.
+The repository carries, in `device/sqm/payload` (staged on a unit's persistent
+volume, not packed in the image), iproute2 5.19.0 `tc` linked statically with
+musl from Zig 0.14.1, Linux 3.10 fq_codel, and the out-of-tree CAKE scheduler
+at commit `53ff94d4b58071307084d47a7937afbe71e40070`. CAKE uses GPL-2.0 or BSD-3-Clause.
 The kernel and iproute2 carry GPL terms. The musl notice, kernel configuration,
 ABI patches, exact upstream source locations and ARM build recipe accompany
 the payload in [device/sqm/source](device/sqm/source/). Release distributors
