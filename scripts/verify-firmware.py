@@ -224,6 +224,9 @@ def main():
           not stray and sorted(p.name for p in firmware.iterdir()) == ['.keep', 'mrvl'])
     for path in stray[:8]:
         print('      modem firmware candidate '+path)
+    # The download clamp module is staged per unit (docs/download-clamp.md).
+    qctrl = [str(path.relative_to(d)) for path in Path(d).rglob('*qctrl*') if path.is_file()]
+    check('no download clamp module in the rootfs (staged per unit)', not qctrl)
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)

@@ -2,7 +2,9 @@
 
 Status: bench only, off by default. Nothing changes on a unit until an
 operator stages an image and turns it on. This firmware ships no modem
-firmware bytes and writes no modem feature flags.
+firmware bytes. Since v1.0.15 the keeper writes modem feature flags, but only
+on a confirmed boot of a staged image and only the words `tk/config` lists
+(see [Modem feature flags](#modem-feature-flags)).
 
 ## Why
 
@@ -66,6 +68,16 @@ through the normal crash recovery.
 Reboot only outside the SAS window when no new grants are issued (07:00 to
 10:00 UTC; avoid 06:45 to 10:15). Keep wired recovery connected.
 
+`scripts/stage-latency.sh` does all of the steps below from a workstation,
+checks every copy by SHA-256 on the unit, and also stages the download clamp
+(see [the download clamp](download-clamp.md)):
+
+```sh
+scripts/stage-latency.sh --target <ping responder> <unit> tk.gz device/qctrl/payload/titan_qctrl.ko
+```
+
+By hand:
+
 ```sh
 # On a workstation: the image and its digest.
 sha256sum tk.gz
@@ -80,9 +92,10 @@ EOF
 ssh <unit> reboot
 ```
 
-`config` takes one `sha256=` line per allowed image and up to four `target=`
-lines. A `#` starts a comment. Without `target=` lines the boot confirm uses
-the deaf watchdog's targets (see [the deaf-unit fault](deaf-watchdog.md)).
+`config` takes one `sha256=` line per allowed image, up to four `target=`
+lines and the `wm=` lines of [Modem feature flags](#modem-feature-flags). A
+`#` starts a comment. Without `target=` lines the boot confirm uses the deaf
+watchdog's targets (see [the deaf-unit fault](deaf-watchdog.md)).
 
 To try an image again after a rollback, take its hash out of `quarantine` and
 write `strikes=0` to `strikes`.
@@ -166,13 +179,111 @@ Neither layer can loop:
 - If Linux dies or power fails before the confirm, the same strike count
   applies.
 
+## Modem feature flags
+
+The N4 image boots with every feature off, as this loader requires. Two words
+in modem RAM turn its latency fixes on:
+
+| Word | Value | Meaning |
+| --- | --- | --- |
+| `0x847ed604` | `0x5` | AQM v2: uplink queue control (bits `0x1` and `0x4`) |
+| `0x847ed604` | `0x10` | Grant-hold rescue |
+| `0x847ed604` | `0x15` | Both (the bench setting) |
+| `0x84f93008` | `0x140` | Grant-hold size in bytes. `0x140` fits a 228-byte ping. |
+
+Bench (2026-11-22, N4 image): ping during an upload went from about 100 ms to
+38 ms, and idle ping from 32 ms to 18 ms.
+
+List them in `tk/config`, the hold size first:
+
+```
+wm=0x84f93008:0x140
+wm=0x847ed604:0x15
+```
+
+The keeper accepts only these two words. `0x847ed604` takes only bits `0x15`
+(bits `0x2` and `0x8` exist in the image and must stay off), and
+`0x84f93008` takes 0 to `0x200`. It ignores any other `wm=` line and logs it.
+A value is hex with `0x` or decimal.
+
+### When the keeper writes them
+
+1. Only after the boot confirm succeeds for a staged image: status
+   `state=staged`, a `confirmed=<hash>` result for that same hash, and a modem
+   that did not report `read from nand`. On a stock boot nothing is ever
+   written. A keeper that restarts after the confirm takes over.
+2. Each write session opens the modem console (`/usr/lte/lted_cli`) and sends
+   one line about every 3 s: `arm1log 2`, `quit 0`, `dbg revert`, then
+   `vm 0x847ed600 4`.
+3. It writes only if that read shows the N4 patch magic `4e 34 56 32` in the
+   same session (`tk_boot::flag_writes_allowed`). The magic appears only after
+   the first uplink transport block. Until then the keeper writes nothing and
+   asks again after 15 s, then 30 s, doubling up to 10 minutes.
+4. It reads each word first and writes only what differs: the hold size, then
+   the flags. When turning off it writes the flags first.
+5. It reads every write back in the same session, then sends `arm1log 1`.
+
+The console prints a dump's bytes most significant first, under a header that
+names each column's byte offset:
+
+```
+           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C
+0x847ED604 | 00 00 00 15  .. .. .. ..  .. .. .. ..  .. .. .. ..
+0x84F93008 | 00 00 01 40  .. .. .. ..  .. .. .. ..  .. .. .. ..
+```
+
+The keeper strips colours, maps the columns back with the header, and reads
+the word little-endian. A dump without that header line counts as unread.
+
+**A missing read-back means the write did not happen.** A console left in
+logging mode by `quit 1` ignores every line with no error. That is why each
+write session starts with `quit 0` and `dbg revert`.
+
+### Retries and failure
+
+| Case | What the keeper does |
+| --- | --- |
+| No patch magic | Writes nothing, waits (15 s doubling to 10 min). Not a failure. |
+| No reply to the magic read, or a read-back missing or wrong | Tries again after 20 s. After 3 failed sessions it stops. If any write went out since the last modem restart, it first writes 0 to every word it manages (magic still required) and reads them back. The status says `failed` and whether the words read back 0. |
+| Applied | A read-only check every 10 minutes. A word that reads back wrong is written again. Three checks with no reply start a write session, which resets the console. |
+| Modem restart | The kernel log shows `read from nand` or `read from fs` after the keeper started. It starts over 30 s later. A crash reload runs stock NAND firmware, which never shows the magic, so nothing is written then. |
+| Another console session | The radio profile's marker file is present: the keeper waits 20 s and counts no failure. |
+| `tk/config` changed | Read every 15 s. New values are written at once. `enabled=0`, a deleted file, or no `wm=` lines left write 0 to every word the keeper managed. |
+
+Writes typed by hand in `lted_cli` get overwritten at the next check. Change
+`tk/config` instead.
+
+### Turning the flags off
+
+- **Now, no reboot:** set the `wm=` values to 0 (or delete the lines) in
+  `/mnt/titan-api/tk/config`. The keeper writes 0 and reads it back within
+  about 15 s. Watch `/var/run/witcher-tk.flags`.
+- **Stock modem firmware:** `enabled=0` writes 0 at once, and the next boot
+  loads stock firmware.
+- **By hand**, with the keeper stopped: `wm 0x847ed604 0` and
+  `wm 0x84f93008 0` in a `lted_cli` session (after `arm1log 2`), then read
+  both back.
+
+### Status
+
+`/var/run/witcher-tk.flags`:
+
+| Line | Values |
+| --- | --- |
+| `state` | `off`, `pending`, `waiting-magic`, `applied`, `zeroing`, `failed` |
+| `detail` | Why, in words. On `failed`: what went wrong and whether the words read back 0. |
+| `want` | The words and values the keeper keeps, or `none` |
+| `attempts` | Failed sessions in a row |
+
+`keeper.log` lines start with `tk flags`.
+
 ## Files
 
 On the Witcher volume, `/mnt/titan-api/tk/` once mounted:
 
 | File | Written by | Content |
 | --- | --- | --- |
-| `config` | Operator | `enabled=1`, `sha256=` lines, optional `target=` lines |
+| `config` | Operator | `enabled=1`, `sha256=` lines, optional `target=` and `wm=` lines |
 | `active.gz` | Operator | The staged image |
 | `strikes` | Hook (+1 before each load), keeper (0 on confirm, 2 on rollback) | `strikes=N` |
 | `quarantine` | Keeper | One hash per line |
@@ -184,8 +295,9 @@ In RAM:
 | --- | --- |
 | `/var/run/witcher-tk.status` | `state=staged` or `state=stock`, `reason`, `sha256`, `strikes`, `loaded_at`, `source` (`fs`, `nand`, `unknown`), `firmware` (`clean`, `dirty`) |
 | `/var/run/witcher-tk.result` | `confirmed=<hash>` or `rollback=<hash>` |
+| `/var/run/witcher-tk.flags` | The flag writes (see [Status](#status)) |
 
-`keeper.log` lines start with `tk boot`. A default unit logs none.
+`keeper.log` lines start with `tk boot` or `tk flags`. A default unit logs none.
 
 ## Turning it off
 
@@ -201,10 +313,11 @@ In RAM:
   only root on the unit can write. The hook has a `verify_signature` stub with
   a fixed interface for Phase 2: an Ed25519 signature in `active.gz.sig` over
   the image's SHA-256, checked against a public key in the image.
-- **No feature flags.** The keeper writes no modem memory (`wm`). Images must
-  boot with every feature flag at 0. `titan_pd_model::tk_boot::flag_writes_allowed`
-  is the gate a later change must use: it allows a write only when
-  `vm 0x847ed600 4` reads back the patch magic `4e 34 56 32`.
+- **Flags only from `tk/config`, only two words.** Images must still boot with
+  every feature flag at 0. The keeper writes only the allow-listed words of
+  [Modem feature flags](#modem-feature-flags), and only after
+  `titan_pd_model::tk_boot::flag_writes_allowed` sees the patch magic. A new
+  word needs a code change and its own bench test.
 - **No crash quarantine.** A modem crash after a confirmed boot reloads stock
   NAND firmware without a reboot, but the next boot loads the image again.
 - **No on-device patcher** (Phase 2). Each unit needs the image staged by hand.

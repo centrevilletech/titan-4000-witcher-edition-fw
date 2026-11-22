@@ -314,7 +314,8 @@ pub fn hook_decision(
     }
 }
 
-fn strip_escapes(line: &str) -> String {
+/// The line without terminal colour sequences.
+pub fn strip_escapes(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars();
     while let Some(c) = chars.next() {

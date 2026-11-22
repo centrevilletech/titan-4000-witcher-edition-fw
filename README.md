@@ -130,6 +130,16 @@ each periodic router advertisement, go to a log in RAM, and the status file is
 rewritten on flash at most once a minute. Witcher's logs in `/tmp` stay under
 about 80 KB each. See [Long runs](docs/long-runs.md).
 
+Since v1.0.15 two latency fixes can be turned on per unit, both off by
+default. After a confirmed boot of a staged N4 modem firmware image, the
+keeper writes the image's uplink queue control and grant-hold flags from the
+operator's config and reads each one back (bench: ping during an upload about
+100 ms to 38 ms). A staged download clamp module keeps the tower's download
+queue short (bench: ping during a full download about 310 ms to 50 ms, for
+about 8 % less peak speed). `scripts/stage-latency.sh` stages both. See
+[modem feature flags](docs/tk-boot-loader.md#modem-feature-flags) and the
+[download clamp](docs/download-clamp.md).
+
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
 
@@ -173,6 +183,7 @@ components this repository builds from source.
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
 - [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
+- [Download clamp (off by default)](docs/download-clamp.md)
 
 ## Learn LTE and build something
 

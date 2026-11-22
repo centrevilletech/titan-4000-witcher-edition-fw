@@ -70,3 +70,13 @@ The kernel and iproute2 carry GPL terms. The musl notice, kernel configuration,
 ABI patches, exact upstream source locations and ARM build recipe accompany
 the payload in [device/sqm/source](device/sqm/source/). Release distributors
 should include these inputs and the corresponding upstream sources.
+
+## Download clamp module
+
+`device/qctrl/payload/titan_qctrl.ko` (staged on a unit's persistent volume,
+not packed in the image) is an original Centreville Tech, LLC kernel module.
+Its source in [device/qctrl/source](device/qctrl/source/) is licensed
+GPL-2.0-only, because the module runs inside the GPL-2.0 Linux kernel; the
+license text is [device/sqm/source/COPYING](device/sqm/source/COPYING).
+`device/qctrl/source/build.sh` rebuilds the binary byte for byte with
+Ubuntu 24.04's `gcc-arm-linux-gnueabihf` (GCC 13.3.0-6ubuntu2~24.04.1).

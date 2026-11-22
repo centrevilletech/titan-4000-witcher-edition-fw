@@ -25,6 +25,12 @@ The boot confirm for a staged modem firmware image reads a status file standing
 in for the boot hook's and runs against the ping and reboot stubs: the main run
 has no staged image and must never reboot for it, then one staged boot gets no
 answer (quarantine, one reboot) and one gets an answer (strikes cleared).
+The modem feature flags (v1.0.15) run against a stub modem console that prints
+`vm` dumps the way the unit's does and keeps its RAM in a file: no session
+before a confirmed staged boot, no write before the patch magic, then writes
+read back, a config change that writes 0, and a modem restart from the kernel
+log. The download clamp runs with a bogus staged module and a recording insmod
+stub: it must wait for the links and then refuse the bytes, never load them.
 """
 import errno
 import os
@@ -83,6 +89,42 @@ def main():
     # Deaf watchdog fixtures: a target answers while /tmp/ping-ok exists, and a reboot is only recorded.
     exe('/tmp/bin/ping', 'echo "$*" >> /tmp/ping-calls; [ -e /tmp/ping-ok ]')
     exe('/tmp/bin/reboot', 'echo "reboot $*" >> /tmp/reboot-actions')
+    exe('/tmp/bin/insmod', 'echo "insmod $*" >> /tmp/insmod-calls; exit 1')
+    # A modem console (DM) stand-in: `vm` dumps print most significant byte
+    # first under the unit's column header; `wm` writes a RAM file. The N4
+    # patch magic shows only while /tmp/dm-magic exists.
+    lted = Path('/tmp/bin/lted_cli')
+    lted.write_text(r'''#!/usr/bin/env python3
+import json, os, sys
+ram = json.load(open('/tmp/dm-ram.json')) if os.path.exists('/tmp/dm-ram.json') else {}
+HEADER = '           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C'
+def dump(addr, shown):
+    sys.stdout.write('\n-----\n HEX DUMP  | 4(0x4) Bytes @ 0x%08X\n-----\n%s\n-----\n\x1b[1;32m0x%08X\x1b[0m | %s  .. .. .. ..  .. .. .. ..  .. .. .. .. \n-----\nDM> ' % (addr, HEADER, addr, shown))
+for line in sys.stdin:
+    line = line.strip()
+    with open('/tmp/dm-log', 'a') as log:
+        log.write(line + '\n')
+    words = line.split()
+    if line == 'exit':
+        break
+    if len(words) == 3 and words[0] == 'vm':
+        addr = int(words[1], 16)
+        if addr == 0x847ed600:
+            dump(addr, '4e 34 56 32' if os.path.exists('/tmp/dm-magic') else '00 00 00 00')
+        else:
+            dump(addr, ' '.join('%02x' % b for b in ram.get(str(addr), 0).to_bytes(4, 'big')))
+    elif len(words) == 3 and words[0] == 'wm':
+        addr, value = int(words[1], 16), int(words[2], 16)
+        ram[str(addr)] = value
+        with open('/tmp/dm-ram.json.tmp', 'w') as out:
+            json.dump(ram, out)
+        os.replace('/tmp/dm-ram.json.tmp', '/tmp/dm-ram.json')
+        sys.stdout.write('\n0x%08x: 0x%08x\n\nDM> ' % (addr, value))
+    else:
+        sys.stdout.write('\nDM> ')
+    sys.stdout.flush()
+''')
+    lted.chmod(0o755)
     Path('/tmp/ping-ok').write_text('')
     # The vendor ping watchdog is on in the RAM cache. The stub records each
     # write and updates the cache, as the vendor library does.
@@ -162,7 +204,10 @@ def main():
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
     env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
-             TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk')
+             TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
+             TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
+             TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
+             TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -472,6 +517,11 @@ def main():
         print('PASS: the RAM log holds every flash line; status.json has a live RAM copy.',flush=True)
         assert 'tk boot' not in log(), 'the boot confirm armed without a staged image'
         print('PASS: no staged modem firmware: the boot confirm never armed.',flush=True)
+        assert not Path('/tmp/dm-log').exists(), 'a modem console session ran on a stock boot'
+        assert Path('/tmp/tk.flags').read_text().startswith('state=off\n'), Path('/tmp/tk.flags').read_text()
+        assert 'tk flags' not in log() and 'download clamp' not in log(), log()
+        assert Path('/tmp/qctrl.status').read_text().startswith('state=off\n'), Path('/tmp/qctrl.status').read_text()
+        print('PASS: stock boot: no modem console session, flags and clamp off and silent.',flush=True)
         # A staged modem firmware image whose boot never answers. Nothing has
         # answered since `silent_from`; the deaf watchdog of a new keeper
         # process cannot arm, so any reboot now is the boot confirm's.
@@ -497,10 +547,16 @@ def main():
         assert 'quarantined it, rebooting onto stock modem firmware' in log()
         assert any('192.0.2.9' in call for call in Path('/tmp/ping-calls').read_text().splitlines())
         print('PASS: a staged boot with no answer quarantined its image and asked for one reboot.',flush=True)
+        assert not Path('/tmp/dm-log').exists(), 'a modem console session ran before any boot confirm'
         # A staged image whose boot answers through the core.
         good='b'*64
         Path('/tmp/tk.result').unlink()
-        Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\n')
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\nwm=0x847ed604:0x15\nwm=0x84f93008:0x140\nwm=0x847ed608:0x1\n')
+        # A staged clamp whose bytes are not the pinned module.
+        Path('/tmp/qctrl').mkdir()
+        Path('/tmp/qctrl/config').write_text('mode=2\n')
+        Path('/tmp/qctrl/titan_qctrl.ko').write_bytes(b'not the pinned module\n')
+        Path('/tmp/proc-modules').write_text('')
         Path('/tmp/tk/strikes').write_text('strikes=1\n')
         Path('/tmp/ping-ok').write_text('')
         if not Path('/sys/class/net/lte0pdn0').exists():
@@ -517,6 +573,48 @@ def main():
         wait_for(lambda:time.monotonic()>=until,5)
         assert not Path('/tmp/reboot-actions').exists()
         print('PASS: a staged boot that answered cleared its strikes and did not reboot.',flush=True)
+        # Flags: the first session finds no patch magic and writes nothing.
+        flags=lambda:Path('/tmp/tk.flags').read_text() if Path('/tmp/tk.flags').exists() else ''
+        def dm_ram():
+            try: return json.loads(Path('/tmp/dm-ram.json').read_text())
+            except (FileNotFoundError, ValueError): return None
+        wait_for(lambda:'state=waiting-magic' in flags(),30)
+        dm=Path('/tmp/dm-log').read_text().splitlines()
+        assert dm[:5]==['arm1log 2','quit 0','dbg revert','vm 0x847ed600 4','arm1log 1'], dm
+        assert not any(l.startswith('wm ') for l in dm), dm
+        assert not Path('/tmp/dm-ram.json').exists()
+        assert 'ignored "wm=0x847ed608:0x1" in tk/config' in log(), log()
+        print('PASS: confirmed boot: no flag write before the patch magic; a word off the allow-list is ignored.',flush=True)
+        # The magic shows: both words are written, hold size first, and read back.
+        Path('/tmp/dm-magic').write_text('')
+        wait_for(lambda:'state=applied' in flags(),60)
+        ram_words=dm_ram()
+        assert ram_words=={str(0x84f93008):0x140,str(0x847ed604):0x15}, ram_words
+        dm=Path('/tmp/dm-log').read_text().splitlines()
+        writes=[l for l in dm if l.startswith('wm ')]
+        assert writes==['wm 0x84f93008 0x140','wm 0x847ed604 0x15'], writes
+        assert 'want=0x84f93008=0x140 0x847ed604=0x15\n' in flags(), flags()
+        assert 'tk flags: written and read back' in log(), log()
+        print('PASS: with the patch magic the keeper wrote both flag words and read them back.',flush=True)
+        # Off through tk/config: the keeper writes 0, flags first.
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\n')
+        wait_for(lambda:dm_ram()=={str(0x84f93008):0,str(0x847ed604):0} and 'state=applied' in flags(),40)
+        writes=[l for l in Path('/tmp/dm-log').read_text().splitlines() if l.startswith('wm ')]
+        assert writes[-2:]==['wm 0x847ed604 0x0','wm 0x84f93008 0x0'], writes
+        assert 'tk/config changed' in log(), log()
+        print('PASS: removing the wm= lines wrote 0 to both words and read them back.',flush=True)
+        # A modem firmware load in the kernel log starts the flags over.
+        with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
+        wait_for(lambda:'modem restart seen' in log(),10)
+        assert 'state=pending' in flags(), flags()
+        print('PASS: a modem restart in the kernel log starts the flag writes over.',flush=True)
+        # The clamp waited for the links, refused the bytes and never ran insmod.
+        wait_for(lambda:'state=failed' in (Path('/tmp/qctrl.status').read_text() if Path('/tmp/qctrl.status').exists() else ''),60)
+        status=Path('/tmp/qctrl.status').read_text()
+        assert 'not the pinned' in status, status
+        assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
+        assert 'download clamp waiting' in log() and 'download clamp failed' in log(), log()
+        print('PASS: the clamp waited for the links and refused a module that is not the pinned build.',flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
