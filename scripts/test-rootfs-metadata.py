@@ -3,7 +3,7 @@
 import copy
 import stat
 import unittest
-from rootfs_metadata import boot_errors, resolve, WITCHER_BOOT_SCRIPTS, WITCHER_BUNDLE_SCRIPTS
+from rootfs_metadata import boot_errors, resolve, WITCHER_BOOT_SCRIPTS, WITCHER_BUNDLE_SCRIPTS, WITCHER_BUNDLE_BINARIES
 
 
 class BootMetadataTests(unittest.TestCase):
@@ -38,7 +38,7 @@ class BootMetadataTests(unittest.TestCase):
         for path in ('/etc/sysconfig/script', '/usr/lib', '/usr/lib/titan-api',
                      '/usr/lib/titan-api/ui'):
             baseline[path] = dict(mode=stat.S_IFDIR | 0o755, uid=500, gid=500)
-        scripts = WITCHER_BOOT_SCRIPTS + WITCHER_BUNDLE_SCRIPTS + ('/usr/lib/titan-api/witcher-firstboot', '/usr/lib/titan-api/witcher-entropy')
+        scripts = WITCHER_BOOT_SCRIPTS + WITCHER_BUNDLE_SCRIPTS + WITCHER_BUNDLE_BINARIES
         for path in scripts:
             baseline[path] = dict(mode=stat.S_IFREG | 0o700, uid=500, gid=500)
         # Root can execute 0700; reject only missing/non-executable targets.

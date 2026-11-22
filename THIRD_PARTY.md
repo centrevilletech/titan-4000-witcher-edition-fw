@@ -6,7 +6,10 @@ dependencies, artwork or trademarks.
 
 ## Source-built components
 
-The UI, first-boot service and network keeper are built from this repository.
+The UI, first-boot service, network keeper and the bank guard's NV helper
+(`witcher-nv23`) are built from this repository. The helper contains no vendor
+code: it links at run time to the unit's own vendor libraries, and the build
+reads those libraries from the hash-pinned vendor input without copying them.
 Rust dependencies are pinned in `userspace/Cargo.lock`; UI dependencies are
 pinned in `web/package-lock.json`. Lockfiles identify versions, but do not
 replace the dependencies' copyright and license notices.

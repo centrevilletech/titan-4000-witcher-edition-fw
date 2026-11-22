@@ -164,6 +164,18 @@ def main():
     entropy=Path(d)/'usr/lib/titan-api/witcher-entropy'
     entropy_build=Path(__file__).resolve().parent.parent/'userspace/target/witcher-entropy'
     check('entropy collector matches source build', entropy.is_file() and entropy_build.is_file() and hashlib.sha256(entropy.read_bytes()).digest()==hashlib.sha256(entropy_build.read_bytes()).digest())
+    nv23=Path(d)/'usr/lib/titan-api/witcher-nv23'
+    nv23_build=Path(__file__).resolve().parent.parent/'userspace/target/witcher-nv23'
+    check('bank table helper matches source build', nv23.is_file() and is_exec('usr/lib/titan-api/witcher-nv23')
+          and nv23_build.is_file() and nv23.read_bytes()==nv23_build.read_bytes())
+    check('bank guard init present', os.path.isfile(os.path.join(d,'etc/init.d/witcher-bank-guard'))
+          and is_exec('etc/init.d/witcher-bank-guard'))
+    boot_script=Path(d)/'etc/init.d/witcher-boot'
+    check('witcher-boot starts the bank guard', boot_script.is_file()
+          and '/bin/sh /etc/init.d/witcher-bank-guard boot' in boot_script.read_text())
+    state_script=Path(d)/'etc/init.d/witcher-state'
+    check('witcher-state marks a new data volume for the bank guard', state_script.is_file()
+          and 'bank-guard/volume-created' in state_script.read_text())
     firstboot=Path(d)/'usr/lib/titan-api/witcher-firstboot'
     expected=Path(__file__).resolve().parent.parent/'userspace/target/armv7-unknown-linux-musleabi/release/witcher-firstboot'
     check('firstboot binary matches source build', firstboot.is_file() and expected.is_file() and hashlib.sha256(firstboot.read_bytes()).digest()==hashlib.sha256(expected.read_bytes()).digest())

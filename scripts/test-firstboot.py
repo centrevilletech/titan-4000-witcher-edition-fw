@@ -43,7 +43,8 @@ class FirstBootTests(unittest.TestCase):
     def run_script(self, name, *args, **env):
         text = (REPO / 'overlay' / name).read_text()
         text = text.replace('export PATH=/sbin:/usr/sbin:/bin:/usr/bin', '')
-        text = re.sub(r'/(?:mnt|sys|proc|tmp)(?=[/\s\"\'])', lambda m: str(self.root) + m.group(), text)
+        # Only a path's first component: /proc/sys must not become ROOT/procROOT/sys.
+        text = re.sub(r'(?<![\w.])/(?:mnt|sys|proc|tmp)(?=[/\s\"\'])', lambda m: str(self.root) + m.group(), text)
         script = self.write('fixture.sh', text)
         return subprocess.run(['sh', str(script), *args], env=dict(self.env, **env), capture_output=True, text=True, timeout=10)
 
@@ -58,6 +59,18 @@ class FirstBootTests(unittest.TestCase):
         self.assertEqual(key.read_text(), 'keep me')
         self.assertEqual(len((self.root/'allocations').read_text().splitlines()), 1)
         self.assertEqual((self.root/'mnt/titan-api').stat().st_mode & 0o777, 0o700)
+
+    def test_new_volume_marks_the_first_witcher_boot_for_the_bank_guard(self):
+        self.write('proc/sys/kernel/random/boot_id', 'boot-one\n')
+        self.assertEqual(self.state().returncode, 0)
+        guard = self.root/'mnt/titan-api/bank-guard'
+        self.assertEqual(guard.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((guard/'volume-created').read_text().strip(), 'boot-one')
+        # A later run finds the volume and leaves the record alone.
+        self.write('proc/sys/kernel/random/boot_id', 'boot-two\n')
+        self.assertEqual(self.state().returncode, 0)
+        self.assertEqual((guard/'volume-created').read_text().strip(), 'boot-one')
+        self.assertEqual(len((self.root/'allocations').read_text().splitlines()), 1)
 
     def test_interrupted_mount_reuses_existing_volume(self):
         self.assertNotEqual(self.state(FAIL_MOUNT='1').returncode, 0)
@@ -300,7 +313,7 @@ class IndependentBootTests(unittest.TestCase):
         FirstBootTests.setUp(self)
         self.processes = []
         self.addCleanup(self.stop_processes)
-        for name in ('witcher-management-access', 'titan-sshd', 'titan-pd-keeper'):
+        for name in ('witcher-management-access', 'titan-sshd', 'titan-pd-keeper', 'witcher-bank-guard'):
             self.exe('etc/init.d/'+name, 'echo "${0##*/} $*" >> "$FIXTURE_ROOT/independent"')
         self.exe('etc/init.d/titan-api', 'echo web-failed >> "$FIXTURE_ROOT/independent"; exit 1')
         self.exe('usr/lib/titan-api/witcher-firstboot', 'echo recovery >> "$FIXTURE_ROOT/independent"; while :; do /bin/sleep 1; done')
@@ -313,7 +326,8 @@ class IndependentBootTests(unittest.TestCase):
         self.assertEqual(process.wait(timeout=5), 1)
         self.wait_for(lambda: (self.root/'independent').exists() and all(
             entry in (self.root/'independent').read_text()
-            for entry in ('web-failed', 'titan-sshd boot', 'titan-pd-keeper start', 'recovery', 'witcher-management-access all')))
+            for entry in ('web-failed', 'titan-sshd boot', 'titan-pd-keeper start', 'recovery',
+                          'witcher-management-access all', 'witcher-bank-guard boot')))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,46 @@
+#!/bin/sh
+# Boot confirm for full firmware updates (docs/bank-guard.md).
+#
+#   boot   once per boot, from witcher-boot
+#
+# On the first boot after an update the new bank must prove itself, or the
+# guard switches back to the old bank and reboots once. On every other boot it
+# only records the running bank as the confirmed one. It runs apart from the
+# keeper, because the keeper staying up is part of the proof.
+set -u
+umask 077
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
+runtime=${TITAN_GUARD_RUNTIME:-/tmp}
+state_script=${WITCHER_STATE:-/etc/init.d/witcher-state}
+log=$runtime/witcher-bank-guard.log
+lock=$runtime/witcher-bank-guard.lock
+
+[ "$(id -u)" = 0 ] || [ -n "${TITAN_GUARD_RUNTIME:-}" ] || { echo 'Bank guard requires root.' >&2; exit 77; }
+[ "${1:-}" = boot ] && [ "$#" = 1 ] || { echo 'Usage: witcher-bank-guard boot' >&2; exit 64; }
+
+note() { echo "$(cut -d' ' -f1 /proc/uptime 2> /dev/null) $*" >> "$log"; }
+
+# One guard per boot. /tmp is RAM, so a reboot clears the lock.
+mkdir "$lock" 2> /dev/null || exit 0
+
+# The markers and counters live on the persistent volume.
+if ! /bin/sh "$state_script" mount >> "$log" 2>&1; then
+ note 'persistent volume not mounted; the bank guard is off this boot'
+ exit 0
+fi
+
+tries=0
+while :; do
+ "$bundle/titan-pd-keeper" bank-guard boot >> "$log" 2>&1 < /dev/null
+ status=$?
+ # 0: decided, or nothing to do. Anything else means the guard died. Its
+ # counters are on flash and its window counts from boot, so a restart goes on
+ # where it stopped.
+ [ "$status" = 0 ] && break
+ tries=$((tries + 1))
+ note "bank guard exited with $status (restart $tries of 3)"
+ [ "$tries" -lt 3 ] || break
+ sleep 5
+done
+exit 0

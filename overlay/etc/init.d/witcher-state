@@ -29,6 +29,7 @@ done
 grep -Eq '^mtd20: [0-9a-fA-F]+ [0-9a-fA-F]+ "user"$' /proc/mtd || fail 'partition is not user storage'
 [ "$(cat "$sys/ubi1_0/name")" = cbrs ] || fail 'vendor volume identity changed'
 [ ! -L "$state" ] || fail 'state path is a symlink'
+created=
 if ! mounted; then
  # Do not hide data from an older directory-based installation.
  [ ! -e "$state" ] || { [ -d "$state" ] && [ -z "$(ls -A "$state")" ]; } || fail 'existing unmounted files need recovery'
@@ -37,6 +38,7 @@ if ! mounted; then
   [ "$(cat "$entry/name" 2>/dev/null)" != data ] || found=$entry
  done
  if [ -z "$found" ]; then
+  created=1
   available=$(cat "$sys/ubi1/avail_eraseblocks")
   size=$(cat "$sys/ubi1/eraseblock_size")
   case "$available:$size" in *[!0-9:]*|:*|*:) fail 'invalid free-space metadata';; esac
@@ -48,10 +50,16 @@ if ! mounted; then
 fi
 chown 0:0 "$state"
 chmod 700 "$state"
-for name in ssh tls; do
+for name in ssh tls bank-guard; do
  [ ! -L "$state/$name" ] || fail 'state subdirectory is a symlink'
  mkdir -p "$state/$name"
  chown 0:0 "$state/$name"
  chmod 700 "$state/$name"
 done
+# A new data volume means this is the first Witcher boot after a stock flash.
+# The stock updater leaves no other trace; the bank guard reads this boot id.
+if [ -n "${created:-}" ]; then
+ boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || boot=
+ [ -z "$boot" ] || echo "$boot" > "$state/bank-guard/volume-created" || :
+fi
 sync

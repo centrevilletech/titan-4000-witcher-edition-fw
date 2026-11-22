@@ -6,8 +6,10 @@
 //! the vendor kernel's external device, the watchdog for a unit that is
 //! attached but hears nothing, keeping the LTE driver's downlink MAC on the
 //! customer router, 802.3x flow control on the customer port, which keeper
-//! writes reach flash, and the self-revert of a setting change.
+//! writes reach flash, the self-revert of a setting change, and the boot
+//! confirm that switches a failed firmware update back to the old bank.
 
+pub mod bank_guard;
 pub mod config;
 pub mod deaf;
 pub mod dhcpv6;

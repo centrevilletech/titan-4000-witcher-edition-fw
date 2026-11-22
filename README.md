@@ -143,6 +143,13 @@ To return to stock, upload a compatible vendor `.prg` through
 **System → Firmware**. Select the older-image option for an intended downgrade.
 The updater checks NAND readback and bank selection before restarting.
 
+After a firmware update, the new image must bring up management within 10
+minutes of its first boot. If it cannot, the bank guard selects the old bank
+and reboots once, at most three times for one update. Run
+`titan-pd-keeper bank-guard preflight` before an update: it refuses one that
+would overwrite the last image the guard saw work. See
+[the bank guard](docs/bank-guard.md).
+
 ## Build with us
 
 Bring a reproducible bug, a router that behaves differently, or a fix someone
@@ -162,6 +169,7 @@ components this repository builds from source.
 - [Credential handling](SECURITY.md)
 - [Component provenance and third-party licenses](THIRD_PARTY.md)
 - [Image format and flashing](docs/image-format.md)
+- [Bank guard: boot confirm after a firmware update](docs/bank-guard.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)

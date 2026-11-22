@@ -55,6 +55,8 @@ echo ">> building versioned web UI from source"
 "$HERE/scripts/build-firstboot.sh" "$WORK/rootfs/usr/lib/titan-api/witcher-firstboot"
 "$HERE/scripts/build-keeper.sh" "$WORK/rootfs/usr/lib/titan-api/titan-pd-keeper"
 "$HERE/scripts/build-entropy.sh" "$WORK/rootfs/usr/lib/titan-api/witcher-entropy"
+# Links against the stock libraries just extracted: the bank guard's NV helper.
+"$HERE/scripts/build-nv23.sh" "$WORK/rootfs" "$WORK/rootfs/usr/lib/titan-api/witcher-nv23"
 install -m 644 "$HERE/userspace/entropy/vendor/jitterentropy/LICENSE.bsd" "$WORK/rootfs/usr/lib/titan-api/jitterentropy-LICENSE"
 python3 "$HERE/scripts/stamp-version.py" "$WORK/rootfs"
 cat "$HERE/overlay/board.conf.append" >> "$WORK/rootfs/etc/sysconfig/board.conf"
