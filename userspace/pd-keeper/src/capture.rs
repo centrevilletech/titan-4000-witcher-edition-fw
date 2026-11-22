@@ -1,4 +1,9 @@
 //! Classic BPF for a cooked packet socket. Offsets start at the network header.
+//!
+//! Inbound, the keeper reads ARP, DHCP to a server (UDP port 67), ICMPv6 and
+//! DHCPv6 to a server (UDP port 547). The DHCP checks read the port and never
+//! the destination address, so a unicast renew is read too. Nothing else is
+//! copied out of the kernel.
 use libc::sock_filter;
 use std::{io, mem};
 
@@ -72,8 +77,11 @@ fn program(sniff: bool) -> Vec<sock_filter> {
         op(LOAD_HALF, 42),
         equal(547, 0, 1),
         op(RETURN, 2048),
-        // Any next-header, including fragments, can prove delegated liveness.
-        op(RETURN, 40),
+        // Every other IPv6 frame stays in the kernel. Up to v1.0.12 each one
+        // was cut to 40 bytes and read here to prove the router alive, which
+        // cost a clone, a wakeup and a copy for every upload packet and
+        // download ACK. The port's receive counter now stands in for it.
+        op(RETURN, 0),
     ]);
     code
 }
