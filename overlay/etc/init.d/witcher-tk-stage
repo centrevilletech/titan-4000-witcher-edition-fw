@@ -55,13 +55,15 @@ put() { echo "$1=$2" >> "$status"; }
 say() { echo "witcher-tk: $*"; }
 # Run with a time limit. BusyBox 1.21 on the Titan takes `timeout -t SECS`,
 # newer BusyBox takes `timeout SECS`. If neither works the command does not
-# run, and the check that follows it keeps stock firmware.
+# run, and the check that follows it keeps stock firmware. The probe runs
+# /bin/sh, not `true`: the Titan has no `true` program (only the shell
+# builtin), so probing with it made every boot keep stock firmware.
 tmo_style=
 tmo() {
  t=$1; shift
  if [ -z "$tmo_style" ]; then
-  if timeout -t 1 true > /dev/null 2>&1; then tmo_style=t
-  elif timeout 1 true > /dev/null 2>&1; then tmo_style=plain
+  if timeout -t 1 /bin/sh -c : > /dev/null 2>&1; then tmo_style=t
+  elif timeout 1 /bin/sh -c : > /dev/null 2>&1; then tmo_style=plain
   else tmo_style=none; fi
  fi
  case "$tmo_style" in
