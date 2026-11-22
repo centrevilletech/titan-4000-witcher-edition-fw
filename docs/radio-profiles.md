@@ -46,6 +46,7 @@ prevents activation.
 | | `cycle_hours` 6 to 168, optional | Opt-in enforcement re-attach. See below. Absent: the radio is never cycled for the cap. |
 | | `nudge` `{earfcn, pci}`, optional | Band 48 primary cell held only during an enforcement re-attach. Needs `cycle_hours`. |
 | sqm | `upload_kbit` 64 to 50000, `download_kbit` 64 to 250000 | Bidirectional CAKE on the passthrough path. |
+| | `classify` `true` or `false`, optional | Stage 1 traffic classes on both CAKE qdiscs. Absent means on. See below. |
 
 The keeper accepts each kind once. Version 1 permits 4096 bytes and rejects
 unknown fields and unknown kinds. The socket API uses one JSON document per
@@ -149,6 +150,61 @@ CAKE leaf within 30 s after the keeper rebuilds the filter. Cleanup restores a
 FIFO there because deleting a child in Linux 3.10 prio installs a discarding
 leaf. The CAKE handles are ca01: and ca02:. The restored FIFO uses ca03:. The
 fq_codel module is in the payload for qualification. The v1 applier uses CAKE.
+Up to v1.0.11 download ran `besteffort` and upload `diffserv4` with the
+default host isolation. A CAKE of ours with other modes is changed in place
+at the next check.
+
+### Traffic classes (Stage 1, since v1.0.12)
+
+Both directions run CAKE `diffserv4`, which has four tins: Bulk, Best Effort,
+Video and Voice. Voice may use up to a quarter of the rate and Video half
+before they lose their priority. Hosts are grouped by the far end:
+`dual-dsthost nonat` on upload and `dual-srchost nonat` on download. In IP
+passthrough every IPv4 device in the home shares the router's one WAN
+address. Under the default `triple-isolate`, all of the home's bulk flows
+counted against that one host, and a new game or call flow started with a
+quantum so small (300 bytes at 9 Mbit/s, divided by the number of bulk flows)
+that it dropped out of CAKE's sparse queue after one packet.
+
+Most customer devices send DSCP 0, so filters on each CAKE qdisc pick a tin.
+They use the kernel's built-in `cls_u32` and `act_skbedit` and only set
+`skb->priority` to `<qdisc>:<tin>`, which CAKE reads before DSCP. They change
+no packet, and CAKE keeps its own flow and host hashing. In order:
+
+| Order | Match | Tin |
+| --- | --- | --- |
+| 1 | TCP | DSCP decides (leaves the filter list at once) |
+| 2 | ICMP, ICMPv6 | Voice |
+| 3 | UDP 443 (QUIC), 80, 1194 and 51820 (VPNs) | DSCP decides |
+| 4 | DNS (53), NTP (123) | Voice |
+| 5 | 3074, 27015 to 27050, 50000 to 50019 | Voice |
+| 6 | 3478 to 3481, 8801 to 8810, 19302 to 19309, 50020 to 50059 | Video |
+| 7 | Other UDP of 255 bytes or less (IPv6: payload) | Voice |
+
+Ports match as source or destination, for IPv4 and IPv6: 126 filters per
+direction. QUIC and VPNs stay out of the size rule so one flow is never split
+across two tins. u32 reads ports at fixed offsets, so a packet with IPv4
+options or IPv6 extension headers falls back to its DSCP. On download, the
+DSCP a packet arrives with still counts. CAKE `wash` clears it afterwards.
+
+The keeper installs the filters with one `tc -batch`. After every apply and
+every 30 s check it counts them on each qdisc (`tc filter show`, one
+`skbedit` action per filter). A failed install or a wrong count removes them,
+and the `sqm` action fails, so the profile reverts to stock. `"classify":
+false` keeps `diffserv4` CAKE with DSCP only, for an A/B test or a kernel where
+the filters do not install. The status counters list each tin's packets,
+drops and delay (Bulk, Best Effort, Video, Voice).
+
+Stage 1 has not run on hardware yet. Check before relying on it:
+
+- `tc -s filter show dev lte0pdn2 parent ca01:` and `dev eth0 parent ca02:`
+  list 126 filters each, and the Voice and Video tins count packets under a
+  game-like UDP probe (60 packets a second, about 200 bytes) and a call-like
+  one on 8801.
+- Ping and the probes under 4-stream upload, download and both, against
+  `"classify": false`, with CPU idle and `/proc/net/softnet_stat` drops.
+- The LTE driver receives `skb->priority` values like `ca01:4` on upload.
+  Nothing is known to read them; confirm upload rate and loss are unchanged.
 
 On the bench (fixed rates, 2026-11-22), CAKE held ping under load near idle:
 during download p50 292 to 43 ms, during upload 103 to 32 ms. A fixed rate

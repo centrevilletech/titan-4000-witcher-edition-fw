@@ -576,14 +576,16 @@ fn set(a: &Action, stock: bool) -> io::Result<()> {
 fn count() -> io::Result<u32> {
     failures(&console("rrc dm reest stat ?")?).ok_or_else(|| fail("missing RRC counter"))
 }
-fn rates(p: &Profile) -> Option<(u32, u32)> {
+/// Upload and download rates, and whether the traffic classes are on.
+fn rates(p: &Profile) -> Option<(u32, u32, bool)> {
     p.actions.iter().find_map(|a| {
         if let Action::Sqm {
             upload_kbit,
             download_kbit,
+            classify,
         } = a
         {
-            Some((*upload_kbit, *download_kbit))
+            Some((*upload_kbit, *download_kbit, *classify))
         } else {
             None
         }
