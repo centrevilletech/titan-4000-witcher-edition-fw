@@ -330,6 +330,7 @@ impl Keeper {
         self.maintain_deaf_watchdog();
         self.maintain_mgmt_v6();
         if !self.passthrough {
+            self.packet = None;
             self.ipv4_watch.reset();
             self.ipv4_peer = None;
             self.sas_watch.reset();
@@ -353,10 +354,12 @@ impl Keeper {
         self.logged_idle = false;
         self.ensure_packet()?;
         self.drain();
-        self.maintain_ipv4();
-        self.maintain_ipv4_link();
+        // Both guards must see the same main-table snapshot on this tick.
+        let routes = main_routes();
+        self.maintain_ipv4(&routes);
+        self.maintain_ipv4_link(&routes);
         self.maintain_driver_mac();
-        self.maintain_sas_nat();
+        self.maintain_sas_nat(&routes);
 
         let loaded = config::load_config(&state_dir().join("config.json"));
         let config = match loaded {
@@ -401,10 +404,7 @@ impl Keeper {
         };
 
         let bearer = self.bearer.clone();
-        let live = global_prefix(&command_stdout(
-            "ip",
-            &["-6", "addr", "show", "dev", &bearer],
-        ));
+        let live = live_prefix(&bearer);
         let pinned = match ensure_pin(&config, live) {
             Ok(block) => block,
             Err(err) => {
@@ -541,7 +541,7 @@ impl Keeper {
 
     fn start_serving(&mut self, block: Block) -> Result<(), String> {
         self.ensure_packet()?;
-        let sniffed = self.sniff_core_ra();
+        let sniffed = self.sniff_core_ra()?;
         self.reinstall_filter()?;
         self.hold_sysctl();
         let prefixes = if sniffed.prefixes.is_empty() {
@@ -639,7 +639,10 @@ impl Keeper {
         }
     }
 
-    fn sniff_core_ra(&mut self) -> Sniff {
+    fn sniff_core_ra(&mut self) -> Result<Sniff, String> {
+        let ifindex = interface_index(CUSTOMER).ok_or("eth0 has no interface index")?;
+        let sniff = open_packet(ifindex, true)?;
+        self.packet = Some(sniff);
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
@@ -665,7 +668,10 @@ impl Keeper {
                 found.prefixes[0]
             ));
         }
-        found
+        let steady = open_packet(ifindex, false);
+        self.packet = None;
+        self.packet = Some(steady?);
+        Ok(found)
     }
 
     fn ensure_packet(&mut self) -> Result<(), String> {
@@ -673,8 +679,7 @@ impl Keeper {
             return Ok(());
         }
         let ifindex = interface_index(CUSTOMER).ok_or("eth0 has no interface index")?;
-        let fd = open_packet(ifindex)?;
-        self.packet = Some(Packet { fd });
+        self.packet = Some(open_packet(ifindex, false)?);
         Ok(())
     }
 
@@ -854,7 +859,7 @@ impl Keeper {
         addr
     }
 
-    fn maintain_ipv4(&mut self) {
+    fn maintain_ipv4(&mut self, routes: &str) {
         // Reap a daemon that exited on its own before considering a restart.
         if let Some(child) = &mut self.dhcp_child {
             if !matches!(child.try_wait(), Ok(None)) {
@@ -876,7 +881,6 @@ impl Keeper {
                 self.note("scoped DHCP so discover and offers stay off the customer bearer");
             }
         }
-        let routes = command_stdout("ip", &["route"]);
         let conf = read_file("/tmp/udhcpd.conf");
         let lease = fs::read("/tmp/udhcpd.leases").unwrap_or_default();
         let discover = self.discover.take();
@@ -889,14 +893,14 @@ impl Keeper {
         let bearer = self.bearer.clone();
         let external = ipv4::parse_conf(&conf).is_some_and(|offer| ipv4::needs_assignment(offer.start));
         let assigned = self.assigned_address(external);
-        let plan = ipv4::plan_with_assignment(&conf, &routes, &lease, discover, cooldown, &bearer, assigned)
+        let plan = ipv4::plan_with_assignment(&conf, routes, &lease, discover, cooldown, &bearer, assigned)
             .or_else(|| {
                 if self.now.saturating_sub(self.last_dhcp_probe) < 5 {
                     return None;
                 }
                 self.last_dhcp_probe = self.now;
                 let running = !customer_dhcp_pids(&command_stdout("ps", &[])).is_empty();
-                ipv4::restart_with_assignment(&conf, &routes, running, assigned)
+                ipv4::restart_with_assignment(&conf, routes, running, assigned)
             });
         let Some(plan) = plan else {
             return;
@@ -909,7 +913,7 @@ impl Keeper {
             }
             self.assigned_at = None;
             let current = self.assigned_address(true);
-            let current_routes = command_stdout("ip", &["route"]);
+            let current_routes = main_routes();
             if current != assigned
                 || ipv4::restart_with_assignment(&conf, &current_routes, false, current).is_none()
             {
@@ -965,7 +969,7 @@ impl Keeper {
         }
     }
 
-    fn maintain_ipv4_link(&mut self) {
+    fn maintain_ipv4_link(&mut self, routes: &str) {
         if self.now == self.last_ipv4_check {
             return;
         }
@@ -986,8 +990,7 @@ impl Keeper {
             }
             let external = ipv4::needs_assignment(conf.start);
             let assigned = self.assigned_address(external);
-            let routes = command_stdout("ip", &["route"]);
-            let route = ipv4::offer_route(&conf, &routes, assigned);
+            let route = ipv4::offer_route(&conf, routes, assigned);
             if external {
                 hold_previous = route.is_some()
                     && self.ipv4_peer.is_some_and(|(peer, _)| Some(peer.address) == route)
@@ -1006,10 +1009,7 @@ impl Keeper {
             if local_mac == mac {
                 return None;
             }
-            let local_address = bridge_probe_address(
-                &command_stdout("ip", &["-4", "-o", "addr", "show", "dev", BRIDGE]),
-                bearer,
-            )?;
+            let local_address = bridge_probe_address(bearer)?;
             gateway = Some(conf.router);
             Some(Peer {
                 address: bearer,
@@ -1148,7 +1148,7 @@ impl Keeper {
     /// Keep the vendor SNAT rule for the unit's own SAS traffic. A vendor
     /// firewall restart after a handover removes it, and in this build nothing
     /// else puts it back. Restores only after two missing checks in a row.
-    fn maintain_sas_nat(&mut self) {
+    fn maintain_sas_nat(&mut self, routes: &str) {
         if self
             .last_sas_check
             .is_some_and(|last| self.now.saturating_sub(last) < sas_nat::INTERVAL)
@@ -1159,7 +1159,7 @@ impl Keeper {
         let snat = sas_nat::needed(
             &command_stdout("nvram_get", &["0", "lan_management_ipaddr"]),
             &command_stdout("nvram_get", &["0", "pdn_data_ipaddr"]),
-            &command_stdout("ip", &["route"]),
+            routes,
         );
         let present = snat.and_then(|snat| {
             sas_nat::present(
@@ -1246,8 +1246,7 @@ impl Keeper {
             .bridged_since
             .is_some_and(|since| self.now.saturating_sub(since) >= extdev::SETTLE);
         let customer = self.bearer.clone();
-        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, ready, settled, &customer)
-        {
+        if let ExtAction::Repair(dev) = self.ext_watch.decide(self.now, ready, settled, &customer) {
             self.note(&format!(
                 "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
             ));
@@ -1259,7 +1258,9 @@ impl Keeper {
     /// healthy unit unchanged.
     fn repair_external_dev(&mut self, dev: &str) {
         let Some(mac) = interface_mac(dev) else {
-            self.note(&format!("external device guard: {dev} has no MAC to restore"));
+            self.note(&format!(
+                "external device guard: {dev} has no MAC to restore"
+            ));
             return;
         };
         for (program, args) in extdev::repair_commands(dev, &ipv4::mac_text(mac)) {
@@ -1444,12 +1445,13 @@ impl Keeper {
         if read_file("/proc/sys/net/ipv6/conf/lte0pdn0/disable_ipv6").trim() == "1" {
             return;
         }
-        let dmesg = command_stdout("dmesg", &[]);
-        let iid = match mgmt::assigned_iid(&dmesg).or_else(|| cached_mgmt_iid()) {
+        let assigned = mgmt::assigned_iid(&kernel_messages());
+        let cached = cached_mgmt_iid();
+        let iid = match assigned.or(cached) {
             Some(iid) => iid,
             None => return,
         };
-        if mgmt::assigned_iid(&dmesg).is_some() {
+        if assigned.is_some() && assigned != cached {
             let _ = fs::write(
                 state_dir().join("mgmt-iid.txt"),
                 format!("{}\n", iid.token()),
@@ -1755,14 +1757,81 @@ impl Keeper {
 
 // Probe from an address actually owned by the bridge. Never claim the
 // customer's bearer or the EPC gateway's address/MAC.
-fn bridge_probe_address(text: &str, bearer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr> {
-    text.lines().find_map(|line| {
-        let words: Vec<_> = line.split_whitespace().collect();
-        let i = words.iter().position(|word| *word == "inet")?;
-        let ip: std::net::Ipv4Addr = words.get(i + 1)?.split('/').next()?.parse().ok()?;
-        (!ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback() && ip != bearer)
-            .then_some(ip)
-    })
+fn bridge_probe_address(bearer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr> {
+    // getifaddrs dumps addresses over rtnetlink and includes labeled aliases.
+    let mut head = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return None;
+    }
+    let mut entry = head;
+    let mut result = None;
+    while !entry.is_null() {
+        let interface = unsafe { &*entry };
+        entry = interface.ifa_next;
+        if interface.ifa_addr.is_null()
+            || interface.ifa_name.is_null()
+            || unsafe { (*interface.ifa_addr).sa_family as i32 } != libc::AF_INET
+        {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(interface.ifa_name) }.to_bytes();
+        if name.split(|&c| c == b':').next() != Some(BRIDGE.as_bytes()) {
+            continue;
+        }
+        let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
+        let ip = std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+        if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback() && ip != bearer {
+            result = Some(ip);
+            break;
+        }
+    }
+    unsafe { libc::freeifaddrs(head) };
+    result
+}
+
+// The main table, without spawning ip on every tick.
+fn main_routes() -> String {
+    fs::read_to_string("/proc/net/route")
+        .map(|text| ipv4_routes(&text))
+        .unwrap_or_else(|_| command_stdout("ip", &["route"]))
+}
+
+// The model consumes the two forms printed by ip route. The proc file
+// prints network-order addresses as native-endian hex integers.
+fn ipv4_routes(text: &str) -> String {
+    use std::{fmt::Write, net::Ipv4Addr};
+    let mut routes = String::new();
+    for row in text.lines().skip(1) {
+        let mut fields = row.split_whitespace();
+        let (Some(dev), Some(dest), Some(gw), Some(flags), Some(mask)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.nth(3),
+        ) else {
+            continue;
+        };
+        let (Ok(dest), Ok(gw), Ok(flags), Ok(mask)) = (
+            u32::from_str_radix(dest, 16),
+            u32::from_str_radix(gw, 16),
+            u32::from_str_radix(flags, 16),
+            u32::from_str_radix(mask, 16),
+        ) else {
+            continue;
+        };
+        if flags & 0x201 != 1 || dev == "*" {
+            continue;
+        }
+        if mask == u32::MAX && gw == 0 {
+            let addr = Ipv4Addr::from(dest.to_ne_bytes());
+            let _ = writeln!(routes, "{addr} dev {dev}");
+        } else if mask == 0 && dest == 0 && flags & 2 != 0 {
+            let addr = Ipv4Addr::from(gw.to_ne_bytes());
+            let _ = writeln!(routes, "default via {addr} dev {dev}");
+        }
+    }
+    routes
 }
 
 struct Event {
@@ -1985,12 +2054,12 @@ fn checksum(src: &[u8; 16], dest: &[u8; 16], next: u8, body: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn open_packet(ifindex: i32) -> Result<libc::c_int, String> {
+fn open_packet(ifindex: i32, sniff: bool) -> Result<Packet, String> {
     let fd = unsafe {
         libc::socket(
             libc::AF_PACKET,
-            libc::SOCK_DGRAM,
-            (libc::ETH_P_ALL as u16).to_be() as i32,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
         )
     };
     if fd < 0 {
@@ -1999,13 +2068,13 @@ fn open_packet(ifindex: i32) -> Result<libc::c_int, String> {
             io::Error::last_os_error()
         ));
     }
-    if let Err(err) = setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32) {
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags >= 0 {
-        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    let socket = Packet { fd };
+    setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32)?;
+    crate::capture::install(fd, sniff)?;
+    if !sniff {
+        // Kernels with PACKET_IGNORE_OUTGOING skip the tap before cloning.
+        // Older kernels still apply the direction check in the socket filter.
+        let _ = setsockopt_int(fd, libc::SOL_PACKET, 23, 1);
     }
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as libc::sa_family_t;
@@ -2020,10 +2089,9 @@ fn open_packet(ifindex: i32) -> Result<libc::c_int, String> {
     };
     if bound != 0 {
         let err = io::Error::last_os_error();
-        unsafe { libc::close(fd) };
         return Err(format!("bind customer port: {err}"));
     }
-    Ok(fd)
+    Ok(socket)
 }
 
 fn send_ipv6(
@@ -2177,13 +2245,7 @@ fn send_marked_frame(ifindex: i32, frame: &[u8]) -> Result<(), String> {
     if frame.len() < 14 {
         return Err("Ethernet frame is truncated".into());
     }
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_RAW,
-            (libc::ETH_P_ALL as u16).to_be() as i32,
-        )
-    };
+    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
     if fd < 0 {
         return Err(format!("raw send socket: {}", io::Error::last_os_error()));
     }
@@ -2233,27 +2295,46 @@ pub fn link_local(text: &str, dev: &str) -> Option<[u8; 16]> {
     None
 }
 
-pub fn global_prefix(text: &str) -> Option<Block> {
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("inet6 ") else {
-            continue;
-        };
-        if !rest.contains("scope global") {
-            continue;
+// ip's rtnetlink dump and /proc may enumerate multiple prefixes in different
+// orders. Preserve the original choice during that uncommon attach transition.
+fn live_prefix(dev: &str) -> Option<Block> {
+    if let Ok(text) = fs::read_to_string("/proc/net/if_inet6") {
+        let mut blocks = global_prefixes(&text, dev);
+        let first = blocks.next()?;
+        if blocks.all(|block| block == first) {
+            return Some(first);
         }
-        let Some((addr, len)) = rest.split_whitespace().next()?.split_once('/') else {
-            continue;
-        };
-        if len != "64" {
-            continue;
-        }
-        let Ok(addr) = addr.parse::<Ipv6Addr>() else {
-            continue;
-        };
-        return Some(Block::containing_56(addr.octets()));
     }
-    None
+    command_stdout("ip", &["-6", "addr", "show", "dev", dev])
+        .lines()
+        .find_map(|line| {
+            let address = line.trim().strip_prefix("inet6 ")?;
+            if !address.contains("scope global") {
+                return None;
+            }
+            let ip: Ipv6Addr = address
+                .split_whitespace()
+                .next()?
+                .strip_suffix("/64")?
+                .parse()
+                .ok()?;
+            Some(Block::containing_56(ip.octets()))
+        })
+}
+
+fn global_prefixes<'a>(text: &'a str, dev: &'a str) -> impl Iterator<Item = Block> + 'a {
+    text.lines().filter_map(move |line| {
+        let mut parts = line.split_whitespace();
+        let addr = parts.next()?;
+        let prefix = parts.nth(1)?;
+        let scope = parts.next()?;
+        let name = parts.nth(1)?;
+        if name == dev && scope == "00" && prefix == "40" {
+            parse_hex_addr(addr).map(Block::containing_56)
+        } else {
+            None
+        }
+    })
 }
 
 fn parse_hex_addr(text: &str) -> Option<[u8; 16]> {
@@ -2523,6 +2604,19 @@ fn solicit_mgmt(src: Ipv6Addr) -> Result<(), String> {
     Ok(())
 }
 
+// SYSLOG_ACTION_SIZE_BUFFER and READ_ALL leave the ring and other readers alone.
+fn kernel_messages() -> String {
+    let size = unsafe { libc::klogctl(10, std::ptr::null_mut(), 0) };
+    if (1..=4 * 1024 * 1024).contains(&size) {
+        let mut buffer = vec![0; size as usize];
+        let n = unsafe { libc::klogctl(3, buffer.as_mut_ptr().cast(), size) };
+        if n >= 0 {
+            return String::from_utf8_lossy(&buffer[..n as usize]).into_owned();
+        }
+    }
+    command_stdout("dmesg", &[])
+}
+
 fn command_stdout(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
@@ -2614,6 +2708,7 @@ mod tests {
         icmp[2] = 0;
         icmp[3] = 0;
         assert_eq!(checksum(&src, &dest, 58, &icmp), carried);
+        let packet = crate::capture::tests::captured(&packet, libc::ETH_P_IPV6, true, true);
         assert_eq!(classify_ipv6(&packet, None, None), {
             let prefixes = ra::prefixes_of(&packet[40..]);
             Class::RouterAdvertisement {
@@ -2630,6 +2725,7 @@ mod tests {
         traffic[0] = 0x60;
         traffic[8..24].copy_from_slice(&block.delegated57().addr);
         traffic[23] = 1;
+        let traffic = crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false);
         assert!(matches!(
             classify_ipv6(&traffic, Some(block.delegated57()), None),
             Class::DelegatedTraffic
@@ -2689,10 +2785,30 @@ mod tests {
     }
 
     #[test]
-    fn the_bearer_line_and_a_dhcp_discover_parse() {
-        let text = "inet6 2001:db8:ff:d300::d4/64 scope global \ninet6 fe80::1/64 scope link\n";
+    fn proc_routes_preserve_direct_hosts_and_gateway_defaults() {
+        let encode = |octets| format!("{:08X}", u32::from_ne_bytes(octets));
+        let host_ip = std::net::Ipv4Addr::from([192, 0, 2, 9]);
+        let gw_ip = std::net::Ipv4Addr::from([192, 0, 2, 1]);
+        let host = encode(host_ip.octets());
+        let gw = encode(gw_ip.octets());
+        let text = format!(
+            "Iface Destination Gateway Flags RefCnt Use Metric Mask\n\
+            br0 {host} 00000000 0005 0 0 0 FFFFFFFF\n\
+            wan 00000000 {gw} 0003 0 0 2 00000000\n\
+            wan {host} {gw} 0007 0 0 0 FFFFFFFF\n\
+            br0 {host} 00000000 0205 0 0 0 FFFFFFFF\n"
+        );
         assert_eq!(
-            global_prefix(text).unwrap().to_string(),
+            ipv4_routes(&text),
+            format!("{host_ip} dev br0\ndefault via {gw_ip} dev wan\n")
+        );
+    }
+
+    #[test]
+    fn the_bearer_line_and_a_dhcp_discover_parse() {
+        let text = "fe800000000000000000000000000001 02 40 20 80 wan\n20010db800ffd30000000000000000d4 02 40 00 80 wan";
+        assert_eq!(
+            global_prefixes(text, "wan").next().unwrap().to_string(),
             "2001:db8:ff:d300::/56"
         );
         let mut packet = vec![0u8; 282];

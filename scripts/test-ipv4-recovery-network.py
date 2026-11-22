@@ -61,7 +61,7 @@ def main():
     peer_mac = bytes.fromhex(json.loads(subprocess.check_output([ip,'-n','witcher-peer','-j','link','show','router0']))[0]['address'].replace(':',''))
     def exe(path, text):
         p=Path(path);p.write_text('#!/bin/sh\n'+text+'\n');p.chmod(0o755)
-    exe('/tmp/bin/ip', 'if [ "$1" = route ]; then cat /tmp/routes; else exec /tmp/bin/real-ip "$@"; fi')
+    exe('/tmp/bin/ip', 'exec /tmp/bin/real-ip "$@"')
     exe('/tmp/bin/ps', 'exec /tmp/bin/real-ps -eo pid,args')
     exe('/tmp/bin/nvram_get', 'case "$2" in router_disable) echo "nvram_get success: 1";; lan_management_ipaddr) echo "nvram_get success: 10.1.1.1";; pdn_data_ipaddr) echo "nvram_get success: 172.20.64.152";; wan_get_dns) echo "nvram_get success: 192.0.2.53 0.0.0.0";; sqns_connection_mediaState) echo "nvram_get success: ATTACHED";; *) echo "nvram_get success: ";; esac')
     # Deaf watchdog fixtures: a target answers while /tmp/ping-ok exists, and a reboot is only recorded.
@@ -104,7 +104,8 @@ def main():
     exe('/tmp/bin/ebtables', 'exit 0')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
     exe('/usr/sbin/udhcpd', 'echo start >> /tmp/dhcp-starts; while :; do sleep 30; done')
-    Path('/tmp/routes').write_text('172.20.64.152 dev br0 scope link\ndefault via 172.20.64.151 dev lte0pdn1\n')
+    peer = json.loads(subprocess.check_output([ip, '-n', 'witcher-peer', '-j', '-4', 'addr', 'show', 'router0']))[0]
+    run(ip, 'route', 'add', peer['addr_info'][0]['local'] + '/32', 'dev', 'br0')
     Path('/tmp/udhcpd.conf').write_text('start 172.20.64.152\nend 172.20.64.152\nmax_leases 8\ninterface br0:9\nremaining yes\noption subnet 255.255.255.240\noption router 172.20.64.151\noption lease 120\n')
     def lease():
         Path('/tmp/lease.new').write_bytes(struct.pack('>QI4B6s20s2x',int(time.time()),120,172,20,64,152,peer_mac,b'fixture'))

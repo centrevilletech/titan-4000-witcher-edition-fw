@@ -17,6 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use titan_pd_model::config::{self, Pending};
 
+mod bench;
+mod capture;
 mod run;
 
 fn main() {
@@ -48,6 +50,16 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        Some("bench-bridge-endpoints") => {
+            let result = args
+                .next()
+                .and_then(|s| s.parse().ok())
+                .and_then(bench::endpoints);
+            match result {
+                Some(line) => println!("{line}"),
+                None => std::process::exit(1),
+            }
+        }
         Some("status") => {
             let _ = writeln!(
                 std::io::stdout(),

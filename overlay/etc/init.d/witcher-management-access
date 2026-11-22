@@ -56,6 +56,20 @@ first=$("$iptables" -t nat -S PREROUTING | sed -n '/^-A /{p;q;}')
 # before iptables. Add exact management-port accepts; FORWARD is untouched.
 for chain in INPUT OUTPUT; do
  case "$chain" in INPUT) match=--ip-dport;; OUTPUT) match=--ip-sport;; esac
+ # --Lx prints replayable commands. Require all four accepts ahead of
+ # every vendor rule: checking mere membership misses a prepended DROP.
+ if "$ebtables" -L "$chain" --Lx | awk -v chain="$chain" -v matchopt="$match" '
+  {
+   sub(/^.*-A /, "-A ")
+   if ($1 != "-A" || $2 != chain || ++n > 4) next
+   if (NF == 10 && $3 == "-p" && $4 == "IPv4" && $5 == "--ip-proto" &&
+       ($6 == "6" || $6 == "tcp") && $7 == matchopt && $9 == "-j" && $10 == "ACCEPT")
+     seen[$8] = 1
+  }
+  END { exit !(seen[80] && seen[443] && seen[8081] && seen[2222]) }
+ '; then
+  continue
+ fi
  for port in 80 443 8081 2222; do
   "$ebtables" -D "$chain" -p IPv4 --ip-proto 6 "$match" "$port" -j ACCEPT 2>/dev/null || :
   "$ebtables" -I "$chain" 1 -p IPv4 --ip-proto 6 "$match" "$port" -j ACCEPT
