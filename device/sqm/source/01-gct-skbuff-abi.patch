@@ -1,0 +1,10 @@
+--- include/linux/skbuff.h.orig	2026-11-22 04:23:15.970380414 +0000
++++ include/linux/skbuff.h	2026-11-22 04:23:16.057381863 +0000
+@@ -522,6 +522,7 @@
+ 				*data;
+ 	unsigned int		truesize;
+ 	atomic_t		users;
++	u32			__gct_vendor_pad[6];
+ };
+ 
+ #ifdef __KERNEL__

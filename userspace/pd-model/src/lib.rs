@@ -23,3 +23,4 @@ pub mod sas_nat;
 
 pub use config::{Config, Report, load_config, shown_choice, store_config};
 pub use prefix::Block;
+pub mod radio;

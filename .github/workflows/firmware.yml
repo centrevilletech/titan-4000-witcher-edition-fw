@@ -67,6 +67,8 @@ jobs:
           python3 scripts/test-rootfs-metadata.py
           python3 scripts/test-firstboot.py
           python3 scripts/test-bridge-trial.py
+          (cd overlay/usr/lib/witcher-sqm && sha256sum -c ../../../../device/sqm/SHA256SUMS)
+          bash -n device/sqm/source/rebuild.sh
           python3 -m compileall -q scripts
           bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
           for script in overlay/etc/init.d/* overlay/usr/lib/titan-api/*.sh; do sh -n "$script"; done
@@ -174,6 +176,7 @@ jobs:
           python3 scripts/test-rootfs-metadata.py
           python3 scripts/audit-secrets.py
           python3 scripts/audit-secrets.py --history
+          qemu-arm overlay/usr/lib/witcher-sqm/tc -V | grep -F "iproute2-5.19.0"
           mkdir -p out
           firmware="out/witcher-v$(cat VERSION).prg"
           scripts/build-firmware.sh "$PACK_WORK/stock.prg" -o "$firmware" 2>&1 | tee out/build.log

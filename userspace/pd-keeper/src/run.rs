@@ -1356,6 +1356,11 @@ impl Keeper {
     }
 
     fn deaf_round(&mut self, heard: Option<bool>) {
+        // A guarded radio cycle deliberately interrupts the management bearer.
+        if crate::radio::transition_in_progress(self.now) {
+            self.deaf_watch = deaf::Watch::default();
+            return;
+        }
         let attached = deaf::attached(&command_stdout(
             "nvram_get",
             &["0", "sqns_connection_mediaState"],
@@ -2629,7 +2634,7 @@ fn read_file(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-fn monotonic() -> u64 {
+pub(super) fn monotonic() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,

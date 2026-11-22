@@ -60,3 +60,8 @@ Witcher generates a separate per-unit TLS identity.
 Read [component provenance and licensing](../THIRD_PARTY.md) before distributing
 an image. The root GPL grant does not supply missing vendor redistribution
 rights or corresponding source for bundled binaries.
+
+The image also installs a private static tc and two scheduler modules. The
+builder checks their pinned SHA-256 digests before packing. The verifier
+checks the extracted files. See [radio profiles and SQM](radio-profiles.md)
+for activation and qualification.
