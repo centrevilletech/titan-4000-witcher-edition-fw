@@ -116,6 +116,35 @@ pub fn targets(settings: &Settings, wan_get_dns: &str) -> Vec<IpAddr> {
     }
 }
 
+/// One `key=value` record from the vendor's RAM cache (`/tmp/nvram.cfg`).
+/// Records end in a NUL byte (a newline is accepted too).
+pub fn nvram_field<'a>(cache: &'a [u8], key: &str) -> Option<&'a str> {
+    cache
+        .split(|byte| *byte == 0 || *byte == b'\n')
+        .find_map(|record| record.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
+        .and_then(|value| std::str::from_utf8(value).ok())
+}
+
+/// The value as `ucid` reads it: C `atoi`, so leading digits count and
+/// anything unreadable is 0.
+fn atoi(text: &str) -> i64 {
+    let text = text.trim_start();
+    let (sign, digits) = match text.as_bytes().first() {
+        Some(b'-') => (-1, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    digits[..end].parse::<i64>().map_or(0, |n| sign * n)
+}
+
+/// The vendor ping watchdog in `ucid` runs while `detection_enable` is not 0.
+/// It must stop while this watchdog is on. With this one off, the operator's
+/// vendor setting stands. A missing key means the cache is not ready yet.
+pub fn vendor_watchdog_must_stop(settings: &Settings, detection_enable: Option<&str>) -> bool {
+    settings.enabled && detection_enable.is_some_and(|value| atoi(value) != 0)
+}
+
 /// `nvram_get 0 sqns_connection_mediaState` reports `ATTACHED`.
 pub fn attached(output: &str) -> bool {
     output.rsplit(':').next().unwrap_or("").trim() == "ATTACHED"
@@ -463,5 +492,33 @@ nonsense
         assert!(!attached(""));
         assert_eq!(parse_strikes(&format_strikes(3)), 3);
         assert_eq!(parse_strikes("garbage"), 0);
+    }
+
+    #[test]
+    fn the_vendor_ping_watchdog_is_read_from_the_ram_cache() {
+        let cache = b"detection_interval=3\0detection_enable=1\0detection_enable_x=0\0";
+        assert_eq!(nvram_field(cache, "detection_enable"), Some("1"));
+        assert_eq!(nvram_field(cache, "detection_interval"), Some("3"));
+        assert_eq!(nvram_field(b"a=1\nb=2\n", "b"), Some("2"));
+        // A longer key with the same start is not this one.
+        assert_eq!(nvram_field(b"detection_enable_x=0\0", "detection_enable"), None);
+        assert_eq!(nvram_field(b"", "detection_enable"), None);
+    }
+
+    #[test]
+    fn the_vendor_ping_watchdog_stops_only_while_ours_is_on() {
+        let ours = Settings::default();
+        assert!(vendor_watchdog_must_stop(&ours, Some("1")));
+        assert!(vendor_watchdog_must_stop(&ours, Some(" 2")));
+        assert!(vendor_watchdog_must_stop(&ours, Some("1x")));
+        // Already off, unreadable as a number (ucid reads 0), or not in the
+        // cache yet: nothing to do. Repeating the check is a no-op.
+        assert!(!vendor_watchdog_must_stop(&ours, Some("0")));
+        assert!(!vendor_watchdog_must_stop(&ours, Some("")));
+        assert!(!vendor_watchdog_must_stop(&ours, Some("off")));
+        assert!(!vendor_watchdog_must_stop(&ours, None));
+        // An operator who turned ours off keeps the vendor one as saved.
+        let off = parse_settings("enabled=0\n");
+        assert!(!vendor_watchdog_must_stop(&off, Some("1")));
     }
 }

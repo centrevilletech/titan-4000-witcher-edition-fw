@@ -12,12 +12,37 @@ fi
 for setting in netdev_budget=300 dev_weight=128 netdev_max_backlog=4000; do
  echo "${setting#*=}" > "/proc/sys/net/core/${setting%=*}" || echo "Unable to apply $setting" >&2
 done
+# /tmp is ramfs on this unit: no size limit, and every byte stays in RAM.
+# Once a minute, a Witcher log over 64 KB keeps its last 16 KB in NAME.1 and
+# starts again empty. Every writer appends (O_APPEND), so emptying the file in
+# place is safe while it is open.
+log_cap=65536
+log_keep=16384
+cap_logs() {
+ for file in /tmp/witcher-management.log /tmp/witcher-recovery.log \
+  /tmp/titan-sshd-boot.log /tmp/titan-pd-keeper-boot.log /tmp/titan-api-boot.log \
+  /tmp/witcher-api/api.log /tmp/witcher-api/broker.log /tmp/witcher-api/collector.log \
+  /tmp/witcher-api/routes.log; do
+  [ -f "$file" ] && [ ! -L "$file" ] || continue
+  size=$(wc -c < "$file" 2> /dev/null) || continue
+  # Some wc builds pad the count. Never let a bad value end this loop.
+  size=${size##* }
+  case "$size" in ''|*[!0-9]*) continue;; esac
+  [ "$size" -gt "$log_cap" ] || continue
+  rm -f "$file.1"
+  (umask 077; set -C; tail -c "$log_keep" "$file" > "$file.1") 2> /dev/null
+  : > "$file"
+ done
+}
 # An inherited pipe must never keep rcS waiting for these long-lived services.
 # Vendor startup and re-attachments can rebuild their tables. Keep management
 # available independently of panel startup, APN provisioning and saved flags.
 (
+ tick=0
  while :; do
   /bin/sh /etc/init.d/witcher-management-access all >> /tmp/witcher-management.log 2>&1
+  tick=$((tick + 1))
+  if [ "$tick" -ge 6 ]; then tick=0; cap_logs; fi
   sleep 10
  done
 ) </dev/null >/dev/null 2>&1 &

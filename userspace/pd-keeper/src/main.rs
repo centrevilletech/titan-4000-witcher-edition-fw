@@ -10,12 +10,13 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use titan_pd_model::config::{self, Pending};
+use titan_pd_model::config::{self, Pending, Recovery};
+use titan_pd_model::wear;
 
 mod bench;
 mod capture;
@@ -76,11 +77,11 @@ fn main() {
             }
         }
         Some("status") => {
-            let _ = writeln!(
-                std::io::stdout(),
-                "{}",
-                fs::read_to_string(state().join("status.json")).unwrap_or_default()
-            );
+            // The RAM copy is current. The flash copy can lag by up to a minute.
+            let live = fs::read_to_string(runtime().join("status.json"))
+                .or_else(|_| fs::read_to_string(state().join("status.json")))
+                .unwrap_or_default();
+            let _ = writeln!(std::io::stdout(), "{live}");
         }
         _ => {
             eprintln!(
@@ -91,29 +92,84 @@ fn main() {
     }
 }
 
-fn state() -> PathBuf {
+pub(crate) fn state() -> PathBuf {
     config::default_state_dir()
+}
+
+/// The keeper's RAM directory (`/tmp` is RAM on the Titan). Hot files live here.
+pub(crate) fn runtime() -> PathBuf {
+    env::var_os("TITAN_PD_RUNTIME")
+        .map_or_else(|| PathBuf::from("/tmp/titan-pd-keeper"), PathBuf::from)
 }
 
 /// The guard process did not survive (a reboot kills it). Put the previous
 /// setting back once, after commit and before the re-attach, so a crash in the
-/// re-attach cannot loop.
+/// re-attach cannot loop. The decision uses the boot, not the wall clock: the
+/// unit boots in 2013 until NTP answers (see `config::recovery`).
 fn recover_pending() {
+    let first = note_boot();
     let path = state().join("pending.json");
     let Ok(Some(pending)) = config::load_pending(&path) else {
         return;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if now < pending.not_before || guard_running() {
+    let confirm_file =
+        fs::read_to_string(state().join(format!("confirm-{}", pending.token))).unwrap_or_default();
+    let decision = config::recovery(
+        guard_running(),
+        config::confirmed(&pending.token, &confirm_file),
+        first,
+        wall_now(),
+        pending.not_before,
+    );
+    match decision {
+        Recovery::Wait => {}
+        Recovery::Keep => {
+            let _ = fs::remove_file(&path);
+            log("pending setting change: management had returned before its guard was lost; keeping the new setting");
+        }
+        Recovery::Revert => {
+            log("pending setting change had no guard left; restoring the previous IP family");
+            wait_for_nvram_cache();
+            if !finish_revert(&pending) {
+                log("could not restore ip_proto from the pending setting change");
+            }
+        }
+    }
+}
+
+/// True on the keeper's first start in this boot. The marker sits in RAM, so a
+/// reboot clears it, and it holds the kernel's boot id in case it does not.
+fn note_boot() -> bool {
+    let boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap_or_default();
+    let marker = runtime().join("boot-id");
+    let seen = fs::read_to_string(&marker).ok();
+    let first = config::first_start(seen.as_deref(), &boot_id);
+    if first {
+        let _ = fs::create_dir_all(runtime());
+        let text = if boot_id.trim().is_empty() { "seen" } else { boot_id.trim() };
+        let _ = fs::write(&marker, text);
+    }
+    first
+}
+
+/// The vendor's RAM configuration cache appears early in boot. A revert at
+/// keeper start must not run before it, or the nvram writes fail.
+fn wait_for_nvram_cache() {
+    if env::var_os("TITAN_NVRAM").is_some() {
         return;
     }
-    log("pending setting change had no guard left; restoring the previous IP family");
-    if !finish_revert(&pending) {
-        log("could not restore ip_proto from the pending setting change");
+    let ready = || fs::metadata("/tmp/nvram.cfg").is_ok_and(|meta| meta.len() > 0);
+    let start = Instant::now();
+    while !ready() && start.elapsed() < Duration::from_secs(60) {
+        thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn wall_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn guard_running() -> bool {
@@ -155,22 +211,39 @@ fn finish_revert(pending: &Pending) -> bool {
     true
 }
 
+/// A real event: the flash log (`keeper.log` in the state directory) and the
+/// RAM log, which holds every line.
 pub fn log(line: &str) {
-    let path = state().join("keeper.log");
-    let _ = fs::create_dir_all(state());
-    if fs::metadata(&path).is_ok_and(|meta| meta.len() > 256 * 1024) {
-        let _ = fs::rename(&path, state().join("keeper.log.1"));
-    }
-    let up = fs::read_to_string("/proc/uptime").unwrap_or_default();
-    let up = up.split_whitespace().next().unwrap_or("?");
-    let wall = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{wall} up={up} {line}");
+    let text = stamped(line);
+    let state = state();
+    append(&state, &text, wear::FLASH_LOG_BYTES);
+    if runtime() != state {
+        append(&runtime(), &text, wear::RAM_LOG_BYTES);
     }
     eprintln!("{line}");
+}
+
+/// A routine line: the RAM log only, so it never wears the flash.
+pub fn log_ram(line: &str) {
+    append(&runtime(), &stamped(line), wear::RAM_LOG_BYTES);
+}
+
+fn stamped(line: &str) -> String {
+    let up = fs::read_to_string("/proc/uptime").unwrap_or_default();
+    let up = up.split_whitespace().next().unwrap_or("?").to_owned();
+    format!("{} up={up} {line}", wall_now())
+}
+
+/// Append one line, moving a full log to `keeper.log.1` first.
+fn append(dir: &Path, text: &str, cap: u64) {
+    let path = dir.join("keeper.log");
+    let _ = fs::create_dir_all(dir);
+    if fs::metadata(&path).is_ok_and(|meta| meta.len() > cap) {
+        let _ = fs::rename(&path, dir.join("keeper.log.1"));
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{text}");
+    }
 }
 
 fn arg(args: &[String], name: &str) -> String {
@@ -216,19 +289,21 @@ fn confirm(args: &[String]) -> i32 {
     if token.is_empty() {
         return 64;
     }
-    let start = SystemTime::now();
+    // Monotonic time: an NTP step during the window (sqn-date steps the clock)
+    // must not end it early and revert a working setting, or stretch it.
+    let start = Instant::now();
     let mut saw_down = false;
-    let mut up_since: Option<SystemTime> = None;
-    while start.elapsed().unwrap_or_default() < Duration::from_secs(150) {
+    let mut up_since: Option<Instant> = None;
+    while start.elapsed() < Duration::from_secs(150) {
         let up = mgmt_up();
         if !up {
             saw_down = true;
             up_since = None;
         } else {
-            let since = *up_since.get_or_insert_with(SystemTime::now);
+            let since = *up_since.get_or_insert_with(Instant::now);
             // A bearer that never drops means the re-attach did not happen. Confirming
             // then would keep a new setting that the guard is supposed to revert.
-            let stable = since.elapsed().unwrap_or_default() >= Duration::from_secs(20);
+            let stable = since.elapsed() >= Duration::from_secs(20);
             if saw_down && stable {
                 let _ = fs::create_dir_all(state());
                 if fs::write(state().join(format!("confirm-{token}")), &token).is_ok() {
@@ -258,7 +333,7 @@ fn nvram() -> PathBuf {
     )
 }
 
-fn nvram_set(key: &str, value: &str) -> Result<(), ()> {
+pub(crate) fn nvram_set(key: &str, value: &str) -> Result<(), ()> {
     let mut child = Command::new(nvram())
         .args(["set", "0", key])
         .stdin(std::process::Stdio::piped())

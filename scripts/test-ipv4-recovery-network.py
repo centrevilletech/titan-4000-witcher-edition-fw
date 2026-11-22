@@ -12,6 +12,9 @@ modem-state and reboot stubs. The LTE driver MAC correction reads a file
 standing in for /proc/net/snmp6 and is checked on the wire of a dummy bearer.
 The 802.3x flow control change runs a recording `kern eth` stub that prints
 the kernel's report: this proves when the keeper runs it, not the register.
+The vendor ping watchdog runs against a file standing in for the vendor's RAM
+configuration cache and a recording `titan-nvram` stub. The keeper's RAM log
+and RAM status copy are checked against the flash files in the state directory.
 """
 import errno
 import os
@@ -71,6 +74,11 @@ def main():
     exe('/tmp/bin/ping', 'echo "$*" >> /tmp/ping-calls; [ -e /tmp/ping-ok ]')
     exe('/tmp/bin/reboot', 'echo "reboot $*" >> /tmp/reboot-actions')
     Path('/tmp/ping-ok').write_text('')
+    # The vendor ping watchdog is on in the RAM cache. The stub records each
+    # write and updates the cache, as the vendor library does.
+    Path('/tmp/nvram-cache').write_text('detection_interval=3\ndetection_enable=1\n')
+    exe('/tmp/bin/titan-nvram', 'value=$(cat); echo "$1 $2 $3 $value" >> /tmp/nvram-actions\n'
+        'if [ "$1 $3" = "set detection_enable" ]; then printf "detection_interval=3\\ndetection_enable=%s\\n" "$value" > /tmp/nvram-cache; fi')
     Path('/tmp/pd').mkdir()
     Path('/tmp/pd/watchdog.conf').write_text('deaf_secs=120\n')
     # Management bearer fixture: the global is up, the kernel still accepts
@@ -120,7 +128,7 @@ def main():
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -142,6 +150,8 @@ def main():
         raise AssertionError('Timed out: '+log()+'\nARP '+repr(packets)+'\ncarrier '+repr([Path('/sys/class/net/'+n+'/carrier').read_text() for n in ['eth0','lte0pdn1']])+'\nIP '+subprocess.check_output([ip,'-4','-o','addr','show','dev','br0']).decode()+'\nlease '+Path('/tmp/udhcpd.leases').read_bytes().hex())
     def eth_actions():
         p=Path('/tmp/eth-actions');return p.read_text().splitlines() if p.exists() else []
+    def nvram_actions():
+        p=Path('/tmp/nvram-actions');return p.read_text().splitlines() if p.exists() else []
     try:
         # The keeper turns off PAUSE frames when it starts, and again when eth0
         # comes back up, because opening the port turns them back on.
@@ -155,6 +165,11 @@ def main():
         assert eth_actions()==['kern eth -fc']*2, eth_actions()
         assert log().count('no longer sends 802.3x PAUSE')==1, log()
         print('PASS: PAUSE frames turned off at start and again after eth0 came back up, logged once.',flush=True)
+        # The deaf watchdog is on, so the vendor one is turned off in RAM only.
+        wait_for(lambda:'vendor ping watchdog: turned off in RAM' in log(),10)
+        assert nvram_actions()==['set 0 detection_enable 0'], nvram_actions()
+        assert 'detection_enable=0' in Path('/tmp/nvram-cache').read_text()
+        print('PASS: vendor ping watchdog turned off in the RAM cache, with no commit.',flush=True)
         wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
         # The deaf watchdog arms on the first answer, then the target goes quiet
@@ -306,6 +321,19 @@ def main():
         assert 'rebooting (reboot 1 in a row)' in log()
         assert Path('/tmp/pd/watchdog-strikes.txt').read_text()=='strikes=1\n'
         print('PASS: deaf watchdog rebooted once after %d s of silence while attached.'%waited,flush=True)
+        # Minutes of watchdog rounds later, the vendor flag was written once.
+        assert nvram_actions()==['set 0 detection_enable 0'], nvram_actions()
+        assert log().count('vendor ping watchdog')==1, log()
+        print('PASS: the vendor ping watchdog check is a no-op once the flag is 0.',flush=True)
+        # Every flash line is in the RAM log too, and the RAM status copy is live.
+        ram_log=''.join(p.read_text() for p in (Path('/tmp/runtime/keeper.log.1'),Path('/tmp/runtime/keeper.log')) if p.exists())
+        for line in log().splitlines():
+            assert line in ram_log, line
+        ram_status=json.loads(Path('/tmp/runtime/status.json').read_text())
+        flash_status=json.loads(Path('/tmp/pd/status.json').read_text())
+        assert set(ram_status)==set(flash_status), (ram_status, flash_status)
+        assert 'periodic router advertisement' not in log()
+        print('PASS: the RAM log holds every flash line; status.json has a live RAM copy.',flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)

@@ -42,8 +42,9 @@ use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
 use titan_pd_model::sas_nat::{self, Action as SasAction};
+use titan_pd_model::wear::{self, Route};
 
-use crate::log;
+use crate::{log, log_ram};
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
@@ -122,8 +123,14 @@ struct Keeper {
     passthrough: bool,
     core_mac: [u8; 6],
     saved_sysctl: Vec<(String, String)>,
-    last_logged: String,
-    last_logged_at: u64,
+    /// Which lines reach the flash log (see `titan_pd_model::wear`).
+    notes: wear::Notes,
+    /// The last report written to RAM, and to flash.
+    status_ram: Option<Report>,
+    status_flash: Option<Report>,
+    status_gate: wear::FlashGate,
+    /// When the vendor ping watchdog line was last written.
+    vendor_watchdog_logged: Option<u64>,
     last_mgmt: u64,
     last_mgmt_log: u64,
     mgmt_up_logged: bool,
@@ -314,8 +321,11 @@ impl Keeper {
             passthrough: false,
             core_mac: CORE_MAC,
             saved_sysctl: Vec::new(),
-            last_logged: String::new(),
-            last_logged_at: 0,
+            notes: wear::Notes::default(),
+            status_ram: None,
+            status_flash: None,
+            status_gate: wear::FlashGate::default(),
+            vendor_watchdog_logged: None,
             last_mgmt: 0,
             last_mgmt_log: 0,
             mgmt_up_logged: false,
@@ -1430,6 +1440,7 @@ impl Keeper {
             &state_dir().join("watchdog.conf").to_string_lossy(),
         ));
         self.deaf_secs = settings.deaf_secs;
+        self.maintain_vendor_watchdog(&settings);
         if !settings.enabled {
             self.deaf_round(None);
             return;
@@ -1462,6 +1473,37 @@ impl Keeper {
             children,
             started: self.now,
         });
+    }
+
+    /// Run one watchdog, not two. The vendor's (`ucid`, nvram `detection_enable`)
+    /// reboots after about 110 s without its ping target and has no backoff, so
+    /// two setting saves in a row can reboot the unit. `ucid` reads the flag from
+    /// the RAM cache every 15 s, so clearing it there is enough and nothing is
+    /// committed to flash. An operator who turns this watchdog off keeps the
+    /// vendor setting as saved.
+    fn maintain_vendor_watchdog(&mut self, settings: &deaf::Settings) {
+        let cache = fs::read(nvram_cache()).unwrap_or_default();
+        let value = deaf::nvram_field(&cache, "detection_enable");
+        if !deaf::vendor_watchdog_must_stop(settings, value) {
+            return;
+        }
+        let was = value.unwrap_or("").trim().to_owned();
+        let done = crate::nvram_set("detection_enable", "0").is_ok();
+        // Something that keeps turning it back on must not fill the flash log.
+        let quiet = self
+            .vendor_watchdog_logged
+            .is_some_and(|at| self.now.saturating_sub(at) < 3600);
+        if quiet {
+            return;
+        }
+        self.vendor_watchdog_logged = Some(self.now);
+        if done {
+            self.note(&format!(
+                "vendor ping watchdog: turned off in RAM for this boot (detection_enable was {was}); the keeper's deaf watchdog covers this unit"
+            ));
+        } else {
+            self.note("vendor ping watchdog: could not turn it off; two watchdogs may reboot this unit");
+        }
     }
 
     fn deaf_round(&mut self, heard: Option<bool>) {
@@ -1740,7 +1782,10 @@ impl Keeper {
         }
     }
 
-    fn publish(&self, report: &Report, detail: &str) {
+    /// The live report goes to RAM on every change. The web service reads the
+    /// flash copy, which is rewritten only when it differs, at most once a
+    /// minute; a change inside that minute lands when the minute is up.
+    fn publish(&mut self, report: &Report, detail: &str) {
         let mut report = report.clone();
         // Report::default() already carries "Keeper has not reported yet".
         // A caller that passes a real line must replace that placeholder.
@@ -1748,41 +1793,39 @@ impl Keeper {
         // IPv4 recovery still has useful actions to report when IPv6 is off.
         report.last_action = self.last_action.clone();
         report.last_action_at = self.last_action_at.to_string();
+        if self.status_ram.as_ref() != Some(&report) {
+            let _ = config::store_report(&crate::runtime().join("status.json"), &report);
+            self.status_ram = Some(report.clone());
+        }
+        let differs = self.status_flash.as_ref() != Some(&report);
+        if !self.status_gate.ready(self.now, differs) {
+            return;
+        }
         let path = state_dir().join("status.json");
-        if config::load_report(&path).as_ref() != Some(&report) {
-            let _ = config::store_report(&path, &report);
+        if config::load_report(&path).as_ref() == Some(&report) {
+            // Already there, for example after a keeper restart.
+            self.status_flash = Some(report);
+            return;
+        }
+        self.status_gate.wrote(self.now);
+        if config::store_report(&path, &report).is_ok() {
+            self.status_flash = Some(report);
         }
     }
 
     fn note(&mut self, line: &str) {
         // The loop is 200 ms. An unchanged failure must not fill the log, but a
-        // periodic advertisement and a real action are recorded every time.
-        let always = [
-            "periodic router advertisement",
-            "router solicitation",
-            "link drop",
-            "learned ",
-            "stopped answering",
-            "withdraw",
-            "DHCPv6",
-            "udhcpd",
-            "IPv4 router answered",
-            "SAS NAT",
-            "deaf watchdog",
-            "further router advertisements",
-            "without a new advertisement",
-        ]
-        .iter()
-        .any(|part| line.contains(part));
-        let repeat = line == self.last_logged && self.now.saturating_sub(self.last_logged_at) < 60;
-        if !repeat || always {
-            self.last_action_at = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            self.last_logged = line.to_owned();
-            self.last_logged_at = self.now;
-            log(line);
+        // real action is recorded every time. Routine lines stay in RAM.
+        match self.notes.route(line, self.now) {
+            Route::Ram => {
+                log_ram(line);
+                return;
+            }
+            Route::Flash => {
+                self.last_action_at = unix_now();
+                log(line);
+            }
+            Route::Skip => {}
         }
         self.last_action = line.to_owned();
     }
@@ -2737,6 +2780,11 @@ fn kernel_messages() -> String {
         }
     }
     command_stdout("dmesg", &[])
+}
+
+/// The vendor's RAM configuration cache.
+fn nvram_cache() -> PathBuf {
+    std::env::var_os("TITAN_NVRAM_CACHE").map_or_else(|| PathBuf::from("/tmp/nvram.cfg"), PathBuf::from)
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> String {
