@@ -305,7 +305,11 @@ pub fn read_cmd(addr: u32) -> String {
     format!("vm 0x{addr:08x} 4")
 }
 
+/// `wm 0x84f93008 0x140`. Zero goes out as `0`, the form the bench used.
 pub fn write_cmd(write: &Write) -> String {
+    if write.value == 0 {
+        return format!("wm 0x{:08x} 0", write.addr);
+    }
     format!("wm 0x{:08x} 0x{:x}", write.addr, write.value)
 }
 
@@ -923,6 +927,13 @@ mod tests {
             }
         );
         assert_eq!(write_cmd(&on[0]), "wm 0x84f93008 0x140");
+        assert_eq!(
+            write_cmd(&Write {
+                addr: FLAGS_ADDR,
+                value: 0
+            }),
+            "wm 0x847ed604 0"
+        );
         assert_eq!(read_cmd(FLAGS_ADDR), "vm 0x847ed604 4");
     }
 
@@ -1285,10 +1296,7 @@ mod tests {
             .map(String::as_str)
             .filter(|l| l.starts_with("wm "))
             .collect();
-        assert_eq!(
-            wm[wm.len() - 2..],
-            ["wm 0x847ed604 0x0", "wm 0x84f93008 0x0"]
-        );
+        assert_eq!(wm[wm.len() - 2..], ["wm 0x847ed604 0", "wm 0x84f93008 0"]);
     }
 
     #[test]

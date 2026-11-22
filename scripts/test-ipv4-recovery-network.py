@@ -600,7 +600,7 @@ for line in sys.stdin:
         Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\n')
         wait_for(lambda:dm_ram()=={str(0x84f93008):0,str(0x847ed604):0} and 'state=applied' in flags(),40)
         writes=[l for l in Path('/tmp/dm-log').read_text().splitlines() if l.startswith('wm ')]
-        assert writes[-2:]==['wm 0x847ed604 0x0','wm 0x84f93008 0x0'], writes
+        assert writes[-2:]==['wm 0x847ed604 0','wm 0x84f93008 0'], writes
         assert 'tk/config changed' in log(), log()
         print('PASS: removing the wm= lines wrote 0 to both words and read them back.',flush=True)
         # A modem firmware load in the kernel log starts the flags over.
