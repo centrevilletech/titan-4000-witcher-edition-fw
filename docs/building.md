@@ -61,9 +61,14 @@ Read [component provenance and licensing](../THIRD_PARTY.md) before distributing
 an image. The root GPL grant does not supply missing vendor redistribution
 rights or corresponding source for bundled binaries.
 
-The rootfs is at its size limit: v1.0.9 packed with 0 bytes to spare. The SQM
-tools (a static tc and two scheduler modules, about 720 KB) therefore stay out
+The rootfs is nearly full. The packed UBI image must fit 31,195,136 bytes.
+v1.0.9 had 0 to 131,072 bytes to spare (two CI builds of the same tree
+differed by one 128 KiB erase block). v1.0.10 re-encoded the login photo, which
+left about 786,432 bytes. The build log prints the figure (`UBI bytes ...
+slack ...`), and the build fails with `UBI size wrong` when it is negative.
+Keep at least one erase block of slack.
+
+The SQM tools (a static tc and two scheduler modules, about 720 KB) stay out
 of the image. They live in `device/sqm/payload` with pinned SHA-256 digests,
 and an operator stages them on a unit's persistent volume. See
-[radio profiles and SQM](radio-profiles.md). Any change that grows the rootfs
-needs space freed first; the build fails with `UBI size wrong` otherwise.
+[radio profiles and SQM](radio-profiles.md).
