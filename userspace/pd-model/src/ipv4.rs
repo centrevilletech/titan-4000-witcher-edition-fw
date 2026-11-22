@@ -394,6 +394,11 @@ pub fn restart_with_assignment(
     })
 }
 
+/// The offer a DHCP repair writes back.
+pub fn repair_text(current: &str, _last_good: Option<&str>, _bearer: Ipv4Addr) -> Option<String> {
+    Some(current.to_owned())
+}
+
 pub fn mac_text(mac: [u8; 6]) -> String {
     format!(
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -740,4 +745,22 @@ default via 172.20.64.151 dev lte0pdn1
         assert!(data_assignment(ASSIGNED, &ambiguous, "lte0pdn2").is_none());
     }
 
+    #[test]
+    fn a_dhcp_repair_never_writes_an_empty_or_partial_offer() {
+        let good = "start 172.20.64.152\nend 172.20.64.152\nmax_leases 8\ninterface br0:9\nremaining yes\noption subnet 255.255.255.240\noption router 172.20.64.151\noption lease 120\n";
+        let bearer = Ipv4Addr::new(172, 20, 64, 152);
+        assert_eq!(repair_text(good, None, bearer).as_deref(), Some(good));
+        // rcinit truncated the file and has not finished writing it.
+        assert_eq!(repair_text("", Some(good), bearer).as_deref(), Some(good));
+        assert_eq!(
+            repair_text("start 172.20.64.152\nend 172.2", Some(good), bearer).as_deref(),
+            Some(good)
+        );
+        assert_eq!(repair_text("", None, bearer), None);
+        // A LAN offer, or an offer for another bearer, is not this repair's to write.
+        let lan = "start 10.1.1.100\nend 10.1.1.200\ninterface br0\noption router 10.1.1.1\n";
+        assert_eq!(repair_text(lan, None, bearer), None);
+        assert_eq!(repair_text(lan, Some(good), bearer).as_deref(), Some(good));
+        assert_eq!(repair_text(good, None, Ipv4Addr::new(172, 20, 64, 153)), None);
+    }
 }

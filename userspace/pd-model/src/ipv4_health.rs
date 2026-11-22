@@ -12,6 +12,8 @@ use std::net::Ipv4Addr;
 pub const INTERVAL: u64 = 10;
 pub const TIMEOUT: u64 = 3;
 const MISSES: u8 = 3;
+/// Seconds the watch keeps a router's baseline while the caller cannot name it.
+pub const FORGET: u64 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -27,6 +29,15 @@ pub enum Action {
     Probe(Peer),
     RepairDhcp,
     Renegotiate,
+}
+
+/// What an ARP reply that armed the watch means for the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Armed {
+    /// The first baseline for this router since the keeper started.
+    First,
+    /// The same router armed again, after a cable or LTE outage.
+    Again,
 }
 
 #[derive(Default)]
@@ -89,19 +100,19 @@ impl Watch {
         self.misses = 0;
         self.repaired = false;
     }
-    pub fn reply(&mut self, now: u64, packet: &[u8], source_mac: [u8; 6]) -> bool {
+    pub fn reply(&mut self, now: u64, packet: &[u8], source_mac: [u8; 6]) -> Option<Armed> {
         let (Some(peer), Some(sent)) = (self.peer, self.pending) else {
-            return false;
+            return None;
         };
         if now.saturating_sub(sent) > TIMEOUT || source_mac != peer.mac || !is_reply(packet, peer) {
-            return false;
+            return None;
         }
         let first = !self.armed;
         self.pending = None;
         self.armed = true;
         self.misses = 0;
         self.repaired = false;
-        first
+        first.then_some(Armed::First)
     }
 }
 
@@ -246,7 +257,7 @@ mod tests {
         let mut w = Watch::default();
         assert_eq!(w.tick(0, Some(peer())), Action::Hold);
         assert_eq!(w.tick(10, Some(peer())), Action::Probe(peer()));
-        assert!(w.reply(11, &reply(peer()), peer().mac));
+        assert_eq!(w.reply(11, &reply(peer()), peer().mac), Some(Armed::First));
         w
     }
     #[test]
@@ -254,7 +265,7 @@ mod tests {
         let mut w = armed();
         for t in (20..10000).step_by(10) {
             assert_eq!(w.tick(t, Some(peer())), Action::Probe(peer()));
-            w.reply(t + 1, &reply(peer()), peer().mac);
+            assert_eq!(w.reply(t + 1, &reply(peer()), peer().mac), None);
         }
     }
     #[test]
@@ -285,6 +296,8 @@ mod tests {
         for t in 12..44 {
             w.tick(t, Some(peer()));
         }
+        // Cable or LTE down: the keeper resets the watch.
+        w.reset();
         assert_eq!(w.tick(44, None), Action::Hold);
         for t in 45..200 {
             assert!(matches!(
@@ -305,13 +318,13 @@ mod tests {
     fn wrong_late_or_unsolicited_replies_never_arm() {
         let mut w = Watch::default();
         w.tick(0, Some(peer()));
-        assert!(!w.reply(1, &reply(peer()), peer().mac));
+        assert_eq!(w.reply(1, &reply(peer()), peer().mac), None);
         w.tick(10, Some(peer()));
         let mut bad = reply(peer());
         bad[14] ^= 1;
-        assert!(!w.reply(11, &bad, peer().mac));
-        assert!(!w.reply(11, &reply(peer()), [2, 0, 0, 0, 0, 9]));
-        assert!(!w.reply(14, &reply(peer()), peer().mac));
+        assert_eq!(w.reply(11, &bad, peer().mac), None);
+        assert_eq!(w.reply(11, &reply(peer()), [2, 0, 0, 0, 0, 9]), None);
+        assert_eq!(w.reply(14, &reply(peer()), peer().mac), None);
     }
     #[test]
     fn send_failure_never_counts_as_peer_failure() {
@@ -396,5 +409,62 @@ mod tests {
         let mut big = Activity::default();
         big.sample(100, Some(u64::from(u32::MAX) + 7));
         assert_eq!(big.traffic(110, Some(3)), Traffic::Unknown, "a counter that went backwards");
+    }
+
+    #[test]
+    fn the_same_router_keeps_its_baseline_through_a_lease_file_gap() {
+        let mut w = armed();
+        // The Wi-Fi DHCP server writes its empty list over the shared lease
+        // file every 30 s, so for a moment the caller cannot name the router.
+        for t in 12..30 {
+            assert_eq!(w.tick(t, None), Action::Hold);
+        }
+        // The same router (address and MAC) comes back. The address the
+        // probe is sent from may have changed; that is not a new router.
+        let mut moved = peer();
+        moved.local_address = Ipv4Addr::new(10, 1, 1, 2);
+        let probe = (30..60).find_map(|t| match w.tick(t, Some(moved)) {
+            Action::Probe(p) => Some((t, p)),
+            _ => None,
+        });
+        let (t, p) = probe.expect("probes resume");
+        assert_eq!(p, moved);
+        assert_eq!(t, 30, "the probe that was due runs at once");
+        assert_eq!(
+            w.reply(t + 1, &reply(moved), moved.mac),
+            None,
+            "still armed: nothing new to log"
+        );
+    }
+
+    #[test]
+    fn a_router_armed_again_after_a_reset_is_not_news() {
+        let mut w = armed();
+        // An LTE outage.
+        w.reset();
+        assert_eq!(w.tick(100, Some(peer())), Action::Hold);
+        assert_eq!(w.tick(110, Some(peer())), Action::Probe(peer()));
+        assert_eq!(w.reply(111, &reply(peer()), peer().mac), Some(Armed::Again));
+        // A different router is news.
+        let mut other = peer();
+        other.mac[5] = 7;
+        assert_eq!(w.tick(200, Some(other)), Action::Hold);
+        assert_eq!(w.tick(210, Some(other)), Action::Probe(other));
+        assert_eq!(w.reply(211, &reply(other), other.mac), Some(Armed::First));
+    }
+
+    #[test]
+    fn a_router_gone_for_two_minutes_needs_a_new_baseline() {
+        let mut w = armed();
+        for t in 12..(12 + FORGET) {
+            assert_eq!(w.tick(t, None), Action::Hold);
+        }
+        // It comes back but never answers: no repair from the old baseline.
+        for t in (12 + FORGET)..(12 + FORGET + 600) {
+            assert!(matches!(
+                w.tick(t, Some(peer())),
+                Action::Hold | Action::Probe(_)
+            ));
+        }
     }
 }

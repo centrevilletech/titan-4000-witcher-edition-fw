@@ -149,7 +149,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn preserves_control_bodies_and_delegated_source_even_behind_extension_headers() {
+    fn preserves_control_bodies_and_dhcpv6() {
         let mut p = [0; 128];
         p[0] = 0x60;
         p[8..24].fill(0x44);
@@ -166,10 +166,29 @@ pub(crate) mod tests {
         p[6] = 17;
         p[42..44].copy_from_slice(&547u16.to_be_bytes());
         assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p);
-        p[42..44].fill(0);
+        // A renew to a unicast server address is captured the same way: the
+        // filter reads the port, never the destination.
+        p[24..40].fill(0x55);
+        assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p);
+    }
+
+    #[test]
+    fn bulk_ipv6_from_the_router_stays_in_the_kernel() {
+        // Upload data and download ACKs. Each one copied to the keeper cost a
+        // clone, a wakeup and a read: several percent of the CPU at 100 Mbps.
+        let mut p = [0; 128];
+        p[0] = 0x60;
+        p[8..24].fill(0x44);
         for next in [0, 6, 17, 44, 59] {
             p[6] = next;
-            assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p[..40]);
+            assert!(
+                captured(&p, libc::ETH_P_IPV6, false, false).is_empty(),
+                "next header {next}"
+            );
         }
+        // UDP to any other port, including the DHCPv6 client port.
+        p[6] = 17;
+        p[42..44].copy_from_slice(&546u16.to_be_bytes());
+        assert!(captured(&p, libc::ETH_P_IPV6, false, false).is_empty());
     }
 }

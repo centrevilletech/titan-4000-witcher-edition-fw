@@ -210,4 +210,26 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_re_attach_ends_the_pause() {
+        let mut watch = Watch::default();
+        let mut count = 0;
+        watch.tick(0, Some(count), true);
+        let mut gave_up = 0;
+        for now in 1..200 {
+            count += 3;
+            if watch.tick(now, Some(count), true) == Action::GiveUp {
+                gave_up = now;
+                break;
+            }
+        }
+        assert!(gave_up > 0);
+        // The bearer drops and comes back. A carrier change can leave the
+        // driver on the wrong MAC again, and the old pause must not hide it.
+        watch.tick(gave_up + 5, Some(count), false);
+        watch.tick(gave_up + 10, Some(count), true);
+        count += 5;
+        assert_eq!(watch.tick(gave_up + 11, Some(count), true), Action::Correct);
+    }
 }

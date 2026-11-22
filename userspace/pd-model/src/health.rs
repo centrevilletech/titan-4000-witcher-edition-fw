@@ -52,8 +52,16 @@ pub struct View {
     /// False only when a live bearer /56 is present and it is not the pin.
     pub prefix_ok: bool,
     pub serving: bool,
-    /// RS, DHCPv6, neighbour solicitation for us, or a packet from the delegated prefix.
+    /// RS, DHCPv6, neighbour solicitation for us, a packet from the delegated
+    /// prefix, a delegation still inside its lifetime, or a busy customer port.
     pub router_seen: bool,
+    /// The router has sent IPv6 (a solicitation, a neighbour probe or DHCPv6)
+    /// since it was last plugged in. A router that never speaks IPv6 gains
+    /// nothing from a responder restart or a link drop.
+    pub ipv6_router_heard: bool,
+    /// The customer port's receive counter shows an idle link. An unreadable
+    /// counter is not quiet: a link is never cut on a guess.
+    pub link_quiet: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +189,8 @@ mod tests {
             prefix_ok: true,
             serving: true,
             router_seen: false,
+            ipv6_router_heard: true,
+            link_quiet: true,
         }
     }
 
@@ -289,5 +299,91 @@ mod tests {
             Decision::LinkDrop { .. }
         ));
         assert_eq!(health.link_drops, 1);
+    }
+
+    #[test]
+    fn a_link_that_carries_traffic_is_never_dropped() {
+        let mut health = Health::default();
+        let busy = |now| View {
+            link_quiet: false,
+            ..view(now)
+        };
+        assert_eq!(health.tick(&busy(10)), Decision::Hold);
+        assert_eq!(health.tick(&busy(10 + SILENCE_SECS)), Decision::Reannounce);
+        assert_eq!(
+            health.tick(&busy(10 + SILENCE_SECS + REANNOUNCE_WAIT)),
+            Decision::Restart
+        );
+        for t in (10 + SILENCE_SECS + REANNOUNCE_WAIT + 1)..2000 {
+            assert_eq!(health.tick(&busy(t)), Decision::Hold, "{t}");
+        }
+        assert_eq!(health.link_drops, 0);
+        // The link goes quiet, and the step that was due runs.
+        assert_eq!(health.tick(&view(2000)), Decision::LinkDrop { repeats: 1 });
+    }
+
+    #[test]
+    fn a_router_that_never_spoke_ipv6_is_neither_restarted_nor_dropped() {
+        let mut health = Health::default();
+        let v4_only = |now| View {
+            ipv6_router_heard: false,
+            ..view(now)
+        };
+        assert_eq!(health.tick(&v4_only(0)), Decision::Hold);
+        assert_eq!(health.tick(&v4_only(SILENCE_SECS)), Decision::Reannounce);
+        for t in (SILENCE_SECS + 1)..5000 {
+            assert_eq!(health.tick(&v4_only(t)), Decision::Hold, "{t}");
+        }
+        assert_eq!(health.link_drops, 0);
+    }
+
+    #[test]
+    fn an_ipv4_link_recovery_leaves_the_ipv6_step_alone() {
+        let mut health = Health {
+            phase_since: 100,
+            ..Health::default()
+        };
+        assert_eq!(health.tick(&view(100)), Decision::Hold);
+        assert!(matches!(
+            health.request_link_recovery(105),
+            Decision::LinkDrop { .. }
+        ));
+        assert_eq!(health.link_drops, 1);
+        assert_eq!(health.phase, Phase::Idle);
+        // IPv6 silence still begins at the first step, not at a link drop.
+        assert_eq!(
+            health.tick(&view(100 + SILENCE_SECS)),
+            Decision::Reannounce
+        );
+    }
+
+    #[test]
+    fn an_outage_restarts_the_escalation_from_the_first_step() {
+        let mut health = Health {
+            phase_since: 100,
+            ..Health::default()
+        };
+        assert_eq!(health.tick(&view(100)), Decision::Hold);
+        assert_eq!(health.tick(&view(100 + SILENCE_SECS)), Decision::Reannounce);
+        assert_eq!(
+            health.tick(&view(100 + SILENCE_SECS + REANNOUNCE_WAIT)),
+            Decision::Restart
+        );
+        for t in 170..200 {
+            let down = View {
+                lte_up: false,
+                ..view(t)
+            };
+            assert_eq!(health.tick(&down), Decision::Hold);
+        }
+        assert_eq!(health.phase, Phase::Idle);
+        // LTE is back at 200. The restart step was due, but the escalation
+        // starts over: first a re-announce after the usual silence.
+        assert_eq!(health.tick(&view(200)), Decision::Hold);
+        assert_eq!(health.tick(&view(199 + RESTART_WAIT)), Decision::Hold);
+        assert_eq!(
+            health.tick(&view(199 + SILENCE_SECS)),
+            Decision::Reannounce
+        );
     }
 }

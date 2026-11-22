@@ -511,6 +511,8 @@ impl Keeper {
             prefix_ok: true,
             serving: self.serving,
             router_seen: self.router_seen || held,
+            ipv6_router_heard: true,
+            link_quiet: true,
         });
         self.router_seen = false;
         self.act(decision, block);
@@ -797,7 +799,7 @@ impl Keeper {
             if protocol == libc::ETH_P_ARP as u16 && !outgoing && addr.sll_halen >= 6 {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(&addr.sll_addr[..6]);
-                if self.ipv4_watch.reply(self.now, packet, mac) {
+                if self.ipv4_watch.reply(self.now, packet, mac).is_some() {
                     self.note("IPv4 router answered local ARP; automatic recovery is armed");
                 }
                 continue;
@@ -2812,6 +2814,41 @@ fn state_dir() -> PathBuf {
     titan_pd_model::config::default_state_dir()
 }
 
+/// Whether the customer bearer can carry delegated traffic.
+fn bearer_up(own_prefix: bool, _bridged: bool, carrier: bool) -> bool {
+    own_prefix && carrier
+}
+
+/// `nvram_get 0 router_disable`.
+fn vendor_passthrough(output: &str) -> Option<bool> {
+    Some(output.rsplit(':').next().unwrap_or("").trim() == "1")
+}
+
+/// A neighbour probe for fe80::1 from another router ends the delegation hold.
+fn probe_ends_delegation(_probe: Option<[u8; 6]>, _delegated: Option<[u8; 6]>) -> bool {
+    false
+}
+
+/// The DHCP discover the next plan may act on.
+fn take_discover(slot: &mut Option<[u8; 6]>, _cooldown_elapsed: bool) -> Option<[u8; 6]> {
+    slot.take()
+}
+
+/// A vendor log file, read from where the keeper left off.
+struct FileTail {
+    _path: PathBuf,
+}
+
+impl FileTail {
+    fn new(path: PathBuf) -> Self {
+        Self { _path: path }
+    }
+
+    fn lines(&mut self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2895,9 +2932,19 @@ mod tests {
         traffic[0] = 0x60;
         traffic[8..24].copy_from_slice(&block.delegated57().addr);
         traffic[23] = 1;
-        let traffic = crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false);
+        // Bulk IPv6 stays in the kernel; the port's receive counter stands in.
+        assert!(crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false).is_empty());
+        // ICMPv6 from the delegated prefix, a host behind the router answering
+        // a ping, is still captured and still counts.
+        let mut echo = vec![0u8; 48];
+        echo[0] = 0x60;
+        echo[6] = 58;
+        echo[8..24].copy_from_slice(&block.delegated57().addr);
+        echo[23] = 1;
+        echo[40] = 129;
+        let echo = crate::capture::tests::captured(&echo, libc::ETH_P_IPV6, false, false);
         assert!(matches!(
-            classify_ipv6(&traffic, Some(block.delegated57()), None),
+            classify_ipv6(&echo, Some(block.delegated57()), None),
             Class::DelegatedTraffic
         ));
         let mut solicit = vec![0u8; 48];
@@ -2996,5 +3043,72 @@ mod tests {
             dhcp_client_mac(&packet),
             Some([0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d])
         );
+    }
+
+    #[test]
+    fn the_bearer_stays_up_after_the_vendor_flushes_its_address() {
+        // Eighteen hours into a session the vendor SDK removes the bridged
+        // bearer's own global address, and it never comes back. The bearer
+        // still carries the delegated prefix.
+        assert!(bearer_up(false, true, true));
+        assert!(bearer_up(true, false, true));
+        assert!(bearer_up(true, true, true));
+        assert!(!bearer_up(true, true, false));
+        assert!(!bearer_up(false, false, true));
+    }
+
+    #[test]
+    fn an_unreadable_vendor_mode_keeps_the_last_one() {
+        assert_eq!(vendor_passthrough("nvram_get success: 1\n"), Some(true));
+        assert_eq!(vendor_passthrough("nvram_get success: 0\n"), Some(false));
+        assert_eq!(vendor_passthrough("nvram_get success: \n"), None);
+        assert_eq!(vendor_passthrough(""), None);
+        assert_eq!(vendor_passthrough("nvram_get failed\n"), None);
+    }
+
+    #[test]
+    fn a_probe_from_another_router_ends_the_delegation_hold() {
+        let delegated = [0x02, 0, 0, 0, 0, 0x0a];
+        let other = [0x02, 0, 0, 0, 0, 0x0b];
+        assert!(probe_ends_delegation(Some(other), Some(delegated)));
+        assert!(!probe_ends_delegation(Some(delegated), Some(delegated)));
+        assert!(!probe_ends_delegation(None, Some(delegated)));
+        assert!(!probe_ends_delegation(Some(other), None));
+    }
+
+    #[test]
+    fn a_discover_seen_during_the_dhcp_cooldown_waits_for_it() {
+        let mac = [0x02, 0, 0, 0, 0, 0x0b];
+        let mut slot = Some(mac);
+        assert_eq!(take_discover(&mut slot, false), None);
+        assert_eq!(slot, Some(mac));
+        assert_eq!(take_discover(&mut slot, true), Some(mac));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn a_vendor_log_is_followed_from_its_end_and_again_after_a_reset() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("witcher-tail-{}", std::process::id()));
+        fs::write(&path, " 4:00:00 >|service.c 500 >|   info >| CBRS LTE Freq changed !\n").unwrap();
+        let mut tail = FileTail::new(path.clone());
+        // What was there before the keeper started is history.
+        assert!(tail.lines().is_empty());
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, " 4:58:41 >|service.c 500 >|   info >| CBRS LTE").unwrap();
+        assert!(tail.lines().is_empty(), "half a line waits for the rest");
+        writeln!(file, " Freq changed !").unwrap();
+        assert_eq!(
+            tail.lines(),
+            vec![" 4:58:41 >|service.c 500 >|   info >| CBRS LTE Freq changed !".to_owned()]
+        );
+        assert!(tail.lines().is_empty());
+        // rcinit caps its log at 64 KB and then starts it again empty.
+        fs::write(&path, " 0:00:01 >|service.c 528 >|   info >| Restart service=[cbrs]\n").unwrap();
+        assert_eq!(
+            tail.lines(),
+            vec![" 0:00:01 >|service.c 528 >|   info >| Restart service=[cbrs]".to_owned()]
+        );
+        let _ = fs::remove_file(&path);
     }
 }
