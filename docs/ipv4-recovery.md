@@ -36,8 +36,39 @@ The local reachability monitor is enabled automatically in passthrough:
 This targets loss of local IPv4 reachability. It cannot detect every case in
 which a router still answers ARP but its internet forwarding is broken. It
 neither resets LTE nor reboots the Titan, and does not establish a fix for the
-modem's historical MAC latch. The current bearer selector retains the
-previously qualified 172.20.x.x customer-network assumption.
+modem's historical MAC latch.
+
+## Public data PDN offers
+
+Up to v1.0.7 the keeper found the customer address only by the private
+customer pool's prefix. A passthrough unit whose data PDN carries a public
+IPv4 address got no customer DHCP restart, and its IPv4 peer was never armed
+for the IPv6 driver-MAC repair. A router behind it kept its lease until the
+lease ran out, then lost its WAN address.
+
+Since v1.0.8, an offer outside the private pool and the LAN ranges qualifies
+only when all of this agrees:
+
+- The vendor snapshot `/tmp/nvram.cfg` has exactly one `pdn_data_ifname`,
+  `pdn_data_ipaddr`, `pdn_manage_ifname` and `pdn_manage_ipaddr`. The data and
+  management PDNs use different LTE interfaces and different addresses.
+- The data interface is the keeper's customer bearer, `eth0` is in `br0`, and
+  `br0` has exactly one LTE port.
+- The offer on disk is one address equal to the data address, on `br0` or
+  `br0:9`, with `remaining yes`, a nonzero lease, and a different usable
+  gateway in a contiguous subnet.
+- `ip route` has a direct host route for that address on `br0`, not via a
+  next hop and not `linkdown`. A SAS host route on `br0` cannot qualify.
+
+The keeper reads the snapshot at most once a second. A qualified offer is
+never rewritten. If the customer `udhcpd` is gone, the keeper reads the offer,
+the snapshot, the routes and the process list again, then starts `udhcpd` on
+the unchanged file. That line goes to `keeper.log`. Any disagreement means no
+action. A qualified lease also arms the existing driver-MAC repair. The PHY
+renegotiation in step 3 above stays off for public addresses, because it has
+not been qualified on them. Without the snapshot evidence, an offer outside
+the private pool gets only the v1.0.7 behavior: a DHCP request from a new
+router still releases the old lease.
 
 A renegotiation is a real PHY operation, but is not guaranteed to have the
 same effect as physically unplugging every router model. Reproducing the
