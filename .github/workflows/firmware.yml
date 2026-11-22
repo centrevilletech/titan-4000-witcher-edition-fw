@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      bench_candidate:
+        description: Keep the verified .prg of this ref as witcher-test-candidate (7 days) for a bench test
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -196,8 +201,10 @@ jobs:
             out/witcher.sha256
           retention-days: 14
 
+      # main always keeps it. Any other ref keeps it only from a manual run
+      # with bench_candidate set, so a branch can be bench-tested before merge.
       - name: Retain verified candidate for explicitly requested bench release
-        if: ${{ success() && github.ref == 'refs/heads/main' }}
+        if: ${{ success() && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.bench_candidate)) }}
         uses: actions/upload-artifact@v4
         with:
           name: witcher-test-candidate
