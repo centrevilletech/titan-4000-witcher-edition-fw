@@ -67,6 +67,7 @@ jobs:
           python3 scripts/test-rootfs-metadata.py
           python3 scripts/test-firstboot.py
           python3 scripts/test-bridge-trial.py
+          python3 scripts/test-patch-monitor.py
           (cd device/sqm/payload && sha256sum -c ../SHA256SUMS)
           bash -n device/sqm/source/rebuild.sh
           python3 -m compileall -q scripts
