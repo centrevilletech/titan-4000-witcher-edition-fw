@@ -274,6 +274,7 @@ failed update.
 | `titan-pd-keeper bank-guard status` | prints both views of the table, which copy the kernel would take, every record, the guard state and the `preflight` verdict, as JSON |
 | `titan-pd-keeper bank-guard preflight` | exit 0 to allow an update, 3 to refuse |
 | `titan-pd-keeper bank-guard arm` | after an update's write and before its reboot: arm the guard for the next boot |
+| `titan-pd-keeper bank-guard check 0` (or `1`) | read-only: runs the old-bank checks on that bank, exit 0 if they pass |
 | `titan-pd-keeper bank-guard boot` | the boot run, from the init script |
 
 Files under `/mnt/titan-api/bank-guard/`: `state.json` (counters, the

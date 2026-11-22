@@ -7,7 +7,7 @@
 //! management bearer, to check that the answer no longer reaches the vendor
 //! stack once the keeper has closed the bearer to advertisements.
 //! `bank-guard` is the boot confirm for a full firmware update: `boot` runs
-//! once per boot as its own process, `status`, `preflight` and `arm` are for
+//! once per boot as its own process, `status`, `preflight`, `arm` and `check` are for
 //! operators and updaters (see `bank_guard` and `docs/bank-guard.md`).
 
 use std::env;

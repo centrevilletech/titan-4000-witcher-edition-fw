@@ -558,6 +558,16 @@ class BankGuardBootFlow(unittest.TestCase):
         result = unit.keeper('preflight')
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIn('ok: an update may write bank 1', result.stdout)
+        for bank in ('0', '1'):
+            result = unit.keeper('check', bank)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(f'ok: bank {bank} passes', result.stdout)
+        data = bytearray((unit.root / 'dev/mtd18').read_bytes())
+        data[9] ^= 0x01
+        unit.write_bytes('dev/mtd18', bytes(data))
+        result = unit.keeper('check', '1')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('tk2: the flash does not match its record checksum', result.stdout)
         status = json.loads(unit.keeper('status').stdout)
         self.assertTrue(status['views_agree'])
         self.assertEqual((status['running_bank'], status['selected_bank']), (0, 0))

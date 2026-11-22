@@ -40,8 +40,9 @@ pub fn main(args: &[String]) -> i32 {
         Some("status") if args.len() == 1 => status(),
         Some("preflight") if args.len() == 1 => preflight(),
         Some("arm") if args.len() == 1 => arm(),
+        Some("check") if args.len() == 2 => check(&args[1]),
         _ => {
-            eprintln!("usage: titan-pd-keeper bank-guard boot|status|preflight|arm");
+            eprintln!("usage: titan-pd-keeper bank-guard boot|status|preflight|arm|check 0|1");
             64
         }
     }
@@ -892,6 +893,39 @@ fn arm() -> i32 {
     }
     println!("armed: the next boot of bank {selected} must prove itself or the guard switches back to bank {running}");
     0
+}
+
+/// Read-only: run the old-bank checks on one bank, as a switch would.
+fn check(bank: &str) -> i32 {
+    let bank = match bank {
+        "0" => 0,
+        "1" => 1,
+        _ => {
+            eprintln!("usage: titan-pd-keeper bank-guard check 0|1");
+            return 64;
+        }
+    };
+    let table = match agreed_table() {
+        Ok(table) => table,
+        Err(e) => {
+            println!("unknown: {e}");
+            return 1;
+        }
+    };
+    if let Some(problem) = (0..3).find_map(|part| table.record_problem(part, bank)) {
+        println!("fail: {problem}");
+        return 1;
+    }
+    match check_bank(&table, bank) {
+        Ok(()) => {
+            println!("ok: bank {bank} passes the checks a switch would run");
+            0
+        }
+        Err(e) => {
+            println!("fail: {e}");
+            1
+        }
+    }
 }
 
 fn preflight() -> i32 {
