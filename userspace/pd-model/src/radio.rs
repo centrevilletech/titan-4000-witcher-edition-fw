@@ -55,7 +55,19 @@ pub enum Action {
     Sqm {
         upload_kbit: u32,
         download_kbit: u32,
+        /// Stage 1 traffic classes (`sqm_classes`) on both CAKE qdiscs.
+        /// Absent means on. `false` keeps `diffserv4` CAKE with DSCP only.
+        #[serde(default = "classes_on", skip_serializing_if = "is_on")]
+        classify: bool,
     },
+}
+
+fn classes_on() -> bool {
+    true
+}
+
+fn is_on(value: &bool) -> bool {
+    *value
 }
 
 /// Shortest allowed spacing of enforcement cycles.
@@ -104,6 +116,7 @@ impl Profile {
                 Action::Sqm {
                     upload_kbit,
                     download_kbit,
+                    ..
                 } => (64..=50000).contains(upload_kbit) && (64..=250000).contains(download_kbit),
             };
             if !ok {
@@ -336,6 +349,7 @@ mod tests {
                 Action::Sqm {
                     upload_kbit: 9000,
                     download_kbit: 90000,
+                    classify: true,
                 },
             ],
         };
@@ -449,5 +463,30 @@ mod tests {
         assert_eq!(no(Gate { now: 6 * 3600 - 1, over_since: Some(0), ..ok }), "rate limit");
         assert_eq!(no(Gate { mode_grant: "0", ..ok }), "SAS grant not held");
         assert_eq!(no(Gate { grant_state: "1", ..ok }), "SAS grant not held");
+    }
+
+    #[test]
+    fn sqm_classes_default_on_and_can_be_turned_off() {
+        let on = parse_actions(serde_json::json!([{"kind":"sqm","upload_kbit":9000,"download_kbit":90000}]))
+            .unwrap();
+        assert_eq!(
+            on.actions[0],
+            Action::Sqm { upload_kbit: 9000, download_kbit: 90000, classify: true }
+        );
+        // A profile saved by an older version writes back byte for byte.
+        assert!(!serde_json::to_string(&on).unwrap().contains("classify"));
+        let off = parse_actions(
+            serde_json::json!([{"kind":"sqm","upload_kbit":9000,"download_kbit":90000,"classify":false}]),
+        )
+        .unwrap();
+        assert_eq!(
+            off.actions[0],
+            Action::Sqm { upload_kbit: 9000, download_kbit: 90000, classify: false }
+        );
+        assert_eq!(Profile::parse(&serde_json::to_vec(&off).unwrap()).unwrap(), off);
+        assert!(
+            parse_actions(serde_json::json!([{"kind":"sqm","upload_kbit":9000,"download_kbit":90000,"classify":"yes"}]))
+                .is_err()
+        );
     }
 }

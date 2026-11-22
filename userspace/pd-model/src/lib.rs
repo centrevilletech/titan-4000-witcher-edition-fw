@@ -22,6 +22,7 @@ pub mod prefix;
 pub mod ra;
 pub mod sas_nat;
 pub mod sha256;
+pub mod sqm_classes;
 
 pub use config::{Config, Report, load_config, shown_choice, store_config};
 pub use prefix::Block;
