@@ -1,4 +1,9 @@
 //! Classic BPF for a cooked packet socket. Offsets start at the network header.
+//!
+//! Inbound, the keeper reads ARP, DHCP to a server (UDP port 67), ICMPv6 and
+//! DHCPv6 to a server (UDP port 547). The DHCP checks read the port and never
+//! the destination address, so a unicast renew is read too. Nothing else is
+//! copied out of the kernel.
 use libc::sock_filter;
 use std::{io, mem};
 
@@ -72,8 +77,11 @@ fn program(sniff: bool) -> Vec<sock_filter> {
         op(LOAD_HALF, 42),
         equal(547, 0, 1),
         op(RETURN, 2048),
-        // Any next-header, including fragments, can prove delegated liveness.
-        op(RETURN, 40),
+        // Every other IPv6 frame stays in the kernel. Up to v1.0.12 each one
+        // was cut to 40 bytes and read here to prove the router alive, which
+        // cost a clone, a wakeup and a copy for every upload packet and
+        // download ACK. The port's receive counter now stands in for it.
+        op(RETURN, 0),
     ]);
     code
 }
@@ -149,7 +157,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn preserves_control_bodies_and_delegated_source_even_behind_extension_headers() {
+    fn preserves_control_bodies_and_dhcpv6() {
         let mut p = [0; 128];
         p[0] = 0x60;
         p[8..24].fill(0x44);
@@ -166,10 +174,29 @@ pub(crate) mod tests {
         p[6] = 17;
         p[42..44].copy_from_slice(&547u16.to_be_bytes());
         assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p);
-        p[42..44].fill(0);
+        // A renew to a unicast server address is captured the same way: the
+        // filter reads the port, never the destination.
+        p[24..40].fill(0x55);
+        assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p);
+    }
+
+    #[test]
+    fn bulk_ipv6_from_the_router_stays_in_the_kernel() {
+        // Upload data and download ACKs. Each one copied to the keeper cost a
+        // clone, a wakeup and a read: several percent of the CPU at 100 Mbps.
+        let mut p = [0; 128];
+        p[0] = 0x60;
+        p[8..24].fill(0x44);
         for next in [0, 6, 17, 44, 59] {
             p[6] = next;
-            assert_eq!(captured(&p, libc::ETH_P_IPV6, false, false), p[..40]);
+            assert!(
+                captured(&p, libc::ETH_P_IPV6, false, false).is_empty(),
+                "next header {next}"
+            );
         }
+        // UDP to any other port, including the DHCPv6 client port.
+        p[6] = 17;
+        p[42..44].copy_from_slice(&546u16.to_be_bytes());
+        assert!(captured(&p, libc::ETH_P_IPV6, false, false).is_empty());
     }
 }

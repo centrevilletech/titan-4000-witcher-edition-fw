@@ -116,8 +116,11 @@ impl Watch {
                 self.dev = Some(dev);
             }
             Event::Cleared => {
+                // The kernel confirmed the clear. A later set is a new event,
+                // not a repair that failed, so it does not wait out `RETRY`.
                 self.dev = None;
                 self.since = None;
+                self.retry_at = 0;
             }
         }
     }
@@ -339,5 +342,25 @@ mod tests {
         assert!(!is_lte_bearer("lte0pdn"));
         assert!(!is_lte_bearer("lte0pdn2x"));
         assert!(!is_lte_bearer("lte0pdn123"));
+    }
+
+    #[test]
+    fn a_second_set_after_a_clear_is_repaired_without_waiting_out_the_retry() {
+        let mut watch = Watch::default();
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(100, true, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(
+            watch.decide(100 + SETTLED_GRACE, true, true, "lte0pdn2"),
+            Action::Repair("lte0pdn0".into())
+        );
+        // The kernel confirms the repair, then a second advertisement sets it
+        // again before the keeper closes the bearer to them.
+        watch.note(Event::Cleared);
+        watch.note(Event::Set("lte0pdn0".into()));
+        assert_eq!(watch.decide(102, true, true, "lte0pdn2"), Action::Hold);
+        assert_eq!(
+            watch.decide(102 + SETTLED_GRACE, true, true, "lte0pdn2"),
+            Action::Repair("lte0pdn0".into())
+        );
     }
 }

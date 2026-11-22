@@ -37,7 +37,7 @@ use titan_pd_model::extdev::{self, Action as ExtAction};
 use titan_pd_model::filter;
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
 use titan_pd_model::ipv4::{self, Ipv4Plan};
-use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Peer, Traffic};
+use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Armed, Peer, Traffic};
 use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
@@ -61,6 +61,11 @@ const FLOOD_INTERVAL: u64 = 30;
 /// Seconds the IPv4 check keeps its router through an unreadable lease file.
 const PEER_HOLD: u64 = 8;
 const MGMT_EVERY: u64 = 10;
+/// Seconds between two samples of eth0's receive counter for IPv6 health.
+const LINK_SAMPLE: u64 = 5;
+/// eth0 down this long may be a router swap: the old router's IPv6 history
+/// and delegation hold no longer apply. Our own renegotiation is shorter.
+const ROUTER_SWAP_SECS: u64 = 10;
 const MGMT_LOG_EVERY: u64 = 60;
 /// A plain `reboot` that has not ended this process after this long is forced.
 const REBOOT_FORCE_AFTER: u64 = 45;
@@ -111,11 +116,27 @@ struct Keeper {
     solicit_pending: bool,
     discover: Option<[u8; 6]>,
     router_mac: String,
-    /// Ethernet source we last handed a prefix, and the unix time of that reply.
-    /// A later neighbour probe for fe80::1 from this MAC is the router staying
-    /// up. A probe from anyone else is the stuck-prefix case and does not count.
+    /// Ethernet source we last handed a prefix, and the monotonic time of that
+    /// reply. A later neighbour probe for fe80::1 from this MAC is the router
+    /// staying up. A probe from anyone else is the stuck-prefix case: it does
+    /// not count, and it ends this hold. Up to v1.0.12 this was the wall clock,
+    /// so the NTP step at boot (2013 to 2026) ended a fresh hold at once.
     delegated_mac: Option<[u8; 6]>,
     delegated_at: u64,
+    /// The customer port's receive counter, sampled every `LINK_SAMPLE` s for
+    /// the IPv6 health check. Bulk IPv6 is no longer read from the port.
+    link_rx: ipv4_health::Activity,
+    link_rx_at: Option<u64>,
+    /// The MAC of the last IPv6 control packet from the router (solicitation,
+    /// neighbour probe or DHCPv6). Forgotten when eth0 stays down long enough
+    /// for a router swap.
+    ipv6_router: Option<[u8; 6]>,
+    eth0_down_since: Option<u64>,
+    /// The last DHCP offer that named the IPv4 router, for a repair.
+    ipv4_conf_good: Option<String>,
+    /// `rcinit`'s log, for the lines that come right before a firewall restart.
+    rcinit_log: FileTail,
+    rcinit_read_at: Option<u64>,
     last_action: String,
     last_action_at: u64,
     logged_idle: bool,
@@ -314,6 +335,16 @@ impl Keeper {
             router_mac: String::new(),
             delegated_mac: None,
             delegated_at: 0,
+            link_rx: ipv4_health::Activity::default(),
+            link_rx_at: None,
+            ipv6_router: None,
+            eth0_down_since: None,
+            ipv4_conf_good: None,
+            rcinit_log: FileTail::new(
+                std::env::var_os("TITAN_RCINIT_LOG")
+                    .map_or_else(|| PathBuf::from("/tmp/rcinit.log"), PathBuf::from),
+            ),
+            rcinit_read_at: None,
             last_action: String::new(),
             last_action_at: 0,
             logged_idle: false,
@@ -484,7 +515,11 @@ impl Keeper {
         }
 
         let carrier = carrier_up(CUSTOMER);
-        let lte = live.is_some() && carrier_up(&bearer);
+        self.note_eth0_carrier(carrier);
+        // After 18 h the vendor SDK removes the bridged bearer's own address
+        // for the rest of the session. Bridged with carrier, it still carries
+        // the delegated prefix.
+        let lte = bearer_up(live.is_some(), self.bridged, carrier_up(&bearer));
         if !self.serving && self.now >= self.serve_retry_at {
             if let Err(err) = self.start_serving(block) {
                 self.serve_retry_at = self.now + SERVE_RETRY;
@@ -502,18 +537,39 @@ impl Keeper {
         // gap is not a failure and must not drop the Ethernet link.
         let held = delegation_current(
             self.delegated_mac.map(|mac| (mac, self.delegated_at)),
-            unix_now(),
+            self.now,
         );
+        // Frames from the router stand in for the bulk IPv6 the port filter
+        // no longer copies out, and a busy link is never dropped.
+        let rx = rx_packets(CUSTOMER);
+        if self
+            .link_rx_at
+            .is_none_or(|at| self.now.saturating_sub(at) >= LINK_SAMPLE)
+        {
+            self.link_rx.sample(self.now, rx);
+            self.link_rx_at = Some(self.now);
+        }
+        let traffic = self.link_rx.traffic(self.now, rx);
+        let busy = matches!(traffic, Traffic::Busy { .. });
+        let before = self.health.clone();
         let decision = self.health.tick(&View {
             now: self.now,
             carrier_up: carrier,
             lte_up: lte,
             prefix_ok: true,
             serving: self.serving,
-            router_seen: self.router_seen || held,
+            router_seen: self.router_seen || held || busy,
+            ipv6_router_heard: self.ipv6_router.is_some(),
+            link_quiet: traffic == Traffic::Quiet,
         });
         self.router_seen = false;
-        self.act(decision, block);
+        if matches!(decision, Decision::LinkDrop { .. }) && !self.save_budget() {
+            // Spend nothing that could not be recorded.
+            self.health = before;
+            self.note("Ethernet recovery skipped: cannot persist the shared action budget");
+        } else {
+            self.act(decision, block);
+        }
         self.save_budget();
         let recent = self.now.saturating_sub(self.last_router) < health::SILENCE_SECS
             || self.now.saturating_sub(self.health.phase_since) < health::SILENCE_SECS;
@@ -551,11 +607,7 @@ impl Keeper {
                 }
             }
             Decision::LinkDrop { repeats } => {
-                if !self.save_budget() {
-                    self.note("Ethernet recovery skipped: cannot persist the shared action budget");
-                    return;
-                }
-                // `ip link set eth0 down` does not make this router solicit.
+                // The caller saved the budget first. `ip link set eth0 down` does not make this router solicit.
                 // A burst of renegotiations left it silent. One does, and the
                 // solicitation is answered in this same loop. `repeats` is the
                 // budget step (1, then 8, then 20), not a repeat count.
@@ -722,6 +774,10 @@ impl Keeper {
             if event.outgoing {
                 continue;
             }
+            // Any IPv6 the router sends us shows it speaks IPv6.
+            if !matches!(event.kind, Class::Other | Class::RouterAdvertisement { .. }) {
+                self.ipv6_router = event.source_mac.or(self.ipv6_router);
+            }
             match event.kind {
                 Class::RouterSolicit => {
                     self.router_seen = true;
@@ -736,11 +792,16 @@ impl Keeper {
                     if probe_keeps_delegation(
                         source_mac,
                         self.delegated_mac.map(|mac| (mac, self.delegated_at)),
-                        unix_now(),
+                        self.now,
                     ) {
                         self.router_seen = true;
                         self.last_router = self.now;
                         self.note("router is probing fe80::1 and its delegation is still current");
+                    } else if probe_ends_delegation(source_mac, self.delegated_mac) {
+                        // Another router, with no prefix, is on the port. The
+                        // old delegation must not keep the health check quiet.
+                        self.delegated_mac = None;
+                        self.note("a router with no delegation is probing fe80::1; the earlier delegation no longer holds the health check");
                     }
                 }
                 Class::DhcpV6 {
@@ -797,8 +858,16 @@ impl Keeper {
             if protocol == libc::ETH_P_ARP as u16 && !outgoing && addr.sll_halen >= 6 {
                 let mut mac = [0u8; 6];
                 mac.copy_from_slice(&addr.sll_addr[..6]);
-                if self.ipv4_watch.reply(self.now, packet, mac) {
-                    self.note("IPv4 router answered local ARP; automatic recovery is armed");
+                match self.ipv4_watch.reply(self.now, packet, mac) {
+                    Some(Armed::First) => {
+                        self.note("IPv4 router answered local ARP; automatic recovery is armed")
+                    }
+                    // The same router after a cable or LTE outage: routine,
+                    // so the RAM log only.
+                    Some(Armed::Again) => log_ram(
+                        "IPv4 router answered local ARP again; automatic recovery is armed",
+                    ),
+                    None => {}
                 }
                 continue;
             }
@@ -819,6 +888,7 @@ impl Keeper {
                 mac.copy_from_slice(&addr.sll_addr[..6]);
                 mac
             });
+            let source_mac = (!outgoing).then_some(mac).flatten();
             match kind {
                 Class::DhcpV6 {
                     source, payload, ..
@@ -834,7 +904,11 @@ impl Keeper {
                 }
                 _ => {}
             }
-            events.push(Event { kind, outgoing });
+            events.push(Event {
+                kind,
+                outgoing,
+                source_mac,
+            });
         }
         events
     }
@@ -854,7 +928,7 @@ impl Keeper {
         };
         let packet = udp_packet(src, source, &reply);
         self.delegated_mac = Some(mac);
-        self.delegated_at = unix_now();
+        self.delegated_at = self.now;
         self.router_mac = ipv4::mac_text(mac);
         self.save_delegation();
         self.send_raw(mac, &packet, "DHCPv6 reply from the pinned block");
@@ -916,7 +990,6 @@ impl Keeper {
         }
         let conf = read_file("/tmp/udhcpd.conf");
         let lease = fs::read("/tmp/udhcpd.leases").unwrap_or_default();
-        let discover = self.discover.take();
         // Every DHCP change waits out a cooldown, including repeated vendor
         // rewrites, so a broken server cannot become a restart storm. Stopping
         // a LAN offer has its own clock: it must not delay the offer for a
@@ -925,6 +998,8 @@ impl Keeper {
         if !self.dhcp_gate.any_ready(self.now) {
             return;
         }
+        // A new router's discover seen during the cooldown waits for it.
+        let discover = take_discover(&mut self.discover, cooldown);
         let bearer = self.bearer.clone();
         let external = ipv4::parse_conf(&conf).is_some_and(|offer| ipv4::needs_assignment(offer.start));
         let assigned = self.assigned_address(external);
@@ -986,7 +1061,16 @@ impl Keeper {
             return;
         }
         if let Some(text) = &plan.rewrite {
-            if fs::write("/tmp/udhcpd.conf", text).is_err() {
+            // Never an empty or unreadable offer: udhcpd would not start, and
+            // nothing could rebuild it from that file.
+            if ipv4::parse_conf(text).is_none() {
+                self.note("did not rewrite /tmp/udhcpd.conf: the new offer is empty or unreadable");
+                return;
+            }
+            // Whole or not at all, so no reader sees half a file.
+            let temporary = "/tmp/udhcpd.conf.witcher";
+            if fs::write(temporary, text).is_err() || fs::rename(temporary, "/tmp/udhcpd.conf").is_err() {
+                let _ = fs::remove_file(temporary);
                 self.note("could not rewrite /tmp/udhcpd.conf");
                 return;
             }
@@ -1015,6 +1099,10 @@ impl Keeper {
         let bearer = self.bearer.clone();
         let conf_text = read_file("/tmp/udhcpd.conf");
         let links_up = carrier_up(CUSTOMER) && carrier_up(&bearer);
+        if !links_up {
+            // A cable or LTE outage: the router needs a new baseline after it.
+            self.ipv4_watch.reset();
+        }
         let mut gateway = None;
         let mut hold_previous = self.ipv4_peer
             .is_none_or(|(peer, _)| !ipv4::needs_assignment(peer.address));
@@ -1065,6 +1153,7 @@ impl Keeper {
             Some(peer) => {
                 self.ipv4_peer = Some((peer, self.now));
                 self.ipv4_gateway = gateway;
+                self.ipv4_conf_good = Some(conf_text.clone());
                 Some(peer)
             }
             None if links_up && hold_previous => self
@@ -1096,15 +1185,25 @@ impl Keeper {
             }
             Ipv4Action::RepairDhcp => {
                 self.note("IPv4 router missed three local ARP checks with LTE and Ethernet up; repairing DHCP first");
-                if self.dhcp_gate.restart_ready(self.now) {
-                    self.apply_ipv4(&Ipv4Plan {
-                        stop_lan_offer: false,
-                        rewrite: Some(conf_text),
-                        clear_lease: false,
-                        reason:
-                            "refreshing the current DHCP offer after local IPv4 reachability failed"
-                                .into(),
-                    });
+                // The router may be held through an unreadable offer, for
+                // example while rcinit rewrites the file. Write back the whole
+                // offer last read for this router, never what is there now.
+                let text = phy_peer.and_then(|peer| {
+                    ipv4::repair_text(&conf_text, self.ipv4_conf_good.as_deref(), peer.address)
+                });
+                match text {
+                    Some(text) if self.dhcp_gate.restart_ready(self.now) => {
+                        self.apply_ipv4(&Ipv4Plan {
+                            stop_lan_offer: false,
+                            rewrite: Some(text),
+                            clear_lease: false,
+                            reason:
+                                "refreshing the current DHCP offer after local IPv4 reachability failed"
+                                    .into(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => self.note("DHCP repair skipped: no whole offer for this router to write back"),
                 }
             }
             Ipv4Action::Renegotiate => {
@@ -1121,10 +1220,12 @@ impl Keeper {
                         return;
                     }
                 }
+                let before = self.health.clone();
                 let decision = self.health.request_link_recovery(self.now);
                 // Persist before touching the link; a supervisor restart must
                 // not erase the shared IPv4/IPv6 action budget.
                 if !self.save_budget() {
+                    self.health = before;
                     self.note("IPv4 link recovery skipped: cannot persist the action budget");
                     return;
                 }
@@ -1199,9 +1300,11 @@ impl Keeper {
 
     /// Keep the vendor SNAT rule for the unit's own SAS traffic. A vendor
     /// firewall restart after a handover removes it, and in this build nothing
-    /// else puts it back. Restores only after two missing checks in a row,
-    /// checked every 10 s, or every second for 30 s after a PDN comes up.
+    /// else puts it back. Restores only after missing checks in a row, checked
+    /// every 10 s, or every second for 30 s after a PDN comes up, a vendor log
+    /// line that comes before a firewall restart, or any missing check.
     fn maintain_sas_nat(&mut self, routes: &str) {
+        self.follow_rcinit_log();
         let interval = self.sas_watch.interval(self.now);
         if self
             .last_sas_check
@@ -1221,14 +1324,13 @@ impl Keeper {
                 snat,
             )
         });
-        let burst = self.sas_watch.bursting(self.now);
         let SasAction::Restore(snat) = self.sas_watch.observe(self.now, snat, present) else {
             return;
         };
-        let when = if burst {
-            "missing for 2 s right after a PDN came up"
+        let when = if self.sas_watch.bursting(self.now) {
+            "missing for 2 s in a row"
         } else {
-            "missing twice after a vendor firewall restart"
+            "missing twice in a row"
         };
         self.note(&format!(
             "SAS NAT rule {when}; restoring SNAT from {} to {} so the SAS client can reach the SAS",
@@ -1244,7 +1346,38 @@ impl Keeper {
                 return;
             }
         }
-        self.note("SAS NAT rule restored");
+        // Read it back at once. rcinit can flush the table again within a
+        // second, before the next check; a restore seen working may repeat
+        // after 5 s instead of waiting a minute.
+        let back = sas_nat::present(
+            &command_stdout("iptables", &["-t", "nat", "-S", "POSTROUTING"]),
+            snat,
+        );
+        if back == Some(true) {
+            self.sas_watch.confirm();
+            self.note("SAS NAT rule restored");
+        } else {
+            self.note("SAS NAT rule restored, but it was not in the table when read back");
+        }
+    }
+
+    /// `rcinit` logs `CBRS LTE Freq changed !` (an in-connection carrier
+    /// change) or `Restart service=[cbrs]` just before it rebuilds its
+    /// firewall and flushes the SAS SNAT rule. Neither PDN goes down, so the
+    /// kernel log has no line for it. Read once a second.
+    fn follow_rcinit_log(&mut self) {
+        if self.rcinit_read_at == Some(self.now) {
+            return;
+        }
+        self.rcinit_read_at = Some(self.now);
+        if self
+            .rcinit_log
+            .lines()
+            .iter()
+            .any(|line| sas_nat::firewall_restart(line))
+        {
+            self.sas_watch.burst(self.now);
+        }
     }
 
     /// Which bearer carries the customer, and whether it is bridged to the
@@ -1281,8 +1414,11 @@ impl Keeper {
             return;
         }
         self.mode_checked = Some(self.now);
-        let mode = command_stdout("nvram_get", &["0", "router_disable"]);
-        self.passthrough = mode.rsplit(':').next().unwrap_or("").trim() == "1";
+        // A failed or empty read keeps the last mode. Taking it for NAT stopped
+        // the responder and removed the port filter, and the SQM under it.
+        if let Some(mode) = vendor_passthrough(&command_stdout("nvram_get", &["0", "router_disable"])) {
+            self.passthrough = mode;
+        }
         let named = command_stdout("nvram_get", &["0", "pdn_data_ifname"]);
         let named = named.rsplit(':').next().unwrap_or("").trim();
         if extdev::is_lte_bearer(named) {
@@ -1302,8 +1438,15 @@ impl Keeper {
             if let Some(event) = extdev::parse(&line) {
                 self.ext_watch.note(event);
             }
-            if sas_nat::pdn_up(&line).is_some() {
-                self.sas_watch.burst(self.now);
+            match sas_nat::pdn_up(&line) {
+                Some(dev) if dev == mgmt::MGMT_DEV => {
+                    self.sas_watch.burst(self.now);
+                    // Bring management IPv6 up on this tick, not up to 10 s later.
+                    self.last_mgmt = 0;
+                }
+                Some(_) => self.sas_watch.burst(self.now),
+                None if sas_nat::firewall_restart(&line) => self.sas_watch.burst(self.now),
+                None => {}
             }
             if let Some(efc) = ethernet::efc(&line) {
                 self.flow_report(efc);
@@ -1321,6 +1464,9 @@ impl Keeper {
                 "external device guard: the vendor kernel left {dev} as its external device in IP passthrough; clearing it and restoring the bearer's own MAC"
             ));
             self.repair_external_dev(&dev);
+            // Close the management bearer to advertisements now, so a second
+            // one cannot set the external device again before the next check.
+            self.last_mgmt = 0;
         }
     }
 
@@ -1543,6 +1689,9 @@ impl Keeper {
             DeafAction::ClearStrikes => {
                 if store_strikes(&path, 0) {
                     self.note("deaf watchdog: an hour of answers; earlier reboots are forgotten");
+                } else {
+                    // Ask again next round rather than keep the old count all boot.
+                    self.deaf_watch.clear_failed();
                 }
             }
             DeafAction::Reboot { silent_for } => {
@@ -1830,14 +1979,29 @@ impl Keeper {
         self.last_action = line.to_owned();
     }
 
+    /// eth0 down long enough for a router swap: the old router's IPv6 history
+    /// and delegation hold no longer apply. Our own renegotiation is shorter.
+    fn note_eth0_carrier(&mut self, carrier: bool) {
+        if carrier {
+            self.eth0_down_since = None;
+            return;
+        }
+        let since = *self.eth0_down_since.get_or_insert(self.now);
+        if self.now.saturating_sub(since) >= ROUTER_SWAP_SECS {
+            self.ipv6_router = None;
+            self.delegated_mac = None;
+        }
+    }
+
+    /// The router named in the status after a restart. The saved time is
+    /// wall-clock and says nothing this boot's monotonic clock can use, so no
+    /// delegation hold comes back: the router's next DHCPv6 makes a new one.
     fn load_delegation(&mut self) {
-        let Some((mac, at)) = parse_delegation(&read_file(
+        let Some((mac, _at)) = parse_delegation(&read_file(
             &state_dir().join("router.txt").to_string_lossy(),
         )) else {
             return;
         };
-        self.delegated_mac = Some(mac);
-        self.delegated_at = at;
         self.router_mac = ipv4::mac_text(mac);
     }
 
@@ -1846,7 +2010,8 @@ impl Keeper {
             return;
         };
         let path = state_dir().join("router.txt");
-        let text = format_delegation(mac, self.delegated_at);
+        // The wall-clock time, for a person reading the file.
+        let text = format_delegation(mac, unix_now());
         if read_file(&path.to_string_lossy()) != text {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
@@ -1994,6 +2159,8 @@ fn ipv4_routes(text: &str) -> String {
 struct Event {
     kind: Class,
     outgoing: bool,
+    /// The Ethernet source of an inbound frame.
+    source_mac: Option<[u8; 6]>,
 }
 
 #[derive(Default)]
@@ -2812,6 +2979,108 @@ fn state_dir() -> PathBuf {
     titan_pd_model::config::default_state_dir()
 }
 
+/// Whether the customer bearer can carry delegated traffic: carrier, and
+/// either its own global address or a place in the LAN bridge. The vendor
+/// SDK removes a bridged bearer's own address after 18 h and it never comes
+/// back in that session; up to v1.0.12 that turned IPv6 health off.
+fn bearer_up(own_prefix: bool, bridged: bool, carrier: bool) -> bool {
+    carrier && (own_prefix || bridged)
+}
+
+/// `nvram_get 0 router_disable`: `Some(true)` for passthrough, `Some(false)`
+/// for NAT, `None` for a failed or empty read.
+fn vendor_passthrough(output: &str) -> Option<bool> {
+    if !output.contains(':') {
+        return None;
+    }
+    match output.rsplit(':').next().unwrap_or("").trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// A neighbour probe for fe80::1 from a router other than the one we
+/// delegated to: that router has no prefix (the stuck-prefix case), and the
+/// earlier delegation must not keep the health check quiet for two hours.
+fn probe_ends_delegation(probe: Option<[u8; 6]>, delegated: Option<[u8; 6]>) -> bool {
+    matches!((probe, delegated), (Some(probe), Some(mac)) if probe != mac)
+}
+
+/// The DHCP discover the next plan may act on. During the cooldown it stays
+/// in the slot: taking it then lost a new router's discover.
+fn take_discover(slot: &mut Option<[u8; 6]>, cooldown_elapsed: bool) -> Option<[u8; 6]> {
+    if cooldown_elapsed { slot.take() } else { None }
+}
+
+/// Bytes read from a vendor log per call, so a large backlog cannot stall a tick.
+const TAIL_READ: u64 = 64 * 1024;
+
+/// A vendor log file, read from where the keeper left off. Lines already in
+/// the file when it is first opened are history and are skipped. `rcinit`
+/// caps its log at 64 KB and then starts it again empty, so a file shorter
+/// than the offset is read from the start.
+struct FileTail {
+    path: PathBuf,
+    offset: Option<u64>,
+    pending: Vec<u8>,
+}
+
+impl FileTail {
+    fn new(path: PathBuf) -> Self {
+        let mut tail = Self {
+            path,
+            offset: None,
+            pending: Vec::new(),
+        };
+        let _ = tail.lines();
+        tail
+    }
+
+    /// Complete lines added since the last call.
+    fn lines(&mut self) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = fs::File::open(&self.path) else {
+            return Vec::new();
+        };
+        let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+            return Vec::new();
+        };
+        let start = match self.offset {
+            None => {
+                self.offset = Some(len);
+                return Vec::new();
+            }
+            Some(at) if len < at => {
+                self.pending.clear();
+                0
+            }
+            Some(at) => at,
+        };
+        if len == start {
+            self.offset = Some(len);
+            return Vec::new();
+        }
+        let mut chunk = Vec::new();
+        if file.seek(SeekFrom::Start(start)).is_err()
+            || (&mut file).take(TAIL_READ).read_to_end(&mut chunk).is_err()
+        {
+            return Vec::new();
+        }
+        self.offset = Some(start + chunk.len() as u64);
+        self.pending.extend_from_slice(&chunk);
+        let mut lines = Vec::new();
+        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            lines.push(String::from_utf8_lossy(&line).trim_end().to_owned());
+        }
+        if self.pending.len() > 16 * 1024 {
+            self.pending.clear();
+        }
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2895,9 +3164,19 @@ mod tests {
         traffic[0] = 0x60;
         traffic[8..24].copy_from_slice(&block.delegated57().addr);
         traffic[23] = 1;
-        let traffic = crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false);
+        // Bulk IPv6 stays in the kernel; the port's receive counter stands in.
+        assert!(crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false).is_empty());
+        // ICMPv6 from the delegated prefix, a host behind the router answering
+        // a ping, is still captured and still counts.
+        let mut echo = vec![0u8; 48];
+        echo[0] = 0x60;
+        echo[6] = 58;
+        echo[8..24].copy_from_slice(&block.delegated57().addr);
+        echo[23] = 1;
+        echo[40] = 129;
+        let echo = crate::capture::tests::captured(&echo, libc::ETH_P_IPV6, false, false);
         assert!(matches!(
-            classify_ipv6(&traffic, Some(block.delegated57()), None),
+            classify_ipv6(&echo, Some(block.delegated57()), None),
             Class::DelegatedTraffic
         ));
         let mut solicit = vec![0u8; 48];
@@ -2996,5 +3275,72 @@ mod tests {
             dhcp_client_mac(&packet),
             Some([0x24, 0x2f, 0xd0, 0xb8, 0xf1, 0x9d])
         );
+    }
+
+    #[test]
+    fn the_bearer_stays_up_after_the_vendor_flushes_its_address() {
+        // Eighteen hours into a session the vendor SDK removes the bridged
+        // bearer's own global address, and it never comes back. The bearer
+        // still carries the delegated prefix.
+        assert!(bearer_up(false, true, true));
+        assert!(bearer_up(true, false, true));
+        assert!(bearer_up(true, true, true));
+        assert!(!bearer_up(true, true, false));
+        assert!(!bearer_up(false, false, true));
+    }
+
+    #[test]
+    fn an_unreadable_vendor_mode_keeps_the_last_one() {
+        assert_eq!(vendor_passthrough("nvram_get success: 1\n"), Some(true));
+        assert_eq!(vendor_passthrough("nvram_get success: 0\n"), Some(false));
+        assert_eq!(vendor_passthrough("nvram_get success: \n"), None);
+        assert_eq!(vendor_passthrough(""), None);
+        assert_eq!(vendor_passthrough("nvram_get failed\n"), None);
+    }
+
+    #[test]
+    fn a_probe_from_another_router_ends_the_delegation_hold() {
+        let delegated = [0x02, 0, 0, 0, 0, 0x0a];
+        let other = [0x02, 0, 0, 0, 0, 0x0b];
+        assert!(probe_ends_delegation(Some(other), Some(delegated)));
+        assert!(!probe_ends_delegation(Some(delegated), Some(delegated)));
+        assert!(!probe_ends_delegation(None, Some(delegated)));
+        assert!(!probe_ends_delegation(Some(other), None));
+    }
+
+    #[test]
+    fn a_discover_seen_during_the_dhcp_cooldown_waits_for_it() {
+        let mac = [0x02, 0, 0, 0, 0, 0x0b];
+        let mut slot = Some(mac);
+        assert_eq!(take_discover(&mut slot, false), None);
+        assert_eq!(slot, Some(mac));
+        assert_eq!(take_discover(&mut slot, true), Some(mac));
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn a_vendor_log_is_followed_from_its_end_and_again_after_a_reset() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!("witcher-tail-{}", std::process::id()));
+        fs::write(&path, " 4:00:00 >|service.c 500 >|   info >| CBRS LTE Freq changed !\n").unwrap();
+        let mut tail = FileTail::new(path.clone());
+        // What was there before the keeper started is history.
+        assert!(tail.lines().is_empty());
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        write!(file, " 4:58:41 >|service.c 500 >|   info >| CBRS LTE").unwrap();
+        assert!(tail.lines().is_empty(), "half a line waits for the rest");
+        writeln!(file, " Freq changed !").unwrap();
+        assert_eq!(
+            tail.lines(),
+            vec![" 4:58:41 >|service.c 500 >|   info >| CBRS LTE Freq changed !".to_owned()]
+        );
+        assert!(tail.lines().is_empty());
+        // rcinit caps its log at 64 KB and then starts it again empty.
+        fs::write(&path, " 0:00:01 >|service.c 528 >|   info >| Restart service=[cbrs]\n").unwrap();
+        assert_eq!(
+            tail.lines(),
+            vec![" 0:00:01 >|service.c 528 >|   info >| Restart service=[cbrs]".to_owned()]
+        );
+        let _ = fs::remove_file(&path);
     }
 }

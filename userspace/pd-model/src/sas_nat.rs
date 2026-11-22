@@ -23,6 +23,16 @@
 //! second. The other guards stay: no rule is needed unless the bearer is
 //! bridged, an unreadable table is not a miss, and misses must run in a row
 //! across `BURST_SPAN` seconds, longer than a vendor rebuild.
+//!
+//! An in-connection carrier change also restarts the vendor firewall, with no
+//! PDN coming up and no change to the bridge: `ucid` logs `HandOver CBRS` and
+//! `rcinit` logs `CBRS LTE Freq changed !` just before it flushes the table.
+//! Since v1.0.13 the keeper follows `rcinit`'s log and starts a burst on those
+//! lines (`firewall_restart`). Any first miss starts one too, and checks stay
+//! at one second while a miss run lasts, so a flush the keeper did not see
+//! coming waits at most one normal check. A restore the keeper sees in the
+//! table right after its own commands counts as seen (`confirm`), so a second
+//! vendor flush a moment later is restored after `BURST_RETRY`, not `RETRY`.
 use std::net::Ipv4Addr;
 
 pub const INTERVAL: u64 = 10;
@@ -85,12 +95,28 @@ impl Watch {
         self.burst_until.is_some_and(|until| now < until)
     }
 
-    /// Seconds the caller waits between checks.
+    /// Seconds the caller waits between checks. One second in a burst and
+    /// while a miss run lasts, except while a restore that never showed up in
+    /// the table waits out `RETRY`: a failing command is not a fast loop.
     pub fn interval(&self, now: u64) -> u64 {
-        if self.bursting(now) {
+        if self.waiting_unseen(now) {
+            INTERVAL
+        } else if self.bursting(now) || self.misses > 0 {
             BURST_INTERVAL
         } else {
             INTERVAL
+        }
+    }
+
+    /// The last restore never showed up in the table, and its `RETRY` is not over.
+    fn waiting_unseen(&self, now: u64) -> bool {
+        matches!(self.restored, Some((at, false)) if now < at + RETRY)
+    }
+
+    /// The keeper read the table right after its own restore and saw the rule.
+    pub fn confirm(&mut self) {
+        if let Some((_, seen)) = &mut self.restored {
+            *seen = true;
         }
     }
 
@@ -119,6 +145,10 @@ impl Watch {
             Some(false) => {
                 if self.misses == 0 {
                     self.first_miss = now;
+                    // The flush may have come with no line the keeper reads.
+                    if !self.waiting_unseen(now) {
+                        self.burst(now);
+                    }
                 }
                 self.misses = self.misses.saturating_add(1);
             }
@@ -152,6 +182,16 @@ pub fn pdn_up(line: &str) -> Option<&str> {
     let rest = crate::extdev::message(line).strip_prefix("LTE: set apn type ")?;
     let dev = rest.split(|c: char| c == '(' || c.is_whitespace()).next()?;
     crate::extdev::is_lte_bearer(dev).then_some(dev)
+}
+
+/// A vendor log line that comes right before `rcinit` rebuilds its firewall,
+/// which flushes the nat table: an in-connection carrier change (`rcinit`'s
+/// `CBRS LTE Freq changed !`, `ucid`'s `HandOver CBRS(...)`) or a restart of
+/// the SAS service (`Restart service=[cbrs]`). Each starts a burst.
+pub fn firewall_restart(line: &str) -> bool {
+    ["CBRS LTE Freq changed", "HandOver CBRS", "Restart service=[cbrs]"]
+        .iter()
+        .any(|mark| line.contains(mark))
 }
 
 /// The value printed by `nvram_get 0 <key>` (`nvram_get success: <value>`).
@@ -390,17 +430,91 @@ mod tests {
     }
 
     #[test]
-    fn outside_a_burst_the_ten_second_rule_is_unchanged() {
+    fn outside_a_burst_the_first_miss_starts_one() {
         let mut w = Watch::default();
-        w.burst(0);
-        // The burst is over long before these checks.
-        assert_eq!(w.observe(100, Some(snat()), Some(false)), Action::Hold);
-        assert_eq!(w.observe(110, Some(snat()), Some(false)), Action::Restore(snat()));
-        // Seen working, then flushed again: still one restore a minute.
-        assert_eq!(w.observe(120, Some(snat()), Some(true)), Action::Hold);
+        assert_eq!(w.interval(200), INTERVAL);
+        assert_eq!(w.observe(200, Some(snat()), Some(true)), Action::Hold);
+        assert_eq!(w.interval(205), INTERVAL);
+        // A vendor firewall restart that logged nothing the keeper reads
+        // (an in-connection carrier change, for example) flushed the rule.
+        assert_eq!(w.observe(210, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.interval(210), BURST_INTERVAL);
+        assert_eq!(w.observe(211, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(212, Some(snat()), Some(false)), Action::Restore(snat()));
+        // Seen working, then flushed again: a second burst, and a restore
+        // that showed up in the table may repeat after five seconds.
+        assert_eq!(w.observe(213, Some(snat()), Some(true)), Action::Hold);
+        assert_eq!(w.interval(250), INTERVAL);
+        assert_eq!(w.observe(250, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.interval(250), BURST_INTERVAL);
+        assert_eq!(w.observe(251, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(252, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn a_miss_run_keeps_one_second_checks_past_the_end_of_a_burst() {
+        let mut w = Watch::default();
+        w.burst(100);
+        assert_eq!(w.observe(129, Some(snat()), Some(false)), Action::Hold);
+        // The burst from 100 ends at 130, in the middle of this miss run.
+        assert_eq!(w.interval(130), BURST_INTERVAL);
         assert_eq!(w.observe(130, Some(snat()), Some(false)), Action::Hold);
-        assert_eq!(w.observe(140, Some(snat()), Some(false)), Action::Hold);
-        assert_eq!(w.observe(170, Some(snat()), Some(false)), Action::Restore(snat()));
+        assert_eq!(w.observe(131, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn a_restore_confirmed_in_the_table_may_repeat_after_a_quick_second_flush() {
+        let mut w = Watch::default();
+        w.burst(100);
+        for t in 100..102 {
+            assert_eq!(w.observe(t, Some(snat()), Some(false)), Action::Hold);
+        }
+        assert_eq!(w.observe(102, Some(snat()), Some(false)), Action::Restore(snat()));
+        // The keeper reads the table right after its own commands: the rule
+        // is there. rcinit's next rebuild flushes it before the 103 check.
+        w.confirm();
+        let again = (103..115)
+            .find(|&t| w.observe(t, Some(snat()), Some(false)) == Action::Restore(snat()));
+        assert_eq!(again, Some(107), "a confirmed restore waits 5 s, not 60 s");
+    }
+
+    #[test]
+    fn an_unconfirmed_restore_waits_a_minute_at_the_normal_pace() {
+        let mut w = Watch::default();
+        assert_eq!(w.observe(100, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(101, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(102, Some(snat()), Some(false)), Action::Restore(snat()));
+        // The commands failed, or the rule never showed up. A failing command
+        // must not become a one-second loop.
+        assert_eq!(w.observe(103, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.interval(103), INTERVAL);
+        for t in (113..162).step_by(10) {
+            assert_eq!(w.observe(t, Some(snat()), Some(false)), Action::Hold, "{t}");
+            assert_eq!(w.interval(t), INTERVAL, "{t}");
+        }
+        assert_eq!(w.observe(162, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn a_carrier_change_or_sas_restart_line_announces_a_firewall_restart() {
+        // rcinit's log, and ucid's handover line, around an in-connection
+        // carrier change. Neither PDN goes down, so no `set apn type` line.
+        assert!(firewall_restart(
+            " 4:58:41 >|service.c             500 >|   info >| CBRS LTE Freq changed !"
+        ));
+        assert!(firewall_restart(
+            "UCID: *******HandOver CBRS(Band:48, Freq:35700, BW:20, Earfcn:55340, pci: 1)*******"
+        ));
+        assert!(firewall_restart(
+            " 5:03:11 >|service.c             528 >|   info >| Restart service=[cbrs]"
+        ));
+        assert!(!firewall_restart(
+            " 5:03:11 >|service.c             528 >|   info >| Restart service=[dnsmasq]"
+        ));
+        assert!(!firewall_restart(
+            " 5:03:00 >|services.c           2923 >|   info >| cbrs_lte_change 1 freqBitMap 3C00003C"
+        ));
+        assert!(!firewall_restart(""));
     }
 
     #[test]

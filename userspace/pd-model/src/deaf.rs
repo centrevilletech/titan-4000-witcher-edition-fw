@@ -191,6 +191,12 @@ pub struct Watch {
 }
 
 impl Watch {
+    /// The caller could not write the cleared count, so the next round of
+    /// answers asks again.
+    pub fn clear_failed(&mut self) {
+        self.cleared = false;
+    }
+
     pub fn armed(&self) -> bool {
         self.armed_at.is_some()
     }
@@ -520,5 +526,24 @@ nonsense
         // An operator who turned ours off keeps the vendor one as saved.
         let off = parse_settings("enabled=0\n");
         assert!(!vendor_watchdog_must_stop(&off, Some("1")));
+    }
+
+    #[test]
+    fn a_strike_reset_that_did_not_reach_flash_is_tried_again() {
+        let mut watch = Watch::default();
+        assert_eq!(watch.observe(0, true, Some(true), DEAF_SECS, 2), Action::Armed);
+        assert_eq!(
+            watch.observe(CLEAR_AFTER, true, Some(true), DEAF_SECS, 2),
+            Action::ClearStrikes
+        );
+        watch.clear_failed();
+        assert_eq!(
+            watch.observe(CLEAR_AFTER + PROBE_EVERY, true, Some(true), DEAF_SECS, 2),
+            Action::ClearStrikes
+        );
+        assert_eq!(
+            watch.observe(CLEAR_AFTER + 2 * PROBE_EVERY, true, Some(true), DEAF_SECS, 2),
+            Action::Hold
+        );
     }
 }

@@ -65,6 +65,9 @@ too early, and never reverted. Now:
   the monotonic clock. An NTP step can no longer end the window early and
   revert a working setting.
 
+The IPv6 health check times prefix delegations with the monotonic clock too,
+since v1.0.13. See [IPv6 router health](ipv6-health.md#a-busy-link-is-never-cut).
+
 ## The vendor ping watchdog
 
 While the keeper's own watchdog is on, the keeper turns off the stock ping

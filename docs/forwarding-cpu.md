@@ -3,13 +3,15 @@
 The customer port is a Linux bridge slave. The receive path delivers all-protocol
 taps before the bridge RX handler. A forwarded unicast consumed by the bridge
 never reaches the slave's EtherType-specific handler. The keeper needs that
-unicast when a delegated IPv6 source is the only evidence of a live router.
+unicast for DHCP renews sent straight to the server.
 
 The keeper attaches classic BPF before binding its cooked socket to the port.
 At steady state it accepts inbound ARP, IPv4 UDP to the DHCP server (including
-IPv4 options), ICMPv6 and DHCPv6 requests. Other IPv6 needs only the first 40
-bytes for the delegated-source check, including fragments and extension
-headers. The existing userspace parsers still authenticate the meaning of a
+IPv4 options), ICMPv6 and DHCPv6 requests. Since v1.0.13 it drops all other
+IPv6. Up to v1.0.12 it copied the first 40 bytes of every other IPv6 frame,
+each upload packet and download ACK, for the delegated-source check; the
+port's receive counter now stands in for that (see
+[IPv6 router health](ipv6-health.md#the-port-filter)). The existing userspace parsers still authenticate the meaning of a
 probe or lease. During the three-second RA sniff a replacement filter also
 admits outbound RAs. Leaving passthrough closes the receive socket. The marked
 raw sender uses protocol zero and registers no receive tap.

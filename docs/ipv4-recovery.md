@@ -14,6 +14,16 @@ customer router had no DHCP server right when the bearer returned. Now the
 offer for the bearer goes out on the next tick. Each kind still waits 15 s for
 its own next change.
 
+A DHCP repair never writes an empty or partial offer. `rcinit` rewrites
+`/tmp/udhcpd.conf` in place, so for a moment the file can be empty. Up to
+v1.0.12 a repair that read it then wrote the empty text back, and with no
+readable offer on disk the customer had no DHCP server until a re-attach.
+Since v1.0.13 a repair writes back the offer on disk only when it is whole and
+names the router's address, else the last whole one the keeper read. Every
+rewrite goes to a new file that is then renamed into place. A discover from a
+new router that arrives during the 15-second cooldown now waits for it, where
+before it was dropped.
+
 In passthrough it also restores the vendor SNAT rule for the unit's own SAS
 traffic when a vendor firewall restart removes it. See
 [SAS reachability in passthrough](cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
@@ -37,18 +47,27 @@ The local reachability monitor is enabled automatically in passthrough:
    frames a second since the probe before last (about 13 s), the link is
    carrying traffic and the keeper skips the renegotiation, logs it, and
    spends nothing from the shared limit. An unreadable counter also skips it.
-   An idle or hung router's own housekeeping stays well under that rate. The
-   IPv6 delegation recovery's renegotiation is unchanged: it is meant for a
-   router that still passes IPv4.
+   An idle or hung router's own housekeeping stays well under that rate.
+   Since v1.0.13 the IPv6 delegation recovery's renegotiation needs a quiet
+   port too. See [IPv6 router health](ipv6-health.md).
 4. A new successful ARP baseline is required before another IPv4
    renegotiation. IPv4 and IPv6 share a limit of three renegotiations in a
    one-hour monotonic-clock window. The action count is saved atomically and
    synced before acting. Failure to save it suppresses the action. The
    existing reboot handling starts a new window when the monotonic clock
    restarts.
-5. Carrier loss, missing bearer routes, or a changed peer disarms the monitor.
-   Returning LTE does not immediately trigger a port reset. A router that
-   never answers this probe is left alone.
+5. Ethernet or LTE carrier loss, or a different router (address or MAC),
+   disarms the monitor. Returning LTE does not immediately trigger a port
+   reset. A router that never answers this probe is left alone.
+6. Since v1.0.13 the baseline belongs to the router. The vendor's Wi-Fi DHCP
+   server writes its empty list over the shared lease file every 30 s, so the
+   keeper sometimes cannot name the router for a moment. Up to v1.0.12 such a
+   gap, or a change in the address the probe is sent from, disarmed the
+   monitor. On the bench it re-armed, and wrote that to flash, every 30 s for
+   15 to 30 minutes after each boot, and it could not count three misses in
+   that time. Now a gap shorter than two minutes keeps the baseline. The
+   arming line goes to flash once per router. Arming the same router again,
+   after a cable or LTE outage, goes to the RAM log only.
 
 This targets loss of local IPv4 reachability. It cannot detect every case in
 which a router still answers ARP but its internet forwarding is broken. It
