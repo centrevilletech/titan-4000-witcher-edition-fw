@@ -1,5 +1,5 @@
 [workspace]
-members = ["pd-model", "pd-keeper", "firstboot"]
+members = ["pd-model", "pd-keeper", "firstboot", "sas-model", "sasd"]
 resolver = "2"
 
 [profile.release]

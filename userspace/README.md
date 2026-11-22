@@ -16,5 +16,9 @@ Other native services, including the web API and key-only SSH server, currently
 ship as pinned overlay binaries. Their source remains in the private ops
 repository; this tree does not yet rebuild every bundled service.
 
+`sas-model` and `sasd` are a CBRS SAS client meant to replace the vendor one.
+They are tested here but are not built into the firmware image yet: read
+[the SAS client notes](../docs/sas-client.md) first.
+
 See [building](../docs/building.md), [IPv4 recovery](../docs/ipv4-recovery.md)
 and [first-boot HTTPS](../docs/first-boot-https.md).

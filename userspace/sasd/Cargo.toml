@@ -1,0 +1,10 @@
+[package]
+name = "witcher-sasd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "CBRS SAS client daemon for the Titan 4000"
+
+[dependencies]
+witcher-sas-model = { path = "../sas-model" }
+serde_json = "1"
