@@ -19,6 +19,9 @@ use titan_pd_model::config::{self, Pending};
 
 mod bench;
 mod capture;
+mod radio;
+mod radio_modem;
+mod radio_sqm;
 mod run;
 
 fn main() {
@@ -29,8 +32,20 @@ fn main() {
                 log("persistent volume is not mounted; keeper state is under /tmp");
             }
             recover_pending();
+            radio::supervise();
             if let Err(err) = run::serve() {
                 log(&format!("keeper stopped: {err}"));
+                std::process::exit(1);
+            }
+        }
+        Some(op @ ("radio-profile" | "opt-guard" | "radio-worker")) => {
+            let result = match op {
+                "radio-profile" => radio::api(args.next().as_deref()),
+                "opt-guard" => radio::guard(),
+                _ => radio::worker(args.next().as_deref()),
+            };
+            if let Err(e) = result {
+                eprintln!("{op}: {e}");
                 std::process::exit(1);
             }
         }

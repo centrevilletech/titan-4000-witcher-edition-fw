@@ -1,0 +1,18 @@
+--- include/linux/netdevice.h.orig	2026-11-22 04:29:27.297562046 +0000
++++ include/linux/netdevice.h	2026-11-22 04:29:27.375563344 +0000
+@@ -1184,6 +1184,7 @@
+ 						 * avoid dirtying this cache line.
+ 						 */
+ 
++	u32			__gct_netdev_pad1; /* GCT 4B delta proven between 0x184 and 0x190 */
+ 	/* Interface address info used in eth_type_trans() */
+ 	unsigned char		*dev_addr;	/* hw address, (before bcast
+ 						   because most packets are
+@@ -1335,6 +1336,7 @@
+ 	int group;
+ 
+ 	struct pm_qos_request	pm_qos_req;
++	u32			__gct_netdev_tail_pad[16]; /* GCT tail pad: ALIGN(sizeof,32)==0x400 */
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 

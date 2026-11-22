@@ -1,0 +1,13 @@
+diff --git a/cobalt_compat.h b/cobalt_compat.h
+index 3da1292..cf6f8ef 100644
+--- a/cobalt_compat.h
++++ b/cobalt_compat.h
+@@ -131,7 +131,7 @@ static inline int skb_mac_offset(const struct sk_buff *skb)
+ #if KERNEL_VERSION(4, 12, 0) > LINUX_VERSION_CODE
+ static void *kvzalloc(size_t sz, gfp_t flags)
+ {
+-	void *ptr = kzalloc(sz, flags);
++	void *ptr = kzalloc(sz, flags | __GFP_NOWARN | __GFP_NORETRY);
+ 
+ 	if (!ptr)
+ 		ptr = vzalloc(sz);

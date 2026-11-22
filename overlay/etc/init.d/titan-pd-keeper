@@ -7,8 +7,10 @@
 #   stop       stop the keeper
 #   restart | status
 #
-# Independent of the web service. It never re-attaches LTE, reboots the unit,
-# or touches SAS. Flash is written only below /mnt/titan-api.
+# Off unless an operator saves a radio profile. A profile re-attaches LTE
+# only for opt-in carrier-cap enforcement: at most once per 6 h or more, and
+# only while the SAS grant is held. Persistent configuration stays below
+# /mnt/titan-api.
 set -u
 umask 077
 bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
