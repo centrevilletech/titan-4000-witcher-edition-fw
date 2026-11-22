@@ -58,6 +58,20 @@ missing on two checks in a row, it runs `kern natq act 0` and inserts the rule,
 at most once a minute. It does not change forwarding, grants or the SAS client.
 NAT mode needs no SNAT for this traffic, and the check does not run there.
 
+That pace was too slow right after a re-attach. The vendor SAS client sends
+its relinquishments about 6 and 12 s after the radio connects. With the rule
+missing for up to 20 s, both failed, the old grants stayed at the SAS, and the
+next grant request got 401: 7 of 28 bench channel changes took 46 to 65 s
+instead of about 12 s. Since v1.0.11, for 30 s after the kernel logs a PDN
+coming up (`LTE: set apn type lte0pdnN`) or the customer bearer joins `br0`,
+the keeper checks every second. The other guards stay: misses must run in a
+row across 2 s (three checks), longer than a vendor rebuild; an unreadable
+table is not a miss; no rule is expected unless the bearer is bridged. In that
+window a restore that later showed up in the table may be followed by another
+after 5 s, because the vendor can flush the table again during bearer setup. A
+restore that never showed up still waits a minute. Outside the window the
+10-second, two-miss, once-a-minute rule is unchanged.
+
 Do not repair this by forcing the vendor cbrs restart while
 `cbrs_mode_grant=0`: the same `rcinit` path inserts `iptables -I FORWARD -j
 DROP` on Band 48 until a grant arrives.

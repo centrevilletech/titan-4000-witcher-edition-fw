@@ -10,7 +10,10 @@ kernel. The external-device guard reads a file standing in for the kernel log
 and runs a recording `kern` stub. The deaf watchdog runs against ping,
 modem-state and reboot stubs. The LTE driver MAC correction reads a file
 standing in for /proc/net/snmp6 and is checked on the wire of a dummy bearer.
+The 802.3x flow control change runs a recording `kern eth` stub that prints
+the kernel's report: this proves when the keeper runs it, not the register.
 """
+import errno
 import os
 import json
 from pathlib import Path
@@ -96,8 +99,11 @@ def main():
     exe('/tmp/bin/iptables', 'if [ "$*" = "-t nat -S POSTROUTING" ]; then echo "-P POSTROUTING ACCEPT"; cat /tmp/nat-rules; exit 0; fi\n'
         'echo "iptables $*" >> /tmp/sas-actions\n'
         'if [ "$*" = "-t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152" ]; then echo "'+sas_rule+'" >> /tmp/nat-rules; exit 0; fi\nexit 1')
-    # `kern netif extdev <dev> down` prints external_dev=NULL to the kernel log on a Titan.
-    exe('/tmp/bin/kern', 'if [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; else echo "kern $*" >> /tmp/sas-actions; fi')
+    # `kern netif extdev <dev> down` prints external_dev=NULL to the kernel log on a Titan,
+    # and `kern eth -fc` prints the flow control report.
+    exe('/tmp/bin/kern', 'if [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; '
+        'elif [ "$1" = eth ]; then echo "kern $*" >> /tmp/eth-actions; echo "4,300,5,-;  dma ctrl(00203206): efc=0 rfa=1(fill=2KB) rfd=2(fill=1KB)" >> /tmp/kmsg; '
+        'else echo "kern $*" >> /tmp/sas-actions; fi')
     Path('/tmp/kmsg').write_text('6,1,1,-;booting\n')
     Path('/tmp/snmp6').write_text('Ip6InReceives 1\nIp6OutForwDatagrams 0\n')
     Path('/tmp/nat-rules').write_text(sas_rule+'\n')
@@ -127,12 +133,29 @@ def main():
                     frame=capture.recv(2048)
                     if frame[12:14]==b'\x08\x06': packets.append(frame.hex())
             except BlockingIOError: pass
+            except OSError as err:
+                # Taking eth0 down reports ENETDOWN once on a bound packet socket.
+                if err.errno!=errno.ENETDOWN: raise
             if keeper.poll() is not None: raise AssertionError('keeper exited: '+log())
             if predicate(): return
             time.sleep(.25)
         raise AssertionError('Timed out: '+log()+'\nARP '+repr(packets)+'\ncarrier '+repr([Path('/sys/class/net/'+n+'/carrier').read_text() for n in ['eth0','lte0pdn1']])+'\nIP '+subprocess.check_output([ip,'-4','-o','addr','show','dev','br0']).decode()+'\nlease '+Path('/tmp/udhcpd.leases').read_bytes().hex())
+    def eth_actions():
+        p=Path('/tmp/eth-actions');return p.read_text().splitlines() if p.exists() else []
     try:
-        wait_for(lambda:'automatic recovery is armed' in log(),25)
+        # The keeper turns off PAUSE frames when it starts, and again when eth0
+        # comes back up, because opening the port turns them back on.
+        wait_for(lambda:eth_actions()==['kern eth -fc'] and 'no longer sends 802.3x PAUSE' in log(),10)
+        run(ip, 'link', 'set', 'eth0', 'down')
+        until=time.monotonic()+3
+        wait_for(lambda:time.monotonic()>=until,5)
+        assert eth_actions()==['kern eth -fc'], eth_actions()
+        run(ip, 'link', 'set', 'eth0', 'up')
+        wait_for(lambda:len(eth_actions())==2,10)
+        assert eth_actions()==['kern eth -fc']*2, eth_actions()
+        assert log().count('no longer sends 802.3x PAUSE')==1, log()
+        print('PASS: PAUSE frames turned off at start and again after eth0 came back up, logged once.',flush=True)
+        wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
         # The deaf watchdog arms on the first answer, then the target goes quiet
         # while the modem stays attached. The reboot is checked at the end.
@@ -228,6 +251,24 @@ def main():
         assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
         assert not Path('/tmp/phy-actions').exists()
         print('PASS: flushed SAS SNAT rule restored once, with natq bridge mode first, and left alone after.',flush=True)
+        # A PDN coming up starts 30 s of checks every second. A flush right
+        # after it is restored within seconds. The last restore was under a
+        # minute ago, but it was seen in the table, so it does not hold this one.
+        with open('/tmp/kmsg','a') as kmsg:
+            kmsg.write('6,103,4,-;LTE: set apn type lte0pdn1(0x1) eps_id=6 192.0.2.7 2001:db8::7\n')
+        until=time.monotonic()+2
+        wait_for(lambda:time.monotonic()>=until,4)
+        Path('/tmp/nat-rules').write_text('')
+        flushed=time.monotonic()
+        wait_for(lambda:len(Path('/tmp/sas-actions').read_text().splitlines())>=4,10)
+        took=time.monotonic()-flushed
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
+        assert took<6, took
+        assert 'missing for 2 s right after a PDN came up' in log(), log()
+        until=time.monotonic()+5
+        wait_for(lambda:time.monotonic()>=until,8)
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
+        print('PASS: after a PDN came up, a flushed SAS SNAT rule was restored in %.1f s.'%took,flush=True)
         if time.monotonic()-silent_from<110:
             assert not Path('/tmp/reboot-actions').exists(), 'the deaf watchdog fired before its wait'
             print('PASS: deaf watchdog held through the first %d s of silence.'%(time.monotonic()-silent_from),flush=True)

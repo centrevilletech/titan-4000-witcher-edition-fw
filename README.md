@@ -108,6 +108,11 @@ to further router advertisements, finds the customer bearer by itself, and in
 every mode reboots a unit that stays attached but hears nothing through the
 core for five minutes. See [the deaf-unit fault](docs/deaf-watchdog.md).
 
+In every mode the keeper stops the Titan from sending 802.3x PAUSE frames to
+the customer router. The vendor driver turns them on although the link agrees
+on none, and each one can stop the router's upload for 33 ms. See
+[Ethernet flow control](docs/ethernet-flow-control.md).
+
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
 
@@ -147,6 +152,7 @@ components this repository builds from source.
 - [Component provenance and third-party licenses](THIRD_PARTY.md)
 - [Image format and flashing](docs/image-format.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
+- [Ethernet flow control](docs/ethernet-flow-control.md)
 
 ## Learn LTE and build something
 

@@ -12,6 +12,17 @@
 //! The keeper restores the same rule the way `rcinit` would: `kern natq act 0`
 //! (the bridge mode `rcinit` sets for passthrough), then the SNAT rule. It does
 //! not touch forwarding, grants or the SAS client.
+//!
+//! Right after a PDN comes up the normal pace is too slow. The vendor SAS
+//! client sends its two relinquishments about 6 and 12 s after the radio
+//! connects. With a check every 10 s and two misses needed, the rule could be
+//! missing for up to 20 s, so both failed, the old grants stayed at the SAS,
+//! and the next grant request got 401 (7 of 28 bench channel changes, each
+//! 46 to 65 s instead of about 12 s). So for `BURST` seconds after the keeper
+//! sees a PDN come up, or the customer bearer join the bridge, it checks every
+//! second. The other guards stay: no rule is needed unless the bearer is
+//! bridged, an unreadable table is not a miss, and misses must run in a row
+//! across `BURST_SPAN` seconds, longer than a vendor rebuild.
 use std::net::Ipv4Addr;
 
 pub const INTERVAL: u64 = 10;
@@ -21,6 +32,16 @@ pub const INTERVAL: u64 = 10;
 const MISSES: u8 = 2;
 /// At most one restore attempt a minute, so a failing command cannot loop.
 pub const RETRY: u64 = 60;
+/// Seconds of one-second checks after a PDN comes up.
+pub const BURST: u64 = 30;
+pub const BURST_INTERVAL: u64 = 1;
+/// In a burst the misses in a row must span at least this many seconds (three
+/// checks), so a vendor rebuild still in progress is never a miss run.
+const BURST_SPAN: u64 = 2;
+/// In a burst, a restore that was seen in the table afterwards may be followed
+/// by another this soon, because the vendor can flush the table again during
+/// bearer setup. A restore never seen in the table still waits `RETRY`.
+const BURST_RETRY: u64 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Snat {
@@ -40,7 +61,12 @@ pub enum Action {
 pub struct Watch {
     snat: Option<Snat>,
     misses: u8,
-    retry_at: u64,
+    /// When the current run of misses started.
+    first_miss: u64,
+    /// The last restore, and whether the rule was in the table after it.
+    restored: Option<(u64, bool)>,
+    /// One-second checks run until this time.
+    burst_until: Option<u64>,
 }
 
 impl Watch {
@@ -48,12 +74,34 @@ impl Watch {
         *self = Self::default();
     }
 
-    /// One check, made every `INTERVAL` seconds by the caller. `snat` is the
+    /// A PDN came up, or the customer bearer joined the bridge: check every
+    /// second for the next `BURST` seconds.
+    pub fn burst(&mut self, now: u64) {
+        let until = now + BURST;
+        self.burst_until = Some(self.burst_until.map_or(until, |old| old.max(until)));
+    }
+
+    pub fn bursting(&self, now: u64) -> bool {
+        self.burst_until.is_some_and(|until| now < until)
+    }
+
+    /// Seconds the caller waits between checks.
+    pub fn interval(&self, now: u64) -> u64 {
+        if self.bursting(now) {
+            BURST_INTERVAL
+        } else {
+            INTERVAL
+        }
+    }
+
+    /// One check, made every `interval()` seconds by the caller. `snat` is the
     /// rule this unit needs now, or `None` when it needs none. `present` is
     /// `None` when the nat table could not be read; that is not a miss.
     pub fn observe(&mut self, now: u64, snat: Option<Snat>, present: Option<bool>) -> Action {
         if self.snat != snat {
-            self.reset();
+            // A new rule starts over. The burst belongs to the bearer setup
+            // that changed it, so it carries on.
+            *self = Self { burst_until: self.burst_until, ..Self::default() };
             self.snat = snat;
         }
         let Some(snat) = snat else {
@@ -63,17 +111,47 @@ impl Watch {
             None => return Action::Hold,
             Some(true) => {
                 self.misses = 0;
+                if let Some((_, seen)) = &mut self.restored {
+                    *seen = true;
+                }
                 return Action::Hold;
             }
-            Some(false) => self.misses = self.misses.saturating_add(1),
+            Some(false) => {
+                if self.misses == 0 {
+                    self.first_miss = now;
+                }
+                self.misses = self.misses.saturating_add(1);
+            }
         }
-        if self.misses < MISSES || now < self.retry_at {
+        let burst = self.bursting(now);
+        let missing = if burst {
+            self.misses >= MISSES && now.saturating_sub(self.first_miss) >= BURST_SPAN
+        } else {
+            self.misses >= MISSES
+        };
+        let wait = match self.restored {
+            Some((at, seen)) => {
+                let window = if burst && seen { BURST_RETRY } else { RETRY };
+                now < at + window
+            }
+            None => false,
+        };
+        if !missing || wait {
             return Action::Hold;
         }
         self.misses = 0;
-        self.retry_at = now + RETRY;
+        self.restored = Some((now, false));
         Action::Restore(snat)
     }
+}
+
+/// The interface of a kernel log line that says a PDN came up:
+/// `LTE: set apn type lte0pdn2(0x1) eps_id=6 <IPv4> <IPv6>`. `/dev/kmsg`
+/// records carry a `level,sequence,time,flags;` prefix; `dmesg` lines do not.
+pub fn pdn_up(line: &str) -> Option<&str> {
+    let rest = crate::extdev::message(line).strip_prefix("LTE: set apn type ")?;
+    let dev = rest.split(|c: char| c == '(' || c.is_whitespace()).next()?;
+    crate::extdev::is_lte_bearer(dev).then_some(dev)
 }
 
 /// The value printed by `nvram_get 0 <key>` (`nvram_get success: <value>`).
@@ -249,6 +327,117 @@ mod tests {
             w.observe(1020, Some(moved), Some(false)),
             Action::Restore(moved)
         );
+    }
+
+    #[test]
+    fn a_burst_checks_every_second_for_thirty_seconds() {
+        let mut w = Watch::default();
+        assert_eq!(w.interval(500), INTERVAL);
+        w.burst(500);
+        assert!(w.bursting(500));
+        assert_eq!(w.interval(500), 1);
+        assert_eq!(w.interval(529), 1);
+        assert!(!w.bursting(530));
+        assert_eq!(w.interval(530), INTERVAL);
+        // A second PDN extends it from the later event.
+        w.burst(520);
+        assert_eq!(w.interval(549), 1);
+        assert_eq!(w.interval(550), INTERVAL);
+    }
+
+    #[test]
+    fn in_a_burst_a_flush_is_restored_after_two_seconds_of_misses() {
+        let mut w = Watch::default();
+        w.burst(100);
+        assert_eq!(w.observe(100, Some(snat()), Some(true)), Action::Hold);
+        // Flushed at 101. Two misses one second apart can still be a vendor
+        // rebuild in progress; the third, two seconds after the first, is not.
+        assert_eq!(w.observe(101, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(102, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(103, Some(snat()), Some(false)), Action::Restore(snat()));
+        // A rebuild that puts the rule back between checks resets the run.
+        let mut v = Watch::default();
+        v.burst(100);
+        assert_eq!(v.observe(101, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(v.observe(102, Some(snat()), Some(true)), Action::Hold);
+        assert_eq!(v.observe(103, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(v.observe(104, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(v.observe(105, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn in_a_burst_a_working_restore_may_repeat_and_a_failing_one_waits_a_minute() {
+        let mut w = Watch::default();
+        w.burst(100);
+        for t in 100..102 {
+            assert_eq!(w.observe(t, Some(snat()), Some(false)), Action::Hold);
+        }
+        assert_eq!(w.observe(102, Some(snat()), Some(false)), Action::Restore(snat()));
+        // The rule is back, then the vendor flushes the table again.
+        assert_eq!(w.observe(103, Some(snat()), Some(true)), Action::Hold);
+        for t in 104..106 {
+            assert_eq!(w.observe(t, Some(snat()), Some(false)), Action::Hold);
+        }
+        // Misses span two seconds at 106, but only four have passed since the
+        // last restore.
+        assert_eq!(w.observe(106, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(107, Some(snat()), Some(false)), Action::Restore(snat()));
+        // This restore never shows up in the table: the next waits RETRY.
+        for t in 108..167 {
+            assert_eq!(w.observe(t, Some(snat()), Some(false)), Action::Hold, "{t}");
+        }
+        assert_eq!(w.observe(167, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn outside_a_burst_the_ten_second_rule_is_unchanged() {
+        let mut w = Watch::default();
+        w.burst(0);
+        // The burst is over long before these checks.
+        assert_eq!(w.observe(100, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(110, Some(snat()), Some(false)), Action::Restore(snat()));
+        // Seen working, then flushed again: still one restore a minute.
+        assert_eq!(w.observe(120, Some(snat()), Some(true)), Action::Hold);
+        assert_eq!(w.observe(130, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(140, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(w.observe(170, Some(snat()), Some(false)), Action::Restore(snat()));
+    }
+
+    #[test]
+    fn a_burst_keeps_every_other_guard() {
+        let mut w = Watch::default();
+        w.burst(0);
+        for t in 0..30 {
+            // No bridged bearer, or an unreadable table: never a restore.
+            assert_eq!(w.observe(t, None, Some(false)), Action::Hold);
+            assert_eq!(w.observe(t, Some(snat()), None), Action::Hold);
+        }
+        // A new bearer address starts the miss count over but keeps the burst.
+        let mut moved = snat();
+        moved.bearer = Ipv4Addr::new(192, 0, 2, 7);
+        let mut v = Watch::default();
+        v.burst(0);
+        assert_eq!(v.observe(1, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(v.observe(2, Some(snat()), Some(false)), Action::Hold);
+        assert_eq!(v.observe(3, Some(moved), Some(false)), Action::Hold);
+        assert!(v.bursting(3));
+        assert_eq!(v.observe(4, Some(moved), Some(false)), Action::Hold);
+        assert_eq!(v.observe(5, Some(moved), Some(false)), Action::Restore(moved));
+        // A reset (the unit left passthrough) ends the burst.
+        v.reset();
+        assert!(!v.bursting(6));
+    }
+
+    #[test]
+    fn a_pdn_up_line_names_its_bearer() {
+        let line = "LTE: set apn type lte0pdn2(0x1) eps_id=6 192.0.2.7 2001:db8::7";
+        assert_eq!(pdn_up(line), Some("lte0pdn2"));
+        assert_eq!(pdn_up(&format!("6,812,15196123,-;{line}")), Some("lte0pdn2"));
+        assert_eq!(pdn_up("LTE: set apn type lte0pdn0 eps_id=5"), Some("lte0pdn0"));
+        assert_eq!(pdn_up("LTE: lte0pdn1(0x0) set interface id: 200:5eff:fe40:3 eps_id=6"), None);
+        assert_eq!(pdn_up("LTE: set apn type eth0(0x1)"), None);
+        assert_eq!(pdn_up("set external_dev: lte0pdn0 ipv6 mask=50"), None);
+        assert_eq!(pdn_up(""), None);
     }
 
     #[test]

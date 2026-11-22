@@ -4,13 +4,14 @@
 //! tested on a host: prefix cuts, DHCPv6 replies, router advertisements, when
 //! to escalate, the IPv4 passthrough repairs, the SAS NAT rule, the guard for
 //! the vendor kernel's external device, the watchdog for a unit that is
-//! attached but hears nothing, and keeping the LTE driver's downlink MAC on
-//! the customer router.
+//! attached but hears nothing, keeping the LTE driver's downlink MAC on the
+//! customer router, and 802.3x flow control on the customer port.
 
 pub mod config;
 pub mod deaf;
 pub mod dhcpv6;
 pub mod driver_mac;
+pub mod ethernet;
 pub mod extdev;
 pub mod filter;
 pub mod health;
