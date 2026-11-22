@@ -13,6 +13,7 @@ WITCHER_BOOT_SCRIPTS = (
     '/etc/init.d/titan-api',
     '/etc/init.d/titan-pd-keeper',
     '/etc/init.d/titan-sshd',
+    '/etc/init.d/witcher-tk-stage',
     '/etc/sysconfig/script/passthru-fix.sh',
 )
 WITCHER_BUNDLE_SCRIPTS = (

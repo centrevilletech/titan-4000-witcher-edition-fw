@@ -21,6 +21,10 @@ The CBRS gate reads the SAS grant keys from that same cache file and edits two
 files standing in for the ebtables and ip6tables FORWARD chains, through stubs
 that print them the way the unit's tools do: this proves the keeper's
 decisions and commands, not the kernel tables.
+The boot confirm for a staged modem firmware image reads a status file standing
+in for the boot hook's and runs against the ping and reboot stubs: the main run
+has no staged image and must never reboot for it, then one staged boot gets no
+answer (quarantine, one reboot) and one gets an answer (strikes cleared).
 """
 import errno
 import os
@@ -46,7 +50,7 @@ def main():
         if os.geteuid() != 0:
             raise SystemExit('Run as root; this test creates isolated mount/network/PID namespaces.')
         subprocess.run(['unshare', '--mount', '--net', '--pid', '--fork', '--mount-proc',
-                        sys.executable, __file__, '--inner'], check=True, timeout=480)
+                        sys.executable, __file__, '--inner'], check=True, timeout=900)
         return
     run('mount', '--make-rprivate', '/')
     run('mount', '-t', 'tmpfs', 'tmpfs', '/tmp')
@@ -157,7 +161,8 @@ def main():
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
+             TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -465,6 +470,53 @@ def main():
         assert set(ram_status)==set(flash_status), (ram_status, flash_status)
         assert 'periodic router advertisement' not in log()
         print('PASS: the RAM log holds every flash line; status.json has a live RAM copy.',flush=True)
+        assert 'tk boot' not in log(), 'the boot confirm armed without a staged image'
+        print('PASS: no staged modem firmware: the boot confirm never armed.',flush=True)
+        # A staged modem firmware image whose boot never answers. Nothing has
+        # answered since `silent_from`; the deaf watchdog of a new keeper
+        # process cannot arm, so any reboot now is the boot confirm's.
+        def restart():
+            nonlocal keeper
+            keeper.terminate();keeper.wait(timeout=5)
+            Path('/tmp/reboot-actions').unlink(missing_ok=True)
+            keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        def uptime():
+            return int(float(Path('/proc/uptime').read_text().split()[0]))
+        bad='a'*64
+        Path('/tmp/tk').mkdir()
+        Path('/tmp/tk/strikes').write_text('strikes=1\n')
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256='+bad+'\ntarget=192.0.2.9\n')
+        up=uptime()
+        Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(bad,max(0,up-400)))
+        restart()
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),max(90,300-up+90))
+        assert Path('/tmp/reboot-actions').read_text().splitlines()[0]=='reboot ', Path('/tmp/reboot-actions').read_text()
+        assert Path('/tmp/tk/quarantine').read_text()==bad+'\n'
+        assert Path('/tmp/tk/strikes').read_text()=='strikes=2\n'
+        assert Path('/tmp/tk.result').read_text()=='rollback='+bad+'\n'
+        assert 'quarantined it, rebooting onto stock modem firmware' in log()
+        assert any('192.0.2.9' in call for call in Path('/tmp/ping-calls').read_text().splitlines())
+        print('PASS: a staged boot with no answer quarantined its image and asked for one reboot.',flush=True)
+        # A staged image whose boot answers through the core.
+        good='b'*64
+        Path('/tmp/tk.result').unlink()
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\n')
+        Path('/tmp/tk/strikes').write_text('strikes=1\n')
+        Path('/tmp/ping-ok').write_text('')
+        if not Path('/sys/class/net/lte0pdn0').exists():
+            run(ip,'link','add','lte0pdn0','type','dummy');run(ip,'link','set','lte0pdn0','up')
+        run(ip,'addr','add','10.200.0.2/30','dev','lte0pdn0')
+        Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(good,uptime()))
+        restart()
+        wait_for(lambda:'tk boot confirmed' in log(),45)
+        assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
+        assert Path('/tmp/tk/confirmed').read_text()=='sha256='+good+'\n'
+        assert Path('/tmp/tk.result').read_text()=='confirmed='+good+'\n'
+        assert Path('/tmp/tk/quarantine').read_text()==bad+'\n'
+        until=time.monotonic()+3
+        wait_for(lambda:time.monotonic()>=until,5)
+        assert not Path('/tmp/reboot-actions').exists()
+        print('PASS: a staged boot that answered cleared its strikes and did not reboot.',flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)

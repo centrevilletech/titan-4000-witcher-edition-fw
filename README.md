@@ -172,6 +172,7 @@ components this repository builds from source.
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
+- [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
 
 ## Learn LTE and build something
 

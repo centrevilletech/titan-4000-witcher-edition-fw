@@ -126,6 +126,12 @@ Each watchdog reboot that is followed by silence again doubles the wait
 before the next one, up to six hours. An hour of answers clears the count
 (`watchdog-strikes.txt` in the keeper state directory).
 
+Because it arms only after a first answer, the watchdog cannot catch a modem
+that never attaches. On a boot that loads a staged modem firmware image, the
+keeper's boot confirm covers that case: no answer within 300 s of the load
+quarantines the image and reboots once onto stock firmware. See the
+[boot-time modem firmware loader](tk-boot-loader.md).
+
 An outage upstream of every target, with the radio still attached, looks the
 same from the unit. Each unit then reboots once, and does not arm again until
 a target answers. To avoid that, name targets on the core itself.

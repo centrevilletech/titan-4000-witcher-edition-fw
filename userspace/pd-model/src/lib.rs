@@ -6,8 +6,9 @@
 //! the vendor kernel's external device, the watchdog for a unit that is
 //! attached but hears nothing, keeping the LTE driver's downlink MAC on the
 //! customer router, 802.3x flow control on the customer port, which keeper
-//! writes reach flash, the self-revert of a setting change, and the drop of
-//! customer IPv6 while the unit holds no SAS grant.
+//! writes reach flash, the self-revert of a setting change, the drop of
+//! customer IPv6 while the unit holds no SAS grant, and the boot confirm for a
+//! staged modem firmware image.
 
 pub mod cbrs_gate;
 pub mod config;
@@ -25,6 +26,7 @@ pub mod prefix;
 pub mod ra;
 pub mod sas_nat;
 pub mod sha256;
+pub mod tk_boot;
 pub mod wear;
 
 pub use config::{Config, Report, load_config, shown_choice, store_config};
