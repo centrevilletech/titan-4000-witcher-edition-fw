@@ -25,15 +25,16 @@ set -- $(ls -ldn "$collector_dir")
 [ "$1" = drwxr-xr-x ] && [ "$3" = 0 ] || exit 77
 # Atomic creation without following a pre-existing file or symlink.
 collector_tmp=$collector_dir/.telemetry.$$.tmp
-(umask 022; set -C; : > "$collector_tmp") || exit 73
+umask 022
+set -C
 trap 'rm -f "$collector_tmp"' EXIT
 trap 'exit 0' HUP INT TERM
 while :; do
+  # Open exclusively in the root-owned directory. rename preserves mode.
   if "$collector_helper" --snapshot > "$collector_tmp"; then
-    chmod 644 "$collector_tmp"
     mv -f "$collector_tmp" "$collector_dir/telemetry.json"
-    (umask 022; set -C; : > "$collector_tmp") || exit 73
+  else
+    rm -f "$collector_tmp"
   fi
-  # Fixed cadence prevents failure loops. Last good snapshot ages on failure.
   sleep 1
 done

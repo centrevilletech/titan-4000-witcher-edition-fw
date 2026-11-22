@@ -8,6 +8,10 @@ if [ "${WITCHER_BOOT_COPY:-}" != 1 ]; then
  cp "$0" /tmp/witcher-boot.sh || exit 1
  WITCHER_BOOT_COPY=1 exec /bin/sh /tmp/witcher-boot.sh boot
 fi
+# Apply once per boot. Keep the kernel softirq deadline and scheduling policy.
+for setting in netdev_budget=300 dev_weight=128 netdev_max_backlog=4000; do
+ echo "${setting#*=}" > "/proc/sys/net/core/${setting%=*}" || echo "Unable to apply $setting" >&2
+done
 # An inherited pipe must never keep rcS waiting for these long-lived services.
 # Vendor startup and re-attachments can rebuild their tables. Keep management
 # available independently of panel startup, APN provisioning and saved flags.

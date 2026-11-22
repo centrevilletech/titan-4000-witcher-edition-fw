@@ -232,14 +232,26 @@ case "${1:-}" in
   take_over || exit 1
   unlock
   # rcinit may still act on enable flags it read before the takeover.
+  health_ticks=0
   while :; do
    sleep 10
    [ ! -e "$vendor_marker" ] || exit 0
-   if ! healthy; then
-    locked || exit $?
-    note 'Native service stopped; restoring factory desktop recovery.'
-    use_vendor
-    exit 1
+   health_ticks=$((health_ticks + 1))
+   # The PID check is a fast hint only. Confirm failures with the full
+   # identity and HTTP checks before changing which server is running.
+   for service in api broker collector; do
+    if ! read -r pid < "/tmp/witcher-api/$service.pid"; then health_ticks=6; break; fi
+    case "$pid" in ''|*[!0-9]*) health_ticks=6; break;; esac
+    kill -0 "$pid" 2>/dev/null || { health_ticks=6; break; }
+   done
+   if [ "$health_ticks" -ge 6 ]; then
+    health_ticks=0
+    if ! healthy; then
+     locked || exit $?
+     note 'Native service stopped; restoring factory desktop recovery.'
+     use_vendor
+     exit 1
+    fi
    fi
    late=$(vendor_pids)
    [ -z "$late" ] || { note "Stopping late vendor web server: $late"; stop_vendor; }
