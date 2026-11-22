@@ -394,9 +394,21 @@ pub fn restart_with_assignment(
     })
 }
 
-/// The offer a DHCP repair writes back.
-pub fn repair_text(current: &str, _last_good: Option<&str>, _bearer: Ipv4Addr) -> Option<String> {
-    Some(current.to_owned())
+/// The offer a DHCP repair writes back: the file on disk when it is a whole
+/// offer of `bearer`, else the last whole one the keeper read for it. Never an
+/// empty or partial file. `rcinit` rewrites `/tmp/udhcpd.conf` in place, and
+/// before v1.0.13 a repair that read it halfway wrote the empty text back and
+/// left the customer with no DHCP server until a re-attach.
+pub fn repair_text(current: &str, last_good: Option<&str>, bearer: Ipv4Addr) -> Option<String> {
+    let offers = |text: &str| {
+        parse_conf(text).is_some_and(|conf| {
+            conf.start == bearer && conf.end == bearer && usable_gateway(conf.router, bearer)
+        })
+    };
+    if offers(current) {
+        return Some(current.to_owned());
+    }
+    last_good.filter(|text| offers(text)).map(str::to_owned)
 }
 
 pub fn mac_text(mac: [u8; 6]) -> String {

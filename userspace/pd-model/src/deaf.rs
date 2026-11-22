@@ -193,7 +193,9 @@ pub struct Watch {
 impl Watch {
     /// The caller could not write the cleared count, so the next round of
     /// answers asks again.
-    pub fn clear_failed(&mut self) {}
+    pub fn clear_failed(&mut self) {
+        self.cleared = false;
+    }
 
     pub fn armed(&self) -> bool {
         self.armed_at.is_some()

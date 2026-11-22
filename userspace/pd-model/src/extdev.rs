@@ -116,8 +116,11 @@ impl Watch {
                 self.dev = Some(dev);
             }
             Event::Cleared => {
+                // The kernel confirmed the clear. A later set is a new event,
+                // not a repair that failed, so it does not wait out `RETRY`.
                 self.dev = None;
                 self.since = None;
+                self.retry_at = 0;
             }
         }
     }

@@ -58,8 +58,11 @@ impl Watch {
         };
         let previous = self.last_count.replace(count);
         if !ready {
+            // A re-attach or a new router ends an episode, and its pause.
             self.tries = 0;
             self.last_rise = None;
+            self.last_sent = None;
+            self.paused_until = 0;
             return Action::Hold;
         }
         // The first reading is only a baseline; a smaller one is a reset.

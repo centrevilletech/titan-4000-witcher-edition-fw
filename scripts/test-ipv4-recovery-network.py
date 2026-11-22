@@ -15,6 +15,8 @@ the kernel's report: this proves when the keeper runs it, not the register.
 The vendor ping watchdog runs against a file standing in for the vendor's RAM
 configuration cache and a recording `titan-nvram` stub. The keeper's RAM log
 and RAM status copy are checked against the flash files in the state directory.
+A file stands in for rcinit's log, and an empty lease file for the vendor Wi-Fi
+DHCP server's write over the shared lease file.
 """
 import errno
 import os
@@ -121,17 +123,25 @@ def main():
     peer = json.loads(subprocess.check_output([ip, '-n', 'witcher-peer', '-j', '-4', 'addr', 'show', 'router0']))[0]
     run(ip, 'route', 'add', peer['addr_info'][0]['local'] + '/32', 'dev', 'br0')
     Path('/tmp/udhcpd.conf').write_text('start 172.20.64.152\nend 172.20.64.152\nmax_leases 8\ninterface br0:9\nremaining yes\noption subnet 255.255.255.240\noption router 172.20.64.151\noption lease 120\n')
+    lease_state={'empty':False}
     def lease():
-        Path('/tmp/lease.new').write_bytes(struct.pack('>QI4B6s20s2x',int(time.time()),120,172,20,64,152,peer_mac,b'fixture'))
+        if lease_state['empty']:
+            # The vendor Wi-Fi server's own list: a timestamp and no lease.
+            Path('/tmp/lease.new').write_bytes(struct.pack('>Q',int(time.time())))
+        else:
+            Path('/tmp/lease.new').write_bytes(struct.pack('>QI4B6s20s2x',int(time.time()),120,172,20,64,152,peer_mac,b'fixture'))
         Path('/tmp/lease.new').replace('/tmp/udhcpd.leases')
     lease()
+    Path('/tmp/rcinit.log').write_text(' 0:00:09 >|rc.c                 1372 >|   info >| IDLE... ...\n')
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
-    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache')
+    env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
+    def ram():
+        return ''.join(p.read_text() for p in (Path('/tmp/runtime/keeper.log.1'),Path('/tmp/runtime/keeper.log')) if p.exists())
     def wait_for(predicate, seconds):
         deadline=time.monotonic()+seconds
         while time.monotonic()<deadline:
@@ -172,6 +182,21 @@ def main():
         print('PASS: vendor ping watchdog turned off in the RAM cache, with no commit.',flush=True)
         wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
+        # The vendor Wi-Fi DHCP server writes its empty list over the shared
+        # lease file every 30 s. A gap longer than the keeper's 8 s hold must
+        # not start the IPv4 check over, or log a new arming.
+        armed_lines=ram().count('automatic recovery is armed')
+        lease_state['empty']=True
+        lease()
+        until=time.monotonic()+12
+        wait_for(lambda:time.monotonic()>=until,15)
+        lease_state['empty']=False
+        until=time.monotonic()+15
+        wait_for(lambda:time.monotonic()>=until,20)
+        assert ram().count('automatic recovery is armed')==armed_lines, ram()
+        assert log().count('automatic recovery is armed')==1, log()
+        assert 'repairing DHCP first' not in log()
+        print('PASS: a 12 s gap in the lease file kept the IPv4 baseline and logged no new arming.',flush=True)
         # The deaf watchdog arms on the first answer, then the target goes quiet
         # while the modem stays attached. The reboot is checked at the end.
         wait_for(lambda:'deaf watchdog armed' in log(),45)
@@ -254,18 +279,41 @@ def main():
         assert not Path('/tmp/phy-actions').exists()
         # The vendor rule is present, so the keeper leaves the nat table alone.
         assert not Path('/tmp/sas-actions').exists(), Path('/tmp/sas-actions').read_text()
-        # A vendor firewall restart flushes it. Two missed checks restore it,
-        # in rcinit's order, and nothing more runs once it is back.
+        # A vendor firewall restart that logs nothing the keeper reads flushes
+        # it. The first missed check starts one-second checks, so it is back
+        # within one normal check plus two seconds, in rcinit's order, and
+        # nothing more runs once it is back.
         Path('/tmp/nat-rules').write_text('')
+        flushed=time.monotonic()
         restored=['kern natq act 0','iptables -t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152']
         wait_for(lambda:Path('/tmp/sas-actions').exists() and len(Path('/tmp/sas-actions').read_text().splitlines())>=2,40)
+        took=time.monotonic()-flushed
         assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
+        assert took<15, took
         assert 'SAS NAT rule restored' in log()
-        until=time.monotonic()+25
-        wait_for(lambda:time.monotonic()>=until,30)
+        assert 'not in the table when read back' not in log(), log()
+        # Long enough for the one-second checks to end.
+        until=time.monotonic()+32
+        wait_for(lambda:time.monotonic()>=until,37)
         assert Path('/tmp/sas-actions').read_text().splitlines()==restored, Path('/tmp/sas-actions').read_text()
         assert not Path('/tmp/phy-actions').exists()
-        print('PASS: flushed SAS SNAT rule restored once, with natq bridge mode first, and left alone after.',flush=True)
+        print('PASS: flushed SAS SNAT rule restored once in %.1f s, with natq bridge mode first, and left alone after.'%took,flush=True)
+        # An in-connection carrier change: rcinit logs it, then rebuilds its
+        # firewall. No PDN goes down. The log line starts one-second checks.
+        with open('/tmp/rcinit.log','a') as rcinit:
+            rcinit.write(' 4:58:41 >|service.c             500 >|   info >| CBRS LTE Freq changed !\n')
+        until=time.monotonic()+1.5
+        wait_for(lambda:time.monotonic()>=until,4)
+        Path('/tmp/nat-rules').write_text('')
+        flushed=time.monotonic()
+        wait_for(lambda:len(Path('/tmp/sas-actions').read_text().splitlines())>=4,10)
+        took=time.monotonic()-flushed
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
+        assert took<6, took
+        print('PASS: after rcinit logged a carrier change, a flushed SAS SNAT rule was restored in %.1f s.'%took,flush=True)
+        until=time.monotonic()+31
+        wait_for(lambda:time.monotonic()>=until,36)
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
         # A PDN coming up starts 30 s of checks every second. A flush right
         # after it is restored within seconds. The last restore was under a
         # minute ago, but it was seen in the table, so it does not hold this one.
@@ -275,14 +323,14 @@ def main():
         wait_for(lambda:time.monotonic()>=until,4)
         Path('/tmp/nat-rules').write_text('')
         flushed=time.monotonic()
-        wait_for(lambda:len(Path('/tmp/sas-actions').read_text().splitlines())>=4,10)
+        wait_for(lambda:len(Path('/tmp/sas-actions').read_text().splitlines())>=6,10)
         took=time.monotonic()-flushed
-        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*3, Path('/tmp/sas-actions').read_text()
         assert took<6, took
-        assert 'missing for 2 s right after a PDN came up' in log(), log()
+        assert 'SAS NAT rule missing for 2 s in a row' in log(), log()
         until=time.monotonic()+5
         wait_for(lambda:time.monotonic()>=until,8)
-        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*2, Path('/tmp/sas-actions').read_text()
+        assert Path('/tmp/sas-actions').read_text().splitlines()==restored*3, Path('/tmp/sas-actions').read_text()
         print('PASS: after a PDN came up, a flushed SAS SNAT rule was restored in %.1f s.'%took,flush=True)
         if time.monotonic()-silent_from<110:
             assert not Path('/tmp/reboot-actions').exists(), 'the deaf watchdog fired before its wait'
@@ -293,7 +341,7 @@ def main():
         assert not Path('/tmp/phy-actions').exists()
         print('PASS: missing DHCP daemon recovered without Ethernet renegotiation.',flush=True)
         # An LTE outage must not become a downstream-router fault.
-        before=log().count('automatic recovery is armed')
+        before=ram().count('automatic recovery is armed')
         run(ip, 'link', 'set', 'lte0pdn1', 'down')
         run(ip, 'netns', 'exec', 'witcher-peer', '/bin/sh', '-c', 'echo 8 > /proc/sys/net/ipv4/conf/router0/arp_ignore')
         until=time.monotonic()+35
@@ -302,8 +350,10 @@ def main():
         assert 'repairing DHCP first' not in log()
         run(ip, 'netns', 'exec', 'witcher-peer', '/bin/sh', '-c', 'echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore')
         run(ip, 'link', 'set', 'lte0pdn1', 'up')
-        wait_for(lambda:log().count('automatic recovery is armed')>before,20)
-        print('PASS: LTE outage inhibited downstream recovery; return required a new ARP baseline.',flush=True)
+        wait_for(lambda:ram().count('automatic recovery is armed')>before,20)
+        # Arming the same router again is routine: RAM log only.
+        assert log().count('automatic recovery is armed')==1, log()
+        print('PASS: LTE outage inhibited downstream recovery; return required a new ARP baseline, logged in RAM only.',flush=True)
         # Keep Ethernet carrier and LTE up; suppress only the router's replies.
         run(ip, 'netns', 'exec', 'witcher-peer', '/bin/sh', '-c', 'echo 8 > /proc/sys/net/ipv4/conf/router0/arp_ignore')
         wait_for(lambda:'repairing DHCP first' in log(),45)

@@ -7,6 +7,15 @@
 //! example when it filters ARP from the bridge address. Renegotiating that
 //! link would cut working service, so the caller first asks `Activity`
 //! whether frames are still arriving from the router.
+//!
+//! The baseline belongs to the router, its address and MAC. The vendor's
+//! Wi-Fi DHCP server writes its empty list over the shared lease file every
+//! 30 s, so the caller sometimes cannot name the router for a moment. Up to
+//! v1.0.12 any such gap, or a change in the address the probe is sent from,
+//! started the watch over: on the bench it re-armed, and wrote that to flash,
+//! exactly every 30 s for 15 to 30 minutes after each boot, and it could not
+//! count three misses in that time. Now a gap shorter than `FORGET` keeps the
+//! baseline. The caller resets the watch when the cable or LTE goes down.
 use std::net::Ipv4Addr;
 
 pub const INTERVAL: u64 = 10;
@@ -42,27 +51,55 @@ pub enum Armed {
 
 #[derive(Default)]
 pub struct Watch {
+    /// The router being checked. Kept through a short gap.
     peer: Option<Peer>,
+    /// Since when the caller has not named it.
+    gone_since: Option<u64>,
     pending: Option<u64>,
     next: u64,
     armed: bool,
     misses: u8,
     repaired: bool,
+    /// The router whose first baseline has been reported.
+    announced: Option<(Ipv4Addr, [u8; 6])>,
+}
+
+fn same_router(a: &Peer, b: &Peer) -> bool {
+    a.address == b.address && a.mac == b.mac
 }
 
 impl Watch {
+    /// Start over: a new baseline is needed. Which router was already
+    /// reported is kept, so arming it again is not news.
     pub fn reset(&mut self) {
+        let announced = self.announced;
         *self = Self::default();
+        self.announced = announced;
     }
     pub fn tick(&mut self, now: u64, peer: Option<Peer>) -> Action {
-        if self.peer != peer {
-            self.reset();
-            self.peer = peer;
-            self.next = now + INTERVAL;
-        }
-        let Some(peer) = peer else {
+        let Some(current) = peer else {
+            if self.peer.is_some() {
+                let since = *self.gone_since.get_or_insert(now);
+                if now.saturating_sub(since) >= FORGET {
+                    self.reset();
+                }
+            }
+            // No probe while the router has no name. A reply to one already
+            // sent still counts.
             return Action::Hold;
         };
+        let back_in_time = self
+            .gone_since
+            .is_none_or(|since| now.saturating_sub(since) < FORGET);
+        let same = back_in_time && self.peer.is_some_and(|old| same_router(&old, &current));
+        if !same {
+            self.reset();
+            self.next = now + INTERVAL;
+        }
+        // The address the probe is sent from may have changed.
+        self.peer = Some(current);
+        self.gone_since = None;
+        let peer = current;
         if let Some(sent) = self.pending {
             if now.saturating_sub(sent) < TIMEOUT {
                 return Action::Hold;
@@ -112,7 +149,15 @@ impl Watch {
         self.armed = true;
         self.misses = 0;
         self.repaired = false;
-        first.then_some(Armed::First)
+        if !first {
+            return None;
+        }
+        let router = (peer.address, peer.mac);
+        if self.announced == Some(router) {
+            return Some(Armed::Again);
+        }
+        self.announced = Some(router);
+        Some(Armed::First)
     }
 }
 

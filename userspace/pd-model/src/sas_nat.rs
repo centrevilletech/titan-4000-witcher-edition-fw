@@ -23,6 +23,16 @@
 //! second. The other guards stay: no rule is needed unless the bearer is
 //! bridged, an unreadable table is not a miss, and misses must run in a row
 //! across `BURST_SPAN` seconds, longer than a vendor rebuild.
+//!
+//! An in-connection carrier change also restarts the vendor firewall, with no
+//! PDN coming up and no change to the bridge: `ucid` logs `HandOver CBRS` and
+//! `rcinit` logs `CBRS LTE Freq changed !` just before it flushes the table.
+//! Since v1.0.13 the keeper follows `rcinit`'s log and starts a burst on those
+//! lines (`firewall_restart`). Any first miss starts one too, and checks stay
+//! at one second while a miss run lasts, so a flush the keeper did not see
+//! coming waits at most one normal check. A restore the keeper sees in the
+//! table right after its own commands counts as seen (`confirm`), so a second
+//! vendor flush a moment later is restored after `BURST_RETRY`, not `RETRY`.
 use std::net::Ipv4Addr;
 
 pub const INTERVAL: u64 = 10;
@@ -85,17 +95,30 @@ impl Watch {
         self.burst_until.is_some_and(|until| now < until)
     }
 
-    /// Seconds the caller waits between checks.
+    /// Seconds the caller waits between checks. One second in a burst and
+    /// while a miss run lasts, except while a restore that never showed up in
+    /// the table waits out `RETRY`: a failing command is not a fast loop.
     pub fn interval(&self, now: u64) -> u64 {
-        if self.bursting(now) {
+        if self.waiting_unseen(now) {
+            INTERVAL
+        } else if self.bursting(now) || self.misses > 0 {
             BURST_INTERVAL
         } else {
             INTERVAL
         }
     }
 
+    /// The last restore never showed up in the table, and its `RETRY` is not over.
+    fn waiting_unseen(&self, now: u64) -> bool {
+        matches!(self.restored, Some((at, false)) if now < at + RETRY)
+    }
+
     /// The keeper read the table right after its own restore and saw the rule.
-    pub fn confirm(&mut self) {}
+    pub fn confirm(&mut self) {
+        if let Some((_, seen)) = &mut self.restored {
+            *seen = true;
+        }
+    }
 
     /// One check, made every `interval()` seconds by the caller. `snat` is the
     /// rule this unit needs now, or `None` when it needs none. `present` is
@@ -122,6 +145,10 @@ impl Watch {
             Some(false) => {
                 if self.misses == 0 {
                     self.first_miss = now;
+                    // The flush may have come with no line the keeper reads.
+                    if !self.waiting_unseen(now) {
+                        self.burst(now);
+                    }
                 }
                 self.misses = self.misses.saturating_add(1);
             }
@@ -157,9 +184,14 @@ pub fn pdn_up(line: &str) -> Option<&str> {
     crate::extdev::is_lte_bearer(dev).then_some(dev)
 }
 
-/// A vendor log line that comes right before `rcinit` rebuilds its firewall.
-pub fn firewall_restart(_line: &str) -> bool {
-    false
+/// A vendor log line that comes right before `rcinit` rebuilds its firewall,
+/// which flushes the nat table: an in-connection carrier change (`rcinit`'s
+/// `CBRS LTE Freq changed !`, `ucid`'s `HandOver CBRS(...)`) or a restart of
+/// the SAS service (`Restart service=[cbrs]`). Each starts a burst.
+pub fn firewall_restart(line: &str) -> bool {
+    ["CBRS LTE Freq changed", "HandOver CBRS", "Restart service=[cbrs]"]
+        .iter()
+        .any(|mark| line.contains(mark))
 }
 
 /// The value printed by `nvram_get 0 <key>` (`nvram_get success: <value>`).

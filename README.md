@@ -113,6 +113,12 @@ the customer router. The vendor driver turns them on although the link agrees
 on none, and each one can stop the router's upload for 33 ms. See
 [Ethernet flow control](docs/ethernet-flow-control.md).
 
+The keeper never renegotiates a customer link that carries traffic, or the
+link of a router that has not spoken IPv6, and it times prefix delegations
+with the monotonic clock, so the clock step at boot cannot cut a busy link.
+The port filter no longer copies bulk IPv6 out of the kernel. See
+[IPv6 router health](docs/ipv6-health.md).
+
 The keeper writes to flash only when something changes. Routine lines, such as
 each periodic router advertisement, go to a log in RAM, and the status file is
 rewritten on flash at most once a minute. Witcher's logs in `/tmp` stay under
@@ -159,6 +165,7 @@ components this repository builds from source.
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
+- [IPv6 router health and the customer port](docs/ipv6-health.md)
 
 ## Learn LTE and build something
 

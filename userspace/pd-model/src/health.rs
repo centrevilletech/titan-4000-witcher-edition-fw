@@ -4,8 +4,15 @@
 //! Ethernet link drop. It never re-attaches LTE. A link drop is spent from a
 //! budget so a silent router cannot make the keeper flap the port forever.
 //! Silence while LTE is down, or while the cable is unplugged, is not a
-//! downstream failure. A live block that is not the pinned block stops
-//! service instead of advertising a stale prefix.
+//! downstream failure, and the escalation starts over when both are back.
+//! A live block that is not the pinned block stops service instead of
+//! advertising a stale prefix.
+//!
+//! A link that carries traffic is never dropped, and neither is the link of a
+//! router that has not spoken IPv6 since it was plugged in. Before v1.0.13 an
+//! IPv4-only router behind a unit with delegation on lost its link three times
+//! an hour, and a clock step at boot could drop a busy link. The step that was
+//! due waits, without spending the budget, until the link is quiet.
 
 pub const SILENCE_SECS: u64 = 45;
 pub const REANNOUNCE_WAIT: u64 = 20;
@@ -82,9 +89,10 @@ impl Health {
             self.phase_since = view.now;
             return Decision::StopServing;
         }
-        // A radio or cable outage is not the router's fault, and the step
-        // clock restarts so LTE coming back does not immediately drop the link.
+        // A radio or cable outage is not the router's fault. The escalation
+        // starts over, so LTE coming back does not drop the link 30 s later.
         if !view.carrier_up || !view.lte_up {
+            self.phase = Phase::Idle;
             self.phase_since = view.now;
             return Decision::Hold;
         }
@@ -111,12 +119,24 @@ impl Health {
             Phase::Idle if waited >= SILENCE_SECS => {
                 self.begin(Phase::Reannounce, view.now, Decision::Reannounce)
             }
-            Phase::Reannounce if waited >= REANNOUNCE_WAIT => {
+            // Our responders serve IPv6 only. A router that never spoke it
+            // gains nothing from a restart.
+            Phase::Reannounce if waited >= REANNOUNCE_WAIT && view.ipv6_router_heard => {
                 self.begin(Phase::Restart, view.now, Decision::Restart)
             }
-            Phase::Restart if waited >= RESTART_WAIT => self.drop_link(view.now),
-            Phase::LinkDrop if waited >= LINK_DROP_WAIT => self.drop_link(view.now),
+            Phase::Restart if waited >= RESTART_WAIT => self.drop_quiet_link(view),
+            Phase::LinkDrop if waited >= LINK_DROP_WAIT => self.drop_quiet_link(view),
             _ => Decision::Hold,
+        }
+    }
+
+    /// The link drop that is due, only on a quiet link of a router that has
+    /// spoken IPv6. Otherwise it waits, and no budget is spent.
+    fn drop_quiet_link(&mut self, view: &View) -> Decision {
+        if view.ipv6_router_heard && view.link_quiet {
+            self.drop_link(view.now)
+        } else {
+            Decision::Hold
         }
     }
 
@@ -132,13 +152,18 @@ impl Health {
         }
     }
 
-    /// IPv4 and IPv6 spend the same physical-port recovery budget.
+    /// IPv4 and IPv6 spend the same physical-port recovery budget. The IPv6
+    /// escalation keeps its own step: an IPv4 recovery is not a step of it.
     pub fn request_link_recovery(&mut self, now: u64) -> Decision {
         self.refresh_window(now);
         if now < self.quiet_until {
             return Decision::BudgetSpent;
         }
-        self.drop_link(now)
+        let (phase, since) = (self.phase, self.phase_since);
+        let decision = self.drop_link(now);
+        self.phase = phase;
+        self.phase_since = since;
+        decision
     }
 
     fn begin(&mut self, phase: Phase, now: u64, decision: Decision) -> Decision {
