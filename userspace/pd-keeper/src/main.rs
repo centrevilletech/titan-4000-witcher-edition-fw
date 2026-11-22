@@ -6,6 +6,9 @@
 //! `solicit-mgmt` is a diagnostic: it sends one router solicitation on the
 //! management bearer, to check that the answer no longer reaches the vendor
 //! stack once the keeper has closed the bearer to advertisements.
+//! `bank-guard` is the boot confirm for a full firmware update: `boot` runs
+//! once per boot as its own process, `status`, `preflight`, `arm` and `check` are for
+//! operators and updaters (see `bank_guard` and `docs/bank-guard.md`).
 
 use std::env;
 use std::fs;
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use titan_pd_model::config::{self, Pending, Recovery};
 use titan_pd_model::wear;
 
+mod bank_guard;
 mod bench;
 mod capture;
 mod radio;
@@ -50,6 +54,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some("bank-guard") => std::process::exit(bank_guard::main(&args.collect::<Vec<_>>())),
         Some("guard") => std::process::exit(guard(&args.collect::<Vec<_>>())),
         Some("confirm") => std::process::exit(confirm(&args.collect::<Vec<_>>())),
         Some("filter-probe") => std::process::exit(filter_probe()),
@@ -85,7 +90,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|solicit-mgmt|status"
+                "usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|solicit-mgmt|status|bank-guard"
             );
             std::process::exit(64);
         }

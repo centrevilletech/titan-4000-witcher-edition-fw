@@ -70,7 +70,8 @@ jobs:
           (cd device/sqm/payload && sha256sum -c ../SHA256SUMS)
           bash -n device/sqm/source/rebuild.sh
           python3 -m compileall -q scripts
-          bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
+          bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh scripts/build-nv23.sh
+          gcc -fsyntax-only -Wall -Wextra -Werror -fno-builtin userspace/nv23/nv23.c
           for script in overlay/etc/init.d/* overlay/usr/lib/titan-api/*.sh; do sh -n "$script"; done
           git diff --check
       - name: Keeper and protocol tests
@@ -83,6 +84,10 @@ jobs:
         run: |
           cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
           python3 scripts/test-ipv4-recovery-network.py
+      - name: Bank guard boot flow
+        run: |
+          cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
+          python3 scripts/test-bank-guard.py
       - name: UI dependencies
         run: npm ci --prefix web --no-audit --no-fund
       - name: Install browser
@@ -143,7 +148,8 @@ jobs:
           apt-get install -y --no-install-recommends \
             build-essential autoconf automake libtool pkg-config \
             zlib1g-dev liblzo2-dev uuid-dev fakeroot \
-            python3-pip python3-venv python3-lzo ca-certificates curl bzip2 qemu-user
+            python3-pip python3-venv python3-lzo ca-certificates curl bzip2 qemu-user \
+            clang lld
           python3 -m venv --system-site-packages "$PACK_WORK/ubi-venv"
           "$PACK_WORK/ubi-venv/bin/pip" install ubi_reader==0.8.16 ziglang==0.14.1
           echo "$PACK_WORK/ubi-venv/bin" >> "$GITHUB_PATH"

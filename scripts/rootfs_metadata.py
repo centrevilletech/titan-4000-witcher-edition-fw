@@ -13,12 +13,19 @@ WITCHER_BOOT_SCRIPTS = (
     '/etc/init.d/titan-api',
     '/etc/init.d/titan-pd-keeper',
     '/etc/init.d/titan-sshd',
+    '/etc/init.d/witcher-bank-guard',
     '/etc/sysconfig/script/passthru-fix.sh',
 )
 WITCHER_BUNDLE_SCRIPTS = (
     '/usr/lib/titan-api/prepare-tls.sh',
     '/usr/lib/titan-api/start-titan-api.sh',
     '/usr/lib/titan-api/collect.sh',
+)
+# Built from source by the image build, so present only in a full image.
+WITCHER_BUNDLE_BINARIES = (
+    '/usr/lib/titan-api/witcher-firstboot',
+    '/usr/lib/titan-api/witcher-entropy',
+    '/usr/lib/titan-api/witcher-nv23',
 )
 
 
@@ -122,7 +129,7 @@ def boot_errors(stock, built, *, witcher=False):
         required += WITCHER_BOOT_SCRIPTS
         if '/usr/lib/titan-api' in built:
             required += WITCHER_BUNDLE_SCRIPTS
-            required += ('/usr/lib/titan-api/witcher-firstboot', '/usr/lib/titan-api/witcher-entropy')
+            required += WITCHER_BUNDLE_BINARIES
     for path in required:
         try:
             mode = resolve(built, path)['mode']

@@ -13,6 +13,10 @@ Install:
 - Rust 1.99.0 with `armv7-unknown-linux-musleabi`; builds use its bundled linker.
 - Zig 0.14.1 (`pip install ziglang==0.14.1`) for the vendored Jitterentropy
   collector, compiled at `-O0` without link-time optimization.
+- Clang and LLD for `witcher-nv23`, the bank guard's NV helper. It links
+  dynamically against the stock image's own uClibc, `libnvm.so` and
+  `libkzload.so`, read from the extracted vendor root filesystem at build time.
+  With `qemu-arm` on the path, the build also loads it under emulation.
 
 ```bash
 npm ci --prefix web
@@ -33,8 +37,8 @@ manager, not a tracked file or command-line argument.
 also records the source commit, dirty-tree flag and vendor base version.
 Use a new version for a new firmware release and match the tag to it.
 
-The builder compiles `web/`, `userspace/firstboot`, `userspace/pd-keeper` and
-`userspace/entropy`. Other native services are pinned binaries under `overlay/`;
+The builder compiles `web/`, `userspace/firstboot`, `userspace/pd-keeper`,
+`userspace/entropy` and `userspace/nv23`. Other native services are pinned binaries under `overlay/`;
 their source has not yet been imported from the private ops repository.
 
 | Path | Contents |

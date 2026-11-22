@@ -126,6 +126,11 @@ Each watchdog reboot that is followed by silence again doubles the wait
 before the next one, up to six hours. An hour of answers clears the count
 (`watchdog-strikes.txt` in the keeper state directory).
 
+Because it waits for a first answer, the watchdog cannot help an image that
+never reaches the core. After a full firmware update, the
+[bank guard](bank-guard.md) covers that case: no answer within 10 minutes of
+the first boot, and it switches back to the old bank.
+
 An outage upstream of every target, with the radio still attached, looks the
 same from the unit. Each unit then reboots once, and does not arm again until
 a target answers. To avoid that, name targets on the core itself.

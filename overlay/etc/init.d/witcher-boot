@@ -49,6 +49,9 @@ cap_logs() {
 # This supervisor waits for kernel entropy if needed. It does not wait for TLS
 # generation or native web health; existing enrolled keys remain usable.
 /bin/sh /etc/init.d/titan-sshd boot </dev/null >> /tmp/titan-sshd-boot.log 2>&1 &
+# The boot confirm for a full firmware update. It runs apart from the keeper
+# and the web service, and does nothing unless an updater marked this boot.
+/bin/sh /etc/init.d/witcher-bank-guard boot </dev/null >/dev/null 2>&1 &
 # IPv4 repair and IPv6 delegation must survive a failed web/TLS startup.
 /bin/sh /etc/init.d/titan-pd-keeper start </dev/null >> /tmp/titan-pd-keeper-boot.log 2>&1 &
 (

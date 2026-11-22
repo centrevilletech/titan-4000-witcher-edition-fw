@@ -52,11 +52,23 @@ upload a compatible `.prg`. For an intentional downgrade, select the
 older-image option. Witcher's updater checks NAND readback and bank selection
 before rebooting. Keep power connected throughout the operation.
 
-There are two firmware banks, but an intact alternate image is not proof of
-automatic rollback. Browser bank switching and recovery require working Linux
-and networking. `http://DEVICE_IP:8081/` offers password-authenticated recovery
+There are two firmware banks. The boot code itself never switches back, but
+the [bank guard](bank-guard.md) does: on the first boot after an update, the
+new image must bring up management within 10 minutes, or the guard selects the
+old bank and reboots once. It cannot help a kernel that fails before init.
+Browser bank switching and recovery require working Linux and networking. `http://DEVICE_IP:8081/` offers password-authenticated recovery
 while those services are reachable; it cannot repair a failure before init.
 Do not infer that an unresponsive device is safe to power-cycle mid-write.
+
+## Bank selection
+
+NV item 23 in `cmnnv` holds six 36-byte records, two per part (kernel, root
+filesystem, modem firmware). Each has the magic `0xcafebabe`, an Adler-32 with
+seed 0 over its own bytes 4 to 35, the image size, an Adler-32 of the image as
+written, and a sequence number. For each part the bank with the higher
+sequence number boots. The updater writes the inactive bank, then raises its
+sequence numbers. See [the bank guard](bank-guard.md#how-the-titan-picks-a-bank)
+for the full layout and the evidence from the vendor binaries.
 
 ## Verification scope
 
