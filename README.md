@@ -108,6 +108,11 @@ to further router advertisements, finds the customer bearer by itself, and in
 every mode reboots a unit that stays attached but hears nothing through the
 core for five minutes. See [the deaf-unit fault](docs/deaf-watchdog.md).
 
+The build also removes fixed waits from the vendor `ucid` and `rcinit` that
+ran on every LTE reconnect, along with `rcinit`'s Ethernet port bounce on each
+reconnect and its NAT-router firewall restart after a carrier change. See
+[PDN bounces and carrier changes](docs/pdn-bounce.md).
+
 In every mode the keeper stops the Titan from sending 802.3x PAUSE frames to
 the customer router. The vendor driver turns them on although the link agrees
 on none, and each one can stop the router's upload for 33 ms. See
@@ -163,6 +168,7 @@ components this repository builds from source.
 - [Component provenance and third-party licenses](THIRD_PARTY.md)
 - [Image format and flashing](docs/image-format.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
+- [PDN bounces and carrier changes](docs/pdn-bounce.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)

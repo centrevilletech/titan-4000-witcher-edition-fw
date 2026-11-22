@@ -40,7 +40,10 @@ In IP passthrough the customer router holds the data bearer address. The vendor
 <lan_management_ipaddr> -j SNAT --to <pdn_data_ipaddr>` so replies come back.
 About a minute after an LTE handover the connection manager signals `rcinit`,
 which restarts the firewall. That restart removes the rule and selects the
-NAT-router `natq` mode.
+NAT-router `natq` mode. Since v1.0.x the build removes that restart
+(`rcinit` `0xdc48`, see [PDN bounces and carrier changes](pdn-bounce.md)). The
+rest of this section describes the stock path and the keeper's repair, which
+stays in place for every other flush.
 
 Stock firmware puts both back through the cbrs service restart that Block
 Channel requests (`action_service=cbrs`, then `SIGUSR1` to `rcinit`). The

@@ -3,12 +3,15 @@
 
 Checks: container CRCs/length; kernel and tk byte-identical to stock; all 254
 device nodes present with correct major/minor; every inode owned by uid/gid 500;
-the overlay scripts present; and gdmlte.ko carries exactly the one-byte /56
-patch (and nothing else) versus the stock module.
+the overlay scripts present; gdmlte.ko carries exactly the one-byte /56
+patch (and nothing else) versus the stock module; cbrs_fsm carries its patch;
+rcinit and ucid are exactly the pinned patched files. With
+WITCHER_VERIFY_TLS=1 it also runs the packed rcinit and ucid PDN and
+carrier-change code in an emulator (scripts/emulate-pdn-paths.py).
 
 Usage: scripts/verify-firmware.py STOCK.prg BUILT.prg
 """
-import struct, zlib, sys, os, tempfile, collections, hashlib, json, gzip, tarfile, subprocess
+import struct, zlib, sys, os, tempfile, collections, hashlib, json, gzip, tarfile, subprocess, importlib.util
 from pathlib import Path
 from rootfs_metadata import boot_errors, prg_metadata
 from credential_policy import credential_findings, legacy_credentials
@@ -30,6 +33,23 @@ def carve_ubifs(ubi):
         vid,ln=struct.unpack_from('>II',v,8)
         if vid==0: lebs[ln]=p[do:do+leb]
     return b''.join(lebs.get(i,b'\xff'*leb) for i in range(max(lebs)+1))
+
+def patch_script(name):
+    spec=importlib.util.spec_from_file_location(name.replace('-','_'), Path(__file__).with_name(name+'.py'))
+    module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+def check_pdn_patches(d, check):
+    """rcinit and ucid must be exactly the pinned patched files, site by site."""
+    for name, module, pin in (('rcinit', patch_script('patch-rcinit'), 'WITCHER_PATCHED_SHA256'),
+                              ('ucid', patch_script('patch-ucid'), 'STOCK_PATCHED_SHA256')):
+        path=os.path.join(d,'usr/sbin',name)
+        data=open(path,'rb').read() if os.path.exists(path) else b''
+        digest=getattr(module, pin)
+        check(f'{name} is the pinned patched binary (sha256 {digest[:16]}...)', hashlib.sha256(data).hexdigest()==digest)
+        for patch in module.PATCHES:
+            offset=patch.va-module.BASE
+            check(f'{name} {patch.label} (@VA 0x{patch.va:x})', data[offset:offset+len(patch.new)]==patch.new)
 
 def main():
     stock, built = sys.argv[1], sys.argv[2]
@@ -194,9 +214,13 @@ def main():
         cbb=open(cb,'rb').read()
         check('cbrs_fsm block routine no-op (@0x4fcc)', cbb[0x4fcc:0x4fd4]==bytes.fromhex('0000a0e31eff2fe1'))
         check('cbrs_fsm firewall neutered (@0x1c8b4)', cbb[0x1c8b4:0x1c8bc]==b'true    ')
+    check_pdn_patches(d, check)
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('emulate-pdn-paths.py')), d,
+                                 '--expect', 'patched', '--quiet'])
+        check('packed rcinit and ucid PDN and carrier-change paths (real ARM code in Unicorn)', result.returncode == 0)
     print('\nRESULT:', 'ALL PASS' if not fails else f'{len(fails)} FAILURES: {fails}')
     sys.exit(1 if fails else 0)
 
