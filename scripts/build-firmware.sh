@@ -86,6 +86,11 @@ CB="$WORK/rootfs/usr/sbin/cbrs_fsm"
 python3 "$HERE/scripts/patch-cbrs_fsm.py" "$CB" -o "$CB.patched"
 mv "$CB.patched" "$CB"
 
+echo ">> patching monitor (read eth0 packet counters below the atoi clamp)"
+MON="$WORK/rootfs/usr/sbin/monitor"
+python3 "$HERE/scripts/patch-monitor.py" "$MON" -o "$MON.patched"
+mv "$MON.patched" "$MON"
+
 echo ">> restoring stock modes after extraction and patching"
 python3 "$HERE/scripts/restore-rootfs-modes.py" "$WORK/fa/02_rootfs.ubi" "$WORK/rootfs"
 

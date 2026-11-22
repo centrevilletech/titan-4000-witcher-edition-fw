@@ -3,8 +3,9 @@
 
 Checks: container CRCs/length; kernel and tk byte-identical to stock; all 254
 device nodes present with correct major/minor; every inode owned by uid/gid 500;
-the overlay scripts present; and gdmlte.ko carries exactly the one-byte /56
-patch (and nothing else) versus the stock module.
+the overlay scripts present; gdmlte.ko carries exactly the one-byte /56
+patch (and nothing else) versus the stock module; cbrs_fsm and monitor carry
+their patches.
 
 Usage: scripts/verify-firmware.py STOCK.prg BUILT.prg
 """
@@ -194,9 +195,18 @@ def main():
         cbb=open(cb,'rb').read()
         check('cbrs_fsm block routine no-op (@0x4fcc)', cbb[0x4fcc:0x4fd4]==bytes.fromhex('0000a0e31eff2fe1'))
         check('cbrs_fsm firewall neutered (@0x1c8b4)', cbb[0x1c8b4:0x1c8bc]==b'true    ')
+    mon=os.path.join(d,'usr/sbin/monitor')
+    if os.path.exists(mon):
+        mb=open(mon,'rb').read()
+        check('monitor eth0 rx counter read modulo 1e9 (@0x4234)', mb[0x4234:0x4265]==b"grep eth0 /proc/net/dev | awk '{print $3%1e9}'\0\0\0")
+        check('monitor eth0 tx counter read modulo 1e9 (@0x4268)', mb[0x4268:0x429a]==b"grep eth0 /proc/net/dev | awk '{print $11%1e9}'\0\0\0")
+    else:
+        check('monitor present', False)
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-monitor-counters.py')), d])
+        check('monitor eth0 counter commands stay below the atoi clamp (packed BusyBox under QEMU)', result.returncode == 0)
     print('\nRESULT:', 'ALL PASS' if not fails else f'{len(fails)} FAILURES: {fails}')
     sys.exit(1 if fails else 0)
 
