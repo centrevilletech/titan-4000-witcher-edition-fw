@@ -14,9 +14,15 @@
 //! `hand-back` returns control to the vendor: it asks `rcinit` to rebuild its
 //! own no-grant rule and start the vendor client, then removes our rules.
 //!
-//! Exit status 78 from `run` means this client cannot serve the unit (it is
-//! not registered, or its certificate files are unusable) and the vendor
-//! client should run instead: the supervisor then runs `hand-back`.
+//! Exit status 78 from `run` means this client cannot serve the unit (no
+//! usable SAS address or setting, unusable certificate files, or no CBSD ID
+//! and no complete registration data) and the vendor client should run
+//! instead: the supervisor then runs `hand-back`.
+//!
+//! Settings, all optional, for moving to another SAS (`docs/sas-client.md`
+//! section 10): `WITCHER_SAS_CA_FILE`, `WITCHER_SAS_CA_SOURCE`,
+//! `WITCHER_SAS_IP`, `WITCHER_SAS_URL_EXACT`, `WITCHER_SAS_BATCH`,
+//! `WITCHER_SAS_MEAS_FIELD`, `WITCHER_SAS_GROUP` and `WITCHER_SAS_CPI_FILE`.
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
@@ -26,12 +32,13 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::json;
 use witcher_sas_model::band::{self, Range};
 use witcher_sas_model::engine::{Action, Engine, Gate, Input, Policy, RadioCommand};
 use witcher_sas_model::ipc;
 use witcher_sas_model::mock::{Fault, Sim};
 use witcher_sas_model::proto::Kind;
+use witcher_sas_model::registration::{self, MeasField, Options, Stored};
 use witcher_sas_model::vendor_log::{self, Event, Outcome};
 
 mod host;
@@ -84,14 +91,18 @@ fn parse_ranges(text: &str) -> Vec<Range> {
         .collect()
 }
 
+fn environment(variable: &str) -> Option<String> {
+    std::env::var(variable).ok()
+}
+
 fn policy() -> Policy {
+    policy_from(environment)
+}
+
+fn policy_from(get: impl Fn(&str) -> Option<String>) -> Policy {
     let mut policy = Policy::default();
-    let number = |variable: &str| {
-        std::env::var(variable)
-            .ok()
-            .and_then(|text| text.trim().parse::<u64>().ok())
-    };
-    if let Ok(text) = std::env::var("WITCHER_SAS_STANDBY") {
+    let number = |variable: &str| get(variable).and_then(|text| text.trim().parse::<u64>().ok());
+    if let Some(text) = get("WITCHER_SAS_STANDBY") {
         policy.standby = parse_ranges(&text);
     }
     if let Some(seconds) = number("WITCHER_SAS_RETAIN") {
@@ -100,7 +111,31 @@ fn policy() -> Policy {
     if let Some(seconds) = number("WITCHER_SAS_HANDSHAKE_LIMIT") {
         policy.handshake_limit = seconds;
     }
+    if get("WITCHER_SAS_BATCH").is_some_and(|text| text.trim() == "0") {
+        policy.batch = false;
+    }
     policy
+}
+
+/// Registration settings an operator may set. Errors name the setting.
+fn options_from(get: impl Fn(&str) -> Option<String>) -> Result<Options, String> {
+    let meas = MeasField::parse(&get("WITCHER_SAS_MEAS_FIELD").unwrap_or_default())?;
+    let grouping = registration::parse_grouping(&get("WITCHER_SAS_GROUP").unwrap_or_default())
+        .map_err(|why| format!("WITCHER_SAS_GROUP: {why}"))?;
+    Ok(Options { meas, grouping })
+}
+
+/// What the unit stores for its registration. Nothing here is logged.
+fn stored_unit() -> Stored {
+    let cpi = host::tool("WITCHER_SAS_CPI_FILE", "/mnt/cbrs_cpi_file");
+    Stored {
+        user_id: host::nvram_get_slot(host::SAS_SLOT, "cbrs_userId"),
+        fcc_id: host::nvram_get("cbrs_fccId"),
+        serial: host::nvram_get("sqns_identity_serialNumber"),
+        single_step: host::nvram_get_slot(host::SAS_SLOT, "cbrs_isSingleReg"),
+        category: host::nvram_get("cbrs_category"),
+        cpi_file: host::read_small(&cpi, 16 * 1024),
+    }
 }
 
 /// Monotonic seconds. It starts above zero so no deadline is ever "at 0".
@@ -116,7 +151,7 @@ struct Daemon {
     engine: Engine,
     socket: UnixDatagram,
     credentials: transport::Credentials,
-    base: String,
+    endpoint: transport::Endpoint,
     runtime: PathBuf,
     state: PathBuf,
     log: host::Log,
@@ -137,24 +172,67 @@ fn run() -> i32 {
     let log = host::Log::new(&runtime);
     // Closed until a heartbeat says otherwise.
     host::close_gate();
-    let Some(base) = transport::base_url(&host::nvram_get("cbrs_sasurl")) else {
+    let exact = environment("WITCHER_SAS_URL_EXACT").is_some_and(|text| text.trim() == "1");
+    let configured = host::nvram_get_slot(host::SAS_SLOT, "cbrs_sasurl");
+    let Some(base) = transport::base_url(&configured, exact) else {
         log.line("no usable SAS address in cbrs_sasurl");
         return UNSERVICEABLE;
     };
-    let credentials = match transport::Credentials::prepare(&runtime) {
+    let family = match transport::Family::parse(&environment("WITCHER_SAS_IP").unwrap_or_default())
+    {
+        Ok(family) => family,
+        Err(why) => {
+            log.line(&why);
+            return UNSERVICEABLE;
+        }
+    };
+    let options = match options_from(environment) {
+        Ok(options) => options,
+        Err(why) => {
+            log.line(&why);
+            return UNSERVICEABLE;
+        }
+    };
+    let ca = transport::ca_source(
+        environment("WITCHER_SAS_CA_FILE").as_deref(),
+        environment("WITCHER_SAS_CA_SOURCE").as_deref(),
+    );
+    let credentials = match transport::Credentials::prepare(&runtime, &ca) {
         Ok(credentials) => credentials,
         Err(why) => {
             log.line(&why);
             return UNSERVICEABLE;
         }
     };
-    let registration = fs::read_to_string(state.join("registration.json"))
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let stored = stored_unit();
+    // Built only from what the unit stores. Anything missing leaves the
+    // client unable to register; the log names what, never a value.
+    let registration = match registration::build(&stored, &options) {
+        Ok(request) => {
+            let mode = if request.get("cpiSignatureData").is_some() {
+                "single-step with the installer's signed data"
+            } else {
+                "multi-step"
+            };
+            log.line(&format!("registration request ready: {mode}"));
+            Some(request)
+        }
+        Err(missing) => {
+            log.line(&format!(
+                "no registration request: missing {}",
+                missing.join("; ")
+            ));
+            None
+        }
+    };
+    // The vendor client's CBSD ID may come from another SAS. The engine uses
+    // it only until this SAS shows it does not know it.
     let adopted = Some(host::nvram_get("cbrs_cbsdId"))
         .filter(|id| !id.is_empty() && host::nvram_get("cbrs_registration_status") == "1");
     let clock = Clock(Instant::now());
     let mut engine = Engine::new(policy(), registration, adopted);
+    // Saved grants belong to one SAS address and account.
+    engine.bind(&base, &stored.user_id);
     if let Ok(saved) = fs::read_to_string(state.join("state.json")) {
         match engine.restore(&saved, clock.now()) {
             Ok(count) => log.line(&format!(
@@ -176,7 +254,7 @@ fn run() -> i32 {
         engine,
         socket,
         credentials,
-        base,
+        endpoint: transport::Endpoint { base, family },
         runtime,
         state,
         log,
@@ -222,7 +300,7 @@ impl Daemon {
         match action {
             Action::Send(request) => {
                 let kind = request.kind;
-                match transport::start(&self.credentials, &self.base, &self.runtime, request) {
+                match transport::start(&self.credentials, &self.endpoint, &self.runtime, request) {
                     Ok(call) => self.call = Some(call),
                     // The engine counts a call it never hears back from as lost.
                     Err(why) => self.log.line(&format!("{} not sent: {why}", kind.method())),
@@ -465,6 +543,42 @@ mod tests {
             ]
         );
         assert!(parse_ranges("3500-3520,junk").is_empty());
+    }
+
+    fn settings(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let pairs: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |variable: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| key == variable)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    #[test]
+    fn batching_is_on_unless_the_operator_turns_it_off() {
+        assert!(policy_from(settings(&[])).batch);
+        assert!(policy_from(settings(&[("WITCHER_SAS_BATCH", "1")])).batch);
+        assert!(!policy_from(settings(&[("WITCHER_SAS_BATCH", "0")])).batch);
+    }
+
+    #[test]
+    fn registration_settings_parse_or_fail_closed() {
+        let options = options_from(settings(&[])).unwrap();
+        assert_eq!(options.meas, MeasField::Omit);
+        assert!(options.grouping.is_empty());
+        let options = options_from(settings(&[
+            ("WITCHER_SAS_MEAS_FIELD", "empty"),
+            ("WITCHER_SAS_GROUP", "INTERFERENCE_COORDINATION:g1"),
+        ]))
+        .unwrap();
+        assert_eq!(options.meas, MeasField::Empty);
+        assert_eq!(options.grouping.len(), 1);
+        assert!(options_from(settings(&[("WITCHER_SAS_MEAS_FIELD", "all")])).is_err());
+        assert!(options_from(settings(&[("WITCHER_SAS_GROUP", "x")])).is_err());
     }
 
     #[test]

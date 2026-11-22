@@ -49,9 +49,31 @@ pub fn nvram_value(output: &str) -> &str {
     }
 }
 
+/// A key from nvram slot 0, where the vendor keeps most settings.
 pub fn nvram_get(key: &str) -> String {
+    nvram_get_slot(0, key)
+}
+
+/// The vendor keeps its four SAS settings in slot 3, not slot 0:
+/// `cbrs_userId`, `cbrs_sasurl`, `cbrs_maxerip_def` and `cbrs_isSingleReg`.
+/// Their slot-0 copies are empty on the units checked, and the vendor client
+/// reads slot 3.
+pub const SAS_SLOT: u8 = 3;
+
+pub fn nvram_get_slot(slot: u8, key: &str) -> String {
     let program = tool("TITAN_NVRAM_GET", "nvram_get");
-    nvram_value(&stdout(&program, &["0", key])).to_string()
+    let slot = slot.to_string();
+    nvram_value(&stdout(&program, &[slot.as_str(), key])).to_string()
+}
+
+/// A file's text when it exists, is small and is readable. `None`
+/// otherwise. The caller must never log what it returns.
+pub fn read_small(path: &str, limit: u64) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > limit {
+        return None;
+    }
+    fs::read_to_string(path).ok()
 }
 
 /// Set a key in the shared configuration cache through the Witcher helper,

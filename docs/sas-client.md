@@ -1,7 +1,7 @@
 # A Witcher SAS client for the Titan 4000
 
-Status on 2026-11-22: design and first code. **The code has not run on a radio, is not in the firmware
-image, and nothing starts it.** `userspace/sas-model` holds the logic and a pretend SAS for tests.
+Status on 2026-11-22: design and first code, now written to work with any SAS that follows WINNF-TS-0016
+(section 10). **The code has not run on a radio, is not in the firmware image, and nothing starts it.** `userspace/sas-model` holds the logic and a pretend SAS for tests.
 `userspace/sasd` is the program for the unit. Read [the enforcement notes](cbrs-sas-enforcement.md) first:
 nothing here establishes that a modified unit complies with 47 CFR Part 96. Replacing the SAS client changes
 how an authorized device is controlled. The operator carries that responsibility.
@@ -89,7 +89,9 @@ starting the unit's own `curl`, and it polls that child once a second only while
 | `rcinit` datagrams on `/tmp/.socket_fsm` | `cbrs_mode_grant`, `cbrs_grant_state`, `cbrs_grant_erip`, `sqns_radio_maxTxPower` |
 | Carriers from the same nvram keys `rcinit` uses | Its own drop chain in `iptables`, `ip6tables` and `ebtables` |
 | Saved grants in `state.json` on the Witcher volume | `cbrs_block_list` and `sqns_admin_apply`, only to take the radio off a carrier |
-| The CBSD ID the SAS already issued (`cbrs_cbsdId`) | `status.json` and a log in RAM |
+| The CBSD ID the vendor client left (`cbrs_cbsdId`) | `status.json` and a log in RAM |
+| The SAS address, account and registration mode from nvram **slot 3** (`cbrs_sasurl`, `cbrs_userId`, `cbrs_isSingleReg`), where the vendor client reads them | |
+| The unit identity (`cbrs_fccId`, `sqns_identity_serialNumber`, `cbrs_category`) and the installer's signed file (`/mnt/cbrs_cpi_file`) | |
 
 The decisions live in `witcher-sas-model::engine`. It does no I/O, so every rule below runs in tests against
 a pretend SAS on a virtual clock.
@@ -104,11 +106,21 @@ at the three files with `--cert`, `--key` and `--cacert`, forces TLS 1.2 and the
 deletes the directory when it exits. The daemon never opens the files, never logs them, and no key or
 passphrase is in this repository. The unit talks only to the SAS address already configured in
 `cbrs_sasurl`. The argument order of the vendor tool is `[inferred]` and is the first thing to check on the
-bench.
+bench. The tool copies each path into a 64-byte buffer, so the daemon refuses longer paths.
+
+The trust store can change for a new SAS (section 10): `WITCHER_SAS_CA_FILE` names a plain PEM bundle, for
+example one that holds all four WInnForum roots, and `WITCHER_SAS_CA_SOURCE` names another vendor-encrypted
+file. The daemon checks that the store holds at least one certificate and stops with status 78 if not.
+`curl` uses IPv4 unless `WITCHER_SAS_IP` says `6` or `any`. IPv4 stays the default because a passthrough unit
+has a SAS SNAT rule for IPv4 that the keeper restores.
 
 ### 3.3 State
 
-- **CBSD:** unregistered or registered.
+- **CBSD:** unregistered or registered. A CBSD ID taken over from the vendor client counts as unproven until
+  this SAS answers a request made with it in a way that shows it knows it.
+- **Which SAS:** `state.json` names the SAS address and account it belongs to. At start, state saved for any
+  other address or account is thrown away, so a unit moved to a new SAS starts clean. An unproven CBSD ID is
+  never saved.
 - **Each grant:** Granted, Authorized or Suspended, with its range, power, heartbeat interval, and a
   monotonic deadline for transmit authority.
 - **Gate:** open only while every carrier in use lies inside grants that are Authorized with the deadline
@@ -130,15 +142,17 @@ bench.
 
 | Procedure | When | Notes |
 |---|---|---|
-| Registration | Only when the unit has no CBSD ID, or the SAS answers 103 naming `cbsdId` or 105 | Never at boot, never for a grant error. Waits 60, 300, 900 then 3600 s between failed tries. Version 1 has no registration request of its own: see section 8 |
+| Registration | Only when the unit has no CBSD ID, the SAS answers 103 naming `cbsdId` or 105, the SAS answers 102 or 103 to an unproven CBSD ID, or a conflict stays unnamed (section 3.8) | Never at boot, never for an ordinary grant error. Waits 60, 300, 900 then 3600 s between failed tries. The request is built from what the unit stores: section 10.2 |
 | Spectrum inquiry | Only after a 400, or a 500 with no suggestion | TS-0016 makes it optional before a grant. Skipping it saves the slowest call (up to 16 s) |
 | Grant | For each part of a carrier in use that no held grant covers | Pieces of at most 20 MHz. All pieces go in one request array |
-| Heartbeat | At 80% of `heartbeatInterval`. First one right after a grant, with `operationState` GRANTED | All grants due in the next fifth of an interval share one request. `grantRenew` goes out when `grantExpireTime` is under 2 days away |
+| Heartbeat | At 80% of `heartbeatInterval`. First one right after a grant, with `operationState` GRANTED | All grants due in the next fifth of an interval share one request. `grantRenew` goes out when the grant has less than a quarter of its life left, at most 24 hours and at least three heartbeat intervals, by the SAS's clock from its `Date` header |
 | Relinquishment | For a grant the SAS names in a 401, a grant that drew a 502, and a grant no carrier has used for 24 h | The radio is never on that range when it is sent |
 | Deregistration | Only on a hand back to the vendor client | Gate closed first, then relinquish, then deregister |
 
 One request array per call is allowed for a single CBSD: "individual heartbeat requests are sent for each
-Grant, possibly aggregated in a single transmission" (section 7) `[proven]`.
+Grant, possibly aggregated in a single transmission" (section 7) `[proven]`. A SAS that cannot read a call with
+several objects answers with an HTTP error or an answer of the wrong shape. The client then sends one object
+per call for the rest of its run. `WITCHER_SAS_BATCH=0` starts it that way.
 
 ### 3.5 Which grants to hold
 
@@ -189,12 +203,22 @@ one Grant call every two minutes.
 ### 3.8 500, 501 and 502, per carrier
 
 - **501 (suspended):** keep the grant. Close the gate if the grant covers a carrier in use. Heartbeat it again
-  after 5, 10, 20 s and then every 60 s when the reason is "Interference Calculations Pending", every 300 s
-  for any other reason. Google asks for exactly this: keep the grant, heartbeat for updates, do not
-  re-register `[proven]`. No other carrier's grant is touched.
+  after 5, 10, 20, 60 and 120 s, then every 300 s (sooner if the heartbeat interval is shorter). The client
+  never reads the SAS's message text: TS-0016 gives 501 no reason codes, and each SAS words it its own way.
+  A later 501 never moves the transmit deadline later, so quick heartbeats cannot postpone leaving the
+  carrier. Google asks for this too: keep the grant, heartbeat for updates, do not re-register `[proven]`. No
+  other carrier's grant is touched.
 - **500 (terminated):** the grant is gone. With an `operationParam` suggestion, ask again at that power. With
   none, wait 30 s, send a spectrum inquiry, then ask.
 - **502 (out of sync):** close the gate, give that grant back, ask again, as TS-0016 requires.
+- **401 (conflict):** give back exactly the grants `responseData` names, then ask again. TS-0016 makes
+  `responseData` optional, so a SAS may hold a grant from a lost answer and never name it. After three calls
+  in a row like that for a carrier in use, the client registers again. TS-0016 section 8.3 has the SAS delete
+  every grant of a CBSD that sends a registration request, so that clears the unknown grant. The gate is
+  already closed, because a carrier in use has no grant. This happens at most once in six hours. For a
+  standby range, the client just waits 30 minutes.
+- **HTTP 429 or 503:** the server is busy and did not act. The client waits at least the `Retry-After` it
+  gives (capped at an hour), but always keeps one heartbeat try before a grant's transmit expiry.
 - **Leaving the carrier.** TS-0016 says to turn off transmission on a grant within 60 s after its
   `transmitExpireTime` for 500, 501 and expiry, and within 60 s of receipt for 502 `[proven]`. If a carrier
   in use is still not authorized 45 s after that time, the daemon takes the radio off it:
@@ -250,11 +274,11 @@ This table records what the design does for each rule. It is design intent, not 
 
 | Rule | What it asks | What this client does |
 |---|---|---|
-| 47 CFR 96.39(a) | Report location, and changes to it | Registration data is not changed. See section 8 on registration |
+| 47 CFR 96.39(a) | Report location, and changes to it | Location comes only from the installer: the SAS record, or the signed CPI file in a single-step request (section 10.2). The client never changes it |
 | 96.39(c) | Register and be authorized before service; update the SAS within 60 s of a change | Service (the gate) opens only after a successful heartbeat on every carrier in use. Registration data is never altered by this client |
 | 96.39(c)(1) | Operate at or below the authorized power, on authorized channels | The modem limit is the vendor's formula over the lowest `maxEirp` of the grants in use, never above 26 dBm. The gate closes the moment a carrier in use lacks an Authorized grant |
 | 96.39(c)(2) | Cease, move or change power within 60 s as the SAS instructs | Gate closed in the same second as a 500, 501, 502 or expiry. Radio off the carrier 45 s after transmit expiry if still refused |
-| 96.39(d), (e) | Report signal levels and the channel in use when the SAS directs | Not built in version 1. A `measReportConfig` request is ignored: section 8 |
+| 96.39(d), (e) | Report signal levels and the channel in use when the SAS directs | The registration claims no measurement capability (no `measCapability`), so a compliant SAS asks for none. If a SAS asks anyway, the client logs it, shows it in `status.json`, and sends no made-up numbers |
 | 96.39(f) | Talk only to approved SASs, over secured links | TLS 1.2, both sides authenticated, the WInnForum cipher list, the SAS trust chain already on the unit, the configured SAS address only |
 | 96.39(g) | Protect software from unauthorized change | Outside this client. Replacing the SAS client is a software change the operator must review: section 9 |
 | 96.41(b) | EIRP limits per device class | No limit is raised. Requests use the same `maxEirp` as the vendor client (dBm/MHz, as TS-0016 defines it) |
@@ -268,7 +292,9 @@ This table records what the design does for each rule. It is design intent, not 
 | TS-0016 8.6, 502 | Stop within 60 s and relinquish | Gate closed at once; relinquishment is the next call |
 | TS-0016 8.7 | Stop radio operation on a grant before relinquishing it | Only grants off the air are relinquished. On hand back the gate closes first |
 | TS-0016 8.8 | Cease transmission before deregistering | Hand back only, after the gate closes |
-| TS-0016 table 39, 401 | Fix a conflict by syncing with the SAS and relinquishing out-of-sync grants | Relinquish exactly the grants named in `responseData` |
+| TS-0016 table 39, 401 | Fix a conflict by syncing with the SAS and relinquishing out-of-sync grants | Relinquish exactly the grants named in `responseData`. With none named three times, register again (section 3.8) |
+| TS-0016 8.3, table 4 | Registration: `userId`, `fccId`, `cbsdSerialNumber`; REG-Conditional data may come "by other means", such as the installer | Built only from stored data, multi-step or single-step with the installer's signed file. Fails closed when anything is missing |
+| TS-0016 9.2 | POST to the SAS's base URL, ending `/v1.2/<method>`; the SAS's time in the `Date` header | `/v1.2` is added when missing, or the address is used as written (`WITCHER_SAS_URL_EXACT=1`). Timers use the `Date` header |
 | TS-0016 table 39, 105 | Cease all transmission, drop all grants, consider itself unregistered | All grants dropped, gate closed, radio off the carrier within 60 s, registration after a wait |
 | TS-0112 R1-DEV-02 | Cease within 60 s when a grant expires | `grantRenew` before expiry; a refused heartbeat follows the 500 or 103 path |
 | TS-0112 R2-DEV-03 | No authorization from two SASs at once | One configured SAS |
@@ -291,6 +317,7 @@ This table records what the design does for each rule. It is design intent, not 
 | 9. Batch heartbeats | `a_day_of_normal_service_is_one_grant_call_and_batched_heartbeats`, `the_engine_says_when_it_next_needs_a_tick` |
 | Hand back | `a_hand_back_closes_the_gate_before_anything_is_given_up` |
 | Standby and first-attach limit (both off by default) | `standby_grants_make_a_move_to_a_new_carrier_free`, `the_handshake_limit_is_off_unless_the_operator_sets_it` |
+| Any SAS (section 10) | The tests listed in section 10.1 |
 
 The pretend SAS (`sas-model/src/mock.rs`) can refuse connections, act on a request and lose the answer,
 answer late, answer any code, suspend, terminate, fall out of sync, and forget the unit. It never touches a
@@ -335,10 +362,8 @@ status 78 it runs `hand-back` and stops.
 
 ## 8. What is not built yet
 
-- A registration request of our own. Version 1 adopts the CBSD ID the vendor client obtained and exits with
-  status 78 if the SAS no longer knows it.
 - An answer to status queries on the vendor socket. The web service must read `status.json`.
-- Measurement reports.
+- Real measurement reports. The client claims no capability and sends none (section 10.3).
 - A proven modem command to drop only the uplink secondary carrier.
 - Firmware image wiring: start script, supervisor, image verification.
 
@@ -370,12 +395,96 @@ status 78 it runs `hand-back` and stops.
    picks up nvram writes made through the Witcher helper.
 9. **Tested only on a host.** CI compiles the workspace and runs the tests against the pretend SAS. The
    daemon's I/O paths (`curl`, nvram, the firewall, the vendor socket) have not run on a unit.
+10. **Registration has not met a real SAS.** The builder follows TS-0016 V1.2.7 and the vendor client's field
+    choices. Section 10.5 lists what only a SAS test environment can confirm.
+
+## 10. Moving to another SAS
+
+Google stops its SAS on 2027-06-10. This client must then work with whichever FCC-authorized SAS the
+operator picks. Nothing below is tied to one SAS.
+
+### 10.1 What changed, and the tests
+
+| Gap | Fix | Tests |
+|---|---|---|
+| No registration request: the client took over the vendor's CBSD ID and exited 78 on a SAS that did not know it | `registration.rs` builds the request from what the unit stores (10.2). An ID taken over from the vendor client is dropped on any 102 or 103 until the SAS shows it knows it, and the client registers | `multi_step_sends_only_the_unit_identity`, `single_step_category_b_sends_the_signed_data_and_no_loose_installation`, `single_step_category_a_copies_the_signed_installation_exactly`, `missing_identity_fails_closed_and_names_no_value`, `single_step_without_signed_data_fails_closed`, `signed_data_for_another_unit_is_refused`, `signed_data_without_installation_or_installer_is_refused`, `a_new_sas_gets_a_registration_built_from_the_unit`, `registration_answers_are_read_by_code`, `a_unit_with_no_complete_registration_data_fails_closed`, `a_vendor_cbsd_id_the_new_sas_does_not_know_is_dropped_even_without_a_name`, `a_confirmed_cbsd_id_survives_an_unnamed_103` |
+| `state.json` was not tied to a SAS | It names the SAS address and account. Other state is thrown away at start. An unproven CBSD ID is never saved | `saved_state_from_another_sas_starts_clean`, `an_unproven_cbsd_id_is_not_saved`, `a_saved_state_that_is_damaged_is_refused` |
+| 501 timing read Google's message text | Timing follows the code only. A later 501 never moves the deadline later | `a_suspension_is_handled_the_same_whatever_the_sas_says`, `quick_heartbeats_of_a_suspended_grant_never_postpone_leaving` |
+| One fixed, encrypted trust store | `WITCHER_SAS_CA_FILE` (plain PEM) or `WITCHER_SAS_CA_SOURCE` (vendor-encrypted). Checked for a certificate at start | `the_trust_store_can_be_a_plain_bundle_or_another_vendor_file`, `a_vendor_path_too_long_for_its_tool_is_refused` |
+| A 401 with no `responseData` looped forever | Three in a row for a carrier in use start one new registration, at most once in six hours | `a_conflict_the_sas_never_names_ends_in_one_new_registration`, `an_unnamed_conflict_on_a_standby_range_registers_nothing` |
+| Every call held several objects | A SAS that cannot read that switches the client to one object per call. `WITCHER_SAS_BATCH=0` starts that way | `a_sas_that_reads_one_object_per_call_still_serves_both_carriers`, `batching_is_on_unless_the_operator_turns_it_off` |
+| `curl -4` always; `/v1.2` always added | `WITCHER_SAS_IP=4\|6\|any` (default 4). `WITCHER_SAS_URL_EXACT=1` uses the address as written. A query or fragment is refused | `the_ip_family_is_chosen_by_the_operator`, `an_exact_sas_address_is_used_as_written`, `the_sas_address_gets_the_protocol_version_once` |
+| HTTP 429 and 503 counted as bad answers | They count as busy, with `Retry-After` honored up to an hour, never past a grant's transmit expiry | `a_busy_server_says_when_to_come_back`, `a_busy_sas_gets_the_time_it_asks_for`, `a_busy_hold_never_outlasts_the_right_to_transmit` |
+| `grantRenew` on every heartbeat for grants of 2 days or less | Renew in the last quarter of the grant's life, at most 24 h, at least three heartbeats, by the SAS's clock | `a_short_grant_is_renewed_before_it_ends_and_not_on_every_heartbeat`, `a_day_of_normal_service_is_one_grant_call_and_batched_heartbeats` |
+| `measReportConfig` was dropped, and the stock client sends a made-up -100 dBm report | No `measCapability` in the request. A request for reports is logged and shown, and nothing is sent. `groupingParam` only from `WITCHER_SAS_GROUP` | `the_request_never_claims_a_measurement_capability`, `the_sas_asking_for_measurements_gets_none`, `a_request_for_measurement_reports_is_read_from_any_answer`, `a_heartbeat_never_carries_a_measurement_report`, `grouping_comes_only_from_the_operator_setting`, `registration_settings_parse_or_fail_closed` |
+| The SAS address and account were read from nvram slot 0, where the vendor keeps them empty | They come from slot 3, as the vendor client reads them | Needs the bench (10.5) |
+
+### 10.2 The registration request
+
+The client sends what the vendor client sends, and never more:
+
+- **Multi-step** (`cbrs_isSingleReg` is 0 or empty, the vendor default and what units carry today):
+  `userId`, `fccId` and `cbsdSerialNumber`. TS-0016 calls the rest "REG-Conditional": the installer gives
+  it to the SAS another way. Until the SAS has it, the SAS answers 200 (REG_PENDING), and the client tries
+  again after 60, 300, 900 and then every 3600 s. The log names the missing parameters the SAS lists.
+- **Single-step** (`cbrs_isSingleReg` is 1): the same three, plus `cbsdCategory` from `cbrs_category`,
+  `airInterface` E_UTRA, and `cpiSignatureData` from the three lines of `/mnt/cbrs_cpi_file`. The client
+  checks that the signed data names this unit's FCC ID and serial number (TS-0016 table 10 requires it),
+  holds an `installationParam` and names the installer. A Category B request carries installation data only
+  inside the signed data. A Category A request also copies the signed `installationParam` to the top level,
+  as signed. Loose nvram values, such as coordinates or the vendor's built-in antenna gain, are never used.
+- **Fails closed.** A missing account, FCC ID or serial number, a bad mode, a missing category, or a CPI file
+  that is absent, damaged or for another unit means no request at all. The log names what is missing,
+  never a value. With no CBSD ID either, the daemon exits 78 and the vendor client takes over.
+
+### 10.3 Measurements
+
+The stock client claims measurement capability and sends a fixed -100.0 dBm for every 10 MHz without reading
+the modem `[proven: disassembly of the stock client]`. This client does not claim the capability, so a compliant SAS never asks it
+for reports. If a SAS asks anyway, the client logs it once, shows the request in `status.json`
+(`measReportRequested`), and sends nothing. `WITCHER_SAS_MEAS_FIELD=empty` sends `"measCapability": []` for a
+SAS that wants the field present. Real reports from the modem are later work.
+
+### 10.4 Settings
+
+| Setting | Values | Default |
+|---|---|---|
+| `WITCHER_SAS_CA_FILE` | Path to a plain PEM bundle of SAS trust roots | Not set |
+| `WITCHER_SAS_CA_SOURCE` | Path to a vendor-encrypted trust store | `/mnt/sas_chaincacert.bin` |
+| `WITCHER_SAS_IP` | `4`, `6` or `any` | `4` |
+| `WITCHER_SAS_URL_EXACT` | `1` uses `cbrs_sasurl` as written | Not set: `/v1.2` is added when missing |
+| `WITCHER_SAS_BATCH` | `0` sends one object per call | Several objects per call |
+| `WITCHER_SAS_MEAS_FIELD` | `omit` or `empty` | `omit` |
+| `WITCHER_SAS_GROUP` | `INTERFERENCE_COORDINATION:<group ID>`, comma separated | Not set |
+| `WITCHER_SAS_CPI_FILE` | Path to the installer's signed file | `/mnt/cbrs_cpi_file` |
+
+A bad value stops the daemon with status 78.
+
+### 10.5 What only a real SAS test environment can confirm
+
+1. That the new SAS takes a multi-step registration with only `userId`, `fccId` and `cbsdSerialNumber` once
+   the installer data is loaded, and answers 200 until then.
+2. Whether it wants `measCapability` present (`empty`) or absent, and that it never sends
+   `measReportConfig` to a unit that claims no capability.
+3. How it answers an unknown CBSD ID (103 naming `cbsdId`, a bare 103, 102 or 105), and whether its 401
+   names the conflicting grant.
+4. That it reads request arrays with several objects for one CBSD.
+5. Its base URL, whether it fits `/v1.2/<method>`, its TLS roots, and whether it has an IPv6 address.
+6. Its grant life, heartbeat interval and transmit expiry, and how `grantRenew` behaves.
+7. Whether it sends 429 or 503 with `Retry-After`.
+8. That a single-step request with the unit's signed CPI file registers.
+9. On the bench: that `nvram_get 3` returns the SAS settings, and that the vendor tool decrypts to paths in
+   `/tmp/witcher-sasd/tls`.
+
+Old grants at Google lapse on their own. The client talks only to the configured SAS, so the operator
+deregisters each moved unit in the old SAS's portal, as the migration plan says.
 
 ## Sources
 
 - [47 CFR Part 96](https://www.ecfr.gov/current/title-47/chapter-I/subchapter-D/part-96), sections 96.39,
   96.41, 96.43, 96.45, 96.47 (text read 2026-11-22 from the Cornell LII copy)
 - [WINNF-TS-0016 V1.2.7, SAS to CBSD interface](https://winnf.memberclicks.net/assets/CBRS/WINNF-TS-0016.pdf)
+  (sections 8.3, 9.2 and 10.1, tables 4, 9, 10, 39 and 40, read 2026-11-22)
 - [WINNF-TS-0112 V1.9.2, CBRS operational and functional requirements](https://winnf.memberclicks.net/assets/CBRS/WINNF-TS-0112.pdf)
 - [Google SAS: grant suspension and response codes](https://docs.cloud.google.com/spectrum-access-system/docs/cbsd/errors-grant-suspension)
 - [FCC TCB workshop, CBRS devices, November 2019](https://transition.fcc.gov/oet/ea/presentations/files/nov19/25-CPECBSDs-CC.pdf)

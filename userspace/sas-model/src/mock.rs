@@ -26,6 +26,9 @@ pub enum Fault {
     Slow(u64),
     /// The SAS answers every object with this code and does nothing else.
     Code(i64, String),
+    /// HTTP 429 or 503 before the SAS sees the request, with this
+    /// Retry-After in seconds.
+    Busy(Option<u64>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +36,7 @@ pub enum Outcome {
     Answer { body: String, delay: u64 },
     NoAnswer,
     Refused,
+    Busy(Option<u64>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,6 +50,8 @@ struct Held {
     reason: String,
     terminated: Option<Option<f64>>,
     out_of_step: bool,
+    /// True wall time at which the grant itself ends.
+    grant_until: u64,
 }
 
 pub struct MockSas {
@@ -56,6 +62,21 @@ pub struct MockSas {
     pub latency: u64,
     /// Ranges the SAS will not offer or grant.
     pub unavailable: Vec<Range>,
+    /// How long a new or renewed grant lasts, in seconds.
+    pub grant_life: u64,
+    /// False: a 401 leaves `responseData` out, as TS-0016 allows.
+    pub name_conflicts: bool,
+    /// True: a call with more than one object gets an answer the client
+    /// cannot use, as a SAS that only reads single objects would give.
+    pub single_only: bool,
+    /// Sent in every grant and heartbeat answer when not empty.
+    pub meas_report_config: Vec<String>,
+    /// Heartbeat objects that asked for renewal.
+    pub renewals: usize,
+    /// Request objects that carried a `measReport`. Must stay zero.
+    pub meas_reports: usize,
+    /// Every registration request object the SAS received.
+    pub registrations: Vec<Value>,
     grants: Vec<Held>,
     faults: Vec<(Kind, Fault)>,
     next: u64,
@@ -71,6 +92,13 @@ impl Default for MockSas {
             transmit_life: 21_600,
             latency: 1,
             unavailable: Vec::new(),
+            grant_life: 365 * 86_400,
+            name_conflicts: true,
+            single_only: false,
+            meas_report_config: Vec::new(),
+            renewals: 0,
+            meas_reports: 0,
+            registrations: Vec::new(),
             grants: Vec::new(),
             faults: Vec::new(),
             next: 1,
@@ -152,10 +180,10 @@ impl MockSas {
     /// A grant the client does not know about, as a lost answer leaves.
     pub fn plant(&mut self, range: Range) -> String {
         self.registered = true;
-        self.create(range)
+        self.create(range, u64::MAX)
     }
 
-    fn create(&mut self, range: Range) -> String {
+    fn create(&mut self, range: Range, wall: u64) -> String {
         let id = format!("{CBSD}/{}", self.next);
         self.next += 1;
         self.grants.push(Held {
@@ -167,6 +195,7 @@ impl MockSas {
             reason: String::new(),
             terminated: None,
             out_of_step: false,
+            grant_until: wall.saturating_add(self.grant_life),
         });
         id
     }
@@ -202,8 +231,10 @@ impl MockSas {
 
     pub fn handle(&mut self, wall: u64, kind: Kind, body: &str) -> Outcome {
         let fault = self.take_fault(kind);
-        if fault == Some(Fault::Unreachable) {
-            return Outcome::Refused;
+        match fault {
+            Some(Fault::Unreachable) => return Outcome::Refused,
+            Some(Fault::Busy(retry_after)) => return Outcome::Busy(retry_after),
+            _ => {}
         }
         self.seen.push((wall, kind));
         let request: Value = match serde_json::from_str(body) {
@@ -213,6 +244,16 @@ impl MockSas {
         let Some(items) = request.get(kind.request_key()).and_then(Value::as_array) else {
             return Outcome::NoAnswer;
         };
+        self.meas_reports += items
+            .iter()
+            .filter(|item| item.get("measReport").is_some())
+            .count();
+        if self.single_only && items.len() > 1 {
+            return Outcome::Answer {
+                body: "{}".into(),
+                delay: self.latency,
+            };
+        }
         if let Some(Fault::Code(code, message)) = &fault {
             let answers: Vec<Value> = items
                 .iter()
@@ -231,6 +272,12 @@ impl MockSas {
         }
     }
 
+    fn add_meas_config(&self, answer: &mut Value) {
+        if !self.meas_report_config.is_empty() {
+            answer["measReportConfig"] = json!(self.meas_report_config);
+        }
+    }
+
     fn answer(&self, kind: Kind, answers: Vec<Value>, delay: u64) -> Outcome {
         let mut body = serde_json::Map::new();
         body.insert(kind.response_key(), Value::Array(answers));
@@ -242,7 +289,11 @@ impl MockSas {
 
     fn process(&mut self, wall: u64, kind: Kind, item: &Value) -> Value {
         if kind == Kind::Registration {
+            // TS-0016 section 8.3: a registration request deletes every
+            // grant the SAS held for the CBSD.
+            self.registrations.push(item.clone());
             self.registered = true;
+            self.grants.clear();
             return json!({ "cbsdId": CBSD, "response": response(0, "", &[]) });
         }
         let known = item.get("cbsdId").and_then(Value::as_str) == Some(CBSD) && self.registered;
@@ -292,17 +343,20 @@ impl MockSas {
                     .collect();
                 if !conflicts.is_empty() {
                     let message = "Existing grant overlaps with the requested frequency range";
-                    return json!({ "cbsdId": CBSD, "response": response(401, message, &conflicts) });
+                    let named = if self.name_conflicts { conflicts } else { Vec::new() };
+                    return json!({ "cbsdId": CBSD, "response": response(401, message, &named) });
                 }
-                let id = self.create(range);
-                json!({
+                let id = self.create(range, wall);
+                let mut answer = json!({
                     "cbsdId": CBSD,
                     "grantId": id,
-                    "grantExpireTime": proto::format_utc(wall + 365 * 86_400),
+                    "grantExpireTime": proto::format_utc(wall + self.grant_life),
                     "heartbeatInterval": self.heartbeat_interval,
                     "channelType": "GAA",
                     "response": response(0, "", &[]),
-                })
+                });
+                self.add_meas_config(&mut answer);
+                answer
             }
             Kind::Heartbeat => {
                 let Some(index) = index else {
@@ -315,6 +369,16 @@ impl MockSas {
                 let claims_authorized =
                     item.get("operationState").and_then(Value::as_str) == Some("AUTHORIZED");
                 let now_text = proto::format_utc(wall);
+                if wall >= self.grants[index].grant_until {
+                    let grant = self.grants.remove(index);
+                    return json!({
+                        "cbsdId": CBSD,
+                        "grantId": grant.id,
+                        "transmitExpireTime": now_text,
+                        "response": response(500, "grant expired", &[]),
+                    });
+                }
+                let renew = item.get("grantRenew").and_then(Value::as_bool) == Some(true);
                 if let Some(suggest) = self.grants[index].terminated {
                     let grant = self.grants.remove(index);
                     let mut answer = json!({
@@ -360,14 +424,23 @@ impl MockSas {
                     });
                 }
                 grant.authorized = true;
-                grant.transmit_until = wall + self.transmit_life;
-                json!({
+                if renew {
+                    grant.grant_until = wall + self.grant_life;
+                }
+                grant.transmit_until = (wall + self.transmit_life).min(grant.grant_until);
+                let mut answer = json!({
                     "cbsdId": CBSD,
                     "grantId": grant.id,
                     "transmitExpireTime": proto::format_utc(grant.transmit_until),
                     "heartbeatInterval": self.heartbeat_interval,
                     "response": response(0, "", &[]),
-                })
+                });
+                if renew {
+                    self.renewals += 1;
+                    answer["grantExpireTime"] = json!(proto::format_utc(wall + self.grant_life));
+                }
+                self.add_meas_config(&mut answer);
+                answer
             }
             Kind::Relinquishment => match index {
                 Some(index) => {
@@ -615,6 +688,7 @@ impl Sim {
         let wall = self.wall;
         let result = match self.sas.handle(wall, request.kind, &request.body) {
             Outcome::Refused => (self.now + request.connect_timeout, Err(Failure::Connect)),
+            Outcome::Busy(retry_after) => (self.now + 1, Err(Failure::Busy { retry_after })),
             Outcome::NoAnswer => (self.now + request.answer_timeout, Err(Failure::Timeout)),
             Outcome::Answer { delay, .. } if delay > request.answer_timeout => {
                 (self.now + request.answer_timeout, Err(Failure::Timeout))

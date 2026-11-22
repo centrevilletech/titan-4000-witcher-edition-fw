@@ -46,6 +46,7 @@ pub const INVALID_VALUE: i64 = 103;
 pub const CERT_ERROR: i64 = 104;
 pub const DEREGISTER: i64 = 105;
 pub const REG_PENDING: i64 = 200;
+pub const GROUP_ERROR: i64 = 201;
 pub const UNSUPPORTED_SPECTRUM: i64 = 300;
 pub const INTERFERENCE: i64 = 400;
 pub const GRANT_CONFLICT: i64 = 401;
@@ -70,6 +71,9 @@ pub struct Item {
     pub suggestion: Option<(Range, f64)>,
     /// `availableChannel` entries from a spectrum inquiry.
     pub available: Vec<(Range, f64)>,
+    /// `measReportConfig`: the measurement reports the SAS asks for. This
+    /// client makes no measurements, so it only records the request.
+    pub meas_report_config: Vec<String>,
 }
 
 fn frequency_range(range: Range) -> Value {
@@ -138,13 +142,14 @@ fn parse_item(value: &Value) -> Result<Item, String> {
         .ok_or("a response has no responseCode")?;
     let text =
         |source: &Value, key: &str| source.get(key).and_then(Value::as_str).map(String::from);
-    let data = match response.get("responseData") {
+    let strings = |source: Option<&Value>| match source {
         Some(Value::Array(entries)) => entries
             .iter()
             .filter_map(|entry| entry.as_str().map(String::from))
             .collect(),
         _ => Vec::new(),
     };
+    let data = strings(response.get("responseData"));
     let suggestion = value.get("operationParam").and_then(|param| {
         let range = parse_range(param.get("operationFrequencyRange")?)?;
         Some((range, param.get("maxEirp")?.as_f64()?))
@@ -170,6 +175,7 @@ fn parse_item(value: &Value) -> Result<Item, String> {
         transmit_expire: text(value, "transmitExpireTime").and_then(|time| parse_utc(&time)),
         suggestion,
         available,
+        meas_report_config: strings(value.get("measReportConfig")),
     })
 }
 
@@ -403,6 +409,32 @@ mod tests {
             items[0].available,
             vec![(Range::mhz(3560, 3570).unwrap(), 27.0)]
         );
+    }
+
+    #[test]
+    fn a_request_for_measurement_reports_is_read_from_any_answer() {
+        let body = r#"{"heartbeatResponse":[{"cbsdId":"c","grantId":"g",
+            "transmitExpireTime":"2026-11-22T13:00:44Z",
+            "measReportConfig":["RECEIVED_POWER_WITH_GRANT"],
+            "response":{"responseCode":0}}]}"#;
+        let items = parse(Kind::Heartbeat, body).unwrap();
+        assert_eq!(
+            items[0].meas_report_config,
+            vec!["RECEIVED_POWER_WITH_GRANT".to_string()]
+        );
+        let plain = r#"{"grantResponse":[{"cbsdId":"c","grantId":"g","response":{"responseCode":0}}]}"#;
+        assert!(parse(Kind::Grant, plain).unwrap()[0]
+            .meas_report_config
+            .is_empty());
+    }
+
+    #[test]
+    fn a_heartbeat_never_carries_a_measurement_report() {
+        let body = envelope(
+            Kind::Heartbeat,
+            vec![heartbeat_item("cbsd", "g1", true, true)],
+        );
+        assert!(!body.contains("measReport"));
     }
 
     #[test]

@@ -15,7 +15,12 @@
 //!    new one, and a problem on one carrier never drops another's grant.
 //! 4. When a carrier in use has lost its authorization and 60 seconds since
 //!    transmit expiry are nearly up, the radio leaves that carrier.
-//! 5. Nothing here re-registers or deregisters because of a grant error.
+//! 5. Nothing here re-registers because of a grant error, with one escape:
+//!    a SAS that keeps reporting a conflict with a grant it will not name.
+//! 6. Decisions follow response codes, never the SAS's message text, so any
+//!    SAS that follows WINNF-TS-0016 gets the same treatment.
+//! 7. Saved state belongs to one SAS address and account. A unit moved to
+//!    another SAS starts clean.
 use serde_json::{Value, json};
 
 use crate::band::{self, Range};
@@ -35,6 +40,19 @@ const HEARTBEAT_RETRY: [u64; 4] = [30, 60, 120, 300];
 const GRANT_RETRY: [u64; 5] = [5, 10, 20, 40, 60];
 const REGISTER_RETRY: [u64; 4] = [60, 300, 900, 3600];
 const ORPHAN_TRIES: u32 = 3;
+/// Heartbeat waits for a suspended grant, whatever the SAS's message says.
+/// A short suspension clears in seconds; the waits then settle at 300 s.
+const SUSPENSION_RETRY: [u64; 6] = [5, 10, 20, 60, 120, 300];
+/// A 401 that names no grant this client can give back, this many calls in
+/// a row for a carrier in use, starts a new registration.
+const BLIND_CONFLICTS: u32 = 3;
+/// At most one such new registration in this many seconds.
+const RESET_SPACING: u64 = 21_600;
+/// The longest `Retry-After` this client honors, in seconds.
+const BUSY_HOLD_MAX: u64 = 3600;
+/// Ask for renewal when a grant has less than this left, or a quarter of
+/// its life if that is shorter, but never less than three heartbeats.
+const RENEW_WINDOW: u64 = 86_400;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
@@ -64,6 +82,10 @@ pub struct Policy {
     /// this long after the radio came up on it. Zero keeps the vendor
     /// behavior of staying attached while a first grant is pending.
     pub handshake_limit: u64,
+    /// Put several request objects in one call (TS-0016 section 7 allows
+    /// it). False sends one object per call. A SAS that cannot read a
+    /// multi-object call switches this off by itself.
+    pub batch: bool,
 }
 
 impl Default for Policy {
@@ -79,6 +101,7 @@ impl Default for Policy {
             rejoin_backoff: vec![900, 1800, 3600],
             probe_window: 20,
             handshake_limit: 0,
+            batch: true,
         }
     }
 }
@@ -102,6 +125,9 @@ pub struct Grant {
     /// Unix seconds, as the SAS stated them. Zero when unknown.
     pub grant_expire: u64,
     pub transmit_expire: u64,
+    /// The grant's life in seconds when it was made or last renewed, by the
+    /// SAS's clock. Zero when unknown.
+    pub life: u64,
     /// The monotonic second at which the right to transmit ends or ended.
     deadline: Option<u64>,
     next_heartbeat: u64,
@@ -159,6 +185,9 @@ pub enum Failure {
     Connect,
     /// Sent, but no answer in time. The SAS may still have acted on it.
     Timeout,
+    /// HTTP 429 or 503: the server is busy and did not act. `retry_after`
+    /// is its `Retry-After` in seconds, when it gave one.
+    Busy { retry_after: Option<u64> },
     /// An answer that is not a usable SAS message.
     Malformed(String),
 }
@@ -189,7 +218,7 @@ pub enum Action {
     /// State to keep across a reboot.
     Persist(String),
     Log(String),
-    /// Not registered, and this build has no registration request to send.
+    /// Not registered, and the unit holds no complete registration data.
     CannotRegister,
     Stopped,
 }
@@ -256,6 +285,25 @@ pub struct Engine {
     stopped: bool,
     told_cannot_register: bool,
     dirty: bool,
+    /// The SAS address and account the saved state belongs to.
+    binding: Option<(String, String)>,
+    /// True once this SAS has answered a request made with `cbsd` in a way
+    /// that shows it knows the ID. An ID taken over from the vendor client
+    /// starts false: it may come from another SAS.
+    cbsd_confirmed: bool,
+    /// The SAS's clock minus the unit's, from the last `Date` header.
+    clock_offset: i64,
+    /// One request object per call.
+    single: bool,
+    /// Calls in a row whose 401 named nothing to give back.
+    blind_conflicts: u32,
+    /// This call already counted a blind 401.
+    blind_counted: bool,
+    last_reset: Option<u64>,
+    /// The measurement reports the SAS last asked for. None are ever sent.
+    meas_requested: Vec<String>,
+    /// The last registration answer: its code and any parameter names.
+    last_registration: Option<(i64, Vec<String>)>,
 }
 
 fn retry(table: &[u64], failures: u32) -> u64 {
@@ -263,29 +311,50 @@ fn retry(table: &[u64], failures: u32) -> u64 {
     table.get(index).copied().unwrap_or(60)
 }
 
-/// How soon to heartbeat a suspended grant again. Interference calculations
-/// take the SAS seconds to minutes, so those are checked quickly at first.
-/// Other suspensions last hours, and the grant must be kept meanwhile.
-fn suspension_delay(reason: &str, count: u32, interval: u64) -> u64 {
-    if reason
-        .to_ascii_lowercase()
-        .contains("interference calculations")
-    {
-        return match count {
-            0 | 1 => 5,
-            2 => 10,
-            3 => 20,
-            _ => 60,
-        };
+/// How soon to heartbeat a suspended grant again. TS-0016 gives 501 no reason
+/// codes, and each SAS words its message its own way, so the message is not
+/// read: every suspension is checked quickly at first, then every 300 s (or
+/// sooner if the heartbeat interval is shorter).
+fn suspension_delay(count: u32, interval: u64) -> u64 {
+    retry(&SUSPENSION_RETRY, count).min(interval.max(1))
+}
+
+/// Whether a heartbeat should ask to renew a grant. `sas_now` is the SAS's
+/// clock as best known.
+fn renew_due(grant: &Grant, sas_now: u64) -> bool {
+    if grant.grant_expire == 0 {
+        return false;
     }
-    300_u64.min(interval.max(1))
+    let share = if grant.life > 0 {
+        (grant.life / 4).min(RENEW_WINDOW)
+    } else {
+        RENEW_WINDOW
+    };
+    let window = share.max(grant.interval.saturating_mul(3));
+    grant.grant_expire <= sas_now.saturating_add(window)
+}
+
+/// Codes that show the SAS knows the CBSD ID the request carried.
+fn knows_cbsd(code: i64) -> bool {
+    matches!(
+        code,
+        proto::SUCCESS
+            | proto::UNSUPPORTED_SPECTRUM
+            | proto::INTERFERENCE
+            | proto::GRANT_CONFLICT
+            | proto::TERMINATED_GRANT
+            | proto::SUSPENDED_GRANT
+            | proto::UNSYNC_OP_PARAM
+    )
 }
 
 impl Engine {
     /// `registration` is the unit's registration request object, or `None`
-    /// when this unit must not register by itself. `cbsd` is a CBSD ID the
-    /// SAS already issued, for taking over a registered unit.
+    /// when the unit holds no complete registration data. `cbsd` is a CBSD ID
+    /// the vendor client left, for taking over a registered unit. It is used
+    /// until the SAS shows it does not know it.
     pub fn new(policy: Policy, registration: Option<Value>, cbsd: Option<String>) -> Self {
+        let single = !policy.batch;
         Self {
             policy,
             registration,
@@ -315,19 +384,50 @@ impl Engine {
             stopped: false,
             told_cannot_register: false,
             dirty: false,
+            binding: None,
+            cbsd_confirmed: false,
+            clock_offset: 0,
+            single,
+            blind_conflicts: 0,
+            blind_counted: false,
+            last_reset: None,
+            meas_requested: Vec::new(),
+            last_registration: None,
         }
     }
 
+    /// Tie saved state to this SAS address and account. Call before
+    /// `restore`.
+    pub fn bind(&mut self, sas_url: &str, user_id: &str) {
+        self.binding = Some((sas_url.to_string(), user_id.to_string()));
+    }
+
     /// Bring back the grants saved before a reboot. None of them is usable
-    /// until its next heartbeat succeeds.
+    /// until its next heartbeat succeeds. State saved for another SAS
+    /// address or account is refused, so a unit moved to a new SAS starts
+    /// clean: the old CBSD ID and grant IDs mean nothing there.
     pub fn restore(&mut self, saved: &str, now: u64) -> Result<usize, String> {
         let value: Value =
             serde_json::from_str(saved).map_err(|err| format!("saved state is not JSON: {err}"))?;
-        if value.get("version").and_then(Value::as_u64) != Some(1) {
-            return Err("saved state has an unknown version".into());
+        match value.get("version").and_then(Value::as_u64) {
+            Some(2) => {}
+            Some(1) => return Err("saved state names no SAS address: starting clean".into()),
+            _ => return Err("saved state has an unknown version".into()),
+        }
+        let saved_url = value.get("sasUrl").and_then(Value::as_str);
+        let saved_user = value.get("userId").and_then(Value::as_str);
+        let (url, user) = match &self.binding {
+            Some((url, user)) => (Some(url.as_str()), Some(user.as_str())),
+            None => (None, None),
+        };
+        if saved_url != url || saved_user != user {
+            return Err(
+                "saved state belongs to another SAS address or account: starting clean".into(),
+            );
         }
         if let Some(cbsd) = value.get("cbsdId").and_then(Value::as_str) {
             self.cbsd = Some(cbsd.to_string());
+            self.cbsd_confirmed = true;
         }
         let mut restored = 0;
         for entry in value
@@ -367,6 +467,7 @@ impl Engine {
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
                 transmit_expire: 0,
+                life: entry.get("grantLife").and_then(Value::as_u64).unwrap_or(0),
                 deadline: None,
                 next_heartbeat: now,
                 failures: 0,
@@ -381,6 +482,16 @@ impl Engine {
     }
 
     fn snapshot(&self) -> String {
+        // An ID the SAS has not yet shown it knows is not worth keeping.
+        let cbsd = if self.cbsd_confirmed {
+            self.cbsd.clone()
+        } else {
+            None
+        };
+        let (url, user) = match &self.binding {
+            Some((url, user)) => (Some(url.clone()), Some(user.clone())),
+            None => (None, None),
+        };
         let grants: Vec<Value> = self
             .grants
             .iter()
@@ -393,10 +504,18 @@ impl Engine {
                     "maxEirp": grant.max_eirp,
                     "interval": grant.interval,
                     "grantExpire": grant.grant_expire,
+                    "grantLife": grant.life,
                 })
             })
             .collect();
-        json!({ "version": 1, "cbsdId": self.cbsd, "grants": grants }).to_string()
+        json!({
+            "version": 2,
+            "sasUrl": url,
+            "userId": user,
+            "cbsdId": cbsd,
+            "grants": grants,
+        })
+        .to_string()
     }
 
     pub fn gate(&self) -> Gate {
@@ -454,6 +573,13 @@ impl Engine {
             .collect();
         json!({
             "registered": self.cbsd.is_some(),
+            "cbsdConfirmed": self.cbsd_confirmed,
+            "sasUrl": self.binding.as_ref().map(|(url, _)| url.as_str()),
+            "canRegister": self.registration.is_some(),
+            "lastRegistrationCode": self.last_registration.as_ref().map(|(code, _)| *code),
+            "lastRegistrationData": self.last_registration.as_ref().map(|(_, data)| data.clone()),
+            "oneObjectPerCall": self.single,
+            "measReportRequested": self.meas_requested,
             "online": self.online,
             "inUse": self.in_use().iter().map(Range::to_string).collect::<Vec<_>>(),
             "gate": match self.gate { Gate::Closed => "closed", Gate::Open { .. } => "open" },
@@ -861,6 +987,9 @@ impl Engine {
                     .filter(|orphan| orphan.retry_at <= now)
                     .map(|orphan| Subject::Grant(orphan.id.clone())),
             );
+            if self.single {
+                subjects.truncate(1);
+            }
             if !subjects.is_empty() {
                 let items = subjects
                     .iter()
@@ -975,19 +1104,25 @@ impl Engine {
     fn heartbeat(&mut self, now: u64, wall: u64, cbsd: &str, out: &mut Vec<Action>) {
         let mut items = Vec::new();
         let mut subjects = Vec::new();
-        for grant in &self.grants {
+        let sas_now = wall.saturating_add_signed(self.clock_offset);
+        // A due grant goes first, so one object per call still serves it.
+        let mut order: Vec<&Grant> = self.grants.iter().collect();
+        order.sort_by_key(|grant| grant.next_heartbeat);
+        for grant in order {
             // Grants due soon ride along, so all of them share one call.
             if grant.relinquish || grant.next_heartbeat > now + grant.interval / 5 {
                 continue;
             }
-            let renew = grant.grant_expire > 0 && grant.grant_expire < wall + 2 * 86_400;
             items.push(proto::heartbeat_item(
                 cbsd,
                 &grant.id,
                 grant.usable(now),
-                renew,
+                renew_due(grant, sas_now),
             ));
             subjects.push(Subject::Grant(grant.id.clone()));
+            if self.single {
+                break;
+            }
         }
         if !items.is_empty() {
             self.send(now, Kind::Heartbeat, items, subjects, ANSWER_TIMEOUT, out);
@@ -997,7 +1132,8 @@ impl Engine {
     fn request_grants(&mut self, now: u64, cbsd: &str, pieces: &[Range], out: &mut Vec<Action>) {
         let mut items = Vec::new();
         let mut subjects = Vec::new();
-        for piece in pieces {
+        let count = if self.single { 1 } else { pieces.len() };
+        for piece in pieces.iter().take(count) {
             let eirp = self.eirp_for(*piece);
             items.push(proto::grant_item(cbsd, *piece, eirp));
             subjects.push(Subject::Range(*piece, eirp));
@@ -1040,6 +1176,7 @@ impl Engine {
             self.grants.clear();
             self.orphans.clear();
             self.cbsd = None;
+            self.cbsd_confirmed = false;
             out.push(Action::Persist(self.snapshot()));
             out.push(Action::Stopped);
         }
@@ -1056,6 +1193,7 @@ impl Engine {
         self.grants.clear();
         self.orphans.clear();
         self.cbsd = None;
+        self.cbsd_confirmed = false;
         self.register_at = now + wait;
         self.told_cannot_register = false;
         self.dirty = true;
@@ -1097,10 +1235,18 @@ impl Engine {
         // answer carries it, and from the moment the request left, which can
         // only make the deadline early. Without it, the unit's clock is used.
         let (clock, base) = match answer.server_time {
-            Some(server) => (server, flight.sent_at),
+            Some(server) => {
+                // Kept for grant renewal, which compares SAS wall times.
+                self.clock_offset = i64::try_from(server)
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(i64::try_from(wall).unwrap_or(i64::MAX));
+                (server, flight.sent_at)
+            }
             None => (wall, now),
         };
+        self.blind_counted = false;
         for (item, subject) in answer.items.iter().zip(flight.subjects.iter()) {
+            self.note_measurements(item, out);
             let names_cbsd = item
                 .data
                 .iter()
@@ -1114,22 +1260,29 @@ impl Engine {
                     self.unregistered(now, 3600, true, "the SAS has barred the unit (101)", out);
                     return;
                 }
-                proto::INVALID_VALUE if names_cbsd && flight.kind != Kind::Registration => {
-                    self.unregistered(
-                        now,
-                        5,
-                        false,
-                        "the SAS does not know the CBSD ID (103)",
-                        out,
-                    );
+                _ => {}
+            }
+            if flight.kind != Kind::Registration && self.cbsd.is_some() {
+                // TS-0016 says a SAS "should" answer an unknown CBSD ID with
+                // 103 naming cbsdId. Not every SAS names it, so an ID taken
+                // over from the vendor client is dropped on any 102 or 103
+                // until this SAS has shown it knows the ID.
+                let unproven = !self.cbsd_confirmed
+                    && matches!(item.code, proto::MISSING_PARAM | proto::INVALID_VALUE);
+                if unproven || (item.code == proto::INVALID_VALUE && names_cbsd) {
+                    let why = format!("the SAS does not know the CBSD ID ({})", item.code);
+                    self.unregistered(now, 5, false, &why, out);
                     return;
                 }
-                _ => {}
+                if !self.cbsd_confirmed && knows_cbsd(item.code) {
+                    self.cbsd_confirmed = true;
+                    self.dirty = true;
+                }
             }
             match flight.kind {
                 Kind::Registration => self.on_registration(now, item, out),
                 Kind::SpectrumInquiry => self.on_inquiry(now, item, out),
-                Kind::Grant => self.on_grant(now, item, subject, out),
+                Kind::Grant => self.on_grant(now, clock, item, subject, out),
                 Kind::Heartbeat => self.on_heartbeat(now, clock, base, item, subject, out),
                 Kind::Relinquishment => self.on_relinquishment(now, item, subject, out),
                 Kind::Deregistration => {
@@ -1140,6 +1293,11 @@ impl Engine {
                     self.finish_stop(out);
                 }
             }
+            // A new registration started while reading this answer: the
+            // rest of it refers to grants that no longer exist.
+            if flight.kind != Kind::Registration && self.cbsd.is_none() {
+                return;
+            }
         }
     }
 
@@ -1147,18 +1305,55 @@ impl Engine {
         let what = match failure {
             Failure::Connect => "no connection to the SAS".to_string(),
             Failure::Timeout => "no answer from the SAS in time".to_string(),
+            Failure::Busy { retry_after } => match retry_after {
+                Some(seconds) => format!("the SAS is busy, retry after {seconds} s"),
+                None => "the SAS is busy".to_string(),
+            },
             Failure::Malformed(why) => format!("unusable answer ({why})"),
         };
         out.push(Action::Log(format!(
             "{} failed: {what}",
             flight.kind.method()
         )));
+        // A SAS that cannot read a call with several objects says so with an
+        // HTTP error or an answer of the wrong shape. Send one object per
+        // call from now on, and try again at once.
+        if matches!(failure, Failure::Malformed(_))
+            && flight.subjects.len() > 1
+            && !self.single
+            && flight.kind != Kind::Deregistration
+        {
+            self.single = true;
+            out.push(Action::Log(format!(
+                "the SAS did not take a call with {} objects: one object per call from now on",
+                flight.subjects.len()
+            )));
+            match flight.kind {
+                Kind::Grant => self.grant_at = now,
+                Kind::Relinquishment => self.relinquish_at = now,
+                Kind::Heartbeat => {
+                    for grant in &mut self.grants {
+                        if flight.subjects.contains(&Subject::Grant(grant.id.clone())) {
+                            grant.next_heartbeat = now;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        // A busy server did not act. Its Retry-After, capped, sets the
+        // shortest wait.
+        let hold = match failure {
+            Failure::Busy { retry_after } => retry_after.unwrap_or(0).min(BUSY_HOLD_MAX),
+            _ => 0,
+        };
         match flight.kind {
             Kind::Registration => {
                 self.register_failures += 1;
-                self.register_at = now + retry(&REGISTER_RETRY, self.register_failures);
+                self.register_at = now + retry(&REGISTER_RETRY, self.register_failures).max(hold);
             }
-            Kind::SpectrumInquiry => self.inquiry_at = now + 30,
+            Kind::SpectrumInquiry => self.inquiry_at = now + hold.max(30),
             Kind::Grant => {
                 if *failure == Failure::Timeout {
                     // The SAS may have made the grant. Ask again at once and
@@ -1168,7 +1363,7 @@ impl Engine {
                     self.grant_at = now + 2;
                 } else {
                     self.grant_failures += 1;
-                    self.grant_at = now + retry(&GRANT_RETRY, self.grant_failures);
+                    self.grant_at = now + retry(&GRANT_RETRY, self.grant_failures).max(hold);
                 }
             }
             Kind::Heartbeat => {
@@ -1178,16 +1373,22 @@ impl Engine {
                     };
                     if let Some(grant) = self.grants.iter_mut().find(|grant| grant.id == *id) {
                         grant.failures += 1;
-                        grant.next_heartbeat = now + retry(&HEARTBEAT_RETRY, grant.failures);
+                        let base = retry(&HEARTBEAT_RETRY, grant.failures);
+                        // Honor the hold, but keep one try before the right
+                        // to transmit runs out.
+                        let room = grant
+                            .deadline
+                            .map_or(hold, |end| end.saturating_sub(now + 90));
+                        grant.next_heartbeat = now + base.max(hold.min(room));
                     }
                 }
             }
             Kind::Relinquishment => {
-                self.relinquish_at = now + 30;
+                self.relinquish_at = now + hold.max(30);
                 for orphan in &mut self.orphans {
                     if flight.subjects.contains(&Subject::Grant(orphan.id.clone())) {
                         orphan.tries += 1;
-                        orphan.retry_at = now + 30;
+                        orphan.retry_at = now + hold.max(30);
                     }
                 }
                 self.orphans.retain(|orphan| orphan.tries < ORPHAN_TRIES);
@@ -1196,24 +1397,56 @@ impl Engine {
         }
     }
 
-    fn on_registration(&mut self, now: u64, item: &Item, out: &mut Vec<Action>) {
-        match (item.code, &item.cbsd_id) {
-            (proto::SUCCESS, Some(cbsd)) => {
-                out.push(Action::Log("registration succeeded".into()));
-                self.cbsd = Some(cbsd.clone());
-                self.register_failures = 0;
-                self.dirty = true;
-            }
-            _ => {
-                self.register_failures += 1;
-                let wait = retry(&REGISTER_RETRY, self.register_failures);
-                self.register_at = now + wait;
-                out.push(Action::Log(format!(
-                    "registration answered {} ({}), next try in {wait} s",
-                    item.code, item.message
-                )));
-            }
+    /// Record a request for measurement reports. This client makes no
+    /// measurements and never claims it can, so a compliant SAS never asks.
+    /// If one asks anyway, nothing is sent: a made-up measurement would
+    /// mislead the SAS's view of the band.
+    fn note_measurements(&mut self, item: &Item, out: &mut Vec<Action>) {
+        if item.meas_report_config.is_empty() || item.meas_report_config == self.meas_requested {
+            return;
         }
+        self.meas_requested = item.meas_report_config.clone();
+        out.push(Action::Log(format!(
+            "the SAS asked for measurement reports ({}): this client makes none and sends none",
+            self.meas_requested.join(", ")
+        )));
+    }
+
+    fn on_registration(&mut self, now: u64, item: &Item, out: &mut Vec<Action>) {
+        self.last_registration = Some((item.code, item.data.clone()));
+        if let (proto::SUCCESS, Some(cbsd)) = (item.code, &item.cbsd_id) {
+            out.push(Action::Log("registration succeeded".into()));
+            self.cbsd = Some(cbsd.clone());
+            self.cbsd_confirmed = true;
+            self.register_failures = 0;
+            self.dirty = true;
+            return;
+        }
+        self.register_failures += 1;
+        let wait = retry(&REGISTER_RETRY, self.register_failures);
+        self.register_at = now + wait;
+        // Table 40: for these codes responseData lists parameter names.
+        let names = if item.data.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", item.data.join(", "))
+        };
+        let what = match item.code {
+            proto::SUCCESS => "success with no CBSD ID".to_string(),
+            proto::REG_PENDING => {
+                format!("pending: the SAS still needs installer data{names}")
+            }
+            proto::MISSING_PARAM => format!("missing parameters{names}"),
+            proto::INVALID_VALUE => format!("invalid values{names}"),
+            proto::VERSION => format!("protocol version refused, the SAS takes{names}"),
+            proto::CERT_ERROR => "certificate refused".to_string(),
+            proto::GROUP_ERROR => "grouping refused".to_string(),
+            code => format!("code {code}"),
+        };
+        out.push(Action::Log(format!(
+            "registration answered {} ({what}), next try in {wait} s",
+            item.code
+        )));
     }
 
     fn on_inquiry(&mut self, now: u64, item: &Item, out: &mut Vec<Action>) {
@@ -1241,7 +1474,14 @@ impl Engine {
         self.grant_at = now;
     }
 
-    fn on_grant(&mut self, now: u64, item: &Item, subject: &Subject, out: &mut Vec<Action>) {
+    fn on_grant(
+        &mut self,
+        now: u64,
+        clock: u64,
+        item: &Item,
+        subject: &Subject,
+        out: &mut Vec<Action>,
+    ) {
         let Subject::Range(range, eirp) = subject else {
             return;
         };
@@ -1251,14 +1491,17 @@ impl Engine {
             (proto::SUCCESS, Some(id)) => {
                 out.push(Action::Log(format!("grant for {range} at {eirp} dBm/MHz")));
                 self.grant_failures = 0;
+                self.blind_conflicts = 0;
+                let grant_expire = item.grant_expire.unwrap_or(0);
                 self.grants.push(Grant {
                     id: id.clone(),
                     range,
                     max_eirp: eirp,
                     state: GrantState::Granted,
                     interval: item.heartbeat_interval.unwrap_or(60),
-                    grant_expire: item.grant_expire.unwrap_or(0),
+                    grant_expire,
                     transmit_expire: 0,
+                    life: grant_expire.saturating_sub(clock),
                     deadline: None,
                     next_heartbeat: now,
                     failures: 0,
@@ -1290,8 +1533,7 @@ impl Engine {
                     "grant for {range} conflicts with {unknown} grant(s) the SAS still holds"
                 )));
                 if unknown == 0 {
-                    self.grant_failures += 1;
-                    self.grant_at = now + retry(&GRANT_RETRY, self.grant_failures).max(60);
+                    self.blind_conflict(now, range, out);
                 } else {
                     self.relinquish_at = now;
                     self.grant_at = now;
@@ -1323,6 +1565,48 @@ impl Engine {
                     item.message
                 )));
             }
+        }
+    }
+
+    /// A 401 whose `responseData` names nothing this client can give back.
+    /// TS-0016 makes `responseData` optional, so a SAS may hold a grant from
+    /// a lost answer and never say which. Retrying alone would loop forever.
+    /// After `BLIND_CONFLICTS` such calls for a carrier in use, the client
+    /// registers again: TS-0016 section 8.3 has the SAS delete every grant of
+    /// a CBSD that sends a registration request. The gate is already closed,
+    /// because a carrier in use has no grant.
+    fn blind_conflict(&mut self, now: u64, range: Range, out: &mut Vec<Action>) {
+        let in_use = self.in_use().iter().any(|carrier| carrier.overlaps(range));
+        if !in_use {
+            // A standby range: leave it alone for a while.
+            self.denied.push((range, now + 1800));
+            return;
+        }
+        if !self.blind_counted {
+            self.blind_counted = true;
+            self.blind_conflicts += 1;
+        }
+        let spaced = self
+            .last_reset
+            .is_none_or(|at| now >= at + RESET_SPACING);
+        if self.blind_conflicts < BLIND_CONFLICTS {
+            self.grant_failures += 1;
+            self.grant_at = now + retry(&GRANT_RETRY, self.grant_failures).max(60);
+        } else if spaced {
+            self.blind_conflicts = 0;
+            self.last_reset = Some(now);
+            self.unregistered(
+                now,
+                0,
+                true,
+                "the SAS keeps reporting a grant conflict it does not name (401): registering again clears it",
+                out,
+            );
+        } else {
+            out.push(Action::Log(format!(
+                "a new registration ran less than {RESET_SPACING} s ago: {range} waits 1800 s"
+            )));
+            self.denied.push((range, now + 1800));
         }
     }
 
@@ -1358,6 +1642,10 @@ impl Engine {
                     grant.interval = interval.max(1);
                 }
                 if let Some(expire) = item.grant_expire {
+                    if expire > grant.grant_expire {
+                        // Renewed: the new life sets the next renewal window.
+                        grant.life = expire.saturating_sub(clock);
+                    }
                     grant.grant_expire = expire;
                 }
                 grant.failures = 0;
@@ -1373,15 +1661,20 @@ impl Engine {
             proto::SUSPENDED_GRANT => {
                 let grant = &mut self.grants[index];
                 grant.state = GrantState::Suspended;
-                grant.deadline = Some(base + life.unwrap_or(0));
+                // A later 501 never extends the time already allowed: the
+                // radio must be off the carrier 60 s after the first expiry,
+                // however often the suspended grant is heartbeated.
+                let end = base + life.unwrap_or(0);
+                grant.deadline = Some(grant.deadline.map_or(end, |known| known.min(end)));
                 grant.transmit_expire = item.transmit_expire.unwrap_or(0);
                 if let Some(interval) = item.heartbeat_interval {
                     grant.interval = interval.max(1);
                 }
                 grant.suspensions += 1;
                 grant.failures = 0;
+                // Kept for the status file and the log only.
                 grant.reason = item.message.clone();
-                let wait = suspension_delay(&grant.reason, grant.suspensions, grant.interval);
+                let wait = suspension_delay(grant.suspensions, grant.interval);
                 grant.next_heartbeat = now + wait;
                 out.push(Action::Log(format!(
                     "{range} suspended ({}): grant kept, next heartbeat in {wait} s",
