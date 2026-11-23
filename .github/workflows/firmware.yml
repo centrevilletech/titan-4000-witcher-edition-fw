@@ -77,6 +77,8 @@ jobs:
           (cd device/sqm/payload && sha256sum -c ../SHA256SUMS)
           bash -n device/sqm/source/rebuild.sh
           (cd device/qctrl/payload && sha256sum -c ../SHA256SUMS)
+          (cd device/ufq/payload && sha256sum -c ../SHA256SUMS)
+          bash -n device/ufq/source/build.sh
           bash -n scripts/stage-latency.sh
           python3 -m compileall -q scripts
           bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
@@ -84,6 +86,8 @@ jobs:
           git diff --check
       - name: Download clamp module rebuilds byte for byte
         run: device/qctrl/source/build.sh "$(mktemp -d)"
+      - name: Uplink flow queue module rebuilds byte for byte and passes self-test
+        run: device/ufq/source/build.sh "$(mktemp -d)"
       - name: Keeper and protocol tests
         run: cargo test --locked --workspace --manifest-path userspace/Cargo.toml
       - name: Management reachability across network modes

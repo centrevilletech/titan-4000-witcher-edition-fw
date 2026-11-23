@@ -1,0 +1,34 @@
+# Kernel symbols titan_ufq.ko imports. Each one is exported (__ksymtab_<name>)
+# by the Titan 4000 kernel 3.10.0-uc0, verified against /proc/kallsyms.
+# build.sh refuses a module that imports anything else.
+__aeabi_idiv
+__aeabi_uidiv
+__aeabi_uidivmod
+__arm_ioremap
+__arm_iounmap
+__copy_from_user
+consume_skb
+gipc
+hrtimer_cancel
+hrtimer_start
+kfree_skb
+ktime_get
+local_bh_disable
+local_bh_enable
+memset
+nf_register_hook
+nf_unregister_hook
+printk
+proc_create_data
+register_netdevice_notifier
+remove_proc_entry
+seq_lseek
+seq_printf
+seq_read
+single_open
+single_release
+skb_make_writable
+synchronize_net
+tasklet_hrtimer_init
+tasklet_kill
+unregister_netdevice_notifier
