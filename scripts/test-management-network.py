@@ -185,6 +185,9 @@ try:
             assert saved.read_bytes() == seed
             assert saved.stat().st_mode & 0o777 == 0o600
             saved.unlink()
+            ptype_lines = Path('/proc/net/ptype').read_text().splitlines()
+            all_ptypes = [line for line in ptype_lines[1:] if line.split() and line.split()[0] == 'ALL']
+            assert not all_ptypes, ('unexpected ETH_P_ALL handler in /proc/net/ptype', ptype_lines)
             print('PASS:', topology, 'all assigned addresses; authenticated setup/recovery; inherited blocks overridden; forwarding unchanged', flush=True)
 finally:
     for process in reversed(children):

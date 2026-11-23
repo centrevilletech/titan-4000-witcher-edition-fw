@@ -24,6 +24,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::{Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant},
 };
@@ -36,6 +37,21 @@ use titan_pd_model::{
 const CHECK_EVERY: u64 = 30;
 /// After an attach, re-check the carrier state this soon.
 const AFTER_ATTACH: u64 = 20;
+/// Fallback poll period when no radio profile is configured.
+const IDLE_SUPERVISE_SECS: u64 = 60;
+
+fn profile_signal() -> &'static (Mutex<u64>, Condvar) {
+    static SIGNAL: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+    SIGNAL.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+fn wake_supervisor() {
+    let (lock, cvar) = profile_signal();
+    if let Ok(mut seq) = lock.lock() {
+        *seq = seq.wrapping_add(1);
+        cvar.notify_all();
+    }
+}
 
 const DISK: &str = "/mnt/titan-api/radio";
 const RAM: &str = "/tmp/titan-pd-keeper";
@@ -110,15 +126,31 @@ pub fn supervise() {
         }
     });
     thread::spawn(|| {
+        let mut seen = 0u64;
         loop {
             // No profile on a stock installation. Only inspect the filesystem.
-            if disk("profile.json").exists() || ram("radio-journal").exists() {
+            let active = disk("profile.json").exists() || ram("radio-journal").exists();
+            if active {
                 let _ = Command::new("/tmp/titan-pd-keeper/titan-pd-keeper")
                     .arg("opt-guard")
                     .stdin(Stdio::null())
                     .status();
             }
-            pause(5);
+            let wait = Duration::from_secs(if active { 5 } else { IDLE_SUPERVISE_SECS });
+            let (lock, cvar) = profile_signal();
+            if let Ok(guard) = lock.lock() {
+                let guard = if *guard == seen {
+                    match cvar.wait_timeout(guard, wait) {
+                        Ok((guard, _)) => guard,
+                        Err(poisoned) => poisoned.into_inner().0,
+                    }
+                } else {
+                    guard
+                };
+                seen = *guard;
+            } else {
+                thread::sleep(wait);
+            }
         }
     });
 }
@@ -149,6 +181,7 @@ fn request(input: &[u8]) -> io::Result<Value> {
             let p = Profile::parse(&serde_json::to_vec(&message["profile"])?).map_err(fail)?;
             fs::create_dir_all(DISK)?;
             store(&disk("profile.json"), &p)?;
+            wake_supervisor();
             Ok(json!({"accepted":true}))
         }
         Some("status") => {
