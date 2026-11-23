@@ -117,7 +117,7 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
         deadline: Instant::now() + SESSION_LIMIT,
         timed_out: false,
     };
-    let result = tk_flags::run_session(&mut cli, &plan.writes, plan.session);
+    let result = tk_flags::run_plan(&mut cli, plan);
     if let Some(mut input) = cli.input.take() {
         let _ = writeln!(input, "exit");
     }

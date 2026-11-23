@@ -261,6 +261,7 @@ struct Keeper {
     tk_flags_job: Option<(std::thread::JoinHandle<(tk_flags::Outcome, bool)>, tk_flags::Plan)>,
     tk_flags_config_at: Option<u64>,
     tk_flags_refused: Vec<String>,
+    tk_flags_config_hands_off: bool,
     /// The kernel log showed a modem firmware load after the keeper started.
     modem_restart_seen: bool,
     /// The staged download clamp (see `titan_pd_model::qctrl`).
@@ -531,6 +532,7 @@ impl Keeper {
             tk_flags_job: None,
             tk_flags_config_at: None,
             tk_flags_refused: Vec::new(),
+            tk_flags_config_hands_off: false,
             modem_restart_seen: false,
             qctrl: QctrlWatch::default(),
             fastpath: fastpath_io::Watch::default(),
@@ -2427,9 +2429,19 @@ impl Keeper {
             return;
         };
         let text = read_file(&dir.join("config").to_string_lossy());
-        self.note_tk_flags_refused(&text);
+        let parsed = tk_flags::parse_writes(&text);
+        self.note_tk_flags_refused(&parsed);
+        self.tk_flags_config_hands_off = parsed.hands_off;
         let wanted = tk_flags::wanted(&text, &[]);
-        if wanted.is_empty() {
+        let mut control = tk_flags::Control::new_with_ack(wanted.clone(), parsed.hold_ack, self.now);
+        let hands_off = self.tk_flags_hands_off_reason();
+        if let Some(reason) = hands_off.as_deref() {
+            let (_, line) = control.set_hands_off(Some(reason), self.now);
+            if let Some(line) = line {
+                self.note(&line);
+            }
+            let _ = fs::write(tk_flags_status_path(), control.status(self.now));
+        } else if wanted.is_empty() {
             let _ = fs::write(
                 tk_flags_status_path(),
                 tk_flags::idle_status("no wm= lines in tk/config", self.now),
@@ -2439,26 +2451,33 @@ impl Keeper {
                 "tk flags: modem firmware {short} confirmed; writing {} once the patch magic shows",
                 tk_flags::list(&wanted)
             ));
-        }
-        let control = tk_flags::Control::new(wanted, self.now);
-        if !control.wanted().is_empty() {
             let _ = fs::write(tk_flags_status_path(), control.status(self.now));
         }
         self.tk_flags = Some(control);
         self.tk_flags_config_at = Some(self.now);
     }
 
-    fn note_tk_flags_refused(&mut self, config: &str) {
-        let refused = tk_flags::parse_writes(config).refused;
-        if refused == self.tk_flags_refused {
+    fn tk_flags_hands_off_reason(&self) -> Option<String> {
+        if self.tk_flags_config_hands_off {
+            return Some("manage=off in tk/config".into());
+        }
+        let marker = tk_flags_hands_off_path();
+        if std::path::Path::new(&marker).exists() {
+            return Some(marker);
+        }
+        None
+    }
+
+    fn note_tk_flags_refused(&mut self, parsed: &tk_flags::Parsed) {
+        if parsed.refused == self.tk_flags_refused {
             return;
         }
-        for line in &refused {
+        for (line, reason) in &parsed.refused_reasons {
             self.note(&format!(
-                "tk flags: ignored {line:?} in tk/config: only wm=0x84f93008:<0..0x200> and wm=0x847ed604:<bits 0x15> are allowed"
+                "tk flags: ignored {line:?} in tk/config: {reason}"
             ));
         }
-        self.tk_flags_refused = refused;
+        self.tk_flags_refused = parsed.refused.clone();
     }
 
     /// Run the DM sessions for the flags, one at a time, on their own thread.
@@ -2499,19 +2518,27 @@ impl Keeper {
                 };
             }
         }
-        if let Some(text) = &config_text {
-            self.note_tk_flags_refused(text);
+        let parsed_config = config_text.as_deref().map(tk_flags::parse_writes);
+        if let Some(parsed) = &parsed_config {
+            self.note_tk_flags_refused(parsed);
+            self.tk_flags_config_hands_off = parsed.hands_off;
         }
+        let hands_off = self.tk_flags_hands_off_reason();
         let busy = self.tk_flags_job.is_some() || self.reboot_asked_at.is_some();
         let mut spawned = None;
         if let Some(control) = self.tk_flags.as_mut() {
+            let (ho_changed, ho_line) = control.set_hands_off(hands_off.as_deref(), self.now);
+            if ho_changed {
+                changed = true;
+            }
+            lines.extend(ho_line);
             if restarted {
                 lines.push(control.modem_restarted(self.now));
                 changed = true;
             }
-            if let Some(text) = &config_text {
+            if let (Some(text), Some(parsed)) = (&config_text, &parsed_config) {
                 let wanted = tk_flags::wanted(text, control.wanted());
-                if let Some(line) = control.set_wanted(wanted, self.now) {
+                if let Some(line) = control.set_wanted_with_ack(wanted, parsed.hold_ack, self.now) {
                     lines.push(line);
                     changed = true;
                 }
@@ -2534,7 +2561,9 @@ impl Keeper {
         }
         let status = if changed {
             self.tk_flags.as_ref().map(|control| {
-                if control.wanted().is_empty() {
+                if control.state() == tk_flags::State::HandsOff {
+                    control.status(self.now)
+                } else if control.wanted().is_empty() {
                     tk_flags::idle_status("no wm= lines in tk/config", self.now)
                 } else {
                     control.status(self.now)
@@ -3820,6 +3849,12 @@ fn tk_result_path() -> String {
 /// The flag writes' status, in RAM.
 fn tk_flags_status_path() -> String {
     std::env::var("TITAN_TK_FLAGS").unwrap_or_else(|_| "/var/run/witcher-tk.flags".into())
+}
+
+/// Optional bench/maintenance marker file that pauses all modem console
+/// sessions until removed.
+fn tk_flags_hands_off_path() -> String {
+    std::env::var("TITAN_TK_HANDS_OFF").unwrap_or_else(|_| "/var/run/witcher-tk.hands-off".into())
 }
 
 /// The boot hook's files on the persistent volume, only while it is mounted.
