@@ -181,30 +181,82 @@ Neither layer can loop:
 
 ## Modem feature flags
 
-The N4 image boots with every feature off, as this loader requires. Two words
-in modem RAM turn its latency fixes on:
+Patched modem images boot with every feature off, as this loader requires. The
+keeper manages an allow-listed table of words in modem RAM, keyed by each patch
+layer's magic word:
 
-| Word | Value | Meaning |
-| --- | --- | --- |
-| `0x847ed604` | `0x5` | AQM v2: uplink queue control (bits `0x1` and `0x4`) |
-| `0x847ed604` | `0x10` | Grant-hold rescue |
-| `0x847ed604` | `0x15` | Both (the bench setting) |
-| `0x84f93008` | `0x140` | Grant-hold size in bytes. `0x140` fits a 228-byte ping. |
+### Managed word table
 
-Bench (2026-11-22, N4 image): ping during an upload went from about 100 ms to
-38 ms, and idle ping from 32 ms to 18 ms.
+| Layer & magic (`vm <addr> 4`) | Word | Name | Allowed values | Off / rollback | Meaning |
+| --- | --- | --- | --- | --- | --- |
+| N4 (`0x847ed600`: `4e 34 56 32`) | `0x84f93008` | `HOLD_MARGIN` | `0..=0x200` (`0..=0x800` with `hold_ack=prb-tax`) | `0` | Grant-hold size in bytes (`0x140` fits a 228-byte ping) |
+| N4 | `0x847ed608` | `N4_PDCP_MIN` | `4096..=24576` (`min <= max`) | `0x4000` (16384) | N4 PDCP staging min for images without N5 |
+| N4 | `0x847ed60c` | `N4_PDCP_MAX` | `4096..=24576` (`min <= max`) | `0x6000` (24576) | N4 PDCP staging max for images without N5 |
+| N4 | `0x847ed604` | `N4_FLAGS` | bits `0x15` (`0x1`, `0x4`, `0x10`) | `0` | AQM v2 (`0x5`), grant-hold rescue (`0x10`), both (`0x15`). Bit `0x2` (lead) and bit `0x8` (stock sparse promotion) are refused everywhere. |
+| IMG4 (`0x847ecfe8`: `49 4d 47 34`) | `0x847ed548` | `G1A` | `0` or `1` | `0` | UL GIPC idle-clear |
+| IMG4 | `0x847ed54c` | `G1B` | `0` or `1` | `0` | Bounded LLCE1 poll |
+| IMG4 | `0x847ed550` | `G1C` | `0` or `1` | `0` | Early LLCE0 harvest |
+| IMG4 | `0x847ecf08` | `TK1` | `0` or `1` | `0` | Batched DL GIPC send |
+| IMG4 | `0x847ed554` | `LNK` | `0` or `2` (`1` only with N6 magic and `U2_FLAGS` bit `0x1` in the same config) | `0` | UL local NACK (`2` observe only; `1` active local NACK gated by N6 LNK-FIX) |
+| N5 (`0x84489a64`: `4e 35 46 4c`) | `0x84489a70` | `N5_RATE_BPMS` | `8..=200` | `0` | Sparse-flow rate threshold (bytes/ms) |
+| N5 | `0x84489a74` | `N5_BURST_B` | `512..=16384` | `0` | Sparse-flow burst allowance (bytes) |
+| N5 | `0x84489a78` | `N5_HOLD_MS` | `100..=5000` | `0` | Bulk-flow hold duration (ms) |
+| N5 | `0x84489a7c` | `N5_BUDGET_PCT` | `1..=50` | `0` | Global Ring 0 promoted-byte cap (% of `20 * G_ema`) |
+| N5 | `0x84489a84` | `N5_PDCP_MIN` | `4096..=24576` (`min <= max`) | `0` | N5 PDCP staging min (writing `0` restores 16384) |
+| N5 | `0x84489a88` | `N5_PDCP_MAX` | `4096..=24576` (`min <= max`) | `0` | N5 PDCP staging max (writing `0` restores 24576) |
+| N5 | `0x84489a8c` | `N5_PDCP_K_Q4` | `0..=64` | `0` | Adaptive PDCP multiplier in Q4 |
+| N5 | `0x84489a6c` | `N5_FLAGS` | `0..=3` (bit `0x4` refused) | `0` | `0x1` sparse flow lane, `0x2` N5 PDCP staging override (requires `N4_FLAGS` bit `0x1`), `0x3` both |
+| N6 (`0x8418ff00`: `55 32 48 46`) | `0x8418ff08` | `U2_FLAGS` | `0` or `1` | `0` | LNK-FIX post-ACK filter + per-carrier counters (same magic on N6 and N6H; `0x8418ff04` distinguishes N6 `4e 36 00 00` from N6H `4e 36 48 03`) |
 
-List them in `tk/config`, the hold size first:
+**Never on the allow-list (always refused and logged):** IMG4 words `TRCP`
+(`0x847ecf1c/20/24`), `W5` (`0x847ece88..94`), `UHQ` (`0x847ecff0`), `U3T`
+(`0x847ecff4`), `R17` (`0x847ecff8/fc`), `X4`/`HRB` (`0x847ecf14`), `DSR`
+(`0x847ecf18`), `U14` (`0x847ecf28/2c`), `PHR` (`0x847ecf10`), any RF,
+transmit power, MPR or calibration address, and any address not in the table
+above.
+
+**Cross-word rules:**
+- `N4_PDCP_MIN <= N4_PDCP_MAX` and `N5_PDCP_MIN <= N5_PDCP_MAX` (an omitted
+  side is checked against its boot default `16384` / `24576`).
+- `N5_FLAGS` bit 1 (`0x2`) requires `N4_FLAGS` bit 0 (`0x1`).
+- `LNK=1` (`0x847ed554`) is refused unless the N6 magic (`0x8418ff00`: `55 32 48 46`)
+  is present in the same session and `U2_FLAGS` bit 0 (`0x1`) is requested in
+  the same config (`U2_FLAGS` is written before `LNK` and disabled after `LNK`).
+- `HOLD_MARGIN` above `0x200` (up to `0x800`) requires an explicit
+  `hold_ack=prb-tax` line in `tk/config`. **Tower cost:** while the unit is
+  active, a larger hold margin makes the modem ask for bigger standing padding
+  grants on the uplink carrier (increasing PRB consumption on the sector; on
+  the bench `0x400` cut idle RTT by ~2.5 ms and `0x800` by ~3.2 ms). Do not
+  enable `hold_ack=prb-tax` on a loaded cell without checking sector uplink
+  utilization.
+
+**Profiles in `scripts/stage-latency.sh`:**
+- `--profile latency`: inspects the local `tk.gz` magic bytes (N4, IMG4, N5,
+  N6/N6H) and writes the proven `wm=` set for that image (for N6/N6H: N4 AQM v2
+  + hold `0x140`, G1A/G1B/G1C/TK1, N5 sparse lane + 8/12 KB PDCP staging, and
+  `U2_FLAGS=1`). `--flags`, `--hold`, and `--hold-ack prb-tax` override profile
+  values.
+- `--profile stock`: writes no `wm=` lines.
+
+Example `tk/config` for an N6/N6H image:
 
 ```
+enabled=1
+sha256=<64 hex digits>
 wm=0x84f93008:0x140
 wm=0x847ed604:0x15
+wm=0x847ed548:0x1
+wm=0x847ed54c:0x1
+wm=0x847ed550:0x1
+wm=0x847ecf08:0x1
+wm=0x84489a84:0x2000
+wm=0x84489a88:0x3000
+wm=0x84489a6c:0x3
+wm=0x8418ff08:0x1
 ```
 
-The keeper accepts only these two words. `0x847ed604` takes only bits `0x15`
-(bits `0x2` and `0x8` exist in the image and must stay off), and
-`0x84f93008` takes 0 to `0x200`. It ignores any other `wm=` line and logs it.
-A value is hex with `0x` or decimal.
+A value is hex with `0x` or decimal. Any disallowed `wm=` line is ignored and
+logged with the reason.
 
 ### When the keeper writes them
 
@@ -213,15 +265,24 @@ A value is hex with `0x` or decimal.
    that did not report `read from nand`. On a stock boot nothing is ever
    written. A keeper that restarts after the confirm takes over.
 2. Each write session opens the modem console (`/usr/lte/lted_cli`) and sends
-   one line about every 3 s: `arm1log 2`, `quit 0`, `dbg revert`, then
-   `vm 0x847ed600 4`.
-3. It writes only if that read shows the N4 patch magic `4e 34 56 32` in the
-   same session (`tk_boot::flag_writes_allowed`). The magic appears only after
-   the first uplink transport block. Until then the keeper writes nothing and
-   asks again after 15 s, then 30 s, doubling up to 10 minutes.
-4. It reads each word first and writes only what differs: the hold size, then
-   the flags. When turning off it writes the flags first.
-5. It reads every write back in the same session, then sends `arm1log 1`.
+   one line about every 3 s: `arm1log 2`, `quit 0`, `dbg revert`, then `vm` for
+   every patch layer magic required by the words in that session.
+3. It writes only if every required magic reads back in the same session (N4
+   through `tk_boot::flag_writes_allowed`). The N4 magic appears only after the
+   first uplink transport block. Until then the keeper writes nothing and asks
+   again after 15 s, then 30 s, doubling up to 10 minutes.
+4. It reads each word first and writes only what differs, in safe order:
+   - First: flags that disable or reduce behaviour (reverse dependency order:
+     `N5_FLAGS` before `N4_FLAGS`, all disabling flags before any parameter
+     change).
+   - Second: parameters and limits (`HOLD_MARGIN`, PDCP limits, N5 tunables).
+   - Third: flags that enable (`N4_FLAGS` before `N5_FLAGS`).
+5. Sessions keep the 90 s limit and 3 s line spacing. When a config has more
+   words than fit within a 75 s worst-case budget (for example the 10-word N6
+   latency profile), the keeper splits the apply into consecutive sessions in
+   write order (parameters first, then flags), so a failed session never leaves
+   an enabled flag without its dependent parameter.
+6. It reads every write back in the same session, then sends `arm1log 1`.
 
 The console prints a dump's bytes most significant first, under a header that
 names each column's byte offset:
@@ -239,30 +300,49 @@ the word little-endian. A dump without that header line counts as unread.
 logging mode by `quit 1` ignores every line with no error. That is why each
 write session starts with `quit 0` and `dbg revert`.
 
+### Bench/maintenance hold (`hands-off`)
+
+To work on `/usr/lte/lted_cli` by hand without colliding with the keeper's
+writes or 10-minute checks, put the keeper in hands-off mode in either way:
+
+- **Temporary (RAM, cleared on reboot):** `touch /var/run/witcher-tk.hands-off`
+  (remove with `rm -f /var/run/witcher-tk.hands-off` when done). Takes effect
+  within 1 s.
+- **Persistent (`tk/config`):** add `manage=off` to `/mnt/titan-api/tk/config`
+  (remove it or set `manage=on` when done). Takes effect within 15 s.
+
+While hands-off is active, the keeper opens no console sessions, runs no
+periodic checks, writes no modem words, and reports `state=hands-off` in
+`/var/run/witcher-tk.flags`. Removing the hold resumes management immediately
+with a fresh read of every configured word.
+
 ### Retries and failure
 
 | Case | What the keeper does |
 | --- | --- |
 | No patch magic | Writes nothing, waits (15 s doubling to 10 min). Not a failure. |
-| No reply to the magic read, or a read-back missing or wrong | Tries again after 20 s. After 3 failed sessions it stops. If any write went out since the last modem restart, it first writes 0 to every word it manages (magic still required) and reads them back. The status says `failed` and whether the words read back 0. |
+| No reply to the magic read, or a read-back missing or wrong | Tries again after 20 s. After 3 failed sessions it stops. If any write went out since the last modem restart, it rolls every managed word back to its documented off value (`0x4000`/`0x6000` for N4 PDCP limits, `0` for N5 tunables, flags and hold; magic still required, disabling flags first) and reads them back. The status says `failed` and whether the rollback read back. |
 | Applied | A read-only check every 10 minutes. A word that reads back wrong is written again. Three checks with no reply start a write session, which resets the console. |
 | Modem restart | The kernel log shows `read from nand` or `read from fs` after the keeper started. It starts over 30 s later. A crash reload runs stock NAND firmware, which never shows the magic, so nothing is written then. |
 | Another console session | The radio profile's marker file is present: the keeper waits 20 s and counts no failure. |
-| `tk/config` changed | Read every 15 s. New values are written at once. `enabled=0`, a deleted file, or no `wm=` lines left write 0 to every word the keeper managed. |
+| Hands-off (`manage=off` or `/var/run/witcher-tk.hands-off`) | Stops all console sessions and checks; status says `state=hands-off`. Removing it resumes with a fresh read. |
+| `tk/config` changed | Read every 15 s. New values are written at once (or queued while hands-off). `enabled=0`, a deleted file, or dropped `wm=` lines roll those managed words back to their documented off values. |
 
-Writes typed by hand in `lted_cli` get overwritten at the next check. Change
-`tk/config` instead.
+Unless hands-off is active, writes typed by hand in `lted_cli` get overwritten
+at the next check. Either set hands-off for manual bench work or edit
+`tk/config`.
 
 ### Turning the flags off
 
-- **Now, no reboot:** set the `wm=` values to 0 (or delete the lines) in
-  `/mnt/titan-api/tk/config`. The keeper writes 0 and reads it back within
-  about 15 s. Watch `/var/run/witcher-tk.flags`.
-- **Stock modem firmware:** `enabled=0` writes 0 at once, and the next boot
+- **Now, no reboot:** remove the `wm=` lines (or set `enabled=0`) in
+  `/mnt/titan-api/tk/config`. Within about 15 s the keeper rolls every managed
+  word back to its documented off value (flags first) and reads them back.
+  Watch `/var/run/witcher-tk.flags`.
+- **Stock modem firmware:** `enabled=0` rolls back at once, and the next boot
   loads stock firmware.
-- **By hand**, with the keeper stopped: `wm 0x847ed604 0` and
-  `wm 0x84f93008 0` in a `lted_cli` session (after `arm1log 2`), then read
-  both back.
+- **By hand**, with hands-off set (`touch /var/run/witcher-tk.hands-off`):
+  write the kill switch in a `lted_cli` session (after `arm1log 2`), then read
+  back.
 
 ### Status
 
@@ -270,8 +350,8 @@ Writes typed by hand in `lted_cli` get overwritten at the next check. Change
 
 | Line | Values |
 | --- | --- |
-| `state` | `off`, `pending`, `waiting-magic`, `applied`, `zeroing`, `failed` |
-| `detail` | Why, in words. On `failed`: what went wrong and whether the words read back 0. |
+| `state` | `off`, `pending`, `waiting-magic`, `applied`, `zeroing`, `failed`, `hands-off` |
+| `detail` | Why, in words. On `failed`: what went wrong and whether the rollback read back. |
 | `want` | The words and values the keeper keeps, or `none` |
 | `attempts` | Failed sessions in a row |
 
@@ -296,6 +376,7 @@ In RAM:
 | `/var/run/witcher-tk.status` | `state=staged` or `state=stock`, `reason`, `sha256`, `strikes`, `loaded_at`, `source` (`fs`, `nand`, `unknown`), `firmware` (`clean`, `dirty`) |
 | `/var/run/witcher-tk.result` | `confirmed=<hash>` or `rollback=<hash>` |
 | `/var/run/witcher-tk.flags` | The flag writes (see [Status](#status)) |
+| `/var/run/witcher-tk.hands-off` | Optional operator marker file to pause all modem console sessions (`state=hands-off`) |
 
 `keeper.log` lines start with `tk boot` or `tk flags`. A default unit logs none.
 
@@ -313,11 +394,12 @@ In RAM:
   only root on the unit can write. The hook has a `verify_signature` stub with
   a fixed interface for Phase 2: an Ed25519 signature in `active.gz.sig` over
   the image's SHA-256, checked against a public key in the image.
-- **Flags only from `tk/config`, only two words.** Images must still boot with
+- **Flags only from `tk/config`, allow-listed table only.** Images must still boot with
   every feature flag at 0. The keeper writes only the allow-listed words of
-  [Modem feature flags](#modem-feature-flags), and only after
-  `titan_pd_model::tk_boot::flag_writes_allowed` sees the patch magic. A new
-  word needs a code change and its own bench test.
+  [Modem feature flags](#modem-feature-flags), and only after verifying each
+  layer's patch magic in the same session (N4 through
+  `titan_pd_model::tk_boot::flag_writes_allowed`). A new word needs a code
+  change and its own bench test.
 - **No crash quarantine.** A modem crash after a confirmed boot reloads stock
   NAND firmware without a reboot, but the next boot loads the image again.
 - **No on-device patcher** (Phase 2). Each unit needs the image staged by hand.

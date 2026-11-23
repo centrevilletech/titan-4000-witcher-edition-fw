@@ -98,13 +98,29 @@ def main():
     exe('/tmp/bin/reboot', 'echo "reboot $*" >> /tmp/reboot-actions')
     exe('/tmp/bin/insmod', 'echo "insmod $*" >> /tmp/insmod-calls; exit 1')
     # A modem console (DM) stand-in: `vm` dumps print most significant byte
-    # first under the unit's column header; `wm` writes a RAM file. The N4
-    # patch magic shows only while /tmp/dm-magic exists.
+    # first under the unit's column header; `wm` writes a RAM file. Each patch
+    # layer's magic shows only while its marker file exists.
     lted = Path('/tmp/bin/lted_cli')
     lted.write_text(r'''#!/usr/bin/env python3
 import json, os, sys
 ram = json.load(open('/tmp/dm-ram.json')) if os.path.exists('/tmp/dm-ram.json') else {}
 HEADER = '           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C'
+MAGICS = {
+    0x847ed600: ('/tmp/dm-magic', '4e 34 56 32'),
+    0x847ecfe8: ('/tmp/dm-magic-img4', '49 4d 47 34'),
+    0x84489a64: ('/tmp/dm-magic-n5', '4e 35 46 4c'),
+    0x8418ff00: ('/tmp/dm-magic-n6', '55 32 48 46'),
+}
+BOOT_DEFAULTS = {
+    0x847ed608: 0x4000,
+    0x847ed60c: 0x6000,
+    0x84489a70: 40,
+    0x84489a74: 3072,
+    0x84489a78: 500,
+    0x84489a7c: 10,
+    0x84489a84: 0x4000,
+    0x84489a88: 0x6000,
+}
 def dump(addr, shown):
     sys.stdout.write('\n-----\n HEX DUMP  | 4(0x4) Bytes @ 0x%08X\n-----\n%s\n-----\n\x1b[1;32m0x%08X\x1b[0m | %s  .. .. .. ..  .. .. .. ..  .. .. .. .. \n-----\nDM> ' % (addr, HEADER, addr, shown))
 for line in sys.stdin:
@@ -116,10 +132,12 @@ for line in sys.stdin:
         break
     if len(words) == 3 and words[0] == 'vm':
         addr = int(words[1], 16)
-        if addr == 0x847ed600:
-            dump(addr, '4e 34 56 32' if os.path.exists('/tmp/dm-magic') else '00 00 00 00')
+        if addr in MAGICS:
+            marker, text = MAGICS[addr]
+            dump(addr, text if os.path.exists(marker) else '00 00 00 00')
         else:
-            dump(addr, ' '.join('%02x' % b for b in ram.get(str(addr), 0).to_bytes(4, 'big')))
+            val = ram.get(str(addr), BOOT_DEFAULTS.get(addr, 0))
+            dump(addr, ' '.join('%02x' % b for b in val.to_bytes(4, 'big')))
     elif len(words) == 3 and words[0] == 'wm':
         addr, value = int(words[1], 16), int(words[2], 16)
         ram[str(addr)] = value
@@ -274,7 +292,8 @@ for line in sys.stdin:
 
     env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
              TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
-             TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
+             TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_TK_HANDS_OFF='/tmp/tk.hands-off',
+             TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
              TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
@@ -711,6 +730,110 @@ for line in sys.stdin:
         assert writes[-2:]==['wm 0x847ed604 0','wm 0x84f93008 0'], writes
         assert 'tk/config changed' in log(), log()
         print('PASS: removing the wm= lines wrote 0 to both words and read them back.',flush=True)
+        # Multi-magic N6 latency profile (10 words, split across 2 sessions) + refused words + N4 PDCP rollback.
+        for marker in ('/tmp/dm-magic-img4', '/tmp/dm-magic-n5', '/tmp/dm-magic-n6'):
+            Path(marker).write_text('')
+        dm_before = len(Path('/tmp/dm-log').read_text().splitlines())
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\n'
+            'wm=0x84f93008:0x140\n'
+            'wm=0x847ed604:0x15\n'
+            'wm=0x847ed548:0x1\n'
+            'wm=0x847ed54c:0x1\n'
+            'wm=0x847ed550:0x1\n'
+            'wm=0x847ecf08:0x1\n'
+            'wm=0x84489a84:0x2000\n'
+            'wm=0x84489a88:0x3000\n'
+            'wm=0x84489a6c:0x3\n'
+            'wm=0x8418ff08:0x1\n'
+            'wm=0x847ece88:0x1\n'
+            'wm=0x847ecf28:0x1\n'
+            'wm=0x847ecf10:0x060c\n'
+            'wm=0x847ed604:0x8\n'
+        )
+        n6_expected = {
+            str(0x84f93008): 0x140,
+            str(0x847ed604): 0x15,
+            str(0x847ed548): 1,
+            str(0x847ed54c): 1,
+            str(0x847ed550): 1,
+            str(0x847ecf08): 1,
+            str(0x84489a84): 0x2000,
+            str(0x84489a88): 0x3000,
+            str(0x84489a6c): 3,
+            str(0x8418ff08): 1,
+        }
+        wait_for(lambda: dm_ram() == n6_expected and 'state=applied\n' in flags(), 60)
+        dm_new = Path('/tmp/dm-log').read_text().splitlines()[dm_before:]
+        # Split into 2 sessions (2 `arm1log 2` openings) with params written before flags.
+        assert dm_new.count('arm1log 2') >= 2, dm_new
+        n6_wms = [l for l in dm_new if l.startswith('wm ')]
+        assert n6_wms.index('wm 0x84489a84 0x2000') < n6_wms.index('wm 0x84489a6c 0x3'), n6_wms
+        assert n6_wms.index('wm 0x847ed604 0x15') < n6_wms.index('wm 0x84489a6c 0x3'), n6_wms
+        assert 'ignored "wm=0x847ece88:0x1" in tk/config' in log(), log()
+        assert 'ignored "wm=0x847ecf28:0x1" in tk/config' in log(), log()
+        assert 'ignored "wm=0x847ecf10:0x060c" in tk/config' in log(), log()
+        assert 'ignored "wm=0x847ed604:0x8" in tk/config' in log(), log()
+        print('PASS: N6 latency profile applied across split sessions in safe order; forbidden words refused.', flush=True)
+        # LNK=1 refused without U2_FLAGS bit 0, then accepted with U2_FLAGS=1 (and written after U2_FLAGS).
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\n'
+            'wm=0x847ed554:0x1\n'
+        )
+        wait_for(lambda: 'ignored "wm=0x847ed554:0x1" in tk/config' in log() and dm_ram().get(str(0x8418ff08)) == 0, 60)
+        assert dm_ram().get(str(0x847ed554), 0) == 0, dm_ram()
+        dm_lnk_before = len(Path('/tmp/dm-log').read_text().splitlines())
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\n'
+            'wm=0x847ed554:0x1\n'
+            'wm=0x8418ff08:0x1\n'
+        )
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed554)) == 1 and dm_ram().get(str(0x8418ff08)) == 1, 60)
+        lnk_wms = [l for l in Path('/tmp/dm-log').read_text().splitlines()[dm_lnk_before:] if l.startswith('wm ')]
+        assert lnk_wms.index('wm 0x8418ff08 0x1') < lnk_wms.index('wm 0x847ed554 0x1'), lnk_wms
+        # Re-apply N6 latency profile for the hands-off test below (which also drops LNK back to 0).
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\n'
+            'wm=0x84f93008:0x140\n'
+            'wm=0x847ed604:0x15\n'
+            'wm=0x847ed548:0x1\n'
+            'wm=0x847ed54c:0x1\n'
+            'wm=0x847ed550:0x1\n'
+            'wm=0x847ecf08:0x1\n'
+            'wm=0x84489a84:0x2000\n'
+            'wm=0x84489a88:0x3000\n'
+            'wm=0x84489a6c:0x3\n'
+            'wm=0x8418ff08:0x1\n'
+        )
+        n6_expected_with_lnk_off = dict(n6_expected, **{str(0x847ed554): 0})
+        wait_for(lambda: dm_ram() == n6_expected_with_lnk_off and 'state=applied\n' in flags(), 60)
+        print('PASS: LNK=1 gated on U2_FLAGS bit 0 and N6 magic, written after U2_FLAGS.', flush=True)
+        # Bench/maintenance hands-off hold: marker file stops all console sessions; removing it resumes with a fresh read.
+        Path('/tmp/tk.hands-off').write_text('')
+        wait_for(lambda: 'state=hands-off\n' in flags(), 10)
+        dm_ho_before = len(Path('/tmp/dm-log').read_text().splitlines())
+        # Simulate manual console edit while hands-off; keeper must not touch RAM.
+        cur = dm_ram(); cur[str(0x8418ff08)] = 0
+        Path('/tmp/dm-ram.json').write_text(json.dumps(cur))
+        until = time.monotonic() + 3
+        wait_for(lambda: time.monotonic() >= until, 5)
+        assert len(Path('/tmp/dm-log').read_text().splitlines()) == dm_ho_before
+        assert dm_ram()[str(0x8418ff08)] == 0
+        Path('/tmp/tk.hands-off').unlink()
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram() == n6_expected_with_lnk_off, 45)
+        print('PASS: hands-off marker paused console sessions and removing it resumed with a fresh read.', flush=True)
+        # manage=off in tk/config also enters state=hands-off; removing wm= restores N4 PDCP off values (0x4000/0x6000) and N5 zeros.
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\nmanage=off\nwm=0x847ed608:0x2000\nwm=0x847ed60c:0x3000\n'
+        )
+        wait_for(lambda: 'state=hands-off\n' in flags(), 25)
+        Path('/tmp/tk/config').write_text(
+            'enabled=1\nsha256=' + good + '\nwm=0x847ed608:0x2000\nwm=0x847ed60c:0x3000\n'
+        )
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed608)) == 0x2000 and dm_ram().get(str(0x84489a6c)) == 0, 60)
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256=' + good + '\n')
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed608)) == 0x4000 and dm_ram().get(str(0x847ed60c)) == 0x6000, 60)
+        print('PASS: manage=off held state=hands-off; config removal restored N4 PDCP 0x4000/0x6000 and N5/IMG4/N6 zeros.', flush=True)
         # A modem firmware load in the kernel log starts the flags over.
         with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
         wait_for(lambda:'modem restart seen' in log(),10)
@@ -768,10 +891,15 @@ for line in sys.stdin:
             wait_for(lambda: 'state=covered\n' in cstatus() and 'pcell=3680-3700\n' in cstatus() and 'ulscc=3560-3580\n' in cstatus(), 10)
             assert 'carrier watch' not in log(), log()
             print('PASS: carrier watch saw covered PCell+UL SCell and stayed quiet.', flush=True)
-            # 2. Dry-run hide_grant=1 proves the comparator without forcing a re-grant.
+            # 2. Dry-run hide_grant=1 proves the comparator without forcing a re-grant,
+            #    and logs the transition into uncovered exactly once.
+            before_uncovered = log().count('carrier watch: uncovered')
             Path('/tmp/carrier-watch').mkdir()
             Path('/tmp/carrier-watch/config').write_text('mode=regrant\nquiet_utc=\nhide_grant=1\n')
             wait_for(lambda: 'state=uncovered\n' in cstatus() and 'dry-run hide_grant=1' in log(), 15)
+            until = time.monotonic() + 2
+            wait_for(lambda: time.monotonic() >= until, 4)
+            assert log().count('carrier watch: uncovered') == before_uncovered + 1, log()
             assert rc_sigs() == [], rc_sigs()
             assert not any('sqns_network_cbrs' in a for a in nvram_actions()), nvram_actions()
             Path('/tmp/carrier-watch/config').unlink()
@@ -923,12 +1051,13 @@ else:
             renews = [c for _, c in k1fp_cmds[before_renew:] if c == 'grant 5']
         assert len(renews) >= 2, (renews, k1fp_cmds)
         print('PASS: fast path grant lease renewed every second while SAS grant held (%d writes).' % len(renews), flush=True)
-        # Dropping the SAS grant writes `grant 0` immediately and stops renewals until restored.
+        # Dropping the SAS grant writes `grant 0` immediately, updates status to gate=closed, and stops renewals until restored.
         with fp_lock:
             before_close = len(k1fp_cmds)
         set_grant(['cbrs_mode_grant=1', 'cbrs_grant_state=1'])
         wait_for(lambda: any(c == 'grant 0' for _, c in k1fp_cmds[before_close:]), 10)
         wait_for(lambda: len(gate_rules()) == 4, 10)
+        wait_for(lambda: 'gate=closed\n' in fp_status(), 20)
         until = time.monotonic() + 2.2
         wait_for(lambda: time.monotonic() >= until, 5)
         with fp_lock:
@@ -940,7 +1069,8 @@ else:
             before_reopen = len(k1fp_cmds)
         wait_for(lambda: any(c == 'grant 5' for _, c in k1fp_cmds[before_reopen:]), 10)
         wait_for(lambda: gate_rules() == [], 10)
-        print('PASS: SAS gate close sent grant 0 immediately with no renewal while closed, then resumed.', flush=True)
+        wait_for(lambda: 'gate=open\n' in fp_status(), 20)
+        print('PASS: SAS gate close sent grant 0 immediately, updated fastpath status to gate=closed, then resumed to gate=open.', flush=True)
         # Clamp unload later: keeper notices qctrl_present=1 -> 0 and logs it.
         with fp_lock:
             fp_state['qctrl_present'] = 0
