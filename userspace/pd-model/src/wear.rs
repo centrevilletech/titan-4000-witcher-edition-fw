@@ -47,6 +47,10 @@ pub fn always(line: &str) -> bool {
         "CBRS gate closed",
         "CBRS gate open",
         "CBRS gate rules put back",
+        "carrier watch: uncovered",
+        "carrier watch: covered",
+        "carrier watch: forcing re-grant",
+        "carrier watch: re-grant",
     ]
     .iter()
     .any(|part| line.contains(part))

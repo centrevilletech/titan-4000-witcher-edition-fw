@@ -20,6 +20,7 @@ use titan_pd_model::wear;
 
 mod bench;
 mod capture;
+mod carrier_watch_io;
 mod radio;
 mod radio_modem;
 mod qctrl_io;
@@ -365,7 +366,7 @@ fn nvram_commit() -> Result<(), ()> {
         .ok_or(())
 }
 
-fn signal_rcinit() -> Result<(), ()> {
+pub(crate) fn signal_rcinit() -> Result<(), ()> {
     let entries = fs::read_dir("/proc").map_err(|_| ())?;
     for entry in entries.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {

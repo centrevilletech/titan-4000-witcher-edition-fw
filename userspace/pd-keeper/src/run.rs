@@ -35,6 +35,7 @@ use std::thread;
 use std::time::Duration;
 
 use std::os::unix::process::CommandExt;
+use titan_pd_model::carrier_watch::{self, Action as CarrierAction};
 use titan_pd_model::cbrs_gate::{self, Step as GateStep, Tool as GateTool};
 use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
@@ -55,7 +56,7 @@ use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 
-use crate::{log, log_ram, qctrl_io, tk_flags_io};
+use crate::{carrier_watch_io, log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
@@ -203,6 +204,8 @@ struct Keeper {
     flow_stock_logged: bool,
     /// Customer IPv6 while there is no SAS grant (see `titan_pd_model::cbrs_gate`).
     cbrs_gate: cbrs_gate::Watch,
+    /// Active Band 48 carriers vs held SAS grants (see `titan_pd_model::carrier_watch`).
+    carrier_watch: CarrierWatch,
     /// The boot hook's status was read.
     tk_checked: bool,
     /// Pending confirm for a boot that loaded a staged modem firmware image.
@@ -221,6 +224,29 @@ struct Keeper {
     modem_restart_seen: bool,
     /// The staged download clamp (see `titan_pd_model::qctrl`).
     qctrl: QctrlWatch,
+}
+
+/// Carrier-watch state and incremental `/mnt/cbrslog0.txt` reader.
+struct CarrierWatch {
+    watch: carrier_watch::Watch,
+    log_tail: carrier_watch_io::CbrsLogTail,
+    config: carrier_watch::Config,
+    config_at: Option<u64>,
+    refused_logged: Vec<String>,
+    status_body: String,
+}
+
+impl CarrierWatch {
+    fn new() -> Self {
+        Self {
+            watch: carrier_watch::Watch::default(),
+            log_tail: carrier_watch_io::CbrsLogTail::new(carrier_watch_io::cbrslog_path()),
+            config: carrier_watch::Config::default(),
+            config_at: None,
+            refused_logged: Vec::new(),
+            status_body: String::new(),
+        }
+    }
 }
 
 /// The download clamp's progress this boot.
@@ -431,6 +457,7 @@ impl Keeper {
             flow_failed_logged: false,
             flow_stock_logged: false,
             cbrs_gate: cbrs_gate::Watch::default(),
+            carrier_watch: CarrierWatch::new(),
             tk_checked: false,
             tk_confirm: None,
             tk_probe: None,
@@ -449,6 +476,7 @@ impl Keeper {
         self.refresh_mode();
         // First, and in every mode: nothing below may delay it.
         self.maintain_cbrs_gate();
+        self.maintain_carrier_watch();
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
@@ -1479,6 +1507,77 @@ impl Keeper {
         };
         for err in failed {
             self.note(&format!("CBRS gate: {err}"));
+        }
+    }
+
+    /// Compare active Band 48 transmit carriers (PCell + uplink SCell) against
+    /// held authorized grants in `/mnt/cbrslog0.txt`, at most once per second.
+    /// Runs in every mode. See `titan_pd_model::carrier_watch`.
+    fn maintain_carrier_watch(&mut self) {
+        if !self.carrier_watch.watch.due(self.now) {
+            return;
+        }
+        if self
+            .carrier_watch
+            .config_at
+            .is_none_or(|at| self.now.saturating_sub(at) >= carrier_watch::CONFIG_EVERY)
+        {
+            self.carrier_watch.config_at = Some(self.now);
+            let cfg = carrier_watch_io::load_config();
+            if cfg.refused != self.carrier_watch.refused_logged {
+                for line in &cfg.refused {
+                    self.note(&format!(
+                        "carrier watch: ignored {line:?} in carrier-watch/config"
+                    ));
+                }
+                self.carrier_watch.refused_logged = cfg.refused.clone();
+            }
+            self.carrier_watch.config = cfg;
+        }
+
+        let cache = fs::read(nvram_cache()).unwrap_or_default();
+        let nvram = carrier_watch::read_nvram(&cache);
+        if nvram.cbrs_present && self.carrier_watch.config.mode != carrier_watch::Mode::Off {
+            self.carrier_watch.log_tail.poll();
+        }
+        let wall = unix_now();
+        let grants = self
+            .carrier_watch
+            .log_tail
+            .parser
+            .active_grants(wall, self.carrier_watch.config.hide_grant);
+        let log_seen = self.carrier_watch.log_tail.parser.seen();
+        let outcome = self.carrier_watch.watch.observe(
+            self.now,
+            wall,
+            &self.carrier_watch.config,
+            &nvram,
+            log_seen,
+            &grants,
+        );
+        for line in outcome.logs {
+            self.note(&line);
+        }
+        if outcome.action == CarrierAction::ForceRegrant {
+            if let Err(err) = carrier_watch_io::trigger_regrant() {
+                let line = self
+                    .carrier_watch
+                    .watch
+                    .regrant_dispatch_failed(self.now, &err);
+                self.note(&line);
+            }
+        }
+        let body = self
+            .carrier_watch
+            .watch
+            .status_body(&self.carrier_watch.config);
+        if body != self.carrier_watch.status_body {
+            self.carrier_watch.status_body = body;
+            let text = self
+                .carrier_watch
+                .watch
+                .status_text(&self.carrier_watch.config, self.now);
+            let _ = fs::write(carrier_watch_io::status_path(), text);
         }
     }
 

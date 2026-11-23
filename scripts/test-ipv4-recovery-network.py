@@ -207,7 +207,8 @@ for line in sys.stdin:
              TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
              TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
-             TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod')
+             TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',
+             TITAN_CARRIER_DIR='/tmp/carrier-watch',TITAN_CBRS_LOG='/tmp/cbrslog0.txt',TITAN_CARRIER_STATUS='/tmp/carrier.status')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
         p=Path('/tmp/pd/keeper.log');return p.read_text() if p.exists() else ''
@@ -519,7 +520,7 @@ for line in sys.stdin:
         print('PASS: no staged modem firmware: the boot confirm never armed.',flush=True)
         assert not Path('/tmp/dm-log').exists(), 'a modem console session ran on a stock boot'
         assert Path('/tmp/tk.flags').read_text().startswith('state=off\n'), Path('/tmp/tk.flags').read_text()
-        assert 'tk flags' not in log() and 'download clamp' not in log(), log()
+        assert 'tk flags' not in log() and 'download clamp' not in log() and 'carrier watch' not in log(), log()
         assert Path('/tmp/qctrl.status').read_text().startswith('state=off\n'), Path('/tmp/qctrl.status').read_text()
         print('PASS: stock boot: no modem console session, flags and clamp off and silent.',flush=True)
         # A staged modem firmware image whose boot never answers. Nothing has
@@ -615,6 +616,133 @@ for line in sys.stdin:
         assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
         assert 'download clamp waiting' in log() and 'download clamp failed' in log(), log()
         print('PASS: the clamp waited for the links and refused a module that is not the pinned build.',flush=True)
+        # Carrier watch: compare active Band 48 transmit carriers against
+        # authorized grants in /mnt/cbrslog0.txt, test dry-run hide_grant,
+        # default log mode, rc_signal_done=0 wait, and mode=regrant trigger
+        # (nvram_set sqns_network_cbrs=1 + SIGUSR1 to rcinit).
+        rcinit_stub_path = Path('/tmp/bin/rcinit')
+        rcinit_stub_path.write_text('#!/usr/bin/python3\nimport signal, time\ndef h(s, f):\n    with open("/tmp/rcinit-signals", "a") as out:\n        out.write("USR1\\n")\nsignal.signal(signal.SIGUSR1, h)\nwhile True:\n    time.sleep(60)\n')
+        rcinit_stub_path.chmod(0o755)
+        rcinit_stub = subprocess.Popen([str(rcinit_stub_path)])
+        try:
+            def cstatus():
+                p = Path('/tmp/carrier.status')
+                return p.read_text() if p.exists() else ''
+            def rc_sigs():
+                p = Path('/tmp/rcinit-signals')
+                return p.read_text().splitlines() if p.exists() else []
+            def write_nvram(extra):
+                base = ['detection_interval=3', 'detection_enable=0'] + extra
+                Path('/tmp/nvram-cache.new').write_text('\n'.join(base) + '\n')
+                Path('/tmp/nvram-cache.new').replace('/tmp/nvram-cache')
+            tx_exp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 21600))
+            gr_exp = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() + 86400 * 30))
+            now_hdr = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+            # 1. Covered: PCell 56638 (3680-3700) + ULScc 55440 (3560-3580) both granted.
+            Path('/tmp/cbrslog0.txt').write_text(
+                f'{now_hdr} (L1/P0/R1/G2)\n'
+                f'=0(1):(3560000000-3580000000:27)(1800:{gr_exp})({tx_exp})\n'
+                f'=1(1):(3680000000-3700000000:27)(1800:{gr_exp})({tx_exp})\n'
+                '=(CBRS): Open Radio Traffic Channel.\n'
+            )
+            write_nvram([
+                'sqns_radio_band=48',
+                'sqns_radio_earfcnDl=56638',
+                'sqns_radio_bandwidthDl=20000',
+                'sqns_connection_uplinkScc=freq,pusch,prach,pucch,bw:55440,-55,-55,-55,20',
+                'cbrs_mode_grant=1',
+                'cbrs_grant_state=2',
+                'rc_signal_done=1',
+            ])
+            wait_for(lambda: 'state=covered\n' in cstatus() and 'pcell=3680-3700\n' in cstatus() and 'ulscc=3560-3580\n' in cstatus(), 10)
+            assert 'carrier watch' not in log(), log()
+            print('PASS: carrier watch saw covered PCell+UL SCell and stayed quiet.', flush=True)
+            # 2. Dry-run hide_grant=1 proves the comparator without forcing a re-grant.
+            Path('/tmp/carrier-watch').mkdir()
+            Path('/tmp/carrier-watch/config').write_text('mode=regrant\nquiet_utc=\nhide_grant=1\n')
+            wait_for(lambda: 'state=uncovered\n' in cstatus() and 'dry-run hide_grant=1' in log(), 15)
+            assert rc_sigs() == [], rc_sigs()
+            assert not any('sqns_network_cbrs' in a for a in nvram_actions()), nvram_actions()
+            Path('/tmp/carrier-watch/config').unlink()
+            wait_for(lambda: 'state=covered\n' in cstatus(), 15)
+            print('PASS: carrier watch dry-run hide_grant=1 flagged uncovered without firing re-grant, and deleting config returned to covered.', flush=True)
+            # 3. Real bench incident: grants hold 3620-3640 + 3680-3700 while ULScc is 55440 (3560-3580).
+            # Default mode=log (no config file): logs uncovered, takes no action.
+            with open('/tmp/cbrslog0.txt', 'a') as cf:
+                cf.write(
+                    f'{now_hdr} (L1/P0/R1/G2)\n'
+                    f'=0(1):(3620000000-3640000000:27)(1800:{gr_exp})({tx_exp})\n'
+                    f'=1(1):(3680000000-3700000000:27)(1800:{gr_exp})({tx_exp})\n'
+                    '=(CBRS): Heartbeat1 Success!(responseCode = 0)\n'
+                )
+            wait_for(lambda: 'state=uncovered\n' in cstatus() and 'ulscc=3560-3580' in log(), 10)
+            until = time.monotonic() + 3
+            wait_for(lambda: time.monotonic() >= until, 5)
+            assert rc_sigs() == [], rc_sigs()
+            assert not any('sqns_network_cbrs' in a for a in nvram_actions()), nvram_actions()
+            print('PASS: carrier watch default log mode flagged ungranted UL SCell and took no action.', flush=True)
+            # 4. mode=regrant with rc_signal_done=0 waits, then fires once rc_signal_done=1.
+            write_nvram([
+                'sqns_radio_band=48',
+                'sqns_radio_earfcnDl=56638',
+                'sqns_radio_bandwidthDl=20000',
+                'sqns_connection_uplinkScc=freq,pusch,prach,pucch,bw:55440,-55,-55,-55,20',
+                'cbrs_mode_grant=1',
+                'cbrs_grant_state=2',
+                'rc_signal_done=0',
+            ])
+            Path('/tmp/carrier-watch/config').write_text('mode=regrant\nquiet_utc=\n')
+            wait_for(lambda: 'waiting for rc_signal_done=1' in log(), 12)
+            assert rc_sigs() == [], rc_sigs()
+            write_nvram([
+                'sqns_radio_band=48',
+                'sqns_radio_earfcnDl=56638',
+                'sqns_radio_bandwidthDl=20000',
+                'sqns_connection_uplinkScc=freq,pusch,prach,pucch,bw:55440,-55,-55,-55,20',
+                'cbrs_mode_grant=1',
+                'cbrs_grant_state=2',
+                'rc_signal_done=1',
+            ])
+            wait_for(lambda: 'state=regrant-pending\n' in cstatus() and rc_sigs() == ['USR1'], 10)
+            assert 'set 0 sqns_network_cbrs 1' in nvram_actions(), nvram_actions()
+            assert 'carrier watch: forcing re-grant' in log(), log()
+            # Simulate vendor re-grant completing: cbrs_mode_grant=0, then new grants + cbrs_mode_grant=1.
+            write_nvram([
+                'sqns_radio_band=48',
+                'sqns_radio_earfcnDl=56638',
+                'sqns_radio_bandwidthDl=20000',
+                'sqns_connection_uplinkScc=freq,pusch,prach,pucch,bw:55440,-55,-55,-55,20',
+                'cbrs_mode_grant=0',
+                'cbrs_grant_state=0',
+                'rc_signal_done=1',
+            ])
+            until = time.monotonic() + 2
+            wait_for(lambda: time.monotonic() >= until, 4)
+            assert 'state=regrant-pending\n' in cstatus(), cstatus()
+            with open('/tmp/cbrslog0.txt', 'a') as cf:
+                cf.write(
+                    f'{now_hdr} (L1/P0/R1/G2)\n'
+                    f'=0(1):(3560000000-3580000000:27)(1800:{gr_exp})({tx_exp})\n'
+                    f'=1(1):(3680000000-3700000000:27)(1800:{gr_exp})({tx_exp})\n'
+                    '=(CBRS): Open Radio Traffic Channel.\n'
+                )
+            write_nvram([
+                'sqns_radio_band=48',
+                'sqns_radio_earfcnDl=56638',
+                'sqns_radio_bandwidthDl=20000',
+                'sqns_connection_uplinkScc=freq,pusch,prach,pucch,bw:55440,-55,-55,-55,20',
+                'cbrs_mode_grant=1',
+                'cbrs_grant_state=2',
+                'rc_signal_done=1',
+            ])
+            wait_for(lambda: 'state=covered\n' in cstatus() and 're-grant succeeded in ' in log(), 10)
+            assert 'regrants_triggered=1\n' in cstatus() and 'regrants_succeeded=1\n' in cstatus(), cstatus()
+            assert rc_sigs() == ['USR1'], rc_sigs()
+            print('PASS: carrier watch waited for rc_signal_done=1, fired sqns_network_cbrs=1 + SIGUSR1 to rcinit, and logged re-grant success.', flush=True)
+        finally:
+            if rcinit_stub.poll() is None:
+                rcinit_stub.terminate()
+                rcinit_stub.wait(timeout=3)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
