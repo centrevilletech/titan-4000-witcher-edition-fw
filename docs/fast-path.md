@@ -1,4 +1,4 @@
-# Passthrough bridge fast path (titan_k1fp 2.0)
+# Passthrough bridge fast path (titan_k1fp 2.1)
 
 Status: off by default and not in the firmware image. An operator stages
 `titan_k1fp.ko` per unit in `/mnt/titan-api/fastpath/` with a `config` file;
@@ -15,7 +15,7 @@ idle with 66 to 72 % softirq, backlog drops, and time squeezes in
 ebtables, `br_netfilter`, iptables, and conntrack before reaching
 `dev_queue_xmit`. Saturated softirq also adds queueing delay under load.
 
-`titan_k1fp` (v2.0) short-circuits steady-state unicast IPv4 and IPv6
+`titan_k1fp` (v2.1) short-circuits steady-state unicast IPv4 and IPv6
 TCP/UDP flows between `lte0pdn2` and `eth0` straight from the bridge port
 RX handler to `dev_queue_xmit`, after proving each flow through the full
 stock path first.
@@ -35,8 +35,10 @@ Control and telemetry live in `/proc/k1fp`. Write one command per write:
 | `v4 <0\|1>`, `v6 <0\|1>` | Enable or disable IPv4 or IPv6 fast-path eligibility (both default `1`). |
 | `lease_ms <10..1000>` | Per-flow lease lifetime (default `60` ms). |
 | `sample_ms <2..50>` | Periodic stock-path re-proof interval (default `20` ms, capped at `50` ms). |
+| `wd_mod <0..10000>` | Watchdog `modified + wrongport` burst limit per window (default `20`, `0` disables). |
+| `wd_mod_win_ms <1000..60000>` | Sliding burst window (two half-windows) for `wd_mod` (default `10000` ms). |
 | `flush` | Clear all flow leases and bump the epoch. |
-| `zero` | Zero counters and re-baseline the watchdog. |
+| `zero` | Zero counters, clear the diagnostic mismatch ring, and re-baseline the watchdog. |
 
 ## What stays on the stock path
 
@@ -74,7 +76,18 @@ bridge and netfilter path:
   DROP` and Witcher IPv6 `ebtables FORWARD DROP` drop the next re-proof
   sample within `sample_ms` (20 ms) and revoke the lease. In addition,
   `require_grant=1` closes both families immediately when the grant feeder
-  writes `grant 0` or stops renewing.
+  writes `grant 0` or stops renewing. While the gate is closed, candidates
+  stay on the stock path without sampling or renewing leases, and every
+  gate open/close transition bumps `epoch` so every flow must prove fresh
+  against the open-gate rules before any packet is fast-pathed.
+- **Local-delivery and SLUB-alias proof isolation**: Bridge hooks at
+  `NF_BR_LOCAL_IN` and `NF_BR_LOCAL_OUT` (`NF_BR_PRI_FIRST`) cancel an
+  active pending proof whenever a sampled skb enters `br_pass_frame_up`
+  (such as a reverse-SNATed SAS reply delivered to `br0`) or a locally
+  originated frame on `__br_deliver` aliases its pointer. Any pre-existing
+  lease on a cancelled flow is still revoked fail-closed, while the
+  unit's own synchronous TCP replies cannot trigger false `modified` or
+  `wrongport` counts.
 - **`titan_qctrl` coexistence**: `titan_k1fp` discovers a loaded
   `titan_qctrl` hook live on `NF_BR_FORWARD` under softirq RCU without
   holding stale pointers. On downlink fast path (modes 2 and 3), it calls
@@ -82,13 +95,18 @@ bridge and netfilter path:
   timestamps, OWD, RTT, ECN marking, and UDP drop. On uplink TCP (modes 1
   and 3), it yields to stock while `titan_qctrl` is loaded so RWND
   clamping and ACK thinning run untouched.
-- **In-kernel watchdog (no kernel-log dependence)**: While `mode >= 2`, a
-  100 ms timer and inline proof checks drop `mode` to `0` on unexpected
-  header modifications or wrong-port proofs (`wd_mod`, default 20), lease
-  mismatch storms (`wd_mismatch`, default 64/s), persistent `eth0` TX ring
-  full (`wd_ringfull_ms`, default 500 ms), `eth0` TX stall (`wd_stall_ms`,
-  default 500 ms), invalid TX ring state, or bridge device removal. All
-  health counters live in `/proc/k1fp`.
+- **In-kernel watchdog and mismatch ring (no kernel-log dependence)**:
+  While `mode >= 2`, a 100 ms timer and inline proof checks drop `mode` to
+  `0` on `modified + wrongport` bursts (`wd_mod`, default 20 within a
+  sliding `wd_mod_win_ms` window, default 10 s), lease mismatch storms
+  (`wd_mismatch`, default 64/s), persistent `eth0` TX ring full
+  (`wd_ringfull_ms`, default 500 ms), `eth0` TX stall (`wd_stall_ms`,
+  default 500 ms), invalid TX ring state, or bridge device removal. The
+  last 16 mismatches are recorded in a bounded header-only ring (`diag:`
+  in `/proc/k1fp`, at most `min(hdrlen, 64)` bytes before and after plus a
+  field diff summary, with zero payload bytes beyond transport headers),
+  readable after a trip and cleared by `zero`. All health counters live in
+  `/proc/k1fp`.
 - **Kernel fingerprint verification**: On `insmod`, `titan_k1fp` hashes
   the 8 kernel functions it relies on with freestanding SHA-256 and
   refuses to load on any byte mismatch.
