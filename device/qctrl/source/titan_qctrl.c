@@ -113,6 +113,15 @@ static const char __mod_vermagic[] __attribute__((section(".modinfo"), used)) =
 #define Q_BIAS_MAX_MS     25u
 #define BUSY_US           4883u                     /* 5 ms: 100 ms minimum above this = link busy */
 
+/* Q3 (v0.3-q3): opt-in adaptive ACK thinning & low-burst fast-trough control */
+#define DRAIN_PERIOD_V3    600u                     /* 12 s between gentle drains */
+#define RECOV_COOLDOWN_US  244141u                  /* 250 ms no-thinning cooldown after SACK/dupACK */
+#define DEAD_FLOW_US       146484u                  /* 150 ms without DL data -> drop from n_ctl */
+#define ACK_ADAPT_MIN_TOT  30000u                   /* 30 Mbps total DL floor (never thin degraded 25M link) */
+#define ACK_ADAPT_SS_BYTES 262144u                  /* 256 KB slow-start bypass for adaptive thinning */
+#define THIN_BACKOFF_BASE  500u                     /* 10 s base global backoff after rate drop */
+#define THIN_FLOW_BO_US    9765625u                 /* 10 s per-flow backoff after per-flow rate drop */
+
 enum { OWD_NONE = 0, OWD_CHECK = 1, OWD_OK = 2, OWD_BAD = 3 };
 
 /* TCP flags */
@@ -256,6 +265,15 @@ struct flow_entry {
     u32 rtt_win_min;
     u32 rtt_win_min_prev;
     u32 rtt_avg_us;        /* EWMA 1/8 of RTT samples = mean ACK->data cycle */
+
+    /* Q3 (v0.3): adaptive ACK thinning & fast dead-flow eviction */
+    u32 last_dl_data_us;       /* last DL payload packet arrival */
+    u32 recov_until_us;        /* no thinning while (now - recov_until_us) < 0 */
+    u32 thin_backoff_until_us; /* per-flow thinning backoff deadline */
+    u32 thin_ref_kbps;         /* flow rate snapshot when thinning engaged */
+    u16 thin_drop_ticks;       /* consecutive ticks flow dropped under thinning */
+    u8  thin_active_flow;      /* flow thinned at least one ACK this tick */
+    u8  _pad2;
 };
 
 /* ---------- Global controller & telemetry state ---------- */
@@ -359,6 +377,27 @@ static struct {
     u32 stat_active_ticks;         /* O1b: ticks with the clamp active */
     u32 stat_q_ms_sum;             /* O1b: sum of dq_est_ms over active ticks */
 
+    /* Q3 (v0.3): opt-in knobs (all 0 = exact v0.2-o1b behavior) & telemetry */
+    u32 ack_adapt;                 /* /proc ack_adapt: 0 v0.2-o1b, 1 adaptive safe thinning */
+    u32 ctrl_v3;                   /* /proc ctrl_v3:   0 v0.2-o1b, 1 low-burst fast-trough */
+    u32 ack_ms;                    /* /proc ack_ms:    1..10 ms per-flow ACK time budget (def 6) */
+    u32 ack_segs;                  /* /proc ack_segs:  2..32 per-flow ACK seg budget (def 18) */
+    u32 ack_min_kbps;              /* /proc ack_min_kbps: per-flow rate floor (def 2000) */
+    u32 prev_n_ctl;                /* previous tick n_ctl (suppresses join-split false backoff) */
+    u32 win_trough3_u;             /* 3-tick (60 ms) sliding OWD trough minimum */
+    u32 empty_ticks;               /* consecutive ticks with win_trough_u == 0 (fast recovery) */
+    u32 pre_thin_kbps;             /* EWMA delivered rate while not thinning */
+    u32 thin_ref_kbps;             /* reference rate when adaptive thinning started */
+    u32 thin_armed;                /* 1 while adaptive thinning is active */
+    u32 thin_drop_ticks;           /* consecutive ticks rate fell >18% under thinning */
+    u32 thin_backoff_ticks;        /* global backoff countdown (ticks) */
+    u32 thin_strikes;              /* consecutive global thinning backoffs */
+    u32 thinned_last;              /* stat_acks_thinned at previous tick */
+    u32 stat_thin_backoff;         /* adaptive thinning rate-drop backoffs */
+    u32 stat_thin_bypass_recov;    /* ACKs bypassed: SACK / dupACK / recovery cooldown */
+    u32 stat_thin_bypass_rate;     /* ACKs bypassed: slow-start / rate floor / backoff */
+    u32 stat_thin_bypass_win;      /* ACKs bypassed: clamp window opening */
+
     struct flow_entry flows[FLOW_SLOTS];
 } g;
 
@@ -425,6 +464,9 @@ static struct flow_entry *flow_lookup_or_alloc(u32 ip_cli, u32 ip_srv,
     victim->is_v6 = is_v6;
     victim->mss = DEFAULT_MSS;
     victim->last_seen_us = now;
+    victim->last_dl_data_us = now;
+    victim->recov_until_us = now;
+    victim->thin_backoff_until_us = now;
     return victim;
 }
 
@@ -603,6 +645,48 @@ static void controller_tick(u32 now)
         f->dl_bytes_epoch = 0;
         f->dl_rate_kbps = (f->dl_rate_kbps * 3u + f_kbps) >> 2;
         f->is_bulk = (f->dl_rate_kbps >= 500u && f->dl_bytes_total >= 32768u) ? 1 : 0;
+        if (g.ctrl_v3 && f->is_bulk) {
+            /* Q3: evict finished flows faster than 240 ms EWMA decay while never
+             * evicting live flows on 16-flow or 150 ms RTT paths. */
+            u32 dead_u = ms_to_units(g.rtt_cycle_ms > 75u ? g.rtt_cycle_ms * 2u : 150u);
+            if (dead_u > ms_to_units(400u)) dead_u = ms_to_units(400u);
+            if ((u32)(now - f->last_dl_data_us) > dead_u)
+                f->is_bulk = 0;
+        }
+        /* Q3: per-flow adaptive thinning rate-drop guard.
+         * Compares each thinned flow against its pre-thinning baseline (scaled
+         * down if concurrent flow count grew, so new flows sharing the link do
+         * not falsely trigger backoff). */
+        if (g.ack_adapt) {
+            if (f->thin_active_flow) {
+                if (f->thin_ref_kbps == 0u) {
+                    f->thin_ref_kbps = f->dl_rate_kbps;
+                } else if (g.busy_ticks == 0u && !g.drain_left && !g.drain_settle &&
+                           g.n_ctl <= g.prev_n_ctl &&
+                           f->dl_rate_kbps * 100u < f->thin_ref_kbps * 45u &&
+                           f->thin_ref_kbps >= g.ack_min_kbps) {
+                    if (++f->thin_drop_ticks >= 25u) {
+                        f->thin_backoff_until_us = now + THIN_FLOW_BO_US;
+                        f->thin_drop_ticks = 0;
+                        f->thin_ref_kbps = 0;
+                        if (f->held_ack)
+                            flush_flow_ack(f, &g.stat_acks_flushed_event);
+                        g.stat_thin_backoff++;
+                    }
+                } else {
+                    f->thin_drop_ticks = 0;
+                    if (g.n_ctl > g.prev_n_ctl)
+                        f->thin_ref_kbps = f->dl_rate_kbps;
+                }
+                f->thin_active_flow = 0;
+            } else {
+                f->thin_drop_ticks = 0;
+                if (f->dl_rate_kbps >= g.ack_min_kbps)
+                    f->thin_ref_kbps = f->thin_ref_kbps
+                        ? ((f->thin_ref_kbps * 3u + f->dl_rate_kbps) >> 2)
+                        : f->dl_rate_kbps;
+            }
+        }
         if (f->is_bulk)
             bulk_cnt++;
 
@@ -640,6 +724,7 @@ static void controller_tick(u32 now)
         }
     }
     g.active_bulk_flows = bulk_cnt;
+    g.prev_n_ctl = g.n_ctl;
     g.n_ctl = n_ctl;
     g.w_sum_ms = w_sum;
     g.owd_flows = owd_flows;
@@ -670,10 +755,80 @@ static void controller_tick(u32 now)
             }
         }
         g.win_trough_u = (have >= 3u) ? m : NONE32;   /* need >= 60 ms of samples */
+        /* Q3: 3-tick (60 ms) sliding minimum for lower control lag in ctrl_v3 */
+        {
+            u32 m3 = NONE32, h3 = 0, idx = g.tr_idx;
+            for (k = 0; k < 3u; k++) {
+                idx = (idx == 0u) ? (RATE_RING - 1u) : (idx - 1u);
+                if (g.tr_ring[idx] != NONE32) {
+                    h3++;
+                    if (g.tr_ring[idx] < m3) m3 = g.tr_ring[idx];
+                }
+            }
+            g.win_trough3_u = (h3 >= 2u) ? m3 : g.win_trough_u;
+        }
         if (g.win_trough_u != NONE32 && g.win_trough_u >= BUSY_US) {
             if (g.busy_ticks < 0xffffu) g.busy_ticks++;
         } else {
             g.busy_ticks = 0;
+        }
+        if (g.win_trough_u != NONE32 && g.win_trough_u <= ms_to_units(1u)) {
+            if (g.empty_ticks < 0xffffu) g.empty_ticks++;
+        } else {
+            g.empty_ticks = 0;
+        }
+    }
+    /* Q3: global adaptive ACK thinning rate-drop guard */
+    {
+        u32 thinned_delta = g.stat_acks_thinned - g.thinned_last;
+        g.thinned_last = g.stat_acks_thinned;
+        if (g.ack_adapt) {
+            if (g.thin_backoff_ticks) {
+                g.thin_backoff_ticks--;
+                g.thin_armed = 0;
+                g.thin_drop_ticks = 0;
+            } else if (thinned_delta > 0u) {
+                if (!g.thin_armed) {
+                    u32 base = (g.pre_thin_kbps > g.rate100_kbps) ? g.pre_thin_kbps : g.rate100_kbps;
+                    if (g.c_hat_kbps && base > g.c_hat_kbps)
+                        base = g.c_hat_kbps;
+                    g.thin_armed = 1;
+                    g.thin_ref_kbps = base;
+                    g.thin_drop_ticks = 0;
+                }
+                if (g.thin_ref_kbps >= 15000u && g.busy_ticks == 0u &&
+                    !g.drain_left && !g.drain_settle &&
+                    (!g.ctl_active || g.bulk_ticks >= 75u) &&
+                    g.rate100_kbps * 100u < g.thin_ref_kbps * 75u &&
+                    (!g.c_hat_kbps || g.rate100_kbps * 100u < g.c_hat_kbps * 75u)) {
+                    if (++g.thin_drop_ticks >= 25u) {
+                        u32 j;
+                        if (g.thin_strikes < 4u) g.thin_strikes++;
+                        g.thin_backoff_ticks = THIN_BACKOFF_BASE << (g.thin_strikes > 2u ? 2u : g.thin_strikes - 1u);
+                        g.thin_armed = 0;
+                        g.thin_drop_ticks = 0;
+                        g.stat_thin_backoff++;
+                        for (j = 0; j < FLOW_SLOTS; j++)
+                            flush_flow_ack(&g.flows[j], &g.stat_acks_flushed_event);
+                        g.held_count = 0;
+                    }
+                } else {
+                    g.thin_drop_ticks = 0;
+                    if (g.rate100_kbps > g.thin_ref_kbps) {
+                        u32 nr = (g.thin_ref_kbps * 3u + g.rate100_kbps) >> 2;
+                        if (g.c_hat_kbps && nr > g.c_hat_kbps)
+                            nr = g.c_hat_kbps;
+                        g.thin_ref_kbps = nr;
+                    }
+                    if (g.thin_strikes && g.rate100_kbps * 100u >= g.thin_ref_kbps * 95u)
+                        g.thin_strikes = 0;
+                }
+            } else {
+                g.thin_armed = 0;
+                g.thin_drop_ticks = 0;
+                if (g.rate100_kbps > 0u)
+                    g.pre_thin_kbps = (g.pre_thin_kbps * 3u + g.rate100_kbps) >> 2;
+            }
         }
     }
     g.q_owd_u = q_owd;
@@ -795,7 +950,7 @@ static void controller_tick(u32 now)
         g.ctl_active = 1;
         g.drain_left = 0;
         g.drain_settle = 0;
-        g.drain_next = g.tick_count + DRAIN_PERIOD_TICKS;
+        g.drain_next = g.tick_count + (g.ctrl_v3 ? DRAIN_PERIOD_V3 : DRAIN_PERIOD_TICKS);
         g.probe_state = 0;
         g.probe_due = g.tick_count + PROBE_PERIOD_TICKS;
         g.starve_ticks = 0;
@@ -805,7 +960,7 @@ static void controller_tick(u32 now)
 
     if (g.drain_left) {
         if (--g.drain_left == 0)
-            g.drain_settle = DRAIN_SETTLE_TICKS;
+            g.drain_settle = g.ctrl_v3 ? 4u : DRAIN_SETTLE_TICKS;
     } else if (g.drain_settle) {
         g.drain_settle--;
     } else if (g.q_src == 1u || (g.q_src == 2u && g.rtt_law == 0u)) {
@@ -836,6 +991,14 @@ static void controller_tick(u32 now)
             if (g.q_s_u > target_u) {
                 step_q12 = ((g.q_s_u - target_u) << 12) / cyc_u;
                 step_q12 <<= 2;                                 /* 1/4 instead of 1/16 */
+            } else if (g.ctrl_v3 && g.trough_ms == 0u &&
+                       trs <= ms_to_units(1u) && used &&
+                       g.rate100_kbps * 100u < g.c_hat_kbps * 96u) {
+                /* Q3 zero-collapse guard: trough_ms=0 with ctrl_v3 still refills
+                 * when HARQ-only trough reads <=1 ms and link is under-filled. */
+                u32 r = g.rate100_kbps ? g.rate100_kbps : 1u;
+                step_q12 = (g.c_hat_kbps > r) ? (((g.c_hat_kbps - r) << 6) / r) << 6 : 256u;
+                up = 1;
             } else if (trs >= tt_u) {
                 step_q12 = ((trs - tt_u) << 12) / cyc_u;
             } else if (used) {
@@ -843,10 +1006,18 @@ static void controller_tick(u32 now)
                 u32 a1 = ((tt_u - trs) << 12) / cyc_u;
                 u32 a2 = (g.c_hat_kbps > r) ? (((g.c_hat_kbps - r) << 6) / r) << 6 : 0;
                 step_q12 = (a1 > a2) ? a1 : a2;
+                /* Q3 fast capacity-step recovery: if the queue stayed empty
+                 * (<= 1 ms trough) for >= 4 ticks, ramp W up at ~3%/tick so
+                 * a 65->130 Mbps recovery completes in < 500 ms. */
+                if (g.ctrl_v3 && g.empty_ticks >= 4u && step_q12 < 1920u)
+                    step_q12 = 1920u;
                 up = 1;
             }
             if (step_q12 > 4096u) step_q12 = 4096u;
-            step_q12 >>= 4;                                     /* 1/16 per tick */
+            if (g.ctrl_v3 && up && trs <= ms_to_units(1u))
+                step_q12 = (step_q12 * 3u) >> 5;                /* ~1/11 for faster refill */
+            else
+                step_q12 >>= 4;                                 /* 1/16 per tick */
             if (step_q12 > 246u) step_q12 = 246u;               /* max 6 % per tick */
             if (step_q12) {
                 u32 d = (u32)(((u64)g.w_bytes * step_q12) >> 12);
@@ -877,12 +1048,11 @@ static void controller_tick(u32 now)
                 }
             }
         }
-        /* Periodic drain (also in this mode): 60 ms at 5/8 window empties
-         * the queue so a flow that joined over a standing queue re-reads
-         * its true minimum. */
+        /* Periodic drain (also in this mode): empties the queue so a flow
+         * that joined over a standing queue re-reads its true minimum. */
         if (g.drain_enable && (s32)(g.tick_count - g.drain_next) >= 0) {
             g.drain_left = DRAIN_TICKS;
-            g.drain_next = g.tick_count + DRAIN_PERIOD_TICKS;
+            g.drain_next = g.tick_count + (g.ctrl_v3 ? DRAIN_PERIOD_V3 : DRAIN_PERIOD_TICKS);
             g.stat_drains++;
         }
     } else {
@@ -1213,8 +1383,14 @@ static u32 compute_flow_rwnd_target(const struct flow_entry *f)
     if (!g.ctl_active || g.w_bytes == 0)
         return NO_CLAMP;
     w = g.w_bytes;
-    if (g.drain_left)
-        w = (w >> 1) + (w >> 3);              /* 5/8 during a drain */
+    if (g.drain_left) {
+        if (g.ctrl_v3) {
+            /* Q3: gentler ramped drain (3/4, 3/4, 7/8) avoids rebound bursts */
+            w = (g.drain_left == 1u) ? (w - (w >> 3)) : (w - (w >> 2));
+        } else {
+            w = (w >> 1) + (w >> 3);          /* v0.2-o1b: 5/8 during a drain */
+        }
+    }
 
     /* Mouse / startup flows (< 64 KB) and non-bulk flows may use all of W */
     if (f->dl_bytes_total < 65536u || !f->is_bulk || g.n_ctl <= 1u) {
@@ -1412,6 +1588,7 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
 
             /* Accumulate DL bytes */
             if (tcp_payload_len > 0) {
+                f->last_dl_data_us = now;
                 f->dl_bytes_epoch += tcp_payload_len;
                 if (f->dl_bytes_total < 0x7fffffffu)
                     f->dl_bytes_total += tcp_payload_len;
@@ -1467,6 +1644,12 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
             f->rtt_avg_us = 0;
             f->rtt_win_min = 0;
             f->rtt_win_min_prev = 0;
+            f->last_dl_data_us = now;
+            f->recov_until_us = now;
+            f->thin_backoff_until_us = now;
+            f->thin_ref_kbps = 0;
+            f->thin_drop_ticks = 0;
+            f->thin_active_flow = 0;
             return NF_ACCEPT;
         }
 
@@ -1586,14 +1769,54 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
             /* Strict CAKE safety predicates:
              *  - pure cumulative ACK, no SACK/unknown opts, no ECE/CWR/SYN/FIN/RST/PSH
              *  - strictly advancing ack_seq (never coalesce dupACKs -> protects Fast Retx!)
-             *  - same UL seq, non-zero window, past slow-start (>= 64 KB), active flow */
-            eligible = pure_ack &&
-                       !opts.has_sack_or_unknown &&
-                       win > 0 &&
-                       f->dl_bytes_total >= 65536u &&
-                       f->recent_acks_10ms >= 2u &&
-                       f->last_ul_seq == seq &&
-                       seq_gt(ack, f->held_ack ? f->held_ack_seq : f->last_ack_sent);
+             *  - same UL seq, non-zero window, past slow-start, active flow */
+            if (!g.ack_adapt) {
+                /* Exact v0.2-o1b path */
+                eligible = pure_ack &&
+                           !opts.has_sack_or_unknown &&
+                           win > 0 &&
+                           f->dl_bytes_total >= 65536u &&
+                           f->recent_acks_10ms >= 2u &&
+                           f->last_ul_seq == seq &&
+                           seq_gt(ack, f->held_ack ? f->held_ack_seq : f->last_ack_sent);
+            } else {
+                /* Q3 (v0.3): adaptive, safe, evenly-spaced ACK thinning */
+                u32 ref_ack = f->held_ack ? f->held_ack_seq : f->last_ack_sent;
+                int adv = seq_gt(ack, ref_ack);
+                int in_recov = ((s32)(now - f->recov_until_us) < 0);
+                int flow_bo = ((s32)(now - f->thin_backoff_until_us) < 0);
+                /* Significant clamp window opening: >= 2 MSS jump (or waking from
+                 * <= 4 MSS floor). Ignore 1-unit (128 B) rounding jitter. */
+                u32 win_step = ((u32)(f->mss ? f->mss : DEFAULT_MSS) * 2u) >> f->wscale_cli;
+                u32 win_floor = ((u32)(f->mss ? f->mss : DEFAULT_MSS) * 4u) >> f->wscale_cli;
+                int clamp_open = g.ctl_active && f->wscale_valid &&
+                                 ((u32)win > (u32)f->last_win_sent + (win_step ? win_step : 1u) ||
+                                  (f->last_win_sent <= win_floor && win > f->last_win_sent));
+
+                /* Latch loss-recovery cooldown on any SACK option or duplicate ACK */
+                if (opts.has_sack_or_unknown ||
+                    (pure_ack && ack == ref_ack && win == f->last_win_sent)) {
+                    f->recov_until_us = now + RECOV_COOLDOWN_US;
+                    in_recov = 1;
+                }
+
+                eligible = 0;
+                if (pure_ack && win > 0 && f->last_ul_seq == seq && adv) {
+                    if (in_recov) {
+                        g.stat_thin_bypass_recov++;
+                    } else if (clamp_open) {
+                        g.stat_thin_bypass_win++;
+                    } else if (g.thin_backoff_ticks || flow_bo ||
+                               f->dl_bytes_total < ACK_ADAPT_SS_BYTES ||
+                               f->dl_rate_kbps < g.ack_min_kbps ||
+                               g.rate100_kbps < ACK_ADAPT_MIN_TOT ||
+                               f->recent_acks_10ms < 2u) {
+                        g.stat_thin_bypass_rate++;
+                    } else {
+                        eligible = 1;
+                    }
+                }
+            }
 
             if (!eligible) {
                 /* Preserve strict ordering: flush any held ACK before this event pkt */
@@ -1606,48 +1829,91 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
             }
 
             /* Eligible advancing pure cumulative ACK! */
-            if (f->held_ack) {
-                /* Supersede & free older held ACK (0% tail-ACK loss risk!) */
-                consume_skb(f->held_ack);
-                f->held_ack = NULL;
-                f->held_okfn = NULL;
-                if (g.held_count) g.held_count--;
-                g.stat_acks_thinned++;
+            {
+                u32 span_lim = g.max_ack_span;
+                u32 hold_lim = g.hold_us;
 
-                /* Bound sender burstiness: flush immediately once span >= max_ack_span */
-                if ((u32)(ack - f->last_ack_sent) >= g.max_ack_span) {
-                    f->last_ack_sent = ack;
-                    f->last_win_sent = win;
-                    g.stat_acks_flushed_span++;
-                    return NF_ACCEPT;
+                if (g.ack_adapt) {
+                    /* Per-flow segment budget K (bounded <= 1/4 of flow share,
+                     * >= 4 MSS, <= 32 KB) and time budget N ms (scales gently up
+                     * to 10 ms when >= 8 concurrent bulk flows share the UL ring). */
+                    u32 mss = f->mss ? (u32)f->mss : DEFAULT_MSS;
+                    u32 k_bytes = g.ack_segs * mss;
+                    u32 eff_ms = g.ack_ms;
+                    if (g.n_ctl >= 8u && eff_ms < 10u) {
+                        eff_ms += (g.n_ctl >> 2);
+                        if (eff_ms > 10u) eff_ms = 10u;
+                    }
+                    if (g.ctl_active && g.w_bytes) {
+                        u32 sh = compute_flow_rwnd_target(f);
+                        if (sh != NO_CLAMP && (sh >> 2) < k_bytes)
+                            k_bytes = sh >> 2;
+                    }
+                    if (k_bytes < mss * 4u) k_bytes = mss * 4u;
+                    if (k_bytes > 32768u)   k_bytes = 32768u;
+                    span_lim = k_bytes;
+                    hold_lim = ms_to_units(eff_ms);
+                    if (hold_lim < 500u)  hold_lim = 500u;
+                    if (hold_lim > 9766u) hold_lim = 9766u;
                 }
-                /* Otherwise replace held slot keeping original deadline.
-                 * Y6 FIX: do NOT re-arm the timer here. The original re-armed
-                 * on every supersede (held_count 1 -> 0 -> 1), pushing the
-                 * expiry out by hold_us on each new ACK, so with one bulk flow
-                 * the timer never fired and only the 8 KB span released ACKs.
-                 * The expiry armed at the first hold is still valid because the
-                 * deadline is unchanged. */
-                f->held_ack = skb;
-                f->held_okfn = okfn;
-                f->held_ack_seq = ack;
-                f->last_win_sent = win;
-                g.held_count++;
-                if (!g.timer_pending)
-                    flush_timer_arm(g.hold_us);  /* only if nothing is outstanding */
-                return NF_STOLEN;
-            } else {
-                /* Hold first ACK for at most hold_us (2.5 ms < 5 ms TDD UL period) */
-                f->held_ack = skb;
-                f->held_okfn = okfn;
-                f->held_ack_seq = ack;
-                f->held_deadline_us = now + g.hold_us;
-                f->last_win_sent = win;
-                g.held_count++;
-                /* Y6: arm when no expiry is outstanding (was: held_count == 1) */
-                if (!g.timer_pending)
-                    flush_timer_arm(g.hold_us);
-                return NF_STOLEN;
+
+                if (f->held_ack) {
+                    /* Supersede & free older held ACK (0% tail-ACK loss risk!) */
+                    consume_skb(f->held_ack);
+                    f->held_ack = NULL;
+                    f->held_okfn = NULL;
+                    if (g.held_count) g.held_count--;
+                    g.stat_acks_thinned++;
+                    if (g.ack_adapt)
+                        f->thin_active_flow = 1;
+
+                    /* Bound sender burstiness: flush immediately once span >= span_lim */
+                    if ((u32)(ack - f->last_ack_sent) >= span_lim) {
+                        f->last_ack_sent = ack;
+                        f->last_win_sent = win;
+                        g.stat_acks_flushed_span++;
+                        return NF_ACCEPT;
+                    }
+                    f->held_ack = skb;
+                    f->held_okfn = okfn;
+                    f->held_ack_seq = ack;
+                    f->last_win_sent = win;
+                    g.held_count++;
+                    if (!g.timer_pending) {
+                        u32 rem = f->held_deadline_us - now;
+                        if ((s32)rem <= 0 || rem > HOLD_ANOMALY_US) rem = 250u;
+                        flush_timer_arm(rem);
+                    }
+                    return NF_STOLEN;
+                } else {
+                    u32 deadline = now + hold_lim;
+                    u32 arm_us = hold_lim;
+                    if (g.ack_adapt && hold_lim >= 2048u) {
+                        /* Stagger flow deadlines evenly across the hold window
+                         * (4 phases: 0, 1/4, 2/4, 3/4 of period) while keeping
+                         * every hold in [hold_lim/2 .. hold_lim] so flows flush
+                         * evenly without premature 1 ms flushes or clumping. */
+                        u32 grid = (hold_lim >= 4880u) ? 4096u : 2048u;
+                        u32 phase = ((u32)(f - g.flows) & 3u) * (grid >> 2);
+                        u32 min_t = now + (hold_lim >> 1);
+                        u32 next_t = (min_t & ~(grid - 1u)) + phase;
+                        if ((s32)(next_t - min_t) < 0)
+                            next_t += grid;
+                        if ((s32)(next_t - (now + hold_lim)) <= 0) {
+                            deadline = next_t;
+                            arm_us = deadline - now;
+                        }
+                    }
+                    f->held_ack = skb;
+                    f->held_okfn = okfn;
+                    f->held_ack_seq = ack;
+                    f->held_deadline_us = deadline;
+                    f->last_win_sent = win;
+                    g.held_count++;
+                    if (!g.timer_pending)
+                        flush_timer_arm(arm_us < 250u ? 250u : arm_us);
+                    return NF_STOLEN;
+                }
             }
         }
     }
@@ -1733,19 +1999,21 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
 {
     (void)v;
     seq_printf(m,
-        "titan_qctrl v0.2-o1b (NF_BR_FORWARD prio=+100)\n"
+        "titan_qctrl v0.3-q3 (NF_BR_FORWARD prio=+100)\n"
         "mode=0x%x (ack_thin=%u rwnd_clamp=%u dl_ecn=%u udp_drop=%u)\n"
         "params: target_q_ms=%u hold_us=%u max_ack_span=%u phy_cap_kbps=%u\n"
         "        qsrc=%u slack_ms=%u floor_pct=%u drain=%u probe=%u trough_ms=%u rtt_target_ms=%u ecn_ms=%u wfix_kb=%u rttlaw=%u\n"
+        "        ack_adapt=%u ctrl_v3=%u ack_ms=%u ack_segs=%u ack_min_kbps=%u\n"
         "state:  c_hat_kbps=%u rate100_kbps=%u free_kbps=%u dl_kbps=%u ul_kbps=%u udp_dl_kbps=%u\n"
         "        ctl_active=%u w_kb=%u n_ctl=%u active_bulk=%u inflight_kb=%u release_ticks=%u\n"
         "        dq_est_ms=%u q_src=%u q_owd_ms=%d q_rtt_ms=%d q_bias_ms=%u owd_flows=%u sat_ticks=%u trough100_ms=%d busy_ticks=%u\n"
-        "        rtt_base_ms=%u rtt_cycle_ms=%u p_ecn_pct=%u held_acks=%u timer_pending=%u\n"
+        "        rtt_base_ms=%u rtt_cycle_ms=%u p_ecn_pct=%u held_acks=%u timer_pending=%u thin_bo_ticks=%u\n"
         "stats:  dl_pkts=%u ul_pkts=%u rtt_samples=%u owd_ok=%u owd_bad=%u\n"
         "        active_ticks=%u q_ms_sum=%u seeds=%u sat_updates=%u drains=%u\n"
         "        probe_win=%u probe_fail=%u failsafe=%u\n"
         "        acks_seen=%u acks_thinned=%u flush_timer=%u flush_span=%u flush_ev=%u\n"
         "        flush_wd=%u dropped_netdev=%u ctx_skipped=%u\n"
+        "        thin_backoff=%u bypass_recov=%u bypass_rate=%u bypass_win=%u\n"
         "        rwnd_clamped=%u ecn_marked=%u udp_dropped=%u\n",
         g.mode,
         !!(g.mode & MODE_ACK_THIN), !!(g.mode & MODE_RWND_CLAMP),
@@ -1753,6 +2021,7 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
         g.target_q_ms, g.hold_us, g.max_ack_span, g.phy_cap_kbps,
         g.q_force, g.rtt_slack_ms, g.floor_pct, g.drain_enable, g.probe_enable,
         g.trough_ms, g.rtt_target_ms, g.ecn_ms, g.w_fix_bytes >> 10, g.rtt_law,
+        g.ack_adapt, g.ctrl_v3, g.ack_ms, g.ack_segs, g.ack_min_kbps,
         g.c_hat_kbps, g.rate100_kbps, g.free_kbps,
         g.last_dl_kbps, g.last_ul_kbps, g.last_udp_dl_kbps,
         g.ctl_active, g.w_bytes >> 10, g.n_ctl, g.active_bulk_flows,
@@ -1763,13 +2032,14 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
         units_to_ms(g.q_bias_u), g.owd_flows, g.sat_ticks,
         g.win_trough_u == NONE32 ? -1 : (int)units_to_ms(g.win_trough_u), g.busy_ticks,
         g.rtt_base_global_ms, g.rtt_cycle_ms,
-        (g.p_ecn_q10 * 100u) >> 10, g.held_count, g.timer_pending,
+        (g.p_ecn_q10 * 100u) >> 10, g.held_count, g.timer_pending, g.thin_backoff_ticks,
         g.stat_dl_pkts, g.stat_ul_pkts, g.stat_rtt_samples, g.stat_owd_ok, g.stat_owd_bad,
         g.stat_active_ticks, g.stat_q_ms_sum, g.stat_seeds, g.stat_sat_updates, g.stat_drains,
         g.stat_probe_win, g.stat_probe_fail, g.stat_failsafe,
         g.stat_acks_seen, g.stat_acks_thinned, g.stat_acks_flushed_timer,
         g.stat_acks_flushed_span, g.stat_acks_flushed_event,
         g.stat_acks_flushed_wd, g.stat_acks_dropped_netdev, g.stat_ctx_skipped,
+        g.stat_thin_backoff, g.stat_thin_bypass_recov, g.stat_thin_bypass_rate, g.stat_thin_bypass_win,
         g.stat_rwnd_clamped, g.stat_ecn_marked, g.stat_udp_dropped);
     return 0;
 }
@@ -1869,6 +2139,28 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
             if (g.held_count)
                 flush_timer_arm(250u);
         }
+    } else if (starts_with(kbuf, "ack_adapt") && parse_u32(kbuf + 9, &val)) {
+        if (val <= 1u) {                              /* Q3: 0 v0.2-o1b, 1 adaptive safe */
+            g.ack_adapt = val;
+            g.thin_backoff_ticks = 0;
+            g.thin_armed = 0;
+            g.thin_drop_ticks = 0;
+            g.thin_strikes = 0;
+            if (g.held_count)
+                flush_timer_arm(250u);
+        }
+    } else if (starts_with(kbuf, "ctrl_v3") && parse_u32(kbuf + 7, &val)) {
+        if (val <= 1u) g.ctrl_v3 = val;               /* Q3: 0 v0.2-o1b, 1 low-burst v0.3 */
+    } else if (starts_with(kbuf, "ack_ms") && parse_u32(kbuf + 6, &val)) {
+        if (val >= 1u && val <= 10u) {                /* Q3: per-flow time budget (ms) */
+            g.ack_ms = val;
+            if (g.held_count)
+                flush_timer_arm(250u);
+        }
+    } else if (starts_with(kbuf, "ack_segs") && parse_u32(kbuf + 8, &val)) {
+        if (val >= 2u && val <= 32u) g.ack_segs = val;/* Q3: per-flow seg budget */
+    } else if (starts_with(kbuf, "ack_min_kbps") && parse_u32(kbuf + 12, &val)) {
+        if (val <= 100000u) g.ack_min_kbps = val;     /* Q3: per-flow rate floor */
     } else if (starts_with(kbuf, "ack_span") && parse_u32(kbuf + 8, &val)) {
         if (val >= 2696u && val <= 32768u) g.max_ack_span = val;
     } else if (starts_with(kbuf, "phy") && parse_u32(kbuf + 3, &val)) {
@@ -1903,6 +2195,11 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
         g.stat_probe_win = g.stat_probe_fail = g.stat_drains = 0;
         g.stat_failsafe = g.stat_seeds = 0;
         g.stat_active_ticks = g.stat_q_ms_sum = 0;
+        g.stat_thin_backoff = g.stat_thin_bypass_recov = 0;
+        g.stat_thin_bypass_rate = g.stat_thin_bypass_win = 0;
+        g.thin_backoff_ticks = g.thin_armed = g.thin_drop_ticks = 0;
+        g.thin_strikes = g.thin_ref_kbps = g.pre_thin_kbps = 0;
+        g.thinned_last = 0;
         g.ctl_active = 0;
         g.release_left = 0;
         g.starve_ticks = 0;
@@ -1947,6 +2244,12 @@ int init_module(void)
     g.q_trough_u = NONE32;
     g.last_trough_u = NONE32;
     g.win_trough_u = NONE32;
+    g.win_trough3_u = NONE32;
+    g.ack_adapt = 0u;            /* Q3: off by default -> exact v0.2-o1b behavior */
+    g.ctrl_v3 = 0u;              /* Q3: off by default -> exact v0.2-o1b behavior */
+    g.ack_ms = 6u;               /* Q3: default 6 ms per-flow ACK budget */
+    g.ack_segs = 18u;            /* Q3: default 18 segs per-flow ACK budget */
+    g.ack_min_kbps = 2000u;      /* Q3: default 2 Mbps per-flow floor */
     {
         u32 k;
         for (k = 0; k < RATE_RING; k++) g.tr_ring[k] = NONE32;
@@ -1987,7 +2290,7 @@ int init_module(void)
         return ret;
     }
 
-    printk("titan_qctrl: loaded (o1b) in observe-only mode (mode=0); control via /proc/titan_qctrl\n");
+    printk("titan_qctrl: loaded (v0.3-q3) in observe-only mode (mode=0); control via /proc/titan_qctrl\n");
     return 0;
 }
 

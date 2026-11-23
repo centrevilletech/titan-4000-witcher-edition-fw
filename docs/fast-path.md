@@ -147,9 +147,9 @@ Every 15 s the keeper:
 
 1. Reads `/mnt/titan-api/fastpath/config`.
 2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
-   `/proc/k1fp` reports a version string other than `titan_k1fp v2.0`. If
+   `/proc/k1fp` reports a version string other than `titan_k1fp v2.1`. If
    `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
-   exact pinned version line `titan_k1fp v2.0`, the keeper adopts it, logs
+   exact pinned version line `titan_k1fp v2.1`, the keeper adopts it, logs
    `fast path: adopted a loaded module`, and takes over its mode and grant
    lease without running `insmod`.
 3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and

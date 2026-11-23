@@ -1,11 +1,13 @@
-//! The download clamp: the `titan_qctrl` kernel module (v0.2-o1b).
+//! The download clamp: the `titan_qctrl` kernel module (v0.3-q3).
 //!
 //! Under a full download the tower queue fills and ping rises to about 300 ms.
 //! The module sits on the bridge between the customer bearer and the
 //! customer port and shrinks the TCP receive window the customer's devices
 //! advertise, so the senders keep only a short queue at the tower. Bench
 //! (2026-11-22): ping during a full download about 310 ms down to 50 ms, for
-//! about 8 % less peak speed. See docs/download-clamp.md.
+//! about 8 % less peak speed. v0.3-q3 adds opt-in adaptive safe ACK thinning
+//! (`ack_adapt`) and low-burst window control (`ctrl_v3`), both off by default
+//! so the default code path matches v0.2-o1b. See docs/download-clamp.md.
 //!
 //! The image has no room for it, so an operator stages the module per unit
 //! in `/mnt/titan-api/qctrl/` with a `config`. The keeper:
@@ -20,7 +22,7 @@
 //! pass-through without unloading it.
 
 /// The first line of `/proc/titan_qctrl` for the allowed build.
-pub const VERSION_LINE: &str = "titan_qctrl v0.2-o1b";
+pub const VERSION_LINE: &str = "titan_qctrl v0.3-q3";
 /// The module's name in `/proc/modules`.
 pub const MODULE: &str = "titan_qctrl";
 /// The file in the staging directory and in the manifest.
@@ -37,6 +39,11 @@ pub const CHECK_EVERY: u64 = 15;
 pub const TROUGH_MAX: u32 = 40;
 pub const TARGET_MIN: u32 = 4;
 pub const TARGET_MAX: u32 = 80;
+pub const ACK_MS_MIN: u32 = 1;
+pub const ACK_MS_MAX: u32 = 10;
+pub const ACK_SEGS_MIN: u32 = 2;
+pub const ACK_SEGS_MAX: u32 = 32;
+pub const ACK_MIN_KBPS_MAX: u32 = 100_000;
 
 /// `/mnt/titan-api/qctrl/config`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -44,19 +51,25 @@ pub struct Config {
     pub mode: u32,
     pub trough_ms: Option<u32>,
     pub target_ms: Option<u32>,
+    pub ack_adapt: Option<u32>,
+    pub ctrl_v3: Option<u32>,
+    pub ack_ms: Option<u32>,
+    pub ack_segs: Option<u32>,
+    pub ack_min_kbps: Option<u32>,
     /// Lines that were not used, as written.
     pub refused: Vec<String>,
 }
 
 fn plain(text: &str) -> Option<u32> {
-    if text.is_empty() || text.len() > 5 || !text.bytes().all(|b| b.is_ascii_digit()) {
+    if text.is_empty() || text.len() > 6 || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     text.parse().ok()
 }
 
-/// `mode=N`, `trough_ms=N`, `target_ms=N`, plain decimal, `#` comments. The
-/// last line for a key wins. A bad `mode` line leaves the clamp off; a bad
+/// `mode=N`, `trough_ms=N`, `target_ms=N`, `ack_adapt=0|1`, `ctrl_v3=0|1`,
+/// `ack_ms=N`, `ack_segs=N`, `ack_min_kbps=N`, plain decimal, `#` comments.
+/// The last line for a key wins. A bad `mode` line leaves the clamp off; a bad
 /// knob line leaves the module default.
 pub fn parse_config(text: &str) -> Config {
     let mut config = Config::default();
@@ -93,6 +106,26 @@ pub fn parse_config(text: &str) -> Config {
                 config.target_ms = Some(ms);
                 true
             }
+            ("ack_adapt", Some(v)) if v <= 1 => {
+                config.ack_adapt = Some(v);
+                true
+            }
+            ("ctrl_v3", Some(v)) if v <= 1 => {
+                config.ctrl_v3 = Some(v);
+                true
+            }
+            ("ack_ms", Some(ms)) if (ACK_MS_MIN..=ACK_MS_MAX).contains(&ms) => {
+                config.ack_ms = Some(ms);
+                true
+            }
+            ("ack_segs", Some(segs)) if (ACK_SEGS_MIN..=ACK_SEGS_MAX).contains(&segs) => {
+                config.ack_segs = Some(segs);
+                true
+            }
+            ("ack_min_kbps", Some(kbps)) if kbps <= ACK_MIN_KBPS_MAX => {
+                config.ack_min_kbps = Some(kbps);
+                true
+            }
             _ => false,
         };
         if !ok {
@@ -110,6 +143,11 @@ pub struct Proc {
     pub mode: Option<u32>,
     pub trough_ms: Option<u32>,
     pub target_ms: Option<u32>,
+    pub ack_adapt: Option<u32>,
+    pub ctrl_v3: Option<u32>,
+    pub ack_ms: Option<u32>,
+    pub ack_segs: Option<u32>,
+    pub ack_min_kbps: Option<u32>,
 }
 
 pub fn parse_proc(text: &str) -> Proc {
@@ -130,6 +168,16 @@ pub fn parse_proc(text: &str) -> Proc {
             proc.trough_ms = proc.trough_ms.or_else(|| ms.parse().ok());
         } else if let Some(ms) = word.strip_prefix("target_q_ms=") {
             proc.target_ms = proc.target_ms.or_else(|| ms.parse().ok());
+        } else if let Some(v) = word.strip_prefix("ack_adapt=") {
+            proc.ack_adapt = proc.ack_adapt.or_else(|| v.parse().ok());
+        } else if let Some(v) = word.strip_prefix("ctrl_v3=") {
+            proc.ctrl_v3 = proc.ctrl_v3.or_else(|| v.parse().ok());
+        } else if let Some(ms) = word.strip_prefix("ack_ms=") {
+            proc.ack_ms = proc.ack_ms.or_else(|| ms.parse().ok());
+        } else if let Some(segs) = word.strip_prefix("ack_segs=") {
+            proc.ack_segs = proc.ack_segs.or_else(|| segs.parse().ok());
+        } else if let Some(kbps) = word.strip_prefix("ack_min_kbps=") {
+            proc.ack_min_kbps = proc.ack_min_kbps.or_else(|| kbps.parse().ok());
         }
     }
     proc
@@ -145,6 +193,21 @@ pub fn proc_writes(config: &Config) -> Vec<String> {
     if let Some(ms) = config.target_ms {
         lines.push(format!("target_ms {ms}\n"));
     }
+    if let Some(v) = config.ack_adapt {
+        lines.push(format!("ack_adapt {v}\n"));
+    }
+    if let Some(v) = config.ctrl_v3 {
+        lines.push(format!("ctrl_v3 {v}\n"));
+    }
+    if let Some(ms) = config.ack_ms {
+        lines.push(format!("ack_ms {ms}\n"));
+    }
+    if let Some(segs) = config.ack_segs {
+        lines.push(format!("ack_segs {segs}\n"));
+    }
+    if let Some(kbps) = config.ack_min_kbps {
+        lines.push(format!("ack_min_kbps {kbps}\n"));
+    }
     lines.push(format!("mode {}\n", config.mode));
     lines
 }
@@ -156,6 +219,13 @@ pub fn matches(config: &Config, proc: &Proc) -> bool {
         && proc.mode == Some(config.mode)
         && config.trough_ms.is_none_or(|ms| proc.trough_ms == Some(ms))
         && config.target_ms.is_none_or(|ms| proc.target_ms == Some(ms))
+        && config.ack_adapt.is_none_or(|v| proc.ack_adapt == Some(v))
+        && config.ctrl_v3.is_none_or(|v| proc.ctrl_v3 == Some(v))
+        && config.ack_ms.is_none_or(|ms| proc.ack_ms == Some(ms))
+        && config.ack_segs.is_none_or(|segs| proc.ack_segs == Some(segs))
+        && config
+            .ack_min_kbps
+            .is_none_or(|kbps| proc.ack_min_kbps == Some(kbps))
 }
 
 /// Which clamp module is loaded.
@@ -206,10 +276,12 @@ pub fn settled(up_since: Option<u64>, now: u64) -> bool {
 pub fn status(state: &str, detail: &str, config: &Config, now: u64) -> String {
     let knob = |v: Option<u32>| v.map_or_else(|| "default".to_owned(), |v| v.to_string());
     format!(
-        "state={state}\ndetail={detail}\nmode={}\ntrough_ms={}\ntarget_ms={}\nupdated={now}\n",
+        "state={state}\ndetail={detail}\nmode={}\ntrough_ms={}\ntarget_ms={}\nack_adapt={}\nctrl_v3={}\nupdated={now}\n",
         config.mode,
         knob(config.trough_ms),
-        knob(config.target_ms)
+        knob(config.target_ms),
+        knob(config.ack_adapt),
+        knob(config.ctrl_v3)
     )
 }
 
@@ -217,22 +289,23 @@ pub fn status(state: &str, detail: &str, config: &Config, now: u64) -> String {
 mod tests {
     use super::*;
 
-    // As printed by v0.2-o1b (first lines of qctrl_proc_show).
-    const PROC: &str = "titan_qctrl v0.2-o1b (NF_BR_FORWARD prio=+100)\nmode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0)\nparams: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\nstate:  c_hat_kbps=0 rate100_kbps=0 free_kbps=0 dl_kbps=0 ul_kbps=0 udp_dl_kbps=0\n        ctl_active=0 w_kb=0 n_ctl=0 active_bulk=0 inflight_kb=0 release_ticks=0\n        dq_est_ms=0 q_src=0 q_owd_ms=-1 q_rtt_ms=-1 q_bias_ms=0 owd_flows=0 sat_ticks=0 trough100_ms=-1 busy_ticks=0\n";
+    // As printed by v0.3-q3 (first lines of qctrl_proc_show).
+    const PROC: &str = "titan_qctrl v0.3-q3 (NF_BR_FORWARD prio=+100)\nmode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0)\nparams: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n        ack_adapt=0 ctrl_v3=0 ack_ms=6 ack_segs=18 ack_min_kbps=2000\nstate:  c_hat_kbps=0 rate100_kbps=0 free_kbps=0 dl_kbps=0 ul_kbps=0 udp_dl_kbps=0\n        ctl_active=0 w_kb=0 n_ctl=0 active_bulk=0 inflight_kb=0 release_ticks=0\n        dq_est_ms=0 q_src=0 q_owd_ms=-1 q_rtt_ms=-1 q_bias_ms=0 owd_flows=0 sat_ticks=0 trough100_ms=-1 busy_ticks=0\n";
     const MODULES: &str =
         "titan_qctrl 47104 0 - Live 0x7f0b4000\nsch_cake 31676 0 - Live 0x7f0a0000\n";
 
     #[test]
     fn the_config_turns_on_only_bench_tested_modes() {
-        let config =
-            parse_config("# download clamp\nmode=2\ntrough_ms = 8 # bursty uplink\ntarget_ms=40\n");
+        let config = parse_config(
+            "# download clamp\nmode=2\ntrough_ms = 8 # bursty uplink\ntarget_ms=40\n",
+        );
         assert_eq!(
             config,
             Config {
                 mode: 2,
                 trough_ms: Some(8),
                 target_ms: Some(40),
-                refused: vec![]
+                ..Config::default()
             }
         );
         assert_eq!(parse_config("").mode, 0);
@@ -250,31 +323,76 @@ mod tests {
 
     #[test]
     fn knobs_stay_inside_the_module_limits() {
-        let config =
-            parse_config("mode=2\ntrough_ms=41\ntarget_ms=3\ntarget_ms=81\nqsrc=2\nnonsense\n");
+        let config = parse_config(
+            "mode=2\ntrough_ms=41\ntarget_ms=3\ntarget_ms=81\nack_adapt=2\nctrl_v3=2\nack_ms=0\nack_ms=11\nack_segs=1\nack_segs=33\nack_min_kbps=100001\nqsrc=2\nnonsense\n",
+        );
         assert_eq!(config.mode, 2);
         assert_eq!(config.trough_ms, None);
         assert_eq!(config.target_ms, None);
+        assert_eq!(config.ack_adapt, None);
+        assert_eq!(config.ctrl_v3, None);
+        assert_eq!(config.ack_ms, None);
+        assert_eq!(config.ack_segs, None);
+        assert_eq!(config.ack_min_kbps, None);
         assert_eq!(
             config.refused,
             vec![
                 "trough_ms=41",
                 "target_ms=3",
                 "target_ms=81",
+                "ack_adapt=2",
+                "ctrl_v3=2",
+                "ack_ms=0",
+                "ack_ms=11",
+                "ack_segs=1",
+                "ack_segs=33",
+                "ack_min_kbps=100001",
                 "qsrc=2",
                 "nonsense"
             ]
         );
-        let config = parse_config("trough_ms=0\ntarget_ms=4\ntarget_ms=80\n");
-        assert_eq!((config.trough_ms, config.target_ms), (Some(0), Some(80)));
+        let config = parse_config(
+            "trough_ms=0\ntarget_ms=4\ntarget_ms=80\nack_adapt=1\nctrl_v3=1\nack_ms=1\nack_ms=10\nack_segs=2\nack_segs=32\nack_min_kbps=100000\n",
+        );
+        assert_eq!(
+            (
+                config.trough_ms,
+                config.target_ms,
+                config.ack_adapt,
+                config.ctrl_v3,
+                config.ack_ms,
+                config.ack_segs,
+                config.ack_min_kbps
+            ),
+            (
+                Some(0),
+                Some(80),
+                Some(1),
+                Some(1),
+                Some(10),
+                Some(32),
+                Some(100_000)
+            )
+        );
     }
 
     #[test]
     fn proc_writes_put_the_mode_last() {
-        let config = parse_config("mode=2\ntrough_ms=8\ntarget_ms=40\n");
+        let config = parse_config(
+            "mode=3\ntrough_ms=8\ntarget_ms=40\nack_adapt=1\nctrl_v3=1\nack_ms=5\nack_segs=14\nack_min_kbps=4000\n",
+        );
         assert_eq!(
             proc_writes(&config),
-            vec!["trough_ms 8\n", "target_ms 40\n", "mode 2\n"]
+            vec![
+                "trough_ms 8\n",
+                "target_ms 40\n",
+                "ack_adapt 1\n",
+                "ctrl_v3 1\n",
+                "ack_ms 5\n",
+                "ack_segs 14\n",
+                "ack_min_kbps 4000\n",
+                "mode 3\n"
+            ]
         );
         assert_eq!(proc_writes(&Config::default()), vec!["mode 0\n"]);
     }
@@ -288,21 +406,28 @@ mod tests {
                 ours: true,
                 mode: Some(2),
                 trough_ms: Some(4),
-                target_ms: Some(40)
+                target_ms: Some(40),
+                ack_adapt: Some(0),
+                ctrl_v3: Some(0),
+                ack_ms: Some(6),
+                ack_segs: Some(18),
+                ack_min_kbps: Some(2000),
             }
         );
         // `rtt_target_ms=15` and `trough100_ms=-1` are other values.
         assert!(matches(
-            &parse_config("mode=2\ntrough_ms=4\ntarget_ms=40\n"),
+            &parse_config("mode=2\ntrough_ms=4\ntarget_ms=40\nack_adapt=0\nctrl_v3=0\n"),
             &proc
         ));
         assert!(matches(&parse_config("mode=2\n"), &proc));
         assert!(!matches(&parse_config("mode=2\ntrough_ms=8\n"), &proc));
         assert!(!matches(&parse_config("mode=3\n"), &proc));
         assert!(!matches(&parse_config("mode=2\ntarget_ms=15\n"), &proc));
-        let y6 = PROC.replace("v0.2-o1b", "v0.1-y6");
-        assert!(!parse_proc(&y6).ours);
-        assert!(!matches(&parse_config("mode=2\n"), &parse_proc(&y6)));
+        assert!(!matches(&parse_config("mode=2\nack_adapt=1\n"), &proc));
+        assert!(!matches(&parse_config("mode=2\nctrl_v3=1\n"), &proc));
+        let o1b = PROC.replace("v0.3-q3", "v0.2-o1b");
+        assert!(!parse_proc(&o1b).ours);
+        assert!(!matches(&parse_config("mode=2\n"), &parse_proc(&o1b)));
         assert!(!parse_proc("").ours);
         assert_eq!(parse_proc("mode=0xc (x)\n").mode, Some(12));
     }
@@ -316,8 +441,8 @@ mod tests {
         assert_eq!(loaded("", ""), Loaded::None);
         assert_eq!(loaded(MODULES, PROC), Loaded::Ours);
         assert_eq!(
-            loaded(MODULES, &PROC.replace("v0.2-o1b", "v0.1-y6")),
-            Loaded::Other("titan_qctrl (titan_qctrl v0.1-y6 (NF_BR_FORWARD prio=+100))".into())
+            loaded(MODULES, &PROC.replace("v0.3-q3", "v0.2-o1b")),
+            Loaded::Other("titan_qctrl (titan_qctrl v0.2-o1b (NF_BR_FORWARD prio=+100))".into())
         );
         assert_eq!(
             loaded(MODULES, ""),
@@ -346,13 +471,13 @@ mod tests {
     fn the_status_names_mode_and_knobs() {
         let text = status(
             "applied",
-            "mode 2 read back",
-            &parse_config("mode=2\ntrough_ms=8\n"),
+            "mode 3 read back",
+            &parse_config("mode=3\ntrough_ms=8\nack_adapt=1\nctrl_v3=1\n"),
             77,
         );
         assert_eq!(
             text,
-            "state=applied\ndetail=mode 2 read back\nmode=2\ntrough_ms=8\ntarget_ms=default\nupdated=77\n"
+            "state=applied\ndetail=mode 3 read back\nmode=3\ntrough_ms=8\ntarget_ms=default\nack_adapt=1\nctrl_v3=1\nupdated=77\n"
         );
     }
 }

@@ -31,6 +31,11 @@
 #   --mode N             Clamp mode: 0, 2, 3 or 6 (default 2)
 #   --trough-ms N        Clamp knob, 0..40 (default: module default 4)
 #   --clamp-target-ms N  Clamp knob, 4..80 (default: module default 40)
+#   --ack-adapt N        Clamp knob, 0 or 1 (default: module default 0)
+#   --ctrl-v3 N          Clamp knob, 0 or 1 (default: module default 0)
+#   --ack-ms N           Clamp knob, 1..10 (default: module default 6)
+#   --ack-segs N         Clamp knob, 2..32 (default: module default 18)
+#   --ack-min-kbps N     Clamp knob, 0..100000 (default: module default 2000)
 #   --no-clamp           Skip the clamp; the .ko argument may be left out
 #   --fastpath PATH      Stage titan_k1fp.ko and fastpath/config
 #   --fastpath-mode N    Fast path mode: 0, 1, 2 or 3 (default 2)
@@ -54,6 +59,11 @@ WRITE_FLAGS=1
 MODE=2
 TROUGH=
 CLAMP_TARGET=
+ACK_ADAPT=
+CTRL_V3=
+ACK_MS=
+ACK_SEGS=
+ACK_MIN_KBPS=
 CLAMP=1
 FASTPATH=
 FASTPATH_MODE=2
@@ -76,6 +86,11 @@ while [ $# -gt 0 ]; do
     --mode) MODE=${2:?}; shift 2 ;;
     --trough-ms) TROUGH=${2:?}; shift 2 ;;
     --clamp-target-ms) CLAMP_TARGET=${2:?}; shift 2 ;;
+    --ack-adapt) ACK_ADAPT=${2:?}; shift 2 ;;
+    --ctrl-v3) CTRL_V3=${2:?}; shift 2 ;;
+    --ack-ms) ACK_MS=${2:?}; shift 2 ;;
+    --ack-segs) ACK_SEGS=${2:?}; shift 2 ;;
+    --ack-min-kbps) ACK_MIN_KBPS=${2:?}; shift 2 ;;
     --no-clamp) CLAMP=0; shift ;;
     --fastpath) FASTPATH=${2:?--fastpath needs a path}; shift 2 ;;
     --fastpath-mode) FASTPATH_MODE=${2:?}; shift 2 ;;
@@ -84,7 +99,7 @@ while [ $# -gt 0 ]; do
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -186,6 +201,11 @@ case "$MODE" in 0|2|3|6) ;; *) die "--mode must be 0, 2, 3 or 6" ;; esac
 case "$FASTPATH_MODE" in 0|1|2|3) ;; *) die "--fastpath-mode must be 0, 1, 2 or 3" ;; esac
 if [ -n "$TROUGH" ]; then [[ "$TROUGH" =~ ^[0-9]+$ ]] && [ "$TROUGH" -le 40 ] || die "--trough-ms must be 0..40"; fi
 if [ -n "$CLAMP_TARGET" ]; then [[ "$CLAMP_TARGET" =~ ^[0-9]+$ ]] && [ "$CLAMP_TARGET" -ge 4 ] && [ "$CLAMP_TARGET" -le 80 ] || die "--clamp-target-ms must be 4..80"; fi
+if [ -n "$ACK_ADAPT" ]; then [[ "$ACK_ADAPT" =~ ^[0-9]+$ ]] && [ "$ACK_ADAPT" -le 1 ] || die "--ack-adapt must be 0 or 1"; fi
+if [ -n "$CTRL_V3" ]; then [[ "$CTRL_V3" =~ ^[0-9]+$ ]] && [ "$CTRL_V3" -le 1 ] || die "--ctrl-v3 must be 0 or 1"; fi
+if [ -n "$ACK_MS" ]; then [[ "$ACK_MS" =~ ^[0-9]+$ ]] && [ "$ACK_MS" -ge 1 ] && [ "$ACK_MS" -le 10 ] || die "--ack-ms must be 1..10"; fi
+if [ -n "$ACK_SEGS" ]; then [[ "$ACK_SEGS" =~ ^[0-9]+$ ]] && [ "$ACK_SEGS" -ge 2 ] && [ "$ACK_SEGS" -le 32 ] || die "--ack-segs must be 2..32"; fi
+if [ -n "$ACK_MIN_KBPS" ]; then [[ "$ACK_MIN_KBPS" =~ ^[0-9]+$ ]] && [ "$ACK_MIN_KBPS" -le 100000 ] || die "--ack-min-kbps must be 0..100000"; fi
 for t in "${TARGETS[@]}"; do
   [[ "$t" =~ ^[0-9A-Fa-f.:]+$ ]] || die "--target $t is not an IP address"
 done
@@ -310,6 +330,16 @@ mode=$MODE"
 trough_ms=$TROUGH"
 [ -n "$CLAMP_TARGET" ] && QCTRL_CONFIG="$QCTRL_CONFIG
 target_ms=$CLAMP_TARGET"
+[ -n "$ACK_ADAPT" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ack_adapt=$ACK_ADAPT"
+[ -n "$CTRL_V3" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ctrl_v3=$CTRL_V3"
+[ -n "$ACK_MS" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ack_ms=$ACK_MS"
+[ -n "$ACK_SEGS" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ack_segs=$ACK_SEGS"
+[ -n "$ACK_MIN_KBPS" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ack_min_kbps=$ACK_MIN_KBPS"
 FASTPATH_CONFIG="# Written by scripts/stage-latency.sh at $stamp
 mode=$FASTPATH_MODE"
 
