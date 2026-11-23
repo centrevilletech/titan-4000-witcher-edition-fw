@@ -31,6 +31,12 @@ before a confirmed staged boot, no write before the patch magic, then writes
 read back, a config change that writes 0, and a modem restart from the kernel
 log. The download clamp runs with a bogus staged module and a recording insmod
 stub: it must wait for the links and then refuse the bytes, never load them.
+The fast path runs first with a bogus staged module (refused before insmod),
+then with the real pinned clamp and fast path modules against a stub insmod
+and a fake /proc/k1fp: clamp loads before fast path, mode 2 is read back,
+grant leases renew every second and revoke immediately on gate close, a change
+in qctrl_present is logged, watchdog trips re-arm at most once per boot before
+holding at mode 0 in state=tripped, and mode=0 rolls back live.
 """
 import errno
 import os
@@ -41,6 +47,7 @@ import struct
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 REPO = Path(__file__).resolve().parent.parent
@@ -203,10 +210,74 @@ for line in sys.stdin:
     capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
     packets=[]
     server=subprocess.Popen(['/usr/sbin/udhcpd','-f','/tmp/udhcpd.conf'])
+    # Fake /proc/k1fp control pipe: receives keeper writes (`mode N`, `grant N`)
+    # and updates /tmp/k1fp-proc atomically the way titan_k1fp does.
+    os.mkfifo('/tmp/k1fp-ctl')
+    fp_lock = threading.Lock()
+    fp_state = {
+        'mode': 0,
+        'gate': 'closed',
+        'grant_left_ms': 0,
+        'qctrl_present': 1,
+        'wd_trips': 0,
+        'wd_reason': 'none',
+    }
+    k1fp_cmds = []
+
+    def write_k1fp_proc():
+        s = fp_state
+        text = (
+            "titan_k1fp v2.0\n"
+            f"mode={s['mode']} lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n"
+            f"require_grant=1 grant_left_ms={s['grant_left_ms']} gate={s['gate']} v4=1 v6=1 lease_ms=60 sample_ms=20\n"
+            f"qctrl: qctrl_present={s['qctrl_present']} qctrl_dl_calls=0 qctrl_dl_drop=0 qctrl_dl_stolen=0 qctrl_ul_stock=0\n"
+            f"watchdog: wd_armed={1 if s['mode'] >= 2 else 0} wd_trips={s['wd_trips']} wd_reason={s['wd_reason']} wd_mod=20 wd_mismatch=64 wd_stall_ms=500 wd_ringfull_ms=500\n"
+            "safety: txirq=0 txdrain=0 dlbypass=0 pins=0 modref=0 err_tx=0\n"
+            "vendor: netifq_enabled=1 net_mode=2 host_mac_learned=1 host_mac=00:11:22:33:44:55 external_dev_set=0\n"
+            "brhook: external_dev_stop=0 list_nr=0 in_hold=0 held=0 holds=0\n"
+            "fast_dl=0 fast_ul=0 fast_dl_KiB=0 fast_ul_KiB=0 would_fast=0 gate_closed=0 xmit_err=0\n"
+        )
+        Path('/tmp/k1fp-proc.tmp').write_text(text)
+        Path('/tmp/k1fp-proc.tmp').replace('/tmp/k1fp-proc')
+
+    k1fp_fd = os.open('/tmp/k1fp-ctl', os.O_RDWR)
+
+    def k1fp_ctl_loop():
+        buf = b''
+        while True:
+            try:
+                chunk = os.read(k1fp_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b'\n' in buf:
+                raw, buf = buf.split(b'\n', 1)
+                cmd = raw.decode('utf-8', 'replace').strip()
+                if not cmd:
+                    continue
+                now_ts = time.monotonic()
+                with fp_lock:
+                    k1fp_cmds.append((now_ts, cmd))
+                    parts = cmd.split()
+                    if len(parts) == 2 and parts[0] == 'mode' and parts[1].isdigit():
+                        fp_state['mode'] = int(parts[1])
+                        write_k1fp_proc()
+                    elif len(parts) == 2 and parts[0] == 'grant' and parts[1].isdigit():
+                        secs = int(parts[1])
+                        fp_state['grant_left_ms'] = secs * 1000
+                        fp_state['gate'] = 'open' if secs > 0 else 'closed'
+                        write_k1fp_proc()
+
+    threading.Thread(target=k1fp_ctl_loop, daemon=True).start()
+
     env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
              TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
              TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
+             TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
+             TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
              TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
@@ -519,9 +590,10 @@ for line in sys.stdin:
         print('PASS: no staged modem firmware: the boot confirm never armed.',flush=True)
         assert not Path('/tmp/dm-log').exists(), 'a modem console session ran on a stock boot'
         assert Path('/tmp/tk.flags').read_text().startswith('state=off\n'), Path('/tmp/tk.flags').read_text()
-        assert 'tk flags' not in log() and 'download clamp' not in log(), log()
+        assert 'tk flags' not in log() and 'download clamp' not in log() and 'fast path' not in log(), log()
         assert Path('/tmp/qctrl.status').read_text().startswith('state=off\n'), Path('/tmp/qctrl.status').read_text()
-        print('PASS: stock boot: no modem console session, flags and clamp off and silent.',flush=True)
+        assert Path('/tmp/fastpath.status').read_text().startswith('state=off\n'), Path('/tmp/fastpath.status').read_text()
+        print('PASS: stock boot: no modem console session, flags, clamp and fast path off and silent.',flush=True)
         # A staged modem firmware image whose boot never answers. Nothing has
         # answered since `silent_from`; the deaf watchdog of a new keeper
         # process cannot arm, so any reboot now is the boot confirm's.
@@ -552,16 +624,23 @@ for line in sys.stdin:
         good='b'*64
         Path('/tmp/tk.result').unlink()
         Path('/tmp/tk/config').write_text('enabled=1\nsha256='+good+'\nwm=0x847ed604:0x15\nwm=0x84f93008:0x140\nwm=0x847ed608:0x1\n')
-        # A staged clamp whose bytes are not the pinned module.
+        # A staged clamp and fast path whose bytes are not the pinned modules.
         Path('/tmp/qctrl').mkdir()
         Path('/tmp/qctrl/config').write_text('mode=2\n')
         Path('/tmp/qctrl/titan_qctrl.ko').write_bytes(b'not the pinned module\n')
+        Path('/tmp/fastpath').mkdir()
+        Path('/tmp/fastpath/config').write_text('mode=2\n')
+        Path('/tmp/fastpath/titan_k1fp.ko').write_bytes(b'not the pinned fast path\n')
         Path('/tmp/proc-modules').write_text('')
         Path('/tmp/tk/strikes').write_text('strikes=1\n')
         Path('/tmp/ping-ok').write_text('')
         if not Path('/sys/class/net/lte0pdn0').exists():
             run(ip,'link','add','lte0pdn0','type','dummy');run(ip,'link','set','lte0pdn0','up')
         run(ip,'addr','add','10.200.0.2/30','dev','lte0pdn0')
+        if not Path('/sys/class/net/lte0pdn2').exists():
+            run(ip,'link','add','lte0pdn2','type','dummy')
+            run(ip,'link','set','lte0pdn2','master','br0')
+            run(ip,'link','set','lte0pdn2','up')
         Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(good,uptime()))
         restart()
         wait_for(lambda:'tk boot confirmed' in log(),45)
@@ -608,13 +687,139 @@ for line in sys.stdin:
         wait_for(lambda:'modem restart seen' in log(),10)
         assert 'state=pending' in flags(), flags()
         print('PASS: a modem restart in the kernel log starts the flag writes over.',flush=True)
-        # The clamp waited for the links, refused the bytes and never ran insmod.
+        # The clamp and fast path waited for the links, refused bogus bytes and never ran insmod.
         wait_for(lambda:'state=failed' in (Path('/tmp/qctrl.status').read_text() if Path('/tmp/qctrl.status').exists() else ''),60)
         status=Path('/tmp/qctrl.status').read_text()
         assert 'not the pinned' in status, status
+        wait_for(lambda:'state=failed' in (Path('/tmp/fastpath.status').read_text() if Path('/tmp/fastpath.status').exists() else ''),60)
+        fp_st=Path('/tmp/fastpath.status').read_text()
+        assert 'not the pinned' in fp_st, fp_st
         assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
         assert 'download clamp waiting' in log() and 'download clamp failed' in log(), log()
-        print('PASS: the clamp waited for the links and refused a module that is not the pinned build.',flush=True)
+        assert 'fast path waiting' in log() and 'fast path failed' in log(), log()
+        print('PASS: the clamp and fast path waited for the links and refused unpinned modules.',flush=True)
+        # Real pinned clamp and fast path modules with a stub insmod and fake /proc/k1fp:
+        # deterministic load order (clamp first), mode 2 read back, grant lease renewal,
+        # immediate grant 0 on CBRS gate close, qctrl_present tracking, watchdog trip policy,
+        # and live rollback.
+        insmod_stub = Path('/tmp/bin/insmod')
+        insmod_stub.write_text(r'''#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+mod = os.path.basename(sys.argv[1])
+with open('/tmp/insmod-calls', 'a') as f:
+    f.write(mod + '\n')
+mods = Path('/tmp/proc-modules').read_text() if Path('/tmp/proc-modules').exists() else ''
+if mod == 'titan_qctrl.ko':
+    Path('/tmp/qctrl-proc').write_text(
+        'titan_qctrl v0.2-o1b (NF_BR_FORWARD prio=+100)\n'
+        'mode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0)\n'
+        'params: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n'
+        '        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n'
+    )
+    if 'titan_qctrl ' not in mods:
+        mods += 'titan_qctrl 47104 0 - Live 0x7f0b4000\n'
+        Path('/tmp/proc-modules').write_text(mods)
+elif mod == 'titan_k1fp.ko':
+    qpresent = 1 if 'titan_qctrl ' in mods else 0
+    Path('/tmp/k1fp-proc').write_text(
+        'titan_k1fp v2.0\n'
+        'mode=0 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n'
+        'require_grant=1 grant_left_ms=0 gate=closed v4=1 v6=1 lease_ms=60 sample_ms=20\n'
+        f'qctrl: qctrl_present={qpresent} qctrl_dl_calls=0 qctrl_dl_drop=0 qctrl_dl_stolen=0 qctrl_ul_stock=0\n'
+        'watchdog: wd_armed=0 wd_trips=0 wd_reason=none wd_mod=20 wd_mismatch=64 wd_stall_ms=500 wd_ringfull_ms=500\n'
+        'safety: txirq=0 txdrain=0 dlbypass=0 pins=0 modref=0 err_tx=0\n'
+        'vendor: netifq_enabled=1 net_mode=2 host_mac_learned=1 host_mac=00:11:22:33:44:55 external_dev_set=0\n'
+        'brhook: external_dev_stop=0 list_nr=0 in_hold=0 held=0 holds=0\n'
+        'fast_dl=0 fast_ul=0 fast_dl_KiB=0 fast_ul_KiB=0 would_fast=0 gate_closed=0 xmit_err=0\n'
+    )
+    if 'titan_k1fp ' not in mods:
+        mods += 'titan_k1fp 32768 0 - Live 0x7f0c0000\n'
+        Path('/tmp/proc-modules').write_text(mods)
+else:
+    sys.exit(1)
+''')
+        insmod_stub.chmod(0o755)
+        shutil.copy2(REPO/'device/qctrl/payload/titan_qctrl.ko', '/tmp/qctrl/titan_qctrl.ko')
+        shutil.copy2(REPO/'device/fastpath/payload/titan_k1fp.ko', '/tmp/fastpath/titan_k1fp.ko')
+        Path('/tmp/qctrl/config').write_text('mode=2\n')
+        Path('/tmp/fastpath/config').write_text('mode=2\n')
+        for p in ('/tmp/proc-modules', '/tmp/qctrl-proc', '/tmp/k1fp-proc', '/tmp/insmod-calls'):
+            Path(p).unlink(missing_ok=True)
+        Path('/tmp/proc-modules').write_text('')
+        with fp_lock:
+            fp_state.update(mode=0, gate='closed', grant_left_ms=0, qctrl_present=1, wd_trips=0, wd_reason='none')
+            k1fp_cmds.clear()
+        fp_status = lambda: Path('/tmp/fastpath.status').read_text() if Path('/tmp/fastpath.status').exists() else ''
+        restart()
+        wait_for(lambda: 'state=applied\n' in fp_status(), 60)
+        calls = Path('/tmp/insmod-calls').read_text().splitlines()
+        assert calls == ['titan_qctrl.ko', 'titan_k1fp.ko'], calls
+        st = fp_status()
+        assert 'mode=2\n' in st and 'active_mode=2\n' in st and 'gate=open\n' in st and 'qctrl_present=1\n' in st, st
+        print('PASS: deterministic load order (clamp then fast path) and mode 2 applied.',flush=True)
+        # Grant lease renews once per second while the SAS grant is held.
+        with fp_lock:
+            before_renew = len(k1fp_cmds)
+        until = time.monotonic() + 2.5
+        wait_for(lambda: time.monotonic() >= until, 5)
+        with fp_lock:
+            renews = [c for _, c in k1fp_cmds[before_renew:] if c == 'grant 5']
+        assert len(renews) >= 2, (renews, k1fp_cmds)
+        print('PASS: fast path grant lease renewed every second while SAS grant held (%d writes).' % len(renews), flush=True)
+        # Dropping the SAS grant writes `grant 0` immediately and stops renewals until restored.
+        with fp_lock:
+            before_close = len(k1fp_cmds)
+        set_grant(['cbrs_mode_grant=1', 'cbrs_grant_state=1'])
+        wait_for(lambda: any(c == 'grant 0' for _, c in k1fp_cmds[before_close:]), 10)
+        wait_for(lambda: len(gate_rules()) == 4, 10)
+        until = time.monotonic() + 2.2
+        wait_for(lambda: time.monotonic() >= until, 5)
+        with fp_lock:
+            after_close = [c for _, c in k1fp_cmds[before_close:]]
+            idx0 = after_close.index('grant 0')
+            assert 'grant 5' not in after_close[idx0:], after_close
+        set_grant(['cbrs_mode_grant=1', 'cbrs_grant_state=2'])
+        with fp_lock:
+            before_reopen = len(k1fp_cmds)
+        wait_for(lambda: any(c == 'grant 5' for _, c in k1fp_cmds[before_reopen:]), 10)
+        wait_for(lambda: gate_rules() == [], 10)
+        print('PASS: SAS gate close sent grant 0 immediately with no renewal while closed, then resumed.', flush=True)
+        # Clamp unload later: keeper notices qctrl_present=1 -> 0 and logs it.
+        with fp_lock:
+            fp_state['qctrl_present'] = 0
+            write_k1fp_proc()
+        wait_for(lambda: 'fast path: download clamp unloaded (qctrl_present=0)' in log(), 25)
+        assert 'qctrl_present=0\n' in fp_status(), fp_status()
+        print('PASS: fast path noticed and logged qctrl_present change.', flush=True)
+        # Watchdog trip #1: keeper logs reason and re-arms mode 2 once.
+        with fp_lock:
+            fp_state['mode'] = 0
+            fp_state['wd_trips'] = 1
+            fp_state['wd_reason'] = 'tx_stall'
+            write_k1fp_proc()
+        wait_for(lambda: 'tx_stall' in log() and fp_state['mode'] == 2 and 'state=applied\n' in fp_status() and 'wd_trips=1\n' in fp_status(), 25)
+        assert 're-arming mode 2' in log(), log()
+        print('PASS: first watchdog trip logged reason and re-armed once.', flush=True)
+        # Watchdog trip #2: keeper does NOT re-arm; stays at mode 0 in state=tripped.
+        with fp_lock:
+            fp_state['mode'] = 0
+            fp_state['wd_trips'] = 2
+            fp_state['wd_reason'] = 'ring_full'
+            write_k1fp_proc()
+        wait_for(lambda: 'state=tripped\n' in fp_status(), 25)
+        assert 'ring_full' in log() and fp_state['mode'] == 0, (fp_state, fp_status())
+        assert 'active_mode=0\n' in fp_status(), fp_status()
+        until = time.monotonic() + 16
+        wait_for(lambda: time.monotonic() >= until, 20)
+        assert 'state=tripped\n' in fp_status() and fp_state['mode'] == 0, (fp_state, fp_status())
+        assert log().count('ring_full') == 1, log()
+        print('PASS: second watchdog trip stayed at mode 0 in state=tripped and logged once.', flush=True)
+        # Live rollback via config change: mode=0 clears tripped state to off.
+        Path('/tmp/fastpath/config').write_text('mode=0\n')
+        wait_for(lambda: 'state=off\n' in fp_status(), 25)
+        assert fp_state['mode'] == 0 and 'mode=0\n' in fp_status(), (fp_state, fp_status())
+        print('PASS: live rollback (mode=0 in fastpath/config) moved fast path to state=off.', flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
