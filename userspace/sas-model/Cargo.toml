@@ -1,0 +1,9 @@
+[package]
+name = "witcher-sas-model"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "CBRS SAS client decisions for a CPE-CBSD, testable on a host"
+
+[dependencies]
+serde_json = "1"

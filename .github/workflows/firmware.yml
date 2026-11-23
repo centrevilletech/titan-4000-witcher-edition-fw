@@ -81,7 +81,7 @@ jobs:
           bash -n device/fastpath/source/build.sh device/fastpath/test/run.sh
           bash -n scripts/stage-latency.sh
           python3 -m compileall -q scripts
-          bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
+          bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh scripts/build-sasd.sh
           for script in overlay/etc/init.d/* overlay/usr/lib/titan-api/*.sh; do sh -n "$script"; done
           git diff --check
       - name: Download clamp module rebuilds byte for byte
