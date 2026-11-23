@@ -6,6 +6,11 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      bench_candidate:
+        description: Keep the verified .prg of this ref as witcher-test-candidate (7 days) for a bench test
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +35,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            build-essential python3 git ca-certificates curl iproute2 iptables ebtables util-linux procps
+            build-essential python3 git ca-certificates curl iproute2 iptables ebtables util-linux procps \
+            gcc-arm-linux-gnueabihf
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - name: Start with fresh checkout metadata
         # clean/reset does not remove cached PR refs or obsolete tags. These
@@ -67,12 +73,17 @@ jobs:
           python3 scripts/test-rootfs-metadata.py
           python3 scripts/test-firstboot.py
           python3 scripts/test-bridge-trial.py
+          python3 scripts/test-tk-stage.py
           (cd device/sqm/payload && sha256sum -c ../SHA256SUMS)
           bash -n device/sqm/source/rebuild.sh
+          (cd device/qctrl/payload && sha256sum -c ../SHA256SUMS)
+          bash -n scripts/stage-latency.sh
           python3 -m compileall -q scripts
           bash -n scripts/build-firmware.sh scripts/build-ui.sh scripts/build-firstboot.sh scripts/build-entropy.sh scripts/build-keeper.sh
           for script in overlay/etc/init.d/* overlay/usr/lib/titan-api/*.sh; do sh -n "$script"; done
           git diff --check
+      - name: Download clamp module rebuilds byte for byte
+        run: device/qctrl/source/build.sh "$(mktemp -d)"
       - name: Keeper and protocol tests
         run: cargo test --locked --workspace --manifest-path userspace/Cargo.toml
       - name: Management reachability across network modes
@@ -196,8 +207,10 @@ jobs:
             out/witcher.sha256
           retention-days: 14
 
+      # main always keeps it. Any other ref keeps it only from a manual run
+      # with bench_candidate set, so a branch can be bench-tested before merge.
       - name: Retain verified candidate for explicitly requested bench release
-        if: ${{ success() && github.ref == 'refs/heads/main' }}
+        if: ${{ success() && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && inputs.bench_candidate)) }}
         uses: actions/upload-artifact@v4
         with:
           name: witcher-test-candidate

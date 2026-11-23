@@ -17,7 +17,14 @@
 //! downlink MAC back on the router when the unit starts forwarding IPv6 (see
 //! `titan_pd_model::driver_mac`). In every mode it stops the Ethernet MAC from
 //! sending 802.3x PAUSE frames to the customer router (see
-//! `titan_pd_model::ethernet`).
+//! `titan_pd_model::ethernet`). In every mode it drops customer IPv6 to and
+//! from LTE while the unit holds no SAS grant, which the vendor does for IPv4
+//! only (see `titan_pd_model::cbrs_gate`). On a boot that loaded a staged
+//! modem firmware image it confirms the boot, or puts stock firmware back (see
+//! `titan_pd_model::tk_boot`), and after the confirm writes the operator's
+//! modem feature flags (see `titan_pd_model::tk_flags`). In every mode it
+//! loads a staged download clamp when its config asks for one (see
+//! `titan_pd_model::qctrl`).
 
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -28,6 +35,7 @@ use std::thread;
 use std::time::Duration;
 
 use std::os::unix::process::CommandExt;
+use titan_pd_model::cbrs_gate::{self, Step as GateStep, Tool as GateTool};
 use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::dhcpv6::{self, client_mac};
@@ -42,9 +50,12 @@ use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
 use titan_pd_model::sas_nat::{self, Action as SasAction};
+use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
+use titan_pd_model::tk_boot::{self, Action as TkAction};
+use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 
-use crate::{log, log_ram};
+use crate::{log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
@@ -54,6 +65,8 @@ const DEFAULT_BEARER: &str = "lte0pdn1";
 const MODE_EVERY: u64 = 5;
 /// Kernel log records read per tick, so a long backlog cannot stall the loop.
 const KMSG_PER_TICK: usize = 1024;
+/// Seconds between reads of `tk/config` for flag changes.
+const TK_FLAGS_CONFIG_EVERY: u64 = 15;
 const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
@@ -188,6 +201,39 @@ struct Keeper {
     flow_logged: bool,
     flow_failed_logged: bool,
     flow_stock_logged: bool,
+    /// Customer IPv6 while there is no SAS grant (see `titan_pd_model::cbrs_gate`).
+    cbrs_gate: cbrs_gate::Watch,
+    /// The boot hook's status was read.
+    tk_checked: bool,
+    /// Pending confirm for a boot that loaded a staged modem firmware image.
+    tk_confirm: Option<tk_boot::Confirm>,
+    tk_probe: Option<DeafProbe>,
+    tk_last_round: Option<u64>,
+    /// The boot hook's status, read once at start.
+    tk_status: tk_boot::BootStatus,
+    /// Modem feature flags after a confirmed staged boot (see
+    /// `titan_pd_model::tk_flags`), and the DM session running for them.
+    tk_flags: Option<tk_flags::Control>,
+    tk_flags_job: Option<(std::thread::JoinHandle<(tk_flags::Outcome, bool)>, tk_flags::Plan)>,
+    tk_flags_config_at: Option<u64>,
+    tk_flags_refused: Vec<String>,
+    /// The kernel log showed a modem firmware load after the keeper started.
+    modem_restart_seen: bool,
+    /// The staged download clamp (see `titan_pd_model::qctrl`).
+    qctrl: QctrlWatch,
+}
+
+/// The download clamp's progress this boot.
+#[derive(Default)]
+struct QctrlWatch {
+    checked_at: Option<u64>,
+    /// The customer port and the management bearer were both up since then.
+    up_since: Option<u64>,
+    /// The last status, so the file and the log change only on news.
+    shown: String,
+    /// A load failed for this config. It is not retried until the config changes.
+    failed_for: Option<qctrl::Config>,
+    refused_logged: Vec<String>,
 }
 
 /// One round of pings, collected on later ticks so the wire loop keeps running.
@@ -384,14 +430,31 @@ impl Keeper {
             flow_logged: false,
             flow_failed_logged: false,
             flow_stock_logged: false,
+            cbrs_gate: cbrs_gate::Watch::default(),
+            tk_checked: false,
+            tk_confirm: None,
+            tk_probe: None,
+            tk_last_round: None,
+            tk_status: tk_boot::BootStatus::default(),
+            tk_flags: None,
+            tk_flags_job: None,
+            tk_flags_config_at: None,
+            tk_flags_refused: Vec::new(),
+            modem_restart_seen: false,
+            qctrl: QctrlWatch::default(),
         }
     }
 
     fn tick(&mut self) -> Result<(), String> {
         self.refresh_mode();
+        // First, and in every mode: nothing below may delay it.
+        self.maintain_cbrs_gate();
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
+        self.maintain_tk_confirm();
+        self.maintain_tk_flags();
+        self.maintain_qctrl();
         self.maintain_mgmt_v6();
         if !self.passthrough {
             self.packet = None;
@@ -1380,6 +1443,45 @@ impl Keeper {
         }
     }
 
+    /// Drop customer IPv6 to and from LTE while the unit holds no SAS grant.
+    /// The vendor stops only IPv4 then, and bridged IPv6 never reaches
+    /// ip6tables. Reads the grant every second; while the gate is closed it
+    /// also puts back rules a vendor firewall restart flushed. See
+    /// `titan_pd_model::cbrs_gate`.
+    fn maintain_cbrs_gate(&mut self) {
+        if !self.cbrs_gate.due(self.now) {
+            return;
+        }
+        let cache = fs::read(nvram_cache()).ok();
+        let gate = cbrs_gate::decide(cache.as_deref());
+        let (step, line) = self.cbrs_gate.observe(self.now, &gate);
+        let changed = line.is_some();
+        if let Some(line) = line {
+            self.note(&line);
+        }
+        let failed = match step {
+            GateStep::Hold => return,
+            GateStep::Close => {
+                let (added, failed) = cbrs_gate::close(&mut gate_command);
+                if added > 0 && !changed {
+                    self.note(&format!(
+                        "CBRS gate rules put back: a vendor firewall restart removed {added} of {}",
+                        cbrs_gate::RULES.len()
+                    ));
+                }
+                failed
+            }
+            GateStep::Open => {
+                let (cleanup, failed) = cbrs_gate::open(&mut gate_command);
+                self.cbrs_gate.cleaned(self.now, cleanup);
+                failed
+            }
+        };
+        for err in failed {
+            self.note(&format!("CBRS gate: {err}"));
+        }
+    }
+
     /// Which bearer carries the customer, and whether it is bridged to the
     /// LAN port. The bridge answers both without a fork. Only when it has no
     /// LTE port is the vendor asked, and then at most every `MODE_EVERY` s.
@@ -1434,7 +1536,12 @@ impl Keeper {
             Some(log) => log.lines(),
             None => return,
         };
+        // Lines before the first full read are the boot backlog.
+        let live = self.kmsg_drained;
         for line in lines {
+            if live && tk_flags::modem_loaded(&line) {
+                self.modem_restart_seen = true;
+            }
             if let Some(event) = extdev::parse(&line) {
                 self.ext_watch.note(event);
             }
@@ -1543,13 +1650,13 @@ impl Keeper {
             let waited = self.now.saturating_sub(asked);
             if !self.reboot_forced && waited >= REBOOT_FORCE_AFTER {
                 self.reboot_forced = true;
-                log("deaf watchdog: the reboot did not happen; forcing it");
+                log("watchdog reboot did not happen; forcing it");
                 let _ = Command::new(reboot_program()).arg("-f").status();
             } else if self.reboot_forced && waited >= REBOOT_GIVE_UP_AFTER {
                 self.reboot_asked_at = None;
                 self.reboot_forced = false;
                 self.deaf_watch = deaf::Watch::default();
-                log("deaf watchdog: the forced reboot did not happen either; watching again");
+                log("the forced watchdog reboot did not happen either; watching again");
             }
             return;
         }
@@ -1597,20 +1704,7 @@ impl Keeper {
             String::new()
         };
         let targets = deaf::targets(&settings, &bearer_dns);
-        let children: Vec<std::process::Child> = targets
-            .iter()
-            .filter_map(|target| {
-                let program = if target.is_ipv6() { "ping6" } else { "ping" };
-                let address = target.to_string();
-                Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
-                    .args(["-c", "1", "-W", "4", address.as_str()])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                    .ok()
-            })
-            .collect();
+        let children = spawn_pings(&targets);
         if children.is_empty() {
             self.deaf_round(None);
             return;
@@ -1700,15 +1794,433 @@ impl Keeper {
                     "deaf watchdog: attached but nothing heard through the core for {silent_for} s; rebooting (reboot {} in a row)",
                     strikes.saturating_add(1)
                 ));
-                unsafe { libc::sync() };
-                self.reboot_asked_at = Some(self.now);
-                self.reboot_forced = false;
-                let _ = Command::new(reboot_program())
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
+                self.request_reboot();
             }
+        }
+    }
+
+    /// A watchdog reboot. `maintain_deaf_watchdog` forces it if it does not
+    /// happen.
+    fn request_reboot(&mut self) {
+        unsafe { libc::sync() };
+        self.reboot_asked_at = Some(self.now);
+        self.reboot_forced = false;
+        let _ = Command::new(reboot_program())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
+    /// Runs in NAT and in passthrough. See `titan_pd_model::tk_boot`. Nothing
+    /// arms unless the boot hook staged a modem firmware image this boot.
+    fn maintain_tk_confirm(&mut self) {
+        if !self.tk_checked {
+            self.tk_checked = true;
+            let status = tk_boot::parse_status(&read_file(&tk_status_path()));
+            if let Some(line) = tk_boot::describe(&status) {
+                self.note(&line);
+            }
+            let decided = fs::metadata(tk_result_path()).is_ok();
+            self.tk_confirm = tk_boot::Confirm::arm(&status, self.now, decided);
+            self.tk_status = status.clone();
+            // A keeper that restarts after the confirm takes the flags over.
+            match tk_flags::armed_sha(&status, &read_file(&tk_result_path())) {
+                Some(sha) => self.arm_tk_flags(&sha),
+                None => {
+                    let reason = if status.staged.is_some() {
+                        "waiting for the boot confirm"
+                    } else {
+                        "stock modem firmware: no flag writes"
+                    };
+                    let _ = fs::write(tk_flags_status_path(), tk_flags::idle_status(reason, self.now));
+                }
+            }
+            let left = self
+                .tk_confirm
+                .as_ref()
+                .map(|confirm| confirm.deadline.saturating_sub(self.now));
+            if let Some(left) = left {
+                self.note(&format!(
+                    "tk boot confirm armed: without a management answer through the core in {left} s the keeper quarantines this image and reboots onto stock modem firmware"
+                ));
+            }
+        }
+        if self.tk_confirm.is_none() || self.reboot_asked_at.is_some() {
+            return;
+        }
+        if let Some(mut probe) = self.tk_probe.take() {
+            let mut heard = false;
+            let mut running = false;
+            for child in probe.children.iter_mut() {
+                match child.try_wait() {
+                    Ok(Some(status)) => heard |= status.success(),
+                    Ok(None) => running = true,
+                    Err(_) => {}
+                }
+            }
+            let timed_out = self.now.saturating_sub(probe.started) >= tk_boot::PROBE_TIMEOUT;
+            if !heard && running && !timed_out {
+                self.tk_probe = Some(probe);
+                return;
+            }
+            for child in probe.children.iter_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.tk_round(Some(heard));
+            return;
+        }
+        if self
+            .tk_last_round
+            .is_some_and(|last| self.now.saturating_sub(last) < tk_boot::PROBE_EVERY)
+        {
+            return;
+        }
+        self.tk_last_round = Some(self.now);
+        let children = spawn_pings(&tk_targets());
+        if children.is_empty() {
+            self.tk_round(None);
+            return;
+        }
+        self.tk_probe = Some(DeafProbe {
+            children,
+            started: self.now,
+        });
+    }
+
+    fn tk_round(&mut self, heard: Option<bool>) {
+        let Some(mut confirm) = self.tk_confirm.take() else {
+            return;
+        };
+        match confirm.observe(self.now, mgmt_address_up(), heard) {
+            TkAction::Hold => self.tk_confirm = Some(confirm),
+            TkAction::Confirmed => self.tk_confirmed(&confirm.sha),
+            TkAction::Rollback => self.tk_rollback(&confirm.sha),
+        }
+    }
+
+    fn tk_confirmed(&mut self, sha: &str) {
+        self.tk_confirmed_record(sha);
+        // Only now, and only for the image the hook staged, may flags be written.
+        if let Some(armed) = tk_flags::armed_sha(&self.tk_status, &format!("confirmed={sha}\n")) {
+            self.arm_tk_flags(&armed);
+        }
+    }
+
+    fn tk_confirmed_record(&mut self, sha: &str) {
+        let _ = fs::write(tk_result_path(), format!("confirmed={sha}\n"));
+        let short = tk_boot::short(sha);
+        let Some(dir) = tk_dir() else {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core, but the persistent volume is not mounted; its strike stays counted"
+            ));
+            return;
+        };
+        let cleared = write_atomic(&dir.join("strikes"), tk_boot::format_strikes(0).as_bytes());
+        let _ = write_atomic(&dir.join("confirmed"), format!("sha256={sha}\n").as_bytes());
+        if cleared {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core; strikes cleared"
+            ));
+        } else {
+            self.note(&format!(
+                "tk boot confirmed: modem firmware {short} answered through the core, but the strike count could not be cleared"
+            ));
+        }
+    }
+
+    /// Quarantine the image and reboot onto stock firmware, but only once a
+    /// read-back shows the boot hook will refuse it: a reboot without that
+    /// record could load the same image again.
+    fn tk_rollback(&mut self, sha: &str) {
+        let _ = fs::write(tk_result_path(), format!("rollback={sha}\n"));
+        let short = tk_boot::short(sha);
+        let secs = tk_boot::CONFIRM_SECS;
+        let Some(dir) = tk_dir() else {
+            self.note(&format!(
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}, but the persistent volume is not mounted; not rebooting"
+            ));
+            return;
+        };
+        let quarantine = dir.join("quarantine");
+        let strikes = dir.join("strikes");
+        let listed = tk_boot::add_quarantine(&read_file(&quarantine.to_string_lossy()), sha);
+        let _ = write_atomic(&quarantine, listed.as_bytes());
+        let _ = write_atomic(&strikes, tk_boot::format_strikes(tk_boot::STRIKE_LIMIT).as_bytes());
+        let recorded = tk_boot::refused(
+            tk_boot::parse_strikes(&read_file(&strikes.to_string_lossy())),
+            &tk_boot::parse_quarantine(&read_file(&quarantine.to_string_lossy())),
+            sha,
+        );
+        if !recorded {
+            self.note(&format!(
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}, and the quarantine could not be recorded; not rebooting"
+            ));
+            return;
+        }
+        self.note(&format!(
+            "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; quarantined it, rebooting onto stock modem firmware"
+        ));
+        self.request_reboot();
+    }
+
+    /// Start the flag writes for a confirmed staged boot. The words and values
+    /// come from `wm=` lines in `tk/config`.
+    fn arm_tk_flags(&mut self, sha: &str) {
+        if self.tk_flags.is_some() {
+            return;
+        }
+        let short = tk_boot::short(sha).to_owned();
+        let Some(dir) = tk_dir() else {
+            self.note(&format!(
+                "tk flags: modem firmware {short} confirmed, but the persistent volume is not mounted; no flag writes"
+            ));
+            let _ = fs::write(
+                tk_flags_status_path(),
+                tk_flags::idle_status("the persistent volume is not mounted", self.now),
+            );
+            return;
+        };
+        let text = read_file(&dir.join("config").to_string_lossy());
+        self.note_tk_flags_refused(&text);
+        let wanted = tk_flags::wanted(&text, &[]);
+        if wanted.is_empty() {
+            let _ = fs::write(
+                tk_flags_status_path(),
+                tk_flags::idle_status("no wm= lines in tk/config", self.now),
+            );
+        } else {
+            self.note(&format!(
+                "tk flags: modem firmware {short} confirmed; writing {} once the patch magic shows",
+                tk_flags::list(&wanted)
+            ));
+        }
+        let control = tk_flags::Control::new(wanted, self.now);
+        if !control.wanted().is_empty() {
+            let _ = fs::write(tk_flags_status_path(), control.status(self.now));
+        }
+        self.tk_flags = Some(control);
+        self.tk_flags_config_at = Some(self.now);
+    }
+
+    fn note_tk_flags_refused(&mut self, config: &str) {
+        let refused = tk_flags::parse_writes(config).refused;
+        if refused == self.tk_flags_refused {
+            return;
+        }
+        for line in &refused {
+            self.note(&format!(
+                "tk flags: ignored {line:?} in tk/config: only wm=0x84f93008:<0..0x200> and wm=0x847ed604:<bits 0x15> are allowed"
+            ));
+        }
+        self.tk_flags_refused = refused;
+    }
+
+    /// Run the DM sessions for the flags, one at a time, on their own thread.
+    /// Nothing runs unless `arm_tk_flags` made a `Control`.
+    fn maintain_tk_flags(&mut self) {
+        let mut lines: Vec<String> = Vec::new();
+        let mut changed = false;
+        if self
+            .tk_flags_job
+            .as_ref()
+            .is_some_and(|(job, _)| job.is_finished())
+        {
+            if let Some((job, plan)) = self.tk_flags_job.take() {
+                let (outcome, sent) = job.join().unwrap_or((tk_flags::Outcome::NoReply, false));
+                if let Some(control) = self.tk_flags.as_mut() {
+                    lines.extend(control.finished(self.now, &plan, &outcome, sent));
+                    changed = true;
+                }
+            }
+        }
+        let restarted = std::mem::take(&mut self.modem_restart_seen);
+        if self.tk_flags.is_none() {
+            return;
+        }
+        // The operator may change tk/config: read it again now and then. A
+        // missing file means off; a read error changes nothing.
+        let mut config_text = None;
+        if self
+            .tk_flags_config_at
+            .is_none_or(|at| self.now.saturating_sub(at) >= TK_FLAGS_CONFIG_EVERY)
+        {
+            self.tk_flags_config_at = Some(self.now);
+            if let Some(dir) = tk_dir() {
+                config_text = match fs::read_to_string(dir.join("config")) {
+                    Ok(text) => Some(text),
+                    Err(err) if err.kind() == ErrorKind::NotFound => Some(String::new()),
+                    Err(_) => None,
+                };
+            }
+        }
+        if let Some(text) = &config_text {
+            self.note_tk_flags_refused(text);
+        }
+        let busy = self.tk_flags_job.is_some() || self.reboot_asked_at.is_some();
+        let mut spawned = None;
+        if let Some(control) = self.tk_flags.as_mut() {
+            if restarted {
+                lines.push(control.modem_restarted(self.now));
+                changed = true;
+            }
+            if let Some(text) = &config_text {
+                let wanted = tk_flags::wanted(text, control.wanted());
+                if let Some(line) = control.set_wanted(wanted, self.now) {
+                    lines.push(line);
+                    changed = true;
+                }
+            }
+            if !busy {
+                if let Some(plan) = control.due(self.now) {
+                    match tk_flags_io::spawn(plan.clone()) {
+                        Some(job) => spawned = Some((job, plan)),
+                        None => {
+                            let outcome = tk_flags::Outcome::NoReply;
+                            lines.extend(control.finished(self.now, &plan, &outcome, false));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if spawned.is_some() {
+            self.tk_flags_job = spawned;
+        }
+        let status = if changed {
+            self.tk_flags.as_ref().map(|control| {
+                if control.wanted().is_empty() {
+                    tk_flags::idle_status("no wm= lines in tk/config", self.now)
+                } else {
+                    control.status(self.now)
+                }
+            })
+        } else {
+            None
+        };
+        for line in lines {
+            self.note(&line);
+        }
+        if let Some(status) = status {
+            let _ = fs::write(tk_flags_status_path(), status);
+        }
+    }
+
+    /// Load the staged download clamp once the customer port and LTE are up,
+    /// and keep its mode as `qctrl/config` says. Runs in every mode.
+    fn maintain_qctrl(&mut self) {
+        if self
+            .qctrl
+            .checked_at
+            .is_some_and(|at| self.now.saturating_sub(at) < qctrl::CHECK_EVERY)
+        {
+            return;
+        }
+        self.qctrl.checked_at = Some(self.now);
+        let Some(dir) = qctrl_io::staged_dir() else {
+            self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
+            return;
+        };
+        let config = qctrl::parse_config(&read_file(&dir.join("config").to_string_lossy()));
+        if config.refused != self.qctrl.refused_logged {
+            for line in &config.refused {
+                self.note(&format!(
+                    "download clamp: ignored {line:?} in qctrl/config (allowed: mode=0|2|3|6, trough_ms=0..40, target_ms=4..80)"
+                ));
+            }
+            self.qctrl.refused_logged = config.refused.clone();
+        }
+        let up = carrier_up(CUSTOMER) && (config.mode == 0 || mgmt_address_up());
+        if !up {
+            self.qctrl.up_since = None;
+        } else if self.qctrl.up_since.is_none() {
+            self.qctrl.up_since = Some(self.now);
+        }
+        let proc_text = read_file(&qctrl_io::proc_path());
+        match qctrl::loaded(&read_file(&qctrl_io::modules_path()), &proc_text) {
+            QctrlLoaded::Other(name) => {
+                let (state, detail) = if config.mode == 0 {
+                    ("off", format!("mode 0; another clamp module is loaded ({name})"))
+                } else {
+                    ("failed", format!("another clamp module is loaded ({name}); not loading {}", qctrl::MODULE))
+                };
+                self.qctrl_status(state, &detail, &config);
+                return;
+            }
+            QctrlLoaded::None => {
+                if config.mode == 0 {
+                    self.qctrl_status("off", "mode 0 or no qctrl/config", &config);
+                    return;
+                }
+                if !qctrl::settled(self.qctrl.up_since, self.now) {
+                    self.qctrl_status(
+                        "waiting",
+                        &format!("for the customer port and LTE to stay up {} s", qctrl::SETTLE_SECS),
+                        &config,
+                    );
+                    return;
+                }
+                if self.qctrl.failed_for.as_ref() == Some(&config) {
+                    return;
+                }
+                if let Err(err) = qctrl_io::stage(&dir).and_then(|path| qctrl_io::insmod(&path)) {
+                    self.qctrl.failed_for = Some(config.clone());
+                    self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
+                    return;
+                }
+                self.note(&format!("download clamp: loaded {} from the staged copy", qctrl::VERSION_LINE));
+            }
+            QctrlLoaded::Ours => {}
+        }
+        let proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
+        if !proc.ours {
+            self.qctrl.failed_for = Some(config.clone());
+            self.qctrl_status(
+                "failed",
+                &format!("/proc/titan_qctrl does not show {}", qctrl::VERSION_LINE),
+                &config,
+            );
+            return;
+        }
+        if !qctrl::matches(&config, &proc) {
+            if let Err(err) = qctrl_io::write_proc(&qctrl::proc_writes(&config)) {
+                self.qctrl_status("failed", &err, &config);
+                return;
+            }
+        }
+        let proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
+        if !qctrl::matches(&config, &proc) {
+            let shown = proc.mode.map_or_else(|| "nothing".to_owned(), |m| m.to_string());
+            self.qctrl_status(
+                "failed",
+                &format!("mode {} did not read back (shows {shown})", config.mode),
+                &config,
+            );
+            return;
+        }
+        let state = if config.mode == 0 { "off" } else { "applied" };
+        let detail = format!(
+            "mode {} read back from /proc/titan_qctrl{}{}",
+            config.mode,
+            config.trough_ms.map_or_else(String::new, |ms| format!(", trough_ms {ms}")),
+            config.target_ms.map_or_else(String::new, |ms| format!(", target_ms {ms}"))
+        );
+        self.qctrl_status(state, &detail, &config);
+    }
+
+    /// Write the clamp status file and log the change. A unit that never
+    /// staged a clamp logs nothing.
+    fn qctrl_status(&mut self, state: &str, detail: &str, config: &qctrl::Config) {
+        let key = format!("{state}: {detail}");
+        if key == self.qctrl.shown {
+            return;
+        }
+        let quiet = state == "off" && self.qctrl.shown.is_empty();
+        self.qctrl.shown = key;
+        let _ = fs::write(qctrl_io::status_path(), qctrl::status(state, detail, config, self.now));
+        if !quiet {
+            self.note(&format!("download clamp {state}: {detail}"));
         }
     }
 
@@ -2708,6 +3220,93 @@ fn reboot_program() -> String {
     std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
 }
 
+/// One ping to each target, collected on later ticks.
+fn spawn_pings(targets: &[std::net::IpAddr]) -> Vec<std::process::Child> {
+    targets
+        .iter()
+        .filter_map(|target| {
+            let program = if target.is_ipv6() { "ping6" } else { "ping" };
+            let address = target.to_string();
+            Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
+                .args(["-c", "1", "-W", "4", address.as_str()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .ok()
+        })
+        .collect()
+}
+
+fn tk_status_path() -> String {
+    std::env::var("TITAN_TK_STATUS").unwrap_or_else(|_| "/var/run/witcher-tk.status".into())
+}
+
+/// Written once a keeper process confirmed or rolled back this boot.
+fn tk_result_path() -> String {
+    std::env::var("TITAN_TK_RESULT").unwrap_or_else(|_| "/var/run/witcher-tk.result".into())
+}
+
+/// The flag writes' status, in RAM.
+fn tk_flags_status_path() -> String {
+    std::env::var("TITAN_TK_FLAGS").unwrap_or_else(|_| "/var/run/witcher-tk.flags".into())
+}
+
+/// The boot hook's files on the persistent volume, only while it is mounted.
+fn tk_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("TITAN_TK_DIR") {
+        return Some(PathBuf::from(path));
+    }
+    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/tk"))
+}
+
+/// The tk config's own targets, else the deaf watchdog's.
+fn tk_targets() -> Vec<std::net::IpAddr> {
+    let config = tk_dir()
+        .map(|dir| read_file(&dir.join("config").to_string_lossy()))
+        .unwrap_or_default();
+    let own = tk_boot::parse_targets(&config);
+    if !own.is_empty() {
+        return own;
+    }
+    let settings = deaf::parse_settings(&read_file(
+        &state_dir().join("watchdog.conf").to_string_lossy(),
+    ));
+    let bearer_dns = if settings.targets.is_empty() {
+        command_stdout("nvram_get", &["0", "wan_get_dns"])
+    } else {
+        String::new()
+    };
+    deaf::targets(&settings, &bearer_dns)
+}
+
+/// The management bearer has an IPv4 or global IPv6 address.
+fn mgmt_address_up() -> bool {
+    carrier_up(mgmt::MGMT_DEV)
+        && command_stdout("ip", &["addr", "show", "dev", mgmt::MGMT_DEV])
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with("inet ") || (line.starts_with("inet6 ") && line.contains("scope global")))
+}
+
+/// Write through a synced temporary file, then sync the directory, so a power
+/// cut leaves the old record or the new one.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> bool {
+    use std::io::Write;
+    let temp = path.with_extension("tmp");
+    let written = (|| -> io::Result<()> {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    written.is_ok()
+}
+
 /// Write the strike count through a temporary file, so a power cut cannot
 /// leave a torn record.
 fn store_strikes(path: &std::path::Path, strikes: u32) -> bool {
@@ -2721,6 +3320,29 @@ fn published_detail(existing: &str, argument: &str) -> String {
     } else {
         argument.to_owned()
     }
+}
+
+/// One ebtables or ip6tables command for the CBRS gate: its output when it
+/// exits 0.
+fn gate_command(tool: GateTool, args: &[&str]) -> Result<String, String> {
+    let program = match tool {
+        GateTool::Ebtables => {
+            std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into())
+        }
+        GateTool::Ip6tables => {
+            std::env::var("TITAN_IP6TABLES").unwrap_or_else(|_| "ip6tables".into())
+        }
+    };
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| err.to_string())?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    let err = err.trim();
+    Err(if err.is_empty() { output.status.to_string() } else { err.to_owned() })
 }
 
 fn ebtables(args: &str) -> Result<(), String> {

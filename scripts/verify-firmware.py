@@ -3,12 +3,15 @@
 
 Checks: container CRCs/length; kernel and tk byte-identical to stock; all 254
 device nodes present with correct major/minor; every inode owned by uid/gid 500;
-the overlay scripts present; and gdmlte.ko carries exactly the one-byte /56
-patch (and nothing else) versus the stock module.
+the overlay scripts present; gdmlte.ko carries exactly the one-byte /56
+patch (and nothing else) versus the stock module; and the boot-time tk loader
+keeps the stock modem.ko, adds a copy that differs only in its 4-byte gate, and
+adds no modem firmware bytes.
 
 Usage: scripts/verify-firmware.py STOCK.prg BUILT.prg
 """
-import struct, zlib, sys, os, tempfile, collections, hashlib, json, gzip, tarfile, subprocess
+import struct, zlib, sys, os, re, tempfile, collections, hashlib, json, gzip, tarfile, subprocess
+import importlib.util
 from pathlib import Path
 from rootfs_metadata import boot_errors, prg_metadata
 from credential_policy import credential_findings, legacy_credentials
@@ -194,6 +197,36 @@ def main():
         cbb=open(cb,'rb').read()
         check('cbrs_fsm block routine no-op (@0x4fcc)', cbb[0x4fcc:0x4fd4]==bytes.fromhex('0000a0e31eff2fe1'))
         check('cbrs_fsm firewall neutered (@0x1c8b4)', cbb[0x1c8b4:0x1c8bc]==b'true    ')
+    # Boot-time tk loader (docs/tk-boot-loader.md).
+    spec = importlib.util.spec_from_file_location('patch_modem_ko', Path(__file__).with_name('patch-modem-ko.py'))
+    gate = importlib.util.module_from_spec(spec); spec.loader.exec_module(gate)
+    mk = Path(d)/'lib/modules/3.10.0-uc0/extra/modem.ko'
+    gated = Path(d)/'usr/lib/titan-api/tk/modem-tkfs.ko'
+    mkb = mk.read_bytes() if mk.is_file() else b''
+    gb = gated.read_bytes() if gated.is_file() else b''
+    check('modem.ko is the stock module', hashlib.sha256(mkb).hexdigest() == gate.STOCK_SHA256)
+    changed = [i for i, (a, b) in enumerate(zip(mkb, gb)) if a != b]
+    check('gated modem.ko copy differs only in the 4-byte gate (@0x2088)',
+          hashlib.sha256(gb).hexdigest() == gate.GATED_SHA256 and len(gb) == len(mkb)
+          and changed and min(changed) >= 0x2088 and max(changed) < 0x208c)
+    hook = Path(d)/'etc/init.d/witcher-tk-stage'
+    hook_text = hook.read_text() if hook.is_file() else ''
+    check('tk loader hook pins the gated module', f'gated_sha={gate.GATED_SHA256}\n' in hook_text)
+    lte = Path(d)/'etc/sysconfig/script/start_lte.sh'
+    lte_text = lte.read_text() if lte.is_file() else ''
+    check('start_lte.sh runs the tk loader around modprobe modem only',
+          lte_text.count('witcher-tk-stage') == 2
+          and lte_text.count('\n/bin/sh /etc/init.d/witcher-tk-stage pre\n$PROBE_MODEM\n/bin/sh /etc/init.d/witcher-tk-stage post\n') == 1)
+    firmware = Path(d)/'lib/firmware'
+    stray = [str(path.relative_to(d)) for path in Path(d).rglob('*')
+             if path.is_file() and re.fullmatch(r'tk([._-].*)?\.(gz|xz|bin|gzip)', path.name)]
+    check('no modem firmware image in the rootfs',
+          not stray and sorted(p.name for p in firmware.iterdir()) == ['.keep', 'mrvl'])
+    for path in stray[:8]:
+        print('      modem firmware candidate '+path)
+    # The download clamp module is staged per unit (docs/download-clamp.md).
+    qctrl = [str(path.relative_to(d)) for path in Path(d).rglob('*qctrl*') if path.is_file()]
+    check('no download clamp module in the rootfs (staged per unit)', not qctrl)
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)

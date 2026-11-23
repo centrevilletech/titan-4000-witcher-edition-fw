@@ -41,6 +41,18 @@ components. See [GNU GPLv3 section 6](https://www.gnu.org/licenses/gpl-3.0.html#
 for distribution of covered object code. This inventory is not a complete
 firmware SBOM or a claim that all distribution obligations are satisfied.
 
+## Modem module copy and modem firmware
+
+The build patches vendor binaries from the stock image, as it does for
+`gdmlte.ko` and `cbrs_fsm`. For the [boot-time modem firmware loader](docs/tk-boot-loader.md)
+it also writes a second copy of the vendor `modem.ko` with one 4-byte
+instruction changed. The stock `modem.ko` stays in the image unchanged.
+
+Neither this repository nor the image carries modem firmware (`tk`) bytes,
+stock or patched. The image keeps the stock modem payload byte for byte. An
+operator stages any patched modem firmware on a unit by hand. Do not publish
+such images: they are modified vendor firmware.
+
 ## Images and screenshots
 
 The screenshots are generated from the current UI with synthetic fixtures;
@@ -58,3 +70,13 @@ The kernel and iproute2 carry GPL terms. The musl notice, kernel configuration,
 ABI patches, exact upstream source locations and ARM build recipe accompany
 the payload in [device/sqm/source](device/sqm/source/). Release distributors
 should include these inputs and the corresponding upstream sources.
+
+## Download clamp module
+
+`device/qctrl/payload/titan_qctrl.ko` (staged on a unit's persistent volume,
+not packed in the image) is an original Centreville Tech, LLC kernel module.
+Its source in [device/qctrl/source](device/qctrl/source/) is licensed
+GPL-2.0-only, because the module runs inside the GPL-2.0 Linux kernel; the
+license text is [device/sqm/source/COPYING](device/sqm/source/COPYING).
+`device/qctrl/source/build.sh` rebuilds the binary byte for byte with
+Ubuntu 24.04's `gcc-arm-linux-gnueabihf` (GCC 13.3.0-6ubuntu2~24.04.1).

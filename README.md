@@ -100,6 +100,12 @@ own SAS client reach the SAS. A vendor firewall restart after an LTE handover
 removes it, and the Block Channel patch removes the vendor's way of putting it
 back. See [SAS reachability in passthrough](docs/cbrs-sas-enforcement.md#sas-reachability-in-passthrough).
 
+Without a SAS grant the vendor blocks only customer IPv4. In passthrough the
+customer's IPv6 crosses the bridge, which skips ip6tables, so it kept flowing.
+Since v1.0.14 the keeper drops customer IPv6 to and from LTE whenever the unit
+has no grant, in every mode, and puts the rules back after each vendor
+firewall restart. See [Customer IPv6 without a SAS grant](docs/cbrs-sas-enforcement.md#customer-ipv6-without-a-sas-grant).
+
 A passthrough unit could stay attached but go deaf: the vendor kernel made the
 management bearer its external device, and the LTE driver then addressed
 management traffic to the customer router. The keeper watches the kernel log
@@ -123,6 +129,16 @@ The keeper writes to flash only when something changes. Routine lines, such as
 each periodic router advertisement, go to a log in RAM, and the status file is
 rewritten on flash at most once a minute. Witcher's logs in `/tmp` stay under
 about 80 KB each. See [Long runs](docs/long-runs.md).
+
+Since v1.0.15 two latency fixes can be turned on per unit, both off by
+default. After a confirmed boot of a staged N4 modem firmware image, the
+keeper writes the image's uplink queue control and grant-hold flags from the
+operator's config and reads each one back (bench: ping during an upload about
+100 ms to 38 ms). A staged download clamp module keeps the tower's download
+queue short (bench: ping during a full download about 310 ms to 50 ms, for
+about 8 % less peak speed). `scripts/stage-latency.sh` stages both. See
+[modem feature flags](docs/tk-boot-loader.md#modem-feature-flags) and the
+[download clamp](docs/download-clamp.md).
 
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
@@ -166,6 +182,8 @@ components this repository builds from source.
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
+- [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
+- [Download clamp (off by default)](docs/download-clamp.md)
 
 ## Learn LTE and build something
 

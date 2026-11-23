@@ -22,8 +22,10 @@ mod bench;
 mod capture;
 mod radio;
 mod radio_modem;
+mod qctrl_io;
 mod radio_sqm;
 mod run;
+mod tk_flags_io;
 
 fn main() {
     let mut args = env::args().skip(1);

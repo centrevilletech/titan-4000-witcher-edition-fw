@@ -72,3 +72,9 @@ The SQM tools (a static tc and two scheduler modules, about 720 KB) stay out
 of the image. They live in `device/sqm/payload` with pinned SHA-256 digests,
 and an operator stages them on a unit's persistent volume. See
 [radio profiles and SQM](radio-profiles.md).
+
+The download clamp module (`titan_qctrl.ko`, 22 KB) also stays out of the
+image, for the same reason and so it can change without a reflash. Its
+source, a byte-for-byte rebuild script and the pinned binary are in
+`device/qctrl`, and CI rebuilds it on every push. See
+[the download clamp](download-clamp.md).

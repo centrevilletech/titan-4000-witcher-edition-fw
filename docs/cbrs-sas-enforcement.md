@@ -99,3 +99,81 @@ loop.
 Do not repair this by forcing the vendor cbrs restart while
 `cbrs_mode_grant=0`: the same `rcinit` path inserts `iptables -I FORWARD -j
 DROP` on Band 48 until a grant arrives.
+
+## Customer IPv6 without a SAS grant
+
+The vendor blocks customer traffic without a grant with one IPv4 rule. On
+Band 48, when `cbrs_mode_grant` is `0`, each `rcinit` firewall rebuild adds
+`iptables -I FORWARD -j DROP` and an accept for DHCP. The radio stays attached
+and keeps sending. `ucid` keeps the modem power limit at 26 dBm, and nothing
+suspends the bearer. Only a SAS answer that makes the client block the cell
+(Channel Invalid) takes the radio off that cell.
+
+The vendor has no matching rule for IPv6:
+
+- `rcinit` writes `0` to `/proc/sys/net/bridge/bridge-nf-call-ip6tables`, so
+  IPv6 that crosses `br0` in passthrough never reaches ip6tables.
+- The vendor IPv6 firewall (`ip6tables-restore /tmp/.ip6t`) holds no grant
+  rule.
+
+So a passthrough unit without a grant keeps forwarding the customer router's
+IPv6 in both directions. A bench unit did that on 2026-11-22 while the vendor
+IPv4 drop was in place. With prefix delegation, that is the whole customer
+LAN, on every Witcher release from v1.0.0 to v1.0.13.
+
+Since v1.0.14 the keeper holds four DROP rules whenever the unit has no grant:
+
+| Table | Rule | Stops |
+| --- | --- | --- |
+| ebtables FORWARD | `-p IPv6 -o lte0pdn+ -j DROP` | Bridged IPv6 toward LTE (passthrough uplink) |
+| ebtables FORWARD | `-p IPv6 -i lte0pdn+ -j DROP` | Bridged IPv6 from LTE (passthrough downlink) |
+| ip6tables FORWARD | `-o lte0pdn+ -j DROP` | IPv6 the unit routes toward LTE (NAT mode) |
+| ip6tables FORWARD | `-i lte0pdn+ -j DROP` | IPv6 the unit routes from LTE (NAT mode) |
+
+`-p IPv6` matches the Ethernet type, so it needs no `ebt_ip6` module. The unit
+has none. The rules match only forwarded traffic. The unit's own traffic never
+reaches FORWARD: the SAS client, management on `lte0pdn0`, NTP, and the
+keeper's own router advertisements and DHCPv6 replies use INPUT and OUTPUT or
+skip the bridge.
+
+"Grant held" means `cbrs_mode_grant=1` and `cbrs_grant_state=2`, the same test
+the radio profile uses. The vendor IPv4 rule follows `cbrs_mode_grant`. The
+Block Channel patch stops the SAS client from clearing that key at transmit
+expiry and before a relinquish. The client still sets `cbrs_grant_state` to
+`1` or `0` at those times, so the IPv6 gate closes then too. The gate does not
+check the band, because this is a Band 48 unit and a torn read of the band
+must never open the gate.
+
+The keeper reads both keys from the vendor RAM cache (`/tmp/nvram.cfg`) every
+second, in every mode. It fails closed: a cache it cannot read, a missing key,
+or a value it does not know counts as no grant. The vendor rewrites that file
+in place, so one read can be torn. A clear "no grant" closes the gate at once.
+A read with a missing key or an odd value closes it when a read at least a
+second later agrees.
+
+Each vendor firewall restart flushes both tables (`ebtables -F`,
+`ip6tables -F`). While the gate is closed, the keeper reads both FORWARD chains
+every second and puts back any rule that is missing. If a chain cannot be
+read, it adds the rules anyway, one delete first so copies cannot pile up.
+When the grant returns, it removes every copy of its own rules and leaves all
+other rules alone. Each change goes to the keeper log as `CBRS gate closed`,
+`CBRS gate open` or `CBRS gate rules put back`.
+
+What this does not change:
+
+- IPv4 still follows the vendor rule only. That rule is missing after an
+  in-connection carrier change and, with the Block Channel patch, after
+  transmit expiry. In those cases customer IPv6 stops and IPv4 does not.
+- Customer IPv6 now pauses for each re-grant after a carrier change, for as
+  long as the new grant takes (on the bench, a median of 14 s and up to about
+  a minute). A re-attach that keeps its channel pauses it for about a second.
+- These rules do not stop RF transmission. Without a grant the radio still
+  sends control traffic, the unit's own SAS and management traffic, and
+  customer DHCP, as in the vendor design. The rules reduce what the unit
+  forwards without a grant. They do not by themselves establish compliance.
+- After a vendor firewall restart, forwarded IPv6 can pass for up to about a
+  second before the keeper puts the rules back. The vendor IPv4 rule has a
+  similar short gap during its own rebuild.
+- If the keeper is not running, nothing adds the rules. Rules it already added
+  stay until a vendor firewall restart flushes them. The service supervisor
+  restarts the keeper within about 5 s.

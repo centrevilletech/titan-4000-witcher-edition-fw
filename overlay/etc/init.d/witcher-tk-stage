@@ -1,0 +1,269 @@
+#!/bin/sh
+# Boot-time modem firmware (tk) loader. Off unless an operator opts in.
+#
+# start_lte.sh runs `witcher-tk-stage pre` right before its one
+# `modprobe modem` and `witcher-tk-stage post` right after it returns (the
+# build adds both lines). See docs/tk-boot-loader.md.
+#
+# Without an opt-in, or after any failed check, nothing is bound. The stock
+# modem.ko then loads the stock firmware from NAND, as on a unit without this
+# hook. The only trace is a read-only look at the Witcher volume.
+#
+# The gated modem.ko reads /lib/firmware/tk.gz first. It falls back to NAND
+# only when no tk.gz or tk.xz opens there. A file that opens but is bad is NOT
+# a fallback: the modem CPU starts on whatever reached its RAM
+# (scripts/patch-modem-ko.py has the disassembly). So pre binds /lib/firmware
+# only after the copy it binds has passed every check, and post removes it
+# right after the modprobe. A later modem crash then reloads stock NAND
+# firmware.
+#
+# Files on the Witcher volume (ubi1:data, seen as /mnt/titan-api/tk later):
+#   config      operator: enabled=1, one sha256=<64 hex> line per allowed
+#               image, optional target=<address> lines for the boot confirm
+#   active.gz   operator: the staged image
+#   strikes     strikes=N: staged boots since the last boot confirm. pre adds
+#               one before every load. The keeper writes 0 on a boot confirm.
+#   quarantine  one hash per line, never staged again (the keeper adds them)
+#   confirmed   the last hash the keeper confirmed (information only)
+# For the keeper, in RAM: /var/run/witcher-tk.status
+set -u
+umask 077
+export PATH=/sbin:/usr/sbin:/bin:/usr/bin
+mtd=20
+devn=1
+procmtd=/proc/mtd
+mounts=/proc/mounts
+meminfo=/proc/meminfo
+uptime=/proc/uptime
+ubi=/sys/class/ubi
+ctrl=/dev/ubi_ctrl
+vendor=/mnt
+work=/var/witcher-tk
+status=/var/run/witcher-tk.status
+firmware=/lib/firmware
+module=/lib/modules/3.10.0-uc0/extra/modem.ko
+gated=/usr/lib/titan-api/tk/modem-tkfs.ko
+gated_sha=161ffdd052059a14747041a74b7b7740c705bfd52c9913a9013cbb0a15f55977
+limit=2
+max_bytes=7864320
+min_free_kb=32768
+state=$work/state
+fw=$work/fw
+dir=$state/tk
+
+put() { echo "$1=$2" >> "$status"; }
+say() { echo "witcher-tk: $*"; }
+# Run with a time limit. BusyBox 1.21 on the Titan takes `timeout -t SECS`,
+# newer BusyBox takes `timeout SECS`. If neither works the command does not
+# run, and the check that follows it keeps stock firmware. The probe runs
+# /bin/sh, not `true`: the Titan has no `true` program (only the shell
+# builtin), so probing with it made every boot keep stock firmware.
+tmo_style=
+tmo() {
+ t=$1; shift
+ if [ -z "$tmo_style" ]; then
+  if timeout -t 1 /bin/sh -c : > /dev/null 2>&1; then tmo_style=t
+  elif timeout 1 /bin/sh -c : > /dev/null 2>&1; then tmo_style=plain
+  else tmo_style=none; fi
+ fi
+ case "$tmo_style" in
+  t) timeout -t "$t" "$@";;
+  plain) timeout "$t" "$@";;
+  *) return 124;;
+ esac
+}
+mounted() { awk -v p="$1" '$2 == p { f = 1 } END { exit !f }' "$mounts"; }
+owner() { awk -v p="$1" -v d="$2" '$2 == p && $1 == d { f = 1 } END { exit !f }' "$mounts"; }
+# Unmount $1, lazily if a plain unmount fails. True once it is gone.
+release() {
+ mounted "$1" || return 0
+ umount "$1" 2> /dev/null || umount -l "$1" 2> /dev/null
+ ! mounted "$1"
+}
+# The UBI device number attached to our partition, if any.
+on_mtd() {
+ for d in "$ubi"/ubi[0-9]*; do
+  [ -f "$d/mtd_num" ] || continue
+  if [ "$(cat "$d/mtd_num" 2> /dev/null)" = "$mtd" ]; then echo "${d##*/ubi}"; return 0; fi
+ done
+ return 1
+}
+detach() {
+ on_mtd > /dev/null || return 0
+ tmo 30 ubidetach "$ctrl" -m "$mtd" > /dev/null 2>&1
+ ! on_mtd > /dev/null
+}
+# The last value of key $1 in file $2, with spaces and carriage returns removed.
+# A # starts a comment.
+value() { awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); print v }' "$2" 2> /dev/null; }
+allowed() { awk -F= -v h="$1" '$1 == "sha256" { v = $2; sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); if (tolower(v) == h) f = 1 } END { exit !f }' "$dir/config"; }
+quarantined() {
+ [ -e "$dir/quarantine" ] || return 1
+ awk -v h="$1" '{ v = $0; sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); if (tolower(v) == h) f = 1 } END { exit !f }' "$dir/quarantine"
+}
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+
+# TODO(signature): Phase 1 trusts the sha256 allow-list in config, which only
+# root on the unit can write. Phase 2 checks a signature here, before anything
+# is bound. Interface: verify_signature <image> <sha256> <signature file>
+# exits 0 only when <signature file> (active.gz.sig next to active.gz, a raw
+# 64-byte Ed25519 signature over the 32-byte SHA-256) verifies against the
+# public key the image carries in /usr/lib/titan-api/tk/signing.pub. Any other
+# exit means stock firmware.
+verify_signature() { return 0; }
+
+# Undo whatever this run of pre set up. Never touches what it did not create.
+undo() {
+ [ "$bound_firmware" = 1 ] && release "$firmware" && bound_firmware=0
+ [ "$bound_module" = 1 ] && release "$module" && bound_module=0
+ if [ "$fw_mounted" = 1 ]; then
+  rm -f "$fw/tk.gz"
+  release "$fw" && fw_mounted=0
+ fi
+ [ "$state_mounted" = 1 ] && release "$state" && state_mounted=0
+ [ "$attached" = 1 ] && detach && attached=0
+ rmdir "$fw" "$state" 2> /dev/null
+ return 0
+}
+
+# Every check that must pass before a patched image may load. Sets $why and
+# returns 1 to keep stock firmware.
+stage() {
+ for path in "$firmware" "$module" "$fw" "$state"; do
+  if mounted "$path"; then why='leftover'; return 1; fi
+ done
+ if [ -e "$firmware/tk.gz" ] || [ -e "$firmware/tk.xz" ]; then why='leftover'; return 1; fi
+ grep -Eq "^mtd$mtd: [0-9a-fA-F]+ [0-9a-fA-F]+ \"user\"\$" "$procmtd" || { why='no-user-mtd'; return 1; }
+ if on_mtd > /dev/null || [ -e "$ubi/ubi$devn" ]; then why='ubi-busy'; return 1; fi
+ mkdir -p "$state" "$fw" || { why='workdir'; return 1; }
+ tmo 30 ubiattach "$ctrl" -m "$mtd" -d "$devn" > /dev/null 2>&1
+ # Nothing was attached to the partition before, so whatever is now is ours.
+ attached=1
+ [ "$(on_mtd)" = "$devn" ] || { why='attach'; return 1; }
+ found=
+ for v in "$ubi/ubi${devn}_"*; do
+  [ "$(cat "$v/name" 2> /dev/null)" = data ] && found=1
+ done
+ [ -n "$found" ] || { why='no-volume'; return 1; }
+ tmo 30 mount -t ubifs -o ro "ubi$devn:data" "$state" > /dev/null 2>&1
+ mounted "$state" || { why='mount'; return 1; }
+ state_mounted=1
+
+ [ -d "$dir" ] && [ ! -L "$dir" ] && regular "$dir/config" || { why='off'; return 1; }
+ [ "$(value enabled "$dir/config")" = 1 ] || { why='off'; return 1; }
+ strikes=0
+ if [ -e "$dir/strikes" ]; then
+  strikes=$(value strikes "$dir/strikes")
+  case "$strikes" in ''|*[!0-9]*) why='strikes-unreadable'; return 1;; esac
+  [ "${#strikes}" -le 3 ] || { why='strikes-unreadable'; return 1; }
+ fi
+ [ "$strikes" -lt "$limit" ] || { why='strikes'; return 1; }
+ regular "$dir/active.gz" || { why='no-image'; return 1; }
+ size=$(wc -c < "$dir/active.gz" | tr -d ' ')
+ case "$size" in ''|*[!0-9]*) why='size'; return 1;; esac
+ [ "$size" -ge 1024 ] && [ "$size" -le "$max_bytes" ] || { why='size'; return 1; }
+ free=$(awk '$1 == "MemFree:" { print $2 }' "$meminfo")
+ case "$free" in ''|*[!0-9]*) free=0;; esac
+ [ "$free" -ge "$min_free_kb" ] || { why='memory'; return 1; }
+
+ # Check the copy that will load, not the file on flash.
+ tmo 30 mount -t tmpfs -o size=8m,mode=0700 witcher-tk "$fw" > /dev/null 2>&1
+ mounted "$fw" || { why='tmpfs'; return 1; }
+ fw_mounted=1
+ tmo 60 cp "$dir/active.gz" "$fw/tk.gz" || { why='copy'; return 1; }
+ sha=$(sha256sum "$fw/tk.gz" | cut -d' ' -f1)
+ case "$sha" in *[!0-9a-f]*|'') why='hash'; return 1;; esac
+ [ "${#sha}" -eq 64 ] || { why='hash'; return 1; }
+ allowed "$sha" || { why='not-allowed'; return 1; }
+ if quarantined "$sha"; then why='quarantined'; return 1; fi
+ # The modem's own gzip reader rejects these, after it has already started
+ # down the no-fallback path: magic 1f 8b, method 8, no reserved, encrypted
+ # or multi-part flags.
+ head=$(hexdump -n 4 -v -e '4/1 "%02x"' "$fw/tk.gz" 2> /dev/null)
+ case "$head" in 1f8b08[0-9a-f][0-9a-f]) ;; *) why='header'; return 1;; esac
+ [ $((0x${head#1f8b08} & 226)) -eq 0 ] || { why='header'; return 1; }
+ verify_signature "$fw/tk.gz" "$sha" "$dir/active.gz.sig" || { why='signature'; return 1; }
+ regular "$module" || { why='module'; return 1; }
+ [ "$(sha256sum "$gated" 2> /dev/null | cut -d' ' -f1)" = "$gated_sha" ] || { why='module'; return 1; }
+
+ # Count the strike before the load, so a boot that dies anywhere after
+ # this point still counts.
+ tmo 30 mount -o remount,rw "$state" > /dev/null 2>&1 || { why='strike-write'; return 1; }
+ next=$((strikes + 1))
+ rm -f "$dir/strikes.tmp"
+ { printf 'strikes=%s\n' "$next" > "$dir/strikes.tmp" && sync && mv -f "$dir/strikes.tmp" "$dir/strikes" && sync; } \
+  || { why='strike-write'; return 1; }
+ [ "$(value strikes "$dir/strikes")" = "$next" ] || { why='strike-write'; return 1; }
+ # The vendor attaches this partition again later. Leave it as found.
+ release "$state" || { why='detach'; return 1; }
+ state_mounted=0
+ detach || { why='detach'; return 1; }
+ attached=0
+
+ mount --bind "$gated" "$module" > /dev/null 2>&1
+ mounted "$module" || { why='bind'; return 1; }
+ bound_module=1
+ mount --bind "$fw" "$firmware" > /dev/null 2>&1
+ mounted "$firmware" || { why='bind'; return 1; }
+ bound_firmware=1
+ regular "$firmware/tk.gz" || { why='bind'; return 1; }
+ return 0
+}
+
+pre() {
+ mkdir -p "$work" "${status%/*}"
+ rm -f "$status"
+ attached=0 state_mounted=0 fw_mounted=0 bound_module=0 bound_firmware=0 finished=0
+ why='' sha='' next=''
+ trap '[ "$finished" = 1 ] || { undo; put state stock; put reason aborted; }' EXIT
+ trap 'exit 1' HUP INT TERM
+ if stage; then
+  put state staged
+  put sha256 "$sha"
+  put strikes "$next"
+  say "loading staged modem firmware $sha (strike $next of $limit)"
+ else
+  undo
+  put state stock
+  put reason "$why"
+  [ "$why" = off ] || say "stock modem firmware ($why)"
+ fi
+ finished=1
+}
+
+post() {
+ mkdir -p "${status%/*}"
+ # Make the image unreadable first: /lib/firmware shows this tmpfs while bound.
+ rm -f "$fw/tk.gz" 2> /dev/null
+ if owner "$firmware" witcher-tk; then release "$firmware"; fi
+ release "$module"
+ release "$fw"
+ # pre stopped before it finished (killed): leave the partition as found,
+ # unless the vendor has started using it.
+ if [ -z "$(value state "$status")" ]; then
+  release "$state"
+  detach
+ fi
+ rmdir "$fw" "$state" 2> /dev/null
+ put loaded_at "$(cut -d. -f1 "$uptime")"
+ put source "$(dmesg 2> /dev/null | awk '/read from fs/ { s = "fs" } /read from nand/ { s = "nand" } END { if (s == "") s = "unknown"; print s }')"
+ if [ -e "$firmware/tk.gz" ] || [ -e "$firmware/tk.xz" ] || owner "$firmware" witcher-tk || mounted "$module"; then
+  put firmware dirty
+  say "could not remove the staged modem firmware from /lib/firmware"
+ else
+  put firmware clean
+ fi
+}
+
+# Only at boot, before the vendor mounts its volume. A run on a live unit
+# would take the status for this boot away from the keeper.
+if mounted "$vendor"; then
+ echo 'witcher-tk-stage runs only at boot, from start_lte.sh' >&2
+ exit 64
+fi
+case "${1:-}" in
+ pre) [ "$#" = 1 ] || exit 64; pre;;
+ post) [ "$#" = 1 ] || exit 64; post;;
+ *) echo 'Usage: witcher-tk-stage pre|post' >&2; exit 64;;
+esac
+exit 0
