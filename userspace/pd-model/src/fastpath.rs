@@ -324,7 +324,7 @@ pub fn lease_decision(
     match gate {
         Gate::Open(_) if active => LeaseAction::Renew(GRANT_LEASE_SECS),
         Gate::Open(_) => {
-            if state == LeaseState::Open {
+            if state != LeaseState::Revoked {
                 LeaseAction::Revoke
             } else {
                 LeaseAction::Hold
@@ -359,6 +359,8 @@ pub fn lease_command(action: LeaseAction) -> Option<String> {
 /// Tracks applied mode and watchdog trips / unexpected drops for one boot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TripWatch {
+    /// True after the first `/proc/k1fp` observation in this keeper process.
+    observed: bool,
     /// Mode last confirmed in `/proc/k1fp` (only when > 0).
     applied_mode: Option<u32>,
     /// Automatic re-arms used this boot (capped at `MAX_AUTO_REARMS`).
@@ -401,6 +403,9 @@ fn describe_trip(proc: &Proc, prev_wd_trips: u32, want_mode: u32) -> String {
 
 impl TripWatch {
     pub fn evaluate(&mut self, config: &Config, proc: &Proc) -> TripAction {
+        let first_observation = !self.observed;
+        self.observed = true;
+
         if config.mode == 0 {
             self.applied_mode = None;
             self.tripped_for = None;
@@ -460,7 +465,8 @@ impl TripWatch {
         }
 
         // First observation (e.g. keeper restarted after a watchdog trip).
-        if self.applied_mode.is_none()
+        if first_observation
+            && self.applied_mode.is_none()
             && proc.mode == Some(0)
             && proc.wd_trips.unwrap_or(0) > 0
         {
@@ -926,6 +932,16 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
             tw3.evaluate(&cfg2, &already_tripped),
             TripAction::Tripped { first_notice: true, .. }
         ));
+        // Operator clears tripped state by setting mode=0 then re-enabling mode=2.
+        let cfg0 = parse_config("mode=0\n");
+        assert_eq!(tw3.evaluate(&cfg0, &already_tripped), TripAction::Normal);
+        assert_eq!(tw3.evaluate(&cfg2, &already_tripped), TripAction::Apply);
+
+        // Adopting an already-loaded module running at mode=2 records applied_mode so
+        // any later drop is detected.
+        let mut tw4 = TripWatch::default();
+        assert_eq!(tw4.evaluate(&cfg2, &proc2), TripAction::Normal);
+        assert!(matches!(tw4.evaluate(&cfg2, &proc0), TripAction::Rearm { .. }));
     }
 
     #[test]

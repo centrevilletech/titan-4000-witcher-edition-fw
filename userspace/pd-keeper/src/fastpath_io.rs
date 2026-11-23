@@ -191,6 +191,8 @@ pub struct Watch {
     refused_logged: Vec<String>,
     /// True while our `titan_k1fp v2.0` module is loaded.
     module_loaded: bool,
+    /// True once `maintain()` has loaded or adopted the currently loaded module.
+    managed: bool,
     /// True while loaded, configured `mode > 0`, bridge ready, and not tripped.
     active_for_lease: bool,
     lease_state: LeaseState,
@@ -206,12 +208,11 @@ impl Watch {
     pub fn on_gate(&mut self, gate: &Gate, step: GateStep) {
         let mut loaded = self.module_loaded;
         if !loaded && self.lease_state == LeaseState::Unknown && step == GateStep::Close {
-            // Handle a keeper restart when the module is already loaded before the
-            // first `maintain()` tick runs.
+            // Handle a keeper restart or hand-loaded module before the first
+            // `maintain()` tick runs without suppressing the adoption log.
             let text = read_text(Path::new(&proc_path()));
             if fastpath::parse_proc(&text).ours {
                 loaded = true;
-                self.module_loaded = true;
             }
         }
         if !loaded {
@@ -229,6 +230,7 @@ impl Watch {
             },
             Err(err) if err.kind() == ErrorKind::NotFound => {
                 self.module_loaded = false;
+                self.managed = false;
                 self.active_for_lease = false;
                 self.lease_state = LeaseState::Unknown;
             }
@@ -256,6 +258,7 @@ impl Watch {
 
         let Some(dir) = staged_dir() else {
             self.module_loaded = false;
+            self.managed = false;
             self.active_for_lease = false;
             self.publish(
                 "off",
@@ -291,9 +294,10 @@ impl Watch {
 
         let proc_text = read_text(Path::new(&proc_path()));
         let modules_text = read_text(Path::new(&modules_path()));
-        match fastpath::loaded(&modules_text, &proc_text) {
+        let adopted = match fastpath::loaded(&modules_text, &proc_text) {
             Loaded::Other(name) => {
                 self.module_loaded = false;
+                self.managed = false;
                 self.active_for_lease = false;
                 let (state, detail) = if config.mode == 0 {
                     (
@@ -314,6 +318,7 @@ impl Watch {
             }
             Loaded::None => {
                 self.module_loaded = false;
+                self.managed = false;
                 self.active_for_lease = false;
                 self.qctrl_present = None;
                 self.trip.note_paused();
@@ -403,16 +408,26 @@ impl Watch {
                     fastpath::VERSION_LINE
                 ));
                 self.module_loaded = true;
+                self.managed = true;
                 self.lease_state = LeaseState::Revoked;
+                false
             }
             Loaded::Ours => {
+                let first = !self.managed;
                 self.module_loaded = true;
+                self.managed = true;
+                self.failed_for = None;
+                if first {
+                    note("fast path: adopted a loaded module");
+                }
+                first
             }
-        }
+        };
 
         let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
         if !proc.ours {
             self.module_loaded = false;
+            self.managed = false;
             self.active_for_lease = false;
             self.failed_for = Some(config.clone());
             self.publish(
@@ -474,8 +489,13 @@ impl Watch {
         match self.trip.evaluate(&config, &proc) {
             TripAction::Normal => {
                 self.active_for_lease = config.mode > 0;
+                let mut proc = proc;
                 if config.mode == 0 {
                     self.revoke_if_open();
+                } else if (adopted || self.lease_state != LeaseState::Open)
+                    && self.renew_if_grant_held(nvram_cache_path)
+                {
+                    proc = read_proc_after_grant_open();
                 }
                 let (state, detail) = if config.mode == 0 {
                     ("off", "mode 0 read back from /proc/k1fp".to_owned())
@@ -490,7 +510,7 @@ impl Watch {
                     &detail,
                     &config,
                     Some(&proc),
-                    qctrl_changed,
+                    adopted || qctrl_changed,
                     now,
                     &mut note,
                 );
@@ -630,7 +650,7 @@ impl Watch {
     }
 
     fn revoke_if_open(&mut self) {
-        if self.lease_state == LeaseState::Open && write_proc_cmd("grant 0\n").is_ok() {
+        if self.lease_state != LeaseState::Revoked && write_proc_cmd("grant 0\n").is_ok() {
             self.lease_state = LeaseState::Revoked;
         }
     }

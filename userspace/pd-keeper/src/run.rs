@@ -800,6 +800,8 @@ impl Keeper {
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
+            self.now = monotonic();
+            self.maintain_cbrs_gate();
             for event in self.collect() {
                 if let Class::RouterAdvertisement {
                     prefixes,

@@ -820,6 +820,57 @@ else:
         wait_for(lambda: 'state=off\n' in fp_status(), 25)
         assert fp_state['mode'] == 0 and 'mode=0\n' in fp_status(), (fp_state, fp_status())
         print('PASS: live rollback (mode=0 in fastpath/config) moved fast path to state=off.', flush=True)
+        # Adopting an already-loaded titan_k1fp v2.0 module (loaded by hand, even
+        # without a staged .ko): keeper logs adoption, does not run insmod, takes
+        # over mode and drives the 1 Hz grant lease.
+        Path('/tmp/fastpath/titan_k1fp.ko').unlink(missing_ok=True)
+        Path('/tmp/fastpath/config').write_text('mode=2\n')
+        Path('/tmp/insmod-calls').unlink(missing_ok=True)
+        Path('/tmp/proc-modules').write_text(
+            'titan_qctrl 47104 0 - Live 0x7f0b4000\n'
+            'titan_k1fp 32768 0 - Live 0x7f0c0000\n'
+        )
+        with fp_lock:
+            fp_state.update(mode=2, gate='closed', grant_left_ms=0, qctrl_present=1, wd_trips=0, wd_reason='none')
+            write_k1fp_proc()
+            k1fp_cmds.clear()
+        restart()
+        wait_for(lambda: 'fast path: adopted a loaded module' in log() and 'state=applied\n' in fp_status(), 30)
+        assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
+        assert 'mode=2\n' in fp_status() and 'active_mode=2\n' in fp_status() and 'gate=open\n' in fp_status(), fp_status()
+        with fp_lock:
+            before_adopt_renew = len(k1fp_cmds)
+        until = time.monotonic() + 2.5
+        wait_for(lambda: time.monotonic() >= until, 5)
+        with fp_lock:
+            adopt_renews = [c for _, c in k1fp_cmds[before_adopt_renew:] if c == 'grant 5']
+        assert len(adopt_renews) >= 2, (adopt_renews, k1fp_cmds)
+        print('PASS: adopted pre-loaded titan_k1fp v2.0 without insmod and drove the grant lease.', flush=True)
+        # Wrong version string in /proc/k1fp is still refused (never adopted).
+        Path('/tmp/fastpath.status').unlink(missing_ok=True)
+        before_refuse_log = len(log())
+        Path('/tmp/k1fp-proc').write_text(
+            'titan_k1fp v2.1\n'
+            'mode=0 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n'
+        )
+        with fp_lock:
+            k1fp_cmds.clear()
+        restart()
+        wait_for(lambda: 'state=failed\n' in fp_status() and 'titan_k1fp v2.1' in fp_status(), 30)
+        assert 'fast path: adopted a loaded module' not in log()[before_refuse_log:], log()[before_refuse_log:]
+        assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
+        with fp_lock:
+            assert k1fp_cmds == [], k1fp_cmds
+        # Another *k1fp* module name is still refused (never adopted).
+        Path('/tmp/fastpath.status').unlink(missing_ok=True)
+        before_other_log = len(log())
+        Path('/tmp/proc-modules').write_text('titan_k1fp_v1 20000 0 - Live 0x7f0c0000\n')
+        Path('/tmp/k1fp-proc').unlink(missing_ok=True)
+        restart()
+        wait_for(lambda: 'state=failed\n' in fp_status() and 'titan_k1fp_v1' in fp_status(), 30)
+        assert 'fast path: adopted a loaded module' not in log()[before_other_log:], log()[before_other_log:]
+        assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
+        print('PASS: refused wrong version string and other *k1fp* module without adopting.', flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
