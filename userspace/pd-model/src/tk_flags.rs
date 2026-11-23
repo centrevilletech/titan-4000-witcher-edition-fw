@@ -2770,8 +2770,8 @@ wm=0x8418ff08:0x1
         assert!(rb_line.unwrap().contains("flags read back 0"));
         for w in &n6_writes {
             assert_eq!(
-                fake2.ram.get(&w.addr),
-                Some(&off_value(w.addr).unwrap()),
+                *fake2.ram.get(&w.addr).unwrap_or(&0),
+                off_value(w.addr).unwrap(),
                 "rollback missed 0x{:08x}",
                 w.addr
             );

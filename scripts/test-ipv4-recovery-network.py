@@ -780,7 +780,7 @@ for line in sys.stdin:
             'enabled=1\nsha256=' + good + '\n'
             'wm=0x847ed554:0x1\n'
         )
-        wait_for(lambda: 'ignored "wm=0x847ed554:0x1" in tk/config' in log() and dm_ram().get(str(0x8418ff08)) == 0, 60)
+        wait_for(lambda: 'ignored "wm=0x847ed554:0x1" in tk/config' in log() and dm_ram().get(str(0x8418ff08)) == 0 and 'state=applied\n' in flags(), 60)
         assert dm_ram().get(str(0x847ed554), 0) == 0, dm_ram()
         dm_lnk_before = len(Path('/tmp/dm-log').read_text().splitlines())
         Path('/tmp/tk/config').write_text(
