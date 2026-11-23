@@ -17,8 +17,16 @@
 # Options:
 #   --target ADDR        Ping responder for the boot confirm (up to 4). Without
 #                        one the keeper uses the deaf watchdog's targets.
-#   --flags HEX          0x847ed604 value (default 0x15: AQM v2 + grant hold)
-#   --hold HEX           0x84f93008 grant-hold size in bytes (default 0x140)
+#   --profile NAME       Modem switch profile: latency (inspects tk.gz magics
+#                        for N4 / IMG4 / N5 / N6 and writes the proven set) or
+#                        stock (writes no wm= lines).
+#   --flags HEX          0x847ed604 value (default 0x15: AQM v2 + grant hold;
+#                        overrides profile)
+#   --hold HEX           0x84f93008 grant-hold size in bytes (default 0x140;
+#                        cap 0x200, or 0x800 with --hold-ack prb-tax; overrides
+#                        profile)
+#   --hold-ack TOKEN     Write hold_ack=prb-tax to allow --hold up to 0x800
+#                        (adds padding uplink grants on the tower while active)
 #   --no-flags           Write no wm= lines (the image runs with every flag 0)
 #   --mode N             Clamp mode: 0, 2, 3 or 6 (default 2)
 #   --trough-ms N        Clamp knob, 0..40 (default: module default 4)
@@ -38,8 +46,10 @@ set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 PORT=2222
 SSH_USER=root
+PROFILE=
 FLAGS=0x15
 HOLD=0x140
+HOLD_ACK=
 WRITE_FLAGS=1
 MODE=2
 TROUGH=
@@ -58,8 +68,10 @@ die() { echo "stage-latency: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --target) TARGETS+=("${2:?--target needs an address}"); shift 2 ;;
+    --profile) PROFILE=${2:?--profile needs latency or stock}; shift 2 ;;
     --flags) FLAGS=${2:?}; shift 2 ;;
     --hold) HOLD=${2:?}; shift 2 ;;
+    --hold-ack) HOLD_ACK=${2:?--hold-ack needs prb-tax}; shift 2 ;;
     --no-flags) WRITE_FLAGS=0; shift ;;
     --mode) MODE=${2:?}; shift 2 ;;
     --trough-ms) TROUGH=${2:?}; shift 2 ;;
@@ -72,7 +84,7 @@ while [ $# -gt 0 ]; do
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -89,6 +101,7 @@ status() {
 show() { echo "== $1"; if [ -e "$1" ]; then cat "$1"; else echo "(none)"; fi; }
 echo "== /etc/witcher-release"; cat /etc/witcher-release 2>/dev/null || echo "(none)"
 for f in /var/run/witcher-tk.status /var/run/witcher-tk.result /var/run/witcher-tk.flags \
+         /var/run/witcher-tk.hands-off \
          /var/run/witcher-qctrl.status /var/run/witcher-fastpath.status \
          /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
          /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed \
@@ -140,6 +153,16 @@ fi
 [ "${#TARGETS[@]}" -le 4 ] || die "at most 4 --target addresses"
 
 # ---- Local checks, before anything touches the unit ----
+case "$PROFILE" in
+  ""|latency) ;;
+  stock) WRITE_FLAGS=0 ;;
+  *) die "--profile must be latency or stock" ;;
+esac
+case "$HOLD_ACK" in
+  ""|prb-tax) ;;
+  *) die "--hold-ack must be prb-tax" ;;
+esac
+
 num() { # hex (0x) or decimal to decimal, or fail
   case "$1" in
     0x*|0X*) [[ "${1:2}" =~ ^[0-9A-Fa-f]{1,8}$ ]] || return 1; echo $((16#${1:2})) ;;
@@ -149,7 +172,16 @@ num() { # hex (0x) or decimal to decimal, or fail
 flags=$(num "$FLAGS") || die "--flags $FLAGS is not a number"
 hold=$(num "$HOLD") || die "--hold $HOLD is not a number"
 [ $((flags & ~0x15)) -eq 0 ] || die "--flags $FLAGS sets bits outside 0x15"
-[ "$hold" -le $((0x200)) ] || die "--hold $HOLD is over 0x200"
+hold_cap=$((0x200))
+if [ "$HOLD_ACK" = "prb-tax" ]; then
+  hold_cap=$((0x800))
+fi
+if [ "$hold" -gt "$hold_cap" ]; then
+  if [ -z "$HOLD_ACK" ] && [ "$hold" -le $((0x800)) ]; then
+    die "--hold $HOLD is over 0x200; pass --hold-ack prb-tax to allow up to 0x800"
+  fi
+  die "--hold $HOLD is over $(printf '0x%x' "$hold_cap")"
+fi
 case "$MODE" in 0|2|3|6) ;; *) die "--mode must be 0, 2, 3 or 6" ;; esac
 case "$FASTPATH_MODE" in 0|1|2|3) ;; *) die "--fastpath-mode must be 0, 1, 2 or 3" ;; esac
 if [ -n "$TROUGH" ]; then [[ "$TROUGH" =~ ^[0-9]+$ ]] && [ "$TROUGH" -le 40 ] || die "--trough-ms must be 0..40"; fi
@@ -158,6 +190,44 @@ for t in "${TARGETS[@]}"; do
   [[ "$t" =~ ^[0-9A-Fa-f.:]+$ ]] || die "--target $t is not an IP address"
 done
 
+DETECTED_TIER=""
+HAS_IMG4=0
+HAS_N5=0
+HAS_N6=0
+IS_N6H=0
+
+inspect_tk_magics() {
+  python3 - "$1" <<'PY'
+import gzip, struct, sys
+
+BASE = 0x84100000
+CHECKS = [
+    ("img4", 0x847ecfe8, 0x494d4734),
+    ("n5",   0x84489a64, 0x4e35464c),
+    ("n6",   0x8418ff00, 0x55324846),
+    ("n6h",  0x8418ff04, 0x4e364803),
+]
+with gzip.open(sys.argv[1], "rb") as fh:
+    data = fh.read()
+
+found = {}
+for name, va, want in CHECKS:
+    off = va - BASE
+    if 0 <= off <= len(data) - 4:
+        val = struct.unpack_from("<I", data, off)[0]
+        found[name] = (val == want)
+    else:
+        found[name] = False
+
+print(
+    int(found["img4"]),
+    int(found["n5"]),
+    int(found["n6"]),
+    int(found["n6"] and found["n6h"]),
+)
+PY
+}
+
 if [ "$STAGE_TK" = 1 ]; then
   size=$(wc -c < "$TK")
   [ "$size" -ge 1024 ] && [ "$size" -le $((7680 * 1024)) ] || die "$TK is $size bytes; the boot hook takes 1 KiB to 7.5 MiB"
@@ -165,6 +235,18 @@ if [ "$STAGE_TK" = 1 ]; then
   [ "$m1$m2$m3" = 1f8b08 ] || die "$TK is not a gzip (deflate) file"
   [ $((16#$flg & 0xe2)) -eq 0 ] || die "$TK has gzip header flags 0x$flg; the modem reader takes only FTEXT/FNAME"
   TK_SHA=$(sha256sum "$TK" | cut -d' ' -f1)
+  if [ "$PROFILE" = "latency" ]; then
+    read -r HAS_IMG4 HAS_N5 HAS_N6 IS_N6H < <(inspect_tk_magics "$TK") || die "could not decompress $TK to read patch magics"
+    if [ "$HAS_N6" = 1 ]; then
+      if [ "$IS_N6H" = 1 ]; then DETECTED_TIER="N6H"; else DETECTED_TIER="N6"; fi
+    elif [ "$HAS_N5" = 1 ]; then
+      DETECTED_TIER="N5"
+    elif [ "$HAS_IMG4" = 1 ]; then
+      DETECTED_TIER="IMG4"
+    else
+      DETECTED_TIER="N4"
+    fi
+  fi
 fi
 
 if [ "$CLAMP" = 1 ]; then
@@ -189,9 +271,37 @@ sha256=$TK_SHA"
   for t in "${TARGETS[@]}"; do TK_CONFIG="$TK_CONFIG
 target=$t"; done
   if [ "$WRITE_FLAGS" = 1 ]; then
+    if [ "$HOLD_ACK" = "prb-tax" ]; then
+      TK_CONFIG="$TK_CONFIG
+hold_ack=prb-tax"
+    fi
     TK_CONFIG="$TK_CONFIG
 wm=0x84f93008:$(printf '0x%x' "$hold")
 wm=0x847ed604:$(printf '0x%x' "$flags")"
+    if [ "$PROFILE" = "latency" ]; then
+      if [ "$HAS_IMG4" = 1 ]; then
+        TK_CONFIG="$TK_CONFIG
+wm=0x847ed548:0x1
+wm=0x847ed54c:0x1
+wm=0x847ed550:0x1
+wm=0x847ecf08:0x1"
+      fi
+      if [ "$HAS_N5" = 1 ]; then
+        if [ $((flags & 0x1)) -ne 0 ]; then
+          TK_CONFIG="$TK_CONFIG
+wm=0x84489a84:0x2000
+wm=0x84489a88:0x3000
+wm=0x84489a6c:0x3"
+        else
+          TK_CONFIG="$TK_CONFIG
+wm=0x84489a6c:0x1"
+        fi
+      fi
+      if [ "$HAS_N6" = 1 ]; then
+        TK_CONFIG="$TK_CONFIG
+wm=0x8418ff08:0x1"
+      fi
+    fi
   fi
 fi
 QCTRL_CONFIG="# Written by scripts/stage-latency.sh at $stamp
@@ -205,6 +315,13 @@ mode=$FASTPATH_MODE"
 
 echo "unit:        $SSH_USER@$UNIT port $PORT"
 [ "$STAGE_TK" = 1 ] && echo "tk image:    $TK ($size bytes) sha256 $TK_SHA"
+if [ "$STAGE_TK" = 1 ] && [ -n "$PROFILE" ]; then
+  if [ "$PROFILE" = "latency" ]; then
+    echo "tk profile:  latency (detected $DETECTED_TIER)"
+  else
+    echo "tk profile:  $PROFILE"
+  fi
+fi
 [ "$CLAMP" = 1 ] && echo "clamp:       $KO sha256 $KO_SHA"
 [ "$STAGE_FP" = 1 ] && echo "fast path:   $FASTPATH sha256 $FP_SHA"
 [ "$STAGE_TK" = 1 ] && { echo "--- tk/config"; echo "$TK_CONFIG"; }
@@ -287,7 +404,7 @@ Next: reboot the unit OUTSIDE 07:00 to 10:00 UTC (the SAS grants nothing then):
 After the boot, run this script with --status. Expect:
   witcher-tk.status  state=staged source=fs firmware=clean
   witcher-tk.result  confirmed=$TK_SHA
-  witcher-tk.flags   state=applied (within about a minute of the confirm)
+  witcher-tk.flags   state=applied (within 1 to 3 minutes of the confirm)
   witcher-qctrl.status state=applied (about 30 s after LTE comes up)
 EOF
   if [ "$STAGE_FP" = 1 ]; then

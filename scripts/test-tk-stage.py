@@ -16,6 +16,7 @@ import importlib.util
 import os
 import re
 import shlex
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -495,6 +496,148 @@ class Build(unittest.TestCase):
             hook(out)
         with self.assertRaises(ValueError):
             hook(vendor.replace('$PROBE_MODEM\n', 'modprobe modem\n'))
+
+
+class StageLatencyProfiles(unittest.TestCase):
+    """Test scripts/stage-latency.sh --profile latency|stock and overrides with synthetic images."""
+
+    SCRIPT = REPO / 'scripts/stage-latency.sh'
+    BASE = 0x84100000
+
+    def make_tk(self, directory: Path, name: str, magics: dict[int, int]) -> Path:
+        # Synthetic zero-filled buffer with only our patch magic words placed
+        # at their documented virtual addresses (zero vendor bytes).
+        size = (0x847ed000 - self.BASE) + 64
+        buf = bytearray(size)
+        for va, word in magics.items():
+            struct.pack_into('<I', buf, va - self.BASE, word)
+        path = directory / name
+        path.write_bytes(gzip.compress(bytes(buf), mtime=0))
+        return path
+
+    def run_dry(self, tk_path: Path, *extra_args: str) -> subprocess.CompletedProcess:
+        cmd = ['bash', str(self.SCRIPT), '--dry-run', '--no-clamp', *extra_args, '192.0.2.1', str(tk_path)]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+    def wm_lines(self, stdout: str) -> list[str]:
+        return [l for l in stdout.splitlines() if l.startswith('wm=')]
+
+    def test_profile_latency_selects_words_by_image_magic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            n4 = self.make_tk(d, 'n4.gz', {})
+            img4 = self.make_tk(d, 'img4.gz', {0x847ecfe8: 0x494d4734})
+            n5 = self.make_tk(d, 'n5.gz', {0x847ecfe8: 0x494d4734, 0x84489a64: 0x4e35464c})
+            n6 = self.make_tk(d, 'n6.gz', {
+                0x847ecfe8: 0x494d4734,
+                0x84489a64: 0x4e35464c,
+                0x8418ff00: 0x55324846,
+                0x8418ff04: 0x4e360000,
+            })
+            n6h = self.make_tk(d, 'n6h.gz', {
+                0x847ecfe8: 0x494d4734,
+                0x84489a64: 0x4e35464c,
+                0x8418ff00: 0x55324846,
+                0x8418ff04: 0x4e364803,
+            })
+
+            r = self.run_dry(n4, '--profile', 'latency')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tk profile:  latency (detected N4)', r.stdout)
+            self.assertEqual(self.wm_lines(r.stdout), [
+                'wm=0x84f93008:0x140',
+                'wm=0x847ed604:0x15',
+            ])
+
+            r = self.run_dry(img4, '--profile', 'latency')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tk profile:  latency (detected IMG4)', r.stdout)
+            self.assertEqual(self.wm_lines(r.stdout), [
+                'wm=0x84f93008:0x140',
+                'wm=0x847ed604:0x15',
+                'wm=0x847ed548:0x1',
+                'wm=0x847ed54c:0x1',
+                'wm=0x847ed550:0x1',
+                'wm=0x847ecf08:0x1',
+            ])
+
+            r = self.run_dry(n5, '--profile', 'latency')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tk profile:  latency (detected N5)', r.stdout)
+            self.assertEqual(self.wm_lines(r.stdout), [
+                'wm=0x84f93008:0x140',
+                'wm=0x847ed604:0x15',
+                'wm=0x847ed548:0x1',
+                'wm=0x847ed54c:0x1',
+                'wm=0x847ed550:0x1',
+                'wm=0x847ecf08:0x1',
+                'wm=0x84489a84:0x2000',
+                'wm=0x84489a88:0x3000',
+                'wm=0x84489a6c:0x3',
+            ])
+
+            for path, label in ((n6, 'N6'), (n6h, 'N6H')):
+                r = self.run_dry(path, '--profile', 'latency')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'tk profile:  latency (detected {label})', r.stdout)
+                self.assertEqual(self.wm_lines(r.stdout), [
+                    'wm=0x84f93008:0x140',
+                    'wm=0x847ed604:0x15',
+                    'wm=0x847ed548:0x1',
+                    'wm=0x847ed54c:0x1',
+                    'wm=0x847ed550:0x1',
+                    'wm=0x847ecf08:0x1',
+                    'wm=0x84489a84:0x2000',
+                    'wm=0x84489a88:0x3000',
+                    'wm=0x84489a6c:0x3',
+                    'wm=0x8418ff08:0x1',
+                ])
+
+    def test_profile_stock_writes_no_wm_lines_and_options_override(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            n6 = self.make_tk(d, 'n6.gz', {
+                0x847ecfe8: 0x494d4734,
+                0x84489a64: 0x4e35464c,
+                0x8418ff00: 0x55324846,
+                0x8418ff04: 0x4e360000,
+            })
+            # --profile stock writes no wm= lines.
+            r = self.run_dry(n6, '--profile', 'stock')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tk profile:  stock', r.stdout)
+            self.assertEqual(self.wm_lines(r.stdout), [])
+
+            # Existing --flags / --hold options override --profile latency.
+            r = self.run_dry(n6, '--profile', 'latency', '--flags', '0x10', '--hold', '0x80')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            wms = self.wm_lines(r.stdout)
+            self.assertIn('wm=0x84f93008:0x80', wms)
+            self.assertIn('wm=0x847ed604:0x10', wms)
+            # Without N4 bit 0, N5 drops bit 1 (0x1 instead of 0x3) to stay valid.
+            self.assertIn('wm=0x84489a6c:0x1', wms)
+            self.assertNotIn('wm=0x84489a6c:0x3', wms)
+
+            # Hold > 0x200 refused without --hold-ack prb-tax, accepted up to 0x800 with it.
+            r_bad = self.run_dry(n6, '--profile', 'latency', '--hold', '0x400')
+            self.assertNotEqual(r_bad.returncode, 0)
+            self.assertIn('hold-ack prb-tax', r_bad.stderr)
+
+            r_ack = self.run_dry(n6, '--profile', 'latency', '--hold', '0x400', '--hold-ack', 'prb-tax')
+            self.assertEqual(r_ack.returncode, 0, r_ack.stderr)
+            self.assertIn('hold_ack=prb-tax', r_ack.stdout)
+            self.assertIn('wm=0x84f93008:0x400', self.wm_lines(r_ack.stdout))
+
+            r_over = self.run_dry(n6, '--profile', 'latency', '--hold', '0x801', '--hold-ack', 'prb-tax')
+            self.assertNotEqual(r_over.returncode, 0)
+
+            # Default without --profile stays backwards-compatible (N4 two words only).
+            r_default = self.run_dry(n6)
+            self.assertEqual(r_default.returncode, 0, r_default.stderr)
+            self.assertEqual(self.wm_lines(r_default.stdout), [
+                'wm=0x84f93008:0x140',
+                'wm=0x847ed604:0x15',
+            ])
 
 
 if __name__ == '__main__':
