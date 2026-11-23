@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
- * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.0) for the Global
+ * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.1) for the Global
  * Telecom Titan 4000 (GDM7243AP, Linux 3.10.0-uc0, UP ARMv7, PREEMPT_NONE).
  *
  * Built standalone against titan_k310_abi.h (no 3.10 kernel tree required).
@@ -26,14 +26,20 @@
  *      (default 20 ms, cap 50 ms) and prevent new leases.
  *   2. Userspace grant lease: require_grant=1 by default; expires cleanly
  *      unless renewed with "grant <1..60>" while cbrs_mode_grant=1 and
- *      cbrs_grant_state=2. "grant 0" closes immediately.
+ *      cbrs_grant_state=2. "grant 0" closes immediately. While the gate is
+ *      closed, candidates stay on stock without renewing leases or sampling;
+ *      every gate open/close transition bumps the epoch so flows re-prove
+ *      fresh against the open-gate rules.
  *
  * Watchdog (no dependence on kernel log):
- *   Runs every 100 ms while mode >= 2 and checks modified/wrongport bursts,
+ *   Runs every 100 ms while mode >= 2 and checks modified/wrongport bursts
+ *   in a sliding window (wd_mod per wd_mod_win_ms, default 20 per 10 s),
  *   lease mismatch storms, eth0 TX ring full persistence, TX stall, and bad
- *   ring state, dropping mode -> 0 atomically on any anomaly.
+ *   ring state, dropping mode -> 0 atomically on any anomaly. Recent
+ *   mismatches are captured in a bounded 16-entry header-only ring readable
+ *   from /proc/k1fp after a trip and cleared by "zero".
  *
- * Note: dlbypass (gdmlte live text patch) is intentionally absent in 2.0 so
+ * Note: dlbypass (gdmlte live text patch) is intentionally absent so
  * the vendor netif_enqueue router-MAC rewrite is always preserved.
  */
 
@@ -41,7 +47,7 @@
 #include "k1fp_core.h"
 #include "k1_fp.h"
 
-#define K1_VERSION "titan_k1fp v2.0"
+#define K1_VERSION "titan_k1fp v2.1"
 
 /* ---------- Module metadata matching stock 3.10.0-uc0 ELF ABI ---------- */
 int init_module(void);
@@ -107,6 +113,7 @@ struct k1_stats {
 	u32 brhold, brhold_enter;
 	u32 gate_closed, would_fast;
 	u32 cand_stock, granted4, granted6, brok, modified, wrongport, noconfirm, revoked;
+	u32 local_deliv, local_alias;
 	u32 qctrl_dl_calls, qctrl_dl_drop, qctrl_dl_stolen, qctrl_ul_stock;
 	u32 wd_trips;
 	u32 tx_reclaim, tx_timer, tx_off[4], tx_stallguard, tx_badring;
@@ -146,8 +153,9 @@ static struct {
 	int last_err_tx;
 	u8  tx_pin;
 	int pins;
-	/* proof & stats */
+	/* proof, diagnostic ring & stats */
 	struct k1_pend pend;
+	struct k1_diag_ring diag;
 	struct k1_stats st;
 } g;
 
@@ -518,12 +526,15 @@ static rx_handler_result_t k1_rx(struct sk_buff **pskb)
 	}
 
 	now = (u32)jiffies;
+	/* Gate closed (no SAS grant): stay on stock without renewing leases or
+	 * running comparator proofs against closed-gate firewall churn. Gate
+	 * transitions bump g.epoch so every flow re-proves fresh once open. */
+	if (!k1_gate_open(now)) {
+		g.st.gate_closed++;
+		goto stock;
+	}
 	r = k1_fast_check(tbl, &pkt, now, g.epoch, g.sample_j, g.seed, &f);
 	if (r == K1F_FAST) {
-		if (!k1_gate_open(now)) {
-			g.st.gate_closed++;
-			goto stock_cand;
-		}
 		if (pol == K1P_OBSERVE) {
 			g.st.would_fast++;
 			k1_famcount(g.st.wf4, g.st.wf6, g.st.wfudp, &pkt, dir);
@@ -572,7 +583,7 @@ stock_cand:
 	g.st.cand_stock++;
 	k1_pend_begin(&g.pend, skb, outidx, &pkt, eth, f && r != K1F_NOLEASE && r != K1F_STALE);
 	res = g.orig_rx(pskb);
-	if (!g.pend.granted)
+	if (!g.pend.granted && !g.pend.cancelled)
 		g.st.noconfirm++;
 	if (k1_pend_end(&g.pend, tbl, (u32)jiffies, g.seed))
 		g.st.revoked++;
@@ -593,14 +604,47 @@ static inline u32 k1_outidx(const struct net_device *d)
 
 static inline void k1_check_mod_trip(void)
 {
-	u32 dmod, dwrg;
+	int trip = k1_wd_check_mod(&g.wd, &g.wd_cfg, g.mode >= K1_MODE_DL,
+				   g.st.modified, g.st.wrongport);
 
-	if (g.mode < K1_MODE_DL || !g.wd.armed || !g.wd_cfg.mod_limit)
-		return;
-	dmod = g.st.modified - g.wd.base_modified;
-	dwrg = g.st.wrongport - g.wd.base_wrongport;
-	if (dmod + dwrg >= g.wd_cfg.mod_limit)
-		k1_wd_trip(dwrg > dmod ? K1_WD_WRONGPORT : K1_WD_MODIFIED);
+	if (trip != K1_WD_NONE)
+		k1_wd_trip(trip);
+}
+
+/*
+ * Cancel g.pend before local delivery (br_pass_frame_up -> netif_receive_skb).
+ * Without this, a locally delivered skb (such as a reverse-SNATed SAS reply)
+ * can be freed in tcp_v4_rcv() and immediately re-allocated from the UP SLUB
+ * skbuff_head_cache LIFO freelist for the unit's synchronous reply, causing
+ * k1_br_post() on br_dev_xmit() to match g.pend.skb by pointer equality.
+ */
+static unsigned int k1_br_local_in(unsigned int hooknum, struct sk_buff *skb,
+				   const struct net_device *in, const struct net_device *out,
+				   int (*okfn)(struct sk_buff *))
+{
+	(void)hooknum; (void)in; (void)out; (void)okfn;
+	if (unlikely(g.pend.active && skb == g.pend.skb)) {
+		if (k1_pend_cancel(&g.pend, skb))
+			g.st.local_deliv++;
+	}
+	return NF_ACCEPT;
+}
+
+/*
+ * Belt-and-suspenders guard on NF_BR_LOCAL_OUT (__br_deliver): locally
+ * originated frames never enter __br_forward, so any match with g.pend.skb
+ * here is guaranteed to be a SLUB pointer alias from an earlier drop/free.
+ */
+static unsigned int k1_br_local_out(unsigned int hooknum, struct sk_buff *skb,
+				    const struct net_device *in, const struct net_device *out,
+				    int (*okfn)(struct sk_buff *))
+{
+	(void)hooknum; (void)in; (void)out; (void)okfn;
+	if (unlikely(g.pend.active && skb == g.pend.skb)) {
+		if (k1_pend_cancel(&g.pend, skb))
+			g.st.local_alias++;
+	}
+	return NF_ACCEPT;
 }
 
 static unsigned int k1_br_post(unsigned int hooknum, struct sk_buff *skb,
@@ -608,22 +652,28 @@ static unsigned int k1_br_post(unsigned int hooknum, struct sk_buff *skb,
 			       int (*okfn)(struct sk_buff *))
 {
 	const u8 *eth;
+	u32 outidx, lin;
 	int r;
 
 	(void)hooknum; (void)in; (void)okfn;
 	if (likely(!g.pend.active) || skb != g.pend.skb)
 		return NF_ACCEPT;
 	eth = skb->mac_header;
-	r = k1_stage_br(&g.pend, tbl, skb, k1_outidx(out), eth,
-			skb_headlen(skb) + (u32)(skb->data - eth), skb->priority, skb->mark,
+	outidx = k1_outidx(out);
+	lin = (eth && skb->data >= eth) ? (skb_headlen(skb) + (u32)(skb->data - eth)) : 0u;
+	r = k1_stage_br(&g.pend, tbl, skb, outidx, eth, lin, skb->priority, skb->mark,
 			(u32)jiffies, g.epoch, g.lease_j, g.sample_j, g.seed);
 	if (r == K1S_BROK) {
 		g.st.brok++;
 	} else if (r == K1S_MODIFIED) {
 		g.st.modified++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_BR_POST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	} else if (r == K1S_WRONGPORT) {
 		g.st.wrongport++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_BR_POST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	}
 	return NF_ACCEPT;
@@ -634,22 +684,28 @@ static unsigned int k1_br_last(unsigned int hooknum, struct sk_buff *skb,
 			       int (*okfn)(struct sk_buff *))
 {
 	const u8 *eth;
+	u32 outidx, lin;
 	int r;
 
 	(void)hooknum; (void)in; (void)okfn;
 	if (likely(!g.pend.active) || skb != g.pend.skb)
 		return NF_ACCEPT;
 	eth = skb->mac_header;
-	r = k1_stage_br_last(&g.pend, tbl, skb, k1_outidx(out), eth,
-			     skb_headlen(skb) + (u32)(skb->data - eth), skb->priority, skb->mark,
+	outidx = k1_outidx(out);
+	lin = (eth && skb->data >= eth) ? (skb_headlen(skb) + (u32)(skb->data - eth)) : 0u;
+	r = k1_stage_br_last(&g.pend, tbl, skb, outidx, eth, lin, skb->priority, skb->mark,
 			     (u32)jiffies, g.epoch, g.lease_j, g.sample_j, g.seed);
 	if (r == K1S_GRANTED) {
 		g.st.granted6++;
 	} else if (r == K1S_MODIFIED) {
 		g.st.modified++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_BR_LAST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	} else if (r == K1S_WRONGPORT) {
 		g.st.wrongport++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_BR_LAST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	}
 	return NF_ACCEPT;
@@ -660,28 +716,48 @@ static unsigned int k1_ip4_post(unsigned int hooknum, struct sk_buff *skb,
 				int (*okfn)(struct sk_buff *))
 {
 	const u8 *eth;
+	u32 outidx, lin;
 	int r;
 
 	(void)hooknum; (void)in; (void)out; (void)okfn;
 	if (likely(!g.pend.active) || skb != g.pend.skb)
 		return NF_ACCEPT;
 	eth = skb->mac_header;
-	r = k1_stage_ip4(&g.pend, tbl, skb, k1_outidx(skb->dev), eth,
-			 skb_headlen(skb) + (u32)(skb->data - eth), skb->priority, skb->mark,
+	outidx = k1_outidx(skb->dev);
+	lin = (eth && skb->data >= eth) ? (skb_headlen(skb) + (u32)(skb->data - eth)) : 0u;
+	r = k1_stage_ip4(&g.pend, tbl, skb, outidx, eth, lin, skb->priority, skb->mark,
 			 (u32)jiffies, g.epoch, g.lease_j, g.sample_j, g.seed);
 	if (r == K1S_GRANTED) {
 		g.st.granted4++;
 	} else if (r == K1S_MODIFIED) {
 		g.st.modified++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_IP4_POST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	} else if (r == K1S_WRONGPORT) {
 		g.st.wrongport++;
+		k1_diag_record(&g.diag, &g.pend, (u32)jiffies, K1_STG_IP4_POST,
+			       (u8)r, outidx, eth, lin, skb->priority, skb->mark);
 		k1_check_mod_trip();
 	}
 	return NF_ACCEPT;
 }
 
-static struct nf_hook_ops k1_ops[3] = {
+static struct nf_hook_ops k1_ops[5] = {
+	{
+		.hook = k1_br_local_in,
+		.owner = &__this_module,
+		.pf = NFPROTO_BRIDGE,
+		.hooknum = NF_BR_LOCAL_IN,
+		.priority = NF_BR_PRI_FIRST,
+	},
+	{
+		.hook = k1_br_local_out,
+		.owner = &__this_module,
+		.pf = NFPROTO_BRIDGE,
+		.hooknum = NF_BR_LOCAL_OUT,
+		.priority = NF_BR_PRI_FIRST,
+	},
 	{
 		.hook = k1_br_post,
 		.owner = &__this_module,
@@ -1018,6 +1094,102 @@ static int k1_tx_on(void)
 
 /* ---------- /proc/k1fp ---------- */
 
+static const char *k1_port_name(u8 idx)
+{
+	if (idx == 1u)
+		return "eth0";
+	if (idx == 2u)
+		return "lte0pdn2";
+	return "other";
+}
+
+static const char *k1_stage_name(u8 stg)
+{
+	if (stg == K1_STG_BR_POST)
+		return "br_post";
+	if (stg == K1_STG_BR_LAST)
+		return "br_last";
+	if (stg == K1_STG_IP4_POST)
+		return "ip4_post";
+	return "unknown";
+}
+
+static void k1_show_diff(struct seq_file *m, u16 mask)
+{
+	static const struct {
+		u16 bit;
+		const char *name;
+	} bits[] = {
+		{ K1D_PORT,   "port" },
+		{ K1D_SHORT,  "short" },
+		{ K1D_PRIO,   "prio" },
+		{ K1D_MARK,   "mark" },
+		{ K1D_DMAC,   "dmac" },
+		{ K1D_SMAC,   "smac" },
+		{ K1D_ETYPE,  "etype" },
+		{ K1D_L3TOS,  "l3tos" },
+		{ K1D_L3LEN,  "l3len" },
+		{ K1D_L3TTL,  "l3ttl" },
+		{ K1D_L3CSUM, "l3csum" },
+		{ K1D_L3ADDR, "l3addr" },
+		{ K1D_L4PORT, "l4port" },
+		{ K1D_L4HDR,  "l4hdr" },
+	};
+	unsigned int i;
+	int first = 1;
+
+	if (!mask) {
+		seq_puts(m, "none");
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(bits); i++) {
+		if (mask & bits[i].bit) {
+			if (!first)
+				seq_puts(m, ",");
+			seq_puts(m, bits[i].name);
+			first = 0;
+		}
+	}
+}
+
+static void k1_show_hex(struct seq_file *m, const u8 *buf, u8 len)
+{
+	unsigned int i;
+
+	for (i = 0; i < len; i++)
+		seq_printf(m, "%02x", buf[i]);
+}
+
+static void k1_show_diag(struct seq_file *m, u32 now)
+{
+	u32 total = g.diag.total;
+	u32 count = total < K1_DIAG_RING ? total : K1_DIAG_RING;
+	u32 start = total - count;
+	u32 k;
+
+	seq_printf(m, "diag: entries=%u total=%u\n", count, total);
+	for (k = 0; k < count; k++) {
+		const struct k1_diag_ent *e = &g.diag.e[(start + k) & (K1_DIAG_RING - 1u)];
+		const char *in_name = e->dir == 0u ? "lte0pdn2" : "eth0";
+
+		seq_printf(m, "diag[%u]: age_ms=%u t_ms=%u dir=%s stage=%s reason=%s in=%s exp=%s got=%s fam=%u proto=%u diff=",
+			   k, jiffies_to_msecs(now - e->jiffies), jiffies_to_msecs(e->jiffies),
+			   e->dir == 0u ? "dl" : "ul",
+			   k1_stage_name(e->stage),
+			   e->reason == K1S_WRONGPORT ? "wrongport" : "modified",
+			   in_name, k1_port_name(e->exp_port), k1_port_name(e->got_port),
+			   e->family, e->proto);
+		k1_show_diff(m, e->diff_mask);
+		seq_printf(m, " prio=%u->%u mark=%u->%u\n",
+			   e->prio_pre, e->prio_post, e->mark_pre, e->mark_post);
+		seq_printf(m, "  pre(%u)=", e->pre_len);
+		k1_show_hex(m, e->pre, e->pre_len);
+		seq_printf(m, " post(%u)=", e->post_len);
+		k1_show_hex(m, e->post, e->post_len);
+		seq_puts(m, "\n");
+	}
+}
+
 static int k1_show(struct seq_file *m, void *v)
 {
 	u32 now = (u32)jiffies;
@@ -1055,10 +1227,10 @@ static int k1_show(struct seq_file *m, void *v)
 	seq_printf(m, "qctrl: qctrl_present=%d qctrl_dl_calls=%u qctrl_dl_drop=%u qctrl_dl_stolen=%u qctrl_ul_stock=%u\n",
 		   qctrl_present, g.st.qctrl_dl_calls, g.st.qctrl_dl_drop,
 		   g.st.qctrl_dl_stolen, g.st.qctrl_ul_stock);
-	seq_printf(m, "watchdog: wd_armed=%d wd_trips=%u wd_reason=%s wd_mod=%u wd_mismatch=%u wd_stall_ms=%u wd_ringfull_ms=%u\n",
+	seq_printf(m, "watchdog: wd_armed=%d wd_trips=%u wd_reason=%s wd_mod=%u wd_mismatch=%u wd_stall_ms=%u wd_ringfull_ms=%u wd_mod_win_ms=%u\n",
 		   g.wd.armed, g.st.wd_trips, k1_wd_reason_name(g.wd_last_reason),
 		   g.wd_cfg.mod_limit, g.wd_cfg.mismatch_limit,
-		   g.wd_cfg.stall_ms, g.wd_cfg.ringfull_ms);
+		   g.wd_cfg.stall_ms, g.wd_cfg.ringfull_ms, g.wd_cfg.mod_win_ms);
 	seq_printf(m, "safety: txirq=%d txdrain=%d dlbypass=0 pins=%d modref=%lu err_tx=%d\n",
 		   g.tx_on, g.tx_drain, g.pins,
 		   module_refcount(&__this_module), g.last_err_tx);
@@ -1076,9 +1248,10 @@ static int k1_show(struct seq_file *m, void *v)
 	seq_printf(m, "fam: f4dl=%u f4ul=%u f6dl=%u f6ul=%u fudpdl=%u fudpul=%u wf4dl=%u wf4ul=%u wf6dl=%u wf6ul=%u wfudpdl=%u wfudpul=%u\n",
 		   g.st.f4[0], g.st.f4[1], g.st.f6[0], g.st.f6[1], g.st.fudp[0], g.st.fudp[1],
 		   g.st.wf4[0], g.st.wf4[1], g.st.wf6[0], g.st.wf6[1], g.st.wfudp[0], g.st.wfudp[1]);
-	seq_printf(m, "cand_stock=%u granted4=%u granted6=%u brok=%u modified=%u wrongport=%u noconfirm=%u revoked=%u\n",
+	seq_printf(m, "cand_stock=%u granted4=%u granted6=%u brok=%u modified=%u wrongport=%u noconfirm=%u revoked=%u local_deliv=%u local_alias=%u\n",
 		   g.st.cand_stock, g.st.granted4, g.st.granted6, g.st.brok, g.st.modified,
-		   g.st.wrongport, g.st.noconfirm, g.st.revoked);
+		   g.st.wrongport, g.st.noconfirm, g.st.revoked,
+		   g.st.local_deliv, g.st.local_alias);
 	seq_puts(m, "lease:");
 	for (i = 1; i < K1F__N; i++)
 		seq_printf(m, " %s=%u", fn[i], g.st.fres[i]);
@@ -1099,6 +1272,7 @@ static int k1_show(struct seq_file *m, void *v)
 		   run ? k1_tx_tail_used(d) : -2, run ? netif_queue_stopped(d) : -2);
 	seq_printf(m, "table_inuse=%u evictions=%u hk_attach=%u epoch_bumps=%u epoch=%u\n",
 		   tbl->inuse, tbl->evictions, g.st.hk_attach, g.st.epoch_bumps, g.epoch);
+	k1_show_diag(m, now);
 	local_bh_enable();
 	return 0;
 }
@@ -1187,6 +1361,7 @@ static ssize_t k1_write(struct file *file, const char *ubuf, size_t len, loff_t 
 		if (!strcmp(buf, "zero\n") || !strcmp(buf, "zero")) {
 			local_bh_disable();
 			memset(&g.st, 0, sizeof(g.st));
+			k1_diag_clear(&g.diag);
 			g.wd_last_reason = K1_WD_NONE;
 			if (g.wd.armed) {
 				u32 tail = k1_tx_live(g.lan) ?
@@ -1205,13 +1380,25 @@ static ssize_t k1_write(struct file *file, const char *ubuf, size_t len, loff_t 
 	if (!strcmp(buf, "mode") && v <= K1_MODE_BOTH) {
 		k1_set_mode((int)v);
 	} else if (!strcmp(buf, "grant") && v <= 60u) {
+		u32 now;
+		int was_open;
 		local_bh_disable();
-		g.grant_until = (u32)jiffies + v * HZ;
+		now = (u32)jiffies;
+		was_open = k1_gate_open(now);
+		g.grant_until = now + v * HZ;
 		g.grant_set = v > 0u;
+		if (was_open != k1_gate_open(now))
+			k1_epoch_bump();
 		local_bh_enable();
 	} else if (!strcmp(buf, "require_grant") && v <= 1u) {
+		u32 now;
+		int was_open;
 		local_bh_disable();
+		now = (u32)jiffies;
+		was_open = k1_gate_open(now);
 		g.require_grant = (int)v;
+		if (was_open != k1_gate_open(now))
+			k1_epoch_bump();
 		local_bh_enable();
 	} else if (!strcmp(buf, "v4") && v <= 1u) {
 		local_bh_disable();
@@ -1240,6 +1427,17 @@ static ssize_t k1_write(struct file *file, const char *ubuf, size_t len, loff_t 
 	} else if (!strcmp(buf, "wd_mod") && v <= 10000u) {
 		local_bh_disable();
 		g.wd_cfg.mod_limit = v;
+		local_bh_enable();
+	} else if (!strcmp(buf, "wd_mod_win_ms") && v >= 1000u && v <= 60000u) {
+		local_bh_disable();
+		g.wd_cfg.mod_win_ms = v;
+		if (g.wd.armed) {
+			g.wd.prev_mod_d = 0;
+			g.wd.prev_wrg_d = 0;
+			g.wd.cur_mod_base = g.st.modified;
+			g.wd.cur_wrg_base = g.st.wrongport;
+			g.wd.mod_elapsed_ms = 0;
+		}
 		local_bh_enable();
 	} else if (!strcmp(buf, "wd_mismatch") && v <= 10000u) {
 		local_bh_disable();
@@ -1361,6 +1559,7 @@ int init_module(void)
 	g.orig_rx = (rx_handler_func_t *)FP_BR_HANDLE_FRAME_HOOK_VA;
 	g.br_push_xmit = (int (*)(struct sk_buff *))FP_BR_DEV_QUEUE_PUSH_XMIT_VA;
 	g.wd_cfg.mod_limit = 20u;
+	g.wd_cfg.mod_win_ms = K1_WD_MOD_WIN_MS;
 	g.wd_cfg.mismatch_limit = 64u;
 	g.wd_cfg.stall_ms = 500u;
 	g.wd_cfg.ringfull_ms = 500u;

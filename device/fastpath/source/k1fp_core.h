@@ -2,7 +2,7 @@
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
  * k1fp_core.h - Portable decision, classification, lease, watchdog, TX-ring,
- * and SHA-256 fingerprint logic for titan_k1fp 2.0.
+ * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.1.
  *
  * No kernel headers here. The includer must provide u8/u16/u32/u64/s32 and
  * memcmp/memcpy/memset. The same header compiles into the ARMv7 kernel module
@@ -16,6 +16,9 @@
 #define K1_ETH_HLEN       14u
 #define K1_HDRMAX         96u
 #define K1_SAMPLE_MS_MAX  50u
+#define K1_WD_MOD_WIN_MS  10000u
+#define K1_DIAG_RING      16u  /* power of 2 */
+#define K1_DIAG_MAX       64u  /* max captured header bytes (<= hdrlen, no payload) */
 
 /* Operating modes (0 = off at load) */
 enum k1_mode {
@@ -411,6 +414,7 @@ struct k1_pend {
 	u8  granted;
 	u8  had_lease;
 	u8  active;
+	u8  cancelled; /* cancelled via NF_BR_LOCAL_IN or NF_BR_LOCAL_OUT */
 };
 
 enum k1_stage_res {
@@ -432,6 +436,23 @@ static inline void k1_pend_begin(struct k1_pend *pd, const void *skb, u32 outidx
 	pd->granted = 0;
 	pd->had_lease = (u8)!!had_lease;
 	pd->active = 1;
+	pd->cancelled = 0;
+}
+
+/*
+ * Cancel an in-flight proof when the skb enters local bridge delivery
+ * (NF_BR_LOCAL_IN) or a locally-originated transmit aliases its address
+ * (NF_BR_LOCAL_OUT). Leaves had_lease intact so k1_pend_end() still revokes
+ * any pre-existing lease if a flow turned local (fail-closed).
+ */
+static inline int k1_pend_cancel(struct k1_pend *pd, const void *skb)
+{
+	if (!pd->active || skb != pd->skb)
+		return 0;
+	pd->active = 0;
+	pd->skb = 0;
+	pd->cancelled = 1;
+	return 1;
 }
 
 static inline int k1_pend_same(const struct k1_pend *pd, const u8 *eth, u32 lin,
@@ -515,13 +536,175 @@ static inline int k1_pend_end(struct k1_pend *pd, struct k1_tbl *t, u32 now, u32
 {
 	int r = 0;
 
-	if (!pd->active)
+	if (!pd->active && !pd->cancelled)
 		return 0;
 	if (!pd->granted && pd->had_lease)
 		r = k1_revoke(t, &pd->pkt.key, now, seed);
 	pd->active = 0;
+	pd->cancelled = 0;
 	pd->skb = 0;
 	return r;
+}
+
+/* ---------- Diagnostic mismatch ring (cold path only, no payload) ---------- */
+enum k1_diag_stage {
+	K1_STG_BR_POST = 0,
+	K1_STG_BR_LAST,
+	K1_STG_IP4_POST,
+};
+
+#define K1D_PORT    (1u << 0)  /* egress port != expected */
+#define K1D_SHORT   (1u << 1)  /* linear bytes < expected hdrlen */
+#define K1D_PRIO    (1u << 2)  /* skb->priority changed */
+#define K1D_MARK    (1u << 3)  /* skb->mark changed */
+#define K1D_DMAC    (1u << 4)  /* Ethernet dst MAC (0..5) changed */
+#define K1D_SMAC    (1u << 5)  /* Ethernet src MAC (6..11) changed */
+#define K1D_ETYPE   (1u << 6)  /* Ethertype (12..13) changed */
+#define K1D_L3TOS   (1u << 7)  /* IPv4 TOS or IPv6 TC changed */
+#define K1D_L3LEN   (1u << 8)  /* IPv4 ver/ihl/len/id/frag or IPv6 ver/flow/plen changed */
+#define K1D_L3TTL   (1u << 9)  /* IPv4 TTL/proto or IPv6 nh/hlim changed */
+#define K1D_L3CSUM  (1u << 10) /* IPv4 header checksum changed */
+#define K1D_L3ADDR  (1u << 11) /* IPv4/IPv6 src or dst address changed */
+#define K1D_L4PORT  (1u << 12) /* TCP/UDP src or dst port changed */
+#define K1D_L4HDR   (1u << 13) /* remaining TCP/UDP base header changed */
+
+struct k1_diag_ent {
+	u32 jiffies;
+	u32 prio_pre;
+	u32 prio_post;
+	u32 mark_pre;
+	u32 mark_post;
+	u16 diff_mask;
+	u8  reason;    /* K1S_MODIFIED or K1S_WRONGPORT */
+	u8  stage;     /* K1_STG_* */
+	u8  dir;       /* 0=dl, 1=ul */
+	u8  exp_port;  /* expected outidx */
+	u8  got_port;  /* observed outidx */
+	u8  family;    /* 4 or 6 */
+	u8  proto;     /* 6 or 17 */
+	u8  pre_len;   /* saved before-header bytes (<= min(hdrlen, 64)) */
+	u8  post_len;  /* saved after-header bytes (<= min(lin, pre_len)) */
+	u8  pad;
+	u8  pre[K1_DIAG_MAX];
+	u8  post[K1_DIAG_MAX];
+};
+
+struct k1_diag_ring {
+	struct k1_diag_ent e[K1_DIAG_RING];
+	u32 total;
+};
+
+static inline void k1_diag_clear(struct k1_diag_ring *dr)
+{
+	memset(dr, 0, sizeof(*dr));
+}
+
+static inline int k1_range_diff(const u8 *a, const u8 *b, u32 off, u32 len, u32 avail)
+{
+	if (off >= avail)
+		return 0;
+	if (off + len > avail)
+		len = avail - off;
+	return memcmp(a + off, b + off, len) != 0;
+}
+
+static inline u16 k1_diag_diff(const struct k1_pend *pd, u32 outidx, const u8 *eth,
+			       u32 lin, u32 prio, u32 mark)
+{
+	u16 m = 0;
+	u32 avail;
+
+	if (outidx != pd->outidx)
+		m |= K1D_PORT;
+	if (!eth)
+		lin = 0;
+	if (lin < pd->pkt.hdrlen)
+		m |= K1D_SHORT;
+	if (prio != pd->pkt.prio)
+		m |= K1D_PRIO;
+	if (mark != pd->pkt.mark)
+		m |= K1D_MARK;
+
+	avail = lin < pd->pkt.hdrlen ? lin : pd->pkt.hdrlen;
+	if (!avail)
+		return m;
+
+	if (k1_range_diff(pd->hdr, eth, 0, 6, avail))
+		m |= K1D_DMAC;
+	if (k1_range_diff(pd->hdr, eth, 6, 6, avail))
+		m |= K1D_SMAC;
+	if (k1_range_diff(pd->hdr, eth, 12, 2, avail))
+		m |= K1D_ETYPE;
+
+	if (pd->pkt.family == 4u) {
+		if (k1_range_diff(pd->hdr, eth, 15, 1, avail))
+			m |= K1D_L3TOS;
+		if (k1_range_diff(pd->hdr, eth, 14, 1, avail) ||
+		    k1_range_diff(pd->hdr, eth, 16, 6, avail))
+			m |= K1D_L3LEN;
+		if (k1_range_diff(pd->hdr, eth, 22, 2, avail))
+			m |= K1D_L3TTL;
+		if (k1_range_diff(pd->hdr, eth, 24, 2, avail))
+			m |= K1D_L3CSUM;
+		if (k1_range_diff(pd->hdr, eth, 26, 8, avail))
+			m |= K1D_L3ADDR;
+		if (k1_range_diff(pd->hdr, eth, 34, 4, avail))
+			m |= K1D_L4PORT;
+		if (avail > 38u && k1_range_diff(pd->hdr, eth, 38, avail - 38u, avail))
+			m |= K1D_L4HDR;
+	} else {
+		if (avail > 15u &&
+		    (((pd->hdr[14] ^ eth[14]) & 0x0fu) || ((pd->hdr[15] ^ eth[15]) & 0xf0u)))
+			m |= K1D_L3TOS;
+		if ((avail > 14u && ((pd->hdr[14] ^ eth[14]) & 0xf0u)) ||
+		    (avail > 15u && ((pd->hdr[15] ^ eth[15]) & 0x0fu)) ||
+		    k1_range_diff(pd->hdr, eth, 16, 4, avail))
+			m |= K1D_L3LEN;
+		if (k1_range_diff(pd->hdr, eth, 20, 2, avail))
+			m |= K1D_L3TTL;
+		if (k1_range_diff(pd->hdr, eth, 22, 32, avail))
+			m |= K1D_L3ADDR;
+		if (k1_range_diff(pd->hdr, eth, 54, 4, avail))
+			m |= K1D_L4PORT;
+		if (avail > 58u && k1_range_diff(pd->hdr, eth, 58, avail - 58u, avail))
+			m |= K1D_L4HDR;
+	}
+	return m;
+}
+
+static inline void k1_diag_record(struct k1_diag_ring *dr, const struct k1_pend *pd,
+				  u32 now, u8 stage, u8 reason, u32 outidx,
+				  const u8 *eth, u32 lin, u32 prio, u32 mark)
+{
+	struct k1_diag_ent *e = &dr->e[dr->total & (K1_DIAG_RING - 1u)];
+	u32 cap, post_cap;
+
+	cap = pd->pkt.hdrlen < K1_DIAG_MAX ? pd->pkt.hdrlen : K1_DIAG_MAX;
+	if (!eth)
+		lin = 0;
+	post_cap = lin < cap ? lin : cap;
+
+	memset(e, 0, sizeof(*e));
+	e->jiffies = now;
+	e->prio_pre = pd->pkt.prio;
+	e->prio_post = prio;
+	e->mark_pre = pd->pkt.mark;
+	e->mark_post = mark;
+	e->diff_mask = k1_diag_diff(pd, outidx, eth, lin, prio, mark);
+	e->reason = reason;
+	e->stage = stage;
+	e->dir = (u8)(pd->outidx == 1u ? 0u : 1u);
+	e->exp_port = (u8)pd->outidx;
+	e->got_port = (u8)(outidx <= 2u ? outidx : 0u);
+	e->family = pd->pkt.family;
+	e->proto = pd->pkt.proto;
+	e->pre_len = (u8)cap;
+	e->post_len = (u8)post_cap;
+	if (cap)
+		memcpy(e->pre, pd->hdr, cap);
+	if (post_cap)
+		memcpy(e->post, eth, post_cap);
+	dr->total++;
 }
 
 /* Vendor bridge-input hold state machine */
@@ -612,15 +795,19 @@ static inline const char *k1_wd_reason_name(int r)
 }
 
 struct k1_wd_cfg {
-	u32 mod_limit;       /* modified + wrongport delta in window before trip (0 = off) */
+	u32 mod_limit;       /* modified + wrongport burst in mod_win_ms before trip (0 = off) */
+	u32 mod_win_ms;      /* sliding burst window (2 x half-window) for mod_limit (ms) */
 	u32 mismatch_limit;  /* lease mismatch delta in 1 s window before trip (0 = off) */
 	u32 stall_ms;        /* full ring or stopped queue with frozen tail before trip */
 	u32 ringfull_ms;     /* persistent full ring (even if crawling) before trip */
 };
 
 struct k1_wd_state {
-	u32 base_modified;
-	u32 base_wrongport;
+	u32 prev_mod_d;
+	u32 prev_wrg_d;
+	u32 cur_mod_base;
+	u32 cur_wrg_base;
+	u32 mod_elapsed_ms;
 	u32 win_mismatch_base;
 	u32 win_elapsed_ms;
 	u32 last_tail;
@@ -632,8 +819,11 @@ struct k1_wd_state {
 static inline void k1_wd_arm(struct k1_wd_state *w, u32 cur_modified, u32 cur_wrongport,
 			     u32 cur_mismatch, u32 cur_tail)
 {
-	w->base_modified = cur_modified;
-	w->base_wrongport = cur_wrongport;
+	w->prev_mod_d = 0;
+	w->prev_wrg_d = 0;
+	w->cur_mod_base = cur_modified;
+	w->cur_wrg_base = cur_wrongport;
+	w->mod_elapsed_ms = 0;
 	w->win_mismatch_base = cur_mismatch;
 	w->win_elapsed_ms = 0;
 	w->last_tail = cur_tail;
@@ -642,13 +832,27 @@ static inline void k1_wd_arm(struct k1_wd_state *w, u32 cur_modified, u32 cur_wr
 	w->armed = 1;
 }
 
+static inline int k1_wd_check_mod(const struct k1_wd_state *w, const struct k1_wd_cfg *cfg,
+				  int active_mode, u32 cur_modified, u32 cur_wrongport)
+{
+	u32 dmod, dwrg;
+
+	if (!active_mode || !w->armed || !cfg->mod_limit)
+		return K1_WD_NONE;
+	dmod = w->prev_mod_d + (cur_modified - w->cur_mod_base);
+	dwrg = w->prev_wrg_d + (cur_wrongport - w->cur_wrg_base);
+	if (dmod + dwrg >= cfg->mod_limit)
+		return dwrg > dmod ? K1_WD_WRONGPORT : K1_WD_MODIFIED;
+	return K1_WD_NONE;
+}
+
 static inline int k1_wd_tick(struct k1_wd_state *w, const struct k1_wd_cfg *cfg,
 			     int active_mode, int eth_live, int bad_ring,
 			     int ring_full, int queue_stopped, u32 tail,
 			     u32 cur_modified, u32 cur_wrongport, u32 cur_mismatch,
 			     u32 elapsed_ms)
 {
-	u32 dmod, dwrg, dmis;
+	u32 dmis;
 
 	if (!active_mode || !w->armed)
 		return K1_WD_NONE;
@@ -657,10 +861,19 @@ static inline int k1_wd_tick(struct k1_wd_state *w, const struct k1_wd_cfg *cfg,
 		return K1_WD_BADRING;
 
 	if (cfg->mod_limit) {
-		dmod = cur_modified - w->base_modified;
-		dwrg = cur_wrongport - w->base_wrongport;
-		if (dmod + dwrg >= cfg->mod_limit)
-			return dwrg > dmod ? K1_WD_WRONGPORT : K1_WD_MODIFIED;
+		int mr = k1_wd_check_mod(w, cfg, active_mode, cur_modified, cur_wrongport);
+		u32 half_ms = cfg->mod_win_ms >= 1000u ? (cfg->mod_win_ms >> 1) : (K1_WD_MOD_WIN_MS >> 1);
+
+		if (mr != K1_WD_NONE)
+			return mr;
+		w->mod_elapsed_ms += elapsed_ms;
+		if (w->mod_elapsed_ms >= half_ms) {
+			w->prev_mod_d = cur_modified - w->cur_mod_base;
+			w->prev_wrg_d = cur_wrongport - w->cur_wrg_base;
+			w->cur_mod_base = cur_modified;
+			w->cur_wrg_base = cur_wrongport;
+			w->mod_elapsed_ms = 0;
+		}
 	}
 
 	if (cfg->mismatch_limit) {

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * test_k1fp.c - Userspace unit, integration, and fuzz test suite for
- * k1fp 2.0 (device/fastpath/source/k1fp_core.h).
+ * k1fp 2.1 (device/fastpath/source/k1fp_core.h).
  *
  * Compiled and executed on the host with AddressSanitizer + UBSan via
  * device/fastpath/test/run.sh.
@@ -458,12 +458,122 @@ static void test_cbrs_and_proof_invariants(void)
 	CHECK(k1_fast_check(&tbl, &p, now + 10, 1, 20, seed, &f) == K1F_FAST, "wrap fast");
 	CHECK(k1_fast_check(&tbl, &p, now + 20, 1, 20, seed, &f) == K1F_SAMPLE, "wrap sample");
 	CHECK(k1_fast_check(&tbl, &p, now + 60, 1, 20, seed, &f) == K1F_EXPIRED, "wrap expired");
+
+	/* 4. SKB pointer aliasing / local delivery cancellation (k1fp 2.1 root-cause regression):
+	 *    Downlink SAS reply enters stock_cand, reverse-SNAT diverts to NF_BR_LOCAL_IN,
+	 *    tcp_rcv_established frees skb and immediately re-allocates the exact same pointer
+	 *    for the unit's outgoing SAS packet via br_dev_xmit -> br_deliver/br_flood_deliver
+	 *    -> NF_BR_POST_ROUTING. Must NEVER produce K1S_WRONGPORT or K1S_MODIFIED! */
+	now = 6000;
+	k1_flush(&tbl);
+	n = mk_v4(b, 6, 0x22626d2eu, 0xac144022u, 443, 45123, 0x10, 0, 0, 56, 0); /* 34.98.109.46 -> pdn_ip */
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK, "sas dl parse");
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	/* Unrelated skb hitting LOCAL_IN must NOT cancel our active proof */
+	CHECK(k1_pend_cancel(&pd, mod) == 0 && pd.active == 1, "unrelated skb does not cancel");
+	/* Actual skb enters br_pass_frame_up (NF_BR_LOCAL_IN) -> cancels g.pend */
+	CHECK(k1_pend_cancel(&pd, b) == 1 && pd.active == 0 && pd.cancelled == 1,
+	      "LOCAL_IN cancels pending proof");
+	/* Reused skb pointer `b` now carries outgoing 10.1.1.1 -> 34.98.109.46 out lte0pdn2 (FDB hit)
+	 * and out eth0 (FDB miss -> br_flood_deliver). Both must be K1S_IGNORED. */
+	mk_v4(mod, 6, 0x0a010101u, 0x22626d2eu, 45123, 443, 0x18, 0, 0, 64, 100);
+	CHECK(k1_stage_br(&pd, &tbl, b, 2, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_IGNORED,
+	      "reused skb on lte0pdn2 ignored (no false wrongport)");
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_IGNORED,
+	      "reused skb flooded to eth0 ignored (no false modified)");
+	CHECK(k1_pend_end(&pd, &tbl, now, seed) == 0 && !pd.cancelled, "no-lease cancel does not revoke");
+
+	/* Fail-closed: if a flow HAD an active lease and turned local, k1_pend_end STILL revokes it */
+	k1_grant(&tbl, &p, now, 1, 60, 20, seed);
+	CHECK(k1_fast_check(&tbl, &p, now + 5, 1, 20, seed, &f) == K1F_FAST, "pre-local lease active");
+	k1_pend_begin(&pd, b, 1, &p, b, 1);
+	CHECK(k1_pend_cancel(&pd, b) == 1, "LOCAL_OUT/LOCAL_IN cancels leased flow");
+	CHECK(k1_stage_br(&pd, &tbl, b, 2, mod, n, 0, 0, now + 5, 1, 60, 20, seed) == K1S_IGNORED,
+	      "post-cancel stage ignored");
+	CHECK(k1_pend_end(&pd, &tbl, now + 5, seed) == 1, "cancelled flow with lease still revoked");
+	CHECK(k1_fast_check(&tbl, &p, now + 6, 1, 20, seed, &f) == K1F_EXPIRED, "lease revoked after cancel");
+}
+
+static void test_diag_ring(void)
+{
+	struct k1_diag_ring dr;
+	struct k1_pend pd;
+	struct k1_pkt p;
+	u8 b[256], mod[256];
+	u32 n, i;
+	static const u8 V6_A[16] = { 0x20,0x01,0x0d,0xb8,0,0,0,1,0,0,0,0,0,0,0,1 };
+	static const u8 V6_B[16] = { 0x20,0x01,0x0d,0xb8,0,0,0,2,0,0,0,0,0,0,0,2 };
+
+	k1_diag_clear(&dr);
+	CHECK(dr.total == 0, "diag clear total 0");
+
+	/* IPv4 UDP with 120 bytes of secret payload: hdrlen=42 -> MUST capture at most 42 bytes! */
+	n = mk_v4(b, 17, 0xc6336401u, 0xcb007101u, 53, 55000, 0, 0, 0, 64, 120);
+	memset(b + 42, 0xaa, 120);
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK && p.hdrlen == 42, "diag v4 udp parse");
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+
+	memcpy(mod, b, n);
+	mod[0] ^= 0x02u; /* dmac */
+	mod[15] = 0x28u; /* l3tos */
+	mod[22] = 63u;   /* l3ttl */
+	ip4_fix_csum(mod + 14); /* l3csum */
+	mod[34] ^= 0x01u; /* l4port */
+	k1_diag_record(&dr, &pd, 1000, K1_STG_BR_POST, K1S_MODIFIED, 1, mod, n, 7, 9);
+	CHECK(dr.total == 1, "diag recorded 1");
+	CHECK(dr.e[0].pre_len == 42 && dr.e[0].post_len == 42, "v4 udp captures 42 B (zero payload)");
+	CHECK(dr.e[0].pre[42] == 0 && dr.e[0].post[42] == 0, "zero bytes past hdrlen");
+	CHECK((dr.e[0].diff_mask & (K1D_DMAC | K1D_L3TOS | K1D_L3TTL | K1D_L3CSUM | K1D_L4PORT | K1D_PRIO | K1D_MARK)) ==
+	      (K1D_DMAC | K1D_L3TOS | K1D_L3TTL | K1D_L3CSUM | K1D_L4PORT | K1D_PRIO | K1D_MARK),
+	      "v4 diff mask exact (got 0x%x)", dr.e[0].diff_mask);
+	CHECK((dr.e[0].diff_mask & (K1D_SMAC | K1D_ETYPE | K1D_L3ADDR | K1D_PORT | K1D_SHORT)) == 0,
+	      "v4 diff no false bits");
+
+	/* Wrongport + short/NULL safety */
+	k1_diag_record(&dr, &pd, 1100, K1_STG_BR_POST, K1S_WRONGPORT, 2, NULL, 0, 0, 0);
+	CHECK(dr.total == 2 && dr.e[1].reason == K1S_WRONGPORT && dr.e[1].post_len == 0,
+	      "null eth safe");
+	CHECK((dr.e[1].diff_mask & (K1D_PORT | K1D_SHORT)) == (K1D_PORT | K1D_SHORT),
+	      "wrongport + short flags");
+
+	/* IPv6 TCP (hdrlen=74 > K1_DIAG_MAX=64): capped at 64 B, still detects K1D_L4HDR in bytes 58..73 */
+	n = mk_v6(b, 6, V6_A, V6_B, 443, 51234, 0x10, 0x00, 64, 80);
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK && p.hdrlen == 74, "diag v6 tcp parse");
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	memcpy(mod, b, n);
+	mod[14] |= 0x01u; /* TC high nibble -> K1D_L3TOS */
+	mod[30] ^= 0x01u; /* src IPv6 -> K1D_L3ADDR */
+	mod[68] ^= 0x01u; /* TCP window byte past 64 -> K1D_L4HDR */
+	k1_diag_record(&dr, &pd, 1200, K1_STG_BR_LAST, K1S_MODIFIED, 1, mod, n, 0, 0);
+	CHECK(dr.e[2].pre_len == K1_DIAG_MAX && dr.e[2].post_len == K1_DIAG_MAX, "v6 tcp capped at 64 B");
+	CHECK((dr.e[2].diff_mask & (K1D_L3TOS | K1D_L3ADDR | K1D_L4HDR)) ==
+	      (K1D_L3TOS | K1D_L3ADDR | K1D_L4HDR), "v6 diff detects TC, addr, and L4 past 64 B");
+
+	/* Ring wrap-around past K1_DIAG_RING (16) */
+	k1_diag_clear(&dr);
+	for (i = 0; i < 25; i++)
+		k1_diag_record(&dr, &pd, 2000u + i, K1_STG_IP4_POST, K1S_MODIFIED, 1, mod, n, 0, i);
+	CHECK(dr.total == 25, "ring total == 25");
+	for (i = 0; i < K1_DIAG_RING; i++) {
+		u32 seq = (25u - K1_DIAG_RING) + i;
+		const struct k1_diag_ent *e = &dr.e[seq & (K1_DIAG_RING - 1u)];
+		CHECK(e->jiffies == 2000u + seq && e->mark_post == seq,
+		      "ring wrap slot %u has seq %u", i, seq);
+	}
+
+	/* Cleared by zero */
+	k1_diag_clear(&dr);
+	CHECK(dr.total == 0 && dr.e[0].jiffies == 0 && dr.e[0].pre_len == 0, "diag cleared");
 }
 
 static void test_watchdog(void)
 {
-	struct k1_wd_cfg cfg = { .mod_limit = 20, .mismatch_limit = 64, .stall_ms = 500, .ringfull_ms = 500 };
+	struct k1_wd_cfg cfg = {
+		.mod_limit = 20, .mod_win_ms = 10000,
+		.mismatch_limit = 64, .stall_ms = 500, .ringfull_ms = 500
+	};
 	struct k1_wd_state w;
+	u32 mod_cnt = 0;
 	int i, r = K1_WD_NONE;
 
 	/* Not active -> never trips */
@@ -471,10 +581,39 @@ static void test_watchdog(void)
 	CHECK(k1_wd_tick(&w, &cfg, 0, 1, 1, 1, 1, 10, 999, 999, 999, 100) == K1_WD_NONE,
 	      "inactive mode never trips");
 
-	/* Modified burst -> K1_WD_MODIFIED */
+	/* Modified burst inside window -> K1_WD_MODIFIED (both inline check and tick) */
 	k1_wd_arm(&w, 100, 0, 0, 10);
+	CHECK(k1_wd_check_mod(&w, &cfg, 1, 119, 0) == K1_WD_NONE, "inline mod below limit");
+	CHECK(k1_wd_check_mod(&w, &cfg, 1, 120, 0) == K1_WD_MODIFIED, "inline mod trips");
 	CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 119, 0, 0, 100) == K1_WD_NONE, "mod below limit");
 	CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 120, 0, 0, 100) == K1_WD_MODIFIED, "mod trips");
+
+	/* Boundary-straddling burst (10 before 5 s roll + 10 right after) MUST still trip */
+	k1_wd_arm(&w, 0, 0, 0, 10);
+	for (i = 0; i < 49; i++)
+		CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 10, 0, 0, 100) == K1_WD_NONE, "pre-roll ok");
+	/* Tick 50 rolls half-window: prev_mod_d=10, cur_mod_base=10 */
+	CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 10, 0, 0, 100) == K1_WD_NONE, "roll tick ok");
+	CHECK(k1_wd_check_mod(&w, &cfg, 1, 19, 0) == K1_WD_NONE, "straddle 19 below");
+	CHECK(k1_wd_check_mod(&w, &cfg, 1, 20, 0) == K1_WD_MODIFIED, "straddle 20 trips");
+
+	/* Sparse drip over 5 minutes (2 hits every 10 s = 60 total > 20) must NEVER trip */
+	k1_wd_arm(&w, 0, 0, 0, 10);
+	mod_cnt = 0;
+	for (i = 0; i < 3000; i++) { /* 300 s at 100 ms ticks */
+		if (i % 50 == 0)
+			mod_cnt++; /* 1 hit every 5 s = 2 per 10 s window */
+		r = k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, mod_cnt, 0, 0, 100);
+		CHECK(r == K1_WD_NONE, "sparse drip must not trip (tick %d, total %u)", i, mod_cnt);
+	}
+	CHECK(mod_cnt == 60, "drip accumulated 60 total hits without tripping");
+
+	/* Quiet decay: 15 hits, then 10 s quiet, then 15 more hits -> must NOT trip */
+	k1_wd_arm(&w, 0, 0, 0, 10);
+	CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 15, 0, 0, 100) == K1_WD_NONE, "first 15 ok");
+	for (i = 0; i < 100; i++)
+		CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 0, 10, 15, 0, 0, 100) == K1_WD_NONE, "quiet decay");
+	CHECK(k1_wd_check_mod(&w, &cfg, 1, 30, 0) == K1_WD_NONE, "second 15 after decay ok");
 
 	/* Wrongport burst -> K1_WD_WRONGPORT */
 	k1_wd_arm(&w, 0, 5, 0, 10);
@@ -584,6 +723,7 @@ int main(void)
 	test_fuzz_parse();
 	test_modes_and_qctrl_policy();
 	test_cbrs_and_proof_invariants();
+	test_diag_ring();
 	test_watchdog();
 	test_tx_ring_model();
 	test_sha256_vectors();
@@ -591,6 +731,6 @@ int main(void)
 		fprintf(stderr, "FAILED: %d check(s) failed\n", fails);
 		return 1;
 	}
-	printf("PASS: all k1fp 2.0 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, watchdog, txring, SHA-256)\n");
+	printf("PASS: all k1fp 2.1 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, SHA-256)\n");
 	return 0;
 }

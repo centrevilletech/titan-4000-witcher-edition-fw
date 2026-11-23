@@ -363,9 +363,12 @@ _Static_assert(offsetof(struct net, dev_base_head) == 0x68, "net.dev_base_head !
 #define NF_MAX_HOOKS         8u
 
 #define NF_INET_POST_ROUTING 4u
+#define NF_BR_LOCAL_IN       1u
 #define NF_BR_FORWARD        2u
+#define NF_BR_LOCAL_OUT      3u
 #define NF_BR_POST_ROUTING   4u
 
+#define NF_BR_PRI_FIRST      (-2147483647 - 1)
 #define NF_BR_PRI_NAT_SRC    300
 #define NF_BR_PRI_LAST       2147483647
 #define NF_IP_PRI_LAST       2147483647
