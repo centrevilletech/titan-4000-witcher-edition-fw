@@ -313,6 +313,34 @@ for line in sys.stdin:
         print('PASS: CBRS gate failed closed %.1f s after the grant keys went missing, and opened again.'%took,flush=True)
         wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
+        # Steady-state packet socket audit: the keeper must never hold an
+        # ETH_P_ALL (0003) tap, and /proc/net/ptype must carry no ALL handler
+        # once the test's own capture socket is closed.
+        keeper_inodes=set()
+        for entry in Path(f'/proc/{keeper.pid}/fd').iterdir():
+            try:
+                target=os.readlink(entry)
+            except OSError:
+                continue
+            if target.startswith('socket:[') and target.endswith(']'):
+                keeper_inodes.add(target[8:-1])
+        keeper_protos=set()
+        packet_lines=Path('/proc/net/packet').read_text().splitlines()
+        for row in packet_lines[1:]:
+            cols=row.split()
+            if len(cols)>=9 and cols[8] in keeper_inodes:
+                keeper_protos.add(cols[3].lower())
+        assert '0003' not in keeper_protos, ('keeper opened ETH_P_ALL', keeper_protos, packet_lines)
+        assert {'0806', '0800'}.issubset(keeper_protos), ('expected ARP and IPv4 control sockets', keeper_protos, packet_lines)
+        assert '86dd' not in keeper_protos, ('IPv6 control socket should stay closed when PD is off', keeper_protos, packet_lines)
+        capture.close()
+        ptype_lines=Path('/proc/net/ptype').read_text().splitlines()
+        all_ptypes=[line for line in ptype_lines[1:] if line.split() and line.split()[0]=='ALL']
+        assert not all_ptypes, ('unexpected ETH_P_ALL handler in /proc/net/ptype', ptype_lines)
+        ns_all=[row for row in Path('/proc/net/packet').read_text().splitlines()[1:] if len(row.split())>=4 and row.split()[3].lower()=='0003']
+        assert not ns_all, ('unexpected ETH_P_ALL socket in /proc/net/packet', ns_all)
+        capture=socket.socket(socket.AF_PACKET,socket.SOCK_RAW,socket.htons(3));capture.bind(('eth0',0));capture.setblocking(False)
+        print('PASS: steady state holds protocol-specific control sockets only (no ETH_P_ALL in /proc/net/packet or /proc/net/ptype).',flush=True)
         # The vendor Wi-Fi DHCP server writes its empty list over the shared
         # lease file every 30 s. A gap longer than the keeper's 8 s hold must
         # not start the IPv4 check over, or log a new arming.

@@ -29,6 +29,7 @@
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::net::Ipv6Addr;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -70,7 +71,13 @@ const TK_FLAGS_CONFIG_EVERY: u64 = 15;
 const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
 const SERVE_RETRY: u64 = 60;
-const FLOOD_INTERVAL: u64 = 30;
+/// Seconds between steady-state checks of the DHCP ebtables flood rules.
+/// Firewall restarts and bearer changes trigger an immediate check.
+const FLOOD_INTERVAL: u64 = 300;
+/// Seconds between safety re-checks of `ip -6 route` once management IPv6 has settled.
+const MGMT_ROUTE_VERIFY: u64 = 300;
+/// Seconds between rtnetlink refreshes of br0's probe IPv4 address.
+const PROBE_ADDR_EVERY: u64 = 10;
 /// Seconds the IPv4 check keeps its router through an unreadable lease file.
 const PEER_HOLD: u64 = 8;
 const MGMT_EVERY: u64 = 10;
@@ -87,6 +94,8 @@ const REBOOT_GIVE_UP_AFTER: u64 = 120;
 
 const SO_MARK: libc::c_int = 36;
 const PACKET_OUTGOING: u8 = 4;
+/// Modest receive buffer for control-plane packet sockets (kernel doubles this).
+const CONTROL_RCVBUF: libc::c_int = 65_536;
 /// Source link-layer address of the core's router advertisement on this EPC.
 /// Data frames have to be addressed to this MAC so the bridge forwards them
 /// out lte0pdn1. Addressing them to eth0 makes the bridge deliver them locally.
@@ -105,11 +114,38 @@ impl Drop for Packet {
     }
 }
 
+/// Keeps `br0` subscribed to IPv6 link-local control multicast groups so Linux
+/// bridge MLD snooping always delivers RS and DHCPv6 frames to `br0`.
+struct Ipv6Socket {
+    packet: Packet,
+    _mcast_guard: Option<Packet>,
+}
+
+/// Protocol-specific `AF_PACKET` (`ptype_base`) receive sockets bound to `br0`,
+/// plus an unbound protocol-0 sender socket. No `ETH_P_ALL` socket is ever
+/// opened, so `ptype_all` stays empty, transmit never runs `dev_queue_xmit_nit`,
+/// and bridge-forwarded customer traffic never enters `ptype_base`.
+struct ControlSockets {
+    bridge_ifindex: i32,
+    arp: Packet,
+    dhcp: Packet,
+    ipv6: Option<Ipv6Socket>,
+    tx_ipv6: Packet,
+}
+
+type FileFingerprint = (u64, u64, i64, i64);
+
 struct Keeper {
-    packet: Option<Packet>,
+    sockets: Option<ControlSockets>,
     serving: bool,
     health: Health,
     now: u64,
+    last_sec_tick: Option<u64>,
+    cached_routes: String,
+    nvram_cache: Option<(u64, Vec<u8>)>,
+    config_cache: Option<(Option<FileFingerprint>, Result<Option<Config>, String>)>,
+    saved_budget: Option<(u32, u64, u64)>,
+    probe_addr_cache: Option<(u64, std::net::Ipv4Addr, Option<std::net::Ipv4Addr>)>,
     last_ra: u64,
     last_router: u64,
     dhcp_gate: ipv4::DhcpGate,
@@ -124,6 +160,7 @@ struct Keeper {
     last_sas_check: Option<u64>,
     dhcp_child: Option<std::process::Child>,
     last_flood: u64,
+    flood_bearer: String,
     serve_retry_at: u64,
     router_seen: bool,
     solicit_pending: bool,
@@ -168,6 +205,10 @@ struct Keeper {
     last_mgmt: u64,
     last_mgmt_log: u64,
     mgmt_up_logged: bool,
+    mgmt_iid: Option<mgmt::Iid>,
+    mgmt_klog_checked: bool,
+    mgmt_settled: bool,
+    last_mgmt_route_verify: u64,
     deaf_watch: deaf::Watch,
     deaf_probe: Option<DeafProbe>,
     deaf_secs: u64,
@@ -280,6 +321,14 @@ impl KernelLog {
         })
     }
 
+    /// Character devices (`/dev/kmsg`, `/tmp/titan-kmsg`) support `poll(POLLIN)`
+    /// cleanly. Regular files (used in tests) are always readable and must not
+    /// be passed to `poll`.
+    fn is_pollable(&self) -> bool {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        unsafe { libc::fstat(self.fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR }
+    }
+
     /// Complete lines that have arrived since the last call, and whether the
     /// log was read to its end. At start the backlog takes a few ticks.
     fn lines(&mut self) -> (Vec<String>, bool) {
@@ -336,7 +385,7 @@ pub fn serve() -> Result<(), String> {
         if let Err(err) = keeper.tick() {
             keeper.note(&format!("tick failed: {err}"));
         }
-        thread::sleep(Duration::from_millis(200));
+        keeper.wait_next();
     }
 }
 
@@ -358,10 +407,16 @@ pub fn tc_apply(lines: &[String]) -> Result<(), String> {
 impl Keeper {
     fn new() -> Self {
         Self {
-            packet: None,
+            sockets: None,
             serving: false,
             health: Health::default(),
             now: 0,
+            last_sec_tick: None,
+            cached_routes: String::new(),
+            nvram_cache: None,
+            config_cache: None,
+            saved_budget: None,
+            probe_addr_cache: None,
             last_ra: 0,
             last_router: 0,
             dhcp_gate: ipv4::DhcpGate::default(),
@@ -374,6 +429,7 @@ impl Keeper {
             last_sas_check: None,
             dhcp_child: None,
             last_flood: 0,
+            flood_bearer: String::new(),
             serve_retry_at: 0,
             router_seen: false,
             solicit_pending: false,
@@ -406,6 +462,10 @@ impl Keeper {
             last_mgmt: 0,
             last_mgmt_log: 0,
             mgmt_up_logged: false,
+            mgmt_iid: None,
+            mgmt_klog_checked: false,
+            mgmt_settled: false,
+            last_mgmt_route_verify: 0,
             deaf_watch: deaf::Watch::default(),
             deaf_probe: None,
             deaf_secs: deaf::DEAF_SECS,
@@ -445,8 +505,133 @@ impl Keeper {
         }
     }
 
+    /// Block in `poll()` on the control sockets and real kernel log device so
+    /// control frames and kernel events wake the keeper immediately while idle
+    /// steady state wakes only once per second.
+    fn wait_next(&self) {
+        let fast = self.deaf_probe.is_some()
+            || self.tk_probe.is_some()
+            || (self.kernel_log.is_some() && !self.kmsg_drained);
+        let timeout_ms: libc::c_int = if fast { 200 } else { 1000 };
+        let mut fds = [libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        }; 4];
+        let mut nfds: usize = 0;
+        if let Some(sockets) = &self.sockets {
+            fds[nfds] = libc::pollfd {
+                fd: sockets.arp.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+            fds[nfds] = libc::pollfd {
+                fd: sockets.dhcp.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            nfds += 1;
+            if let Some(ipv6) = &sockets.ipv6 {
+                fds[nfds] = libc::pollfd {
+                    fd: ipv6.packet.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                nfds += 1;
+            }
+        }
+        if let Some(klog) = &self.kernel_log {
+            if klog.is_pollable() {
+                fds[nfds] = libc::pollfd {
+                    fd: klog.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                nfds += 1;
+            }
+        }
+        if nfds == 0 {
+            thread::sleep(Duration::from_millis(timeout_ms as u64));
+            return;
+        }
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
+        if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn budget_tuple(&self) -> (u32, u64, u64) {
+        (
+            self.health.link_drops,
+            self.health.window_start,
+            self.health.quiet_until,
+        )
+    }
+
+    fn read_nvram_cache(&mut self) -> Option<&[u8]> {
+        let refresh = self.nvram_cache.as_ref().is_none_or(|(at, _)| *at != self.now);
+        if refresh {
+            self.nvram_cache = fs::read(nvram_cache()).ok().map(|bytes| (self.now, bytes));
+        }
+        self.nvram_cache.as_ref().map(|(_, bytes)| bytes.as_slice())
+    }
+
+    /// Reads one key from the cached `/tmp/nvram.cfg` in-process, formatted the
+    /// same way as `nvram_get 0 <key>`. Falls back to `nvram_get` only when the
+    /// key is absent from the cache file (for example in host tests with stubs).
+    fn nvram_get_cached(&mut self, key: &str) -> String {
+        if let Some(cache) = self.read_nvram_cache() {
+            if let Some(value) = nvram_get_from_cache(cache, key) {
+                return value;
+            }
+        }
+        command_stdout("nvram_get", &["0", key])
+    }
+
+    fn load_config_cached(&mut self) -> Result<Option<Config>, String> {
+        let path = state_dir().join("config.json");
+        let fp = fs::metadata(&path).ok().map(|meta| {
+            (
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+            )
+        });
+        if let Some((cached_fp, cached_result)) = &self.config_cache {
+            if *cached_fp == fp {
+                return cached_result.clone();
+            }
+        }
+        let loaded = config::load_config(&path);
+        self.config_cache = Some((fp, loaded.clone()));
+        loaded
+    }
+
+    fn bridge_probe_address_cached(
+        &mut self,
+        bearer: std::net::Ipv4Addr,
+    ) -> Option<std::net::Ipv4Addr> {
+        if let Some((at, cached_bearer, addr)) = self.probe_addr_cache {
+            if cached_bearer == bearer
+                && addr.is_some()
+                && self.now.saturating_sub(at) < PROBE_ADDR_EVERY
+            {
+                return addr;
+            }
+        }
+        let addr = bridge_probe_address(bearer);
+        self.probe_addr_cache = Some((self.now, bearer, addr));
+        addr
+    }
+
     fn tick(&mut self) -> Result<(), String> {
-        self.refresh_mode();
+        let new_second = self.last_sec_tick != Some(self.now);
+        if new_second {
+            self.last_sec_tick = Some(self.now);
+            self.refresh_mode();
+        }
         // First, and in every mode: nothing below may delay it.
         self.maintain_cbrs_gate();
         self.maintain_external_dev();
@@ -457,7 +642,7 @@ impl Keeper {
         self.maintain_qctrl();
         self.maintain_mgmt_v6();
         if !self.passthrough {
-            self.packet = None;
+            self.sockets = None;
             self.ipv4_watch.reset();
             self.ipv4_peer = None;
             self.sas_watch.reset();
@@ -475,20 +660,27 @@ impl Keeper {
                 &Report::default(),
                 "IPv6 prefix delegation stays off outside IP passthrough",
             );
-            thread::sleep(Duration::from_secs(1));
             return Ok(());
         }
         self.logged_idle = false;
-        self.ensure_packet()?;
+        let loaded = self.load_config_cached();
+        let want_ipv6 = matches!(&loaded, Ok(Some(cfg)) if cfg.enabled);
+        self.ensure_sockets(want_ipv6)?;
         self.drain();
-        // Both guards must see the same main-table snapshot on this tick.
-        let routes = main_routes();
-        self.maintain_ipv4(&routes);
-        self.maintain_ipv4_link(&routes);
-        self.maintain_driver_mac();
-        self.maintain_sas_nat(&routes);
+        if new_second || self.cached_routes.is_empty() {
+            // Both guards must see the same main-table snapshot on this second.
+            self.cached_routes = main_routes();
+        }
+        let routes = self.cached_routes.clone();
+        if new_second || self.discover.is_some() {
+            self.maintain_ipv4(&routes);
+        }
+        if new_second {
+            self.maintain_ipv4_link(&routes);
+            self.maintain_driver_mac();
+            self.maintain_sas_nat(&routes);
+        }
 
-        let loaded = config::load_config(&state_dir().join("config.json"));
         let config = match loaded {
             Ok(config) => {
                 self.logged_unreadable = false;
@@ -633,7 +825,9 @@ impl Keeper {
         } else {
             self.act(decision, block);
         }
-        self.save_budget();
+        if self.saved_budget != Some(self.budget_tuple()) {
+            self.save_budget();
+        }
         let recent = self.now.saturating_sub(self.last_router) < health::SILENCE_SECS
             || self.now.saturating_sub(self.health.phase_since) < health::SILENCE_SECS;
         let healthy = self.serving && carrier && recent;
@@ -688,7 +882,7 @@ impl Keeper {
     }
 
     fn start_serving(&mut self, block: Block) -> Result<(), String> {
-        self.ensure_packet()?;
+        self.ensure_sockets(true)?;
         let sniffed = self.sniff_core_ra()?;
         self.reinstall_filter()?;
         self.hold_sysctl();
@@ -774,27 +968,34 @@ impl Keeper {
     }
 
     fn send_raw(&mut self, dest_mac: [u8; 6], packet: &[u8], why: &str) {
-        let Some(socket) = self.packet.as_ref() else {
+        let Some(sockets) = self.sockets.as_ref() else {
             self.note(&format!(
                 "did not send ({why}): customer port socket is closed"
             ));
             return;
         };
         let ifindex = interface_index(CUSTOMER).unwrap_or(0);
-        match send_ipv6(socket.fd, ifindex, dest_mac, packet) {
+        match send_ipv6(sockets.tx_ipv6.fd, ifindex, dest_mac, packet) {
             Ok(()) => self.note(why),
             Err(err) => self.note(&format!("send failed ({why}): {err}")),
         }
     }
 
     fn sniff_core_ra(&mut self) -> Result<Sniff, String> {
-        let ifindex = interface_index(CUSTOMER).ok_or("eth0 has no interface index")?;
-        let sniff = open_packet(ifindex, true)?;
-        self.packet = Some(sniff);
+        self.ensure_sockets(true)?;
+        let fd = {
+            let ipv6 = self
+                .sockets
+                .as_ref()
+                .and_then(|sockets| sockets.ipv6.as_ref())
+                .ok_or("IPv6 control socket is not open")?;
+            crate::capture::install_ipv6(ipv6.packet.fd, true)?;
+            ipv6.packet.fd
+        };
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
-            for event in self.collect() {
+            for event in self.collect_ipv6() {
                 if let Class::RouterAdvertisement {
                     prefixes,
                     source_mac,
@@ -806,7 +1007,12 @@ impl Keeper {
                     }
                 }
             }
-            thread::sleep(Duration::from_millis(50));
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let _ = unsafe { libc::poll(&mut pfd, 1, 200) };
         }
         if found.prefixes.is_empty() {
             self.note("no core advertisement seen before the filter; withdrawing the link prefix");
@@ -816,25 +1022,70 @@ impl Keeper {
                 found.prefixes[0]
             ));
         }
-        let steady = open_packet(ifindex, false);
-        self.packet = None;
-        self.packet = Some(steady?);
+        let restore = if let Some(ipv6) = self.sockets.as_ref().and_then(|s| s.ipv6.as_ref()) {
+            crate::capture::install_ipv6(ipv6.packet.fd, false)
+        } else {
+            Ok(())
+        };
+        let _ = self.collect_ipv6();
+        restore?;
         Ok(found)
     }
 
-    fn ensure_packet(&mut self) -> Result<(), String> {
-        if self.packet.is_some() {
-            return Ok(());
+    fn ensure_sockets(&mut self, want_ipv6: bool) -> Result<(), String> {
+        let bridge_ifindex = interface_index(BRIDGE).ok_or("br0 has no interface index")?;
+        if self
+            .sockets
+            .as_ref()
+            .is_some_and(|sockets| sockets.bridge_ifindex != bridge_ifindex)
+        {
+            self.sockets = None;
         }
-        let ifindex = interface_index(CUSTOMER).ok_or("eth0 has no interface index")?;
-        self.packet = Some(open_packet(ifindex, false)?);
+        if self.sockets.is_none() {
+            let arp =
+                open_protocol_packet(bridge_ifindex, libc::ETH_P_ARP, crate::capture::install_arp)?;
+            let dhcp = open_protocol_packet(
+                bridge_ifindex,
+                libc::ETH_P_IP,
+                crate::capture::install_ipv4_dhcp,
+            )?;
+            let tx_ipv6 = open_tx_ipv6()?;
+            self.sockets = Some(ControlSockets {
+                bridge_ifindex,
+                arp,
+                dhcp,
+                ipv6: None,
+                tx_ipv6,
+            });
+        }
+        if let Some(sockets) = self.sockets.as_mut() {
+            if want_ipv6 && sockets.ipv6.is_none() {
+                let packet =
+                    open_protocol_packet(bridge_ifindex, libc::ETH_P_IPV6, |fd| {
+                        crate::capture::install_ipv6(fd, false)
+                    })?;
+                let _mcast_guard = join_ipv6_control_multicast(bridge_ifindex);
+                sockets.ipv6 = Some(Ipv6Socket {
+                    packet,
+                    _mcast_guard,
+                });
+            } else if !want_ipv6 && sockets.ipv6.is_some() {
+                sockets.ipv6 = None;
+            }
+        }
         Ok(())
     }
 
     fn drain(&mut self) {
+        self.drain_arp();
+        self.drain_dhcp();
+        let events = self.collect_ipv6();
+        if events.is_empty() {
+            return;
+        }
         let block = self.serving_block();
-        for event in self.collect() {
-            if event.outgoing {
+        for event in events {
+            if event.outgoing || event.source_mac == Some(self.core_mac) {
                 continue;
             }
             // Any IPv6 the router sends us shows it speaks IPv6.
@@ -886,13 +1137,90 @@ impl Keeper {
         }
     }
 
-    fn collect(&mut self) -> Vec<Event> {
-        let Some(socket) = self.packet.as_ref() else {
+    fn drain_arp(&mut self) {
+        let Some(fd) = self.sockets.as_ref().map(|sockets| sockets.arp.fd) else {
+            return;
+        };
+        loop {
+            let mut buf = [0u8; 256];
+            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    fd,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    (&mut addr as *mut libc::sockaddr_ll).cast(),
+                    &mut len,
+                )
+            };
+            if n < 0 {
+                break;
+            }
+            if addr.sll_pkttype == PACKET_OUTGOING || addr.sll_halen < 6 {
+                continue;
+            }
+            let packet = &buf[..n as usize];
+            let mut mac = [0u8; 6];
+            mac.copy_from_slice(&addr.sll_addr[..6]);
+            match self.ipv4_watch.reply(self.now, packet, mac) {
+                Some(Armed::First) => {
+                    self.note("IPv4 router answered local ARP; automatic recovery is armed")
+                }
+                // The same router after a cable or LTE outage: routine,
+                // so the RAM log only.
+                Some(Armed::Again) => {
+                    log_ram("IPv4 router answered local ARP again; automatic recovery is armed")
+                }
+                None => {}
+            }
+        }
+    }
+
+    fn drain_dhcp(&mut self) {
+        let Some(fd) = self.sockets.as_ref().map(|sockets| sockets.dhcp.fd) else {
+            return;
+        };
+        loop {
+            let mut buf = [0u8; 2048];
+            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    fd,
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                    0,
+                    (&mut addr as *mut libc::sockaddr_ll).cast(),
+                    &mut len,
+                )
+            };
+            if n < 0 {
+                break;
+            }
+            if addr.sll_pkttype == PACKET_OUTGOING {
+                continue;
+            }
+            let packet = &buf[..n as usize];
+            if let Some(mac) = dhcp_client_mac(packet) {
+                self.discover = Some(mac);
+            }
+        }
+    }
+
+    fn collect_ipv6(&mut self) -> Vec<Event> {
+        let Some(fd) = self
+            .sockets
+            .as_ref()
+            .and_then(|sockets| sockets.ipv6.as_ref())
+            .map(|ipv6| ipv6.packet.fd)
+        else {
             return Vec::new();
         };
-        let fd = socket.fd;
-        let our = link_local(&read_file("/proc/net/if_inet6"), BRIDGE);
-        let delegated = self.serving_block().map(|block| block.delegated57());
+        let mut our = None;
+        let mut delegated = None;
+        let mut loaded_context = false;
         let mut events = Vec::new();
         loop {
             let mut buf = [0u8; 2048];
@@ -909,42 +1237,15 @@ impl Keeper {
                 )
             };
             if n < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted {
-                    break;
-                }
                 break;
+            }
+            if !loaded_context {
+                our = link_local(&read_file("/proc/net/if_inet6"), BRIDGE);
+                delegated = self.serving_block().map(|block| block.delegated57());
+                loaded_context = true;
             }
             let packet = &buf[..n as usize];
             let outgoing = addr.sll_pkttype == PACKET_OUTGOING;
-            let protocol = u16::from_be(addr.sll_protocol);
-            if protocol == libc::ETH_P_ARP as u16 && !outgoing && addr.sll_halen >= 6 {
-                let mut mac = [0u8; 6];
-                mac.copy_from_slice(&addr.sll_addr[..6]);
-                match self.ipv4_watch.reply(self.now, packet, mac) {
-                    Some(Armed::First) => {
-                        self.note("IPv4 router answered local ARP; automatic recovery is armed")
-                    }
-                    // The same router after a cable or LTE outage: routine,
-                    // so the RAM log only.
-                    Some(Armed::Again) => log_ram(
-                        "IPv4 router answered local ARP again; automatic recovery is armed",
-                    ),
-                    None => {}
-                }
-                continue;
-            }
-            if protocol == libc::ETH_P_IP as u16 {
-                if !outgoing {
-                    if let Some(mac) = dhcp_client_mac(packet) {
-                        self.discover = Some(mac);
-                    }
-                }
-                continue;
-            }
-            if protocol != libc::ETH_P_IPV6 as u16 {
-                continue;
-            }
             let mut kind = classify_ipv6(packet, delegated, our);
             let mac = (addr.sll_halen >= 6).then(|| {
                 let mut mac = [0u8; 6];
@@ -997,13 +1298,11 @@ impl Keeper {
         self.send_raw(mac, &packet, "DHCPv6 reply from the pinned block");
     }
 
-    fn serving_block(&self) -> Option<Block> {
+    fn serving_block(&mut self) -> Option<Block> {
         if !self.serving {
             return None;
         }
-        let config = config::load_config(&state_dir().join("config.json"))
-            .ok()
-            .flatten()?;
+        let config = self.load_config_cached().ok().flatten()?;
         config.pinned_block().ok().flatten()
     }
 
@@ -1017,16 +1316,30 @@ impl Keeper {
                 return *addr;
             }
         }
-        let read = || {
-            let snapshot = fs::read("/tmp/nvram.cfg").ok()?;
-            let ports = fs::read_dir("/sys/class/net/br0/brif").ok()?
+        let snapshot = if std::env::var_os("TITAN_NVRAM_CACHE").is_none() {
+            self.read_nvram_cache().map(|bytes| bytes.to_vec())
+        } else {
+            fs::read("/tmp/nvram.cfg").ok()
+        };
+        let addr = snapshot.and_then(|snapshot| {
+            let ports = fs::read_dir("/sys/class/net/br0/brif")
+                .ok()?
                 .map(|entry| entry.ok()?.file_name().into_string().ok())
                 .collect::<Option<Vec<_>>>()?;
             ipv4::data_assignment(&snapshot, &ports, &self.bearer)
-        };
-        let addr = read();
+        });
         self.assigned_at = Some((self.now, self.bearer.clone(), addr));
         addr
+    }
+
+    fn customer_dhcp_running(&self) -> bool {
+        if self.dhcp_child.is_some() {
+            return true;
+        }
+        if let Some(running) = customer_dhcp_running_proc() {
+            return running;
+        }
+        !customer_dhcp_pids(&command_stdout("ps", &[])).is_empty()
     }
 
     fn maintain_ipv4(&mut self, routes: &str) {
@@ -1036,19 +1349,31 @@ impl Keeper {
                 self.dhcp_child = None;
             }
         }
-        if self.now.saturating_sub(self.last_flood) >= FLOOD_INTERVAL {
-            let first = self.last_flood == 0;
-            let mut failed = None;
-            for line in ipv4::flood_commands(&self.bearer) {
-                if let Err(err) = ebtables(&line) {
-                    failed = Some(err);
+        let bearer_changed = self.flood_bearer != self.bearer;
+        if self.last_flood == 0
+            || bearer_changed
+            || self.now.saturating_sub(self.last_flood) >= FLOOD_INTERVAL
+        {
+            let first = self.last_flood == 0 && self.flood_bearer.is_empty();
+            let already_present = !first
+                && !bearer_changed
+                && flood_rules_present(&ebtables_list_forward(), &self.bearer);
+            if already_present {
+                self.last_flood = self.now;
+            } else {
+                let mut failed = None;
+                for line in ipv4::flood_commands(&self.bearer) {
+                    if let Err(err) = ebtables(&line) {
+                        failed = Some(err);
+                    }
                 }
-            }
-            self.last_flood = self.now;
-            if let Some(err) = failed {
-                self.note(&format!("DHCP flood rules were not installed: {err}"));
-            } else if first {
-                self.note("scoped DHCP so discover and offers stay off the customer bearer");
+                self.last_flood = self.now;
+                self.flood_bearer = self.bearer.clone();
+                if let Some(err) = failed {
+                    self.note(&format!("DHCP flood rules were not installed: {err}"));
+                } else if first {
+                    self.note("scoped DHCP so discover and offers stay off the customer bearer");
+                }
             }
         }
         let conf = read_file("/tmp/udhcpd.conf");
@@ -1072,7 +1397,7 @@ impl Keeper {
                     return None;
                 }
                 self.last_dhcp_probe = self.now;
-                let running = !customer_dhcp_pids(&command_stdout("ps", &[])).is_empty();
+                let running = self.customer_dhcp_running();
                 ipv4::restart_with_assignment(&conf, routes, running, assigned)
             });
         let Some(plan) = plan else {
@@ -1198,7 +1523,7 @@ impl Keeper {
             if local_mac == mac {
                 return None;
             }
-            let local_address = bridge_probe_address(bearer)?;
+            let local_address = self.bridge_probe_address_cached(bearer)?;
             gateway = Some(conf.router);
             Some(Peer {
                 address: bearer,
@@ -1376,11 +1701,9 @@ impl Keeper {
             return;
         }
         self.last_sas_check = Some(self.now);
-        let snat = sas_nat::needed(
-            &command_stdout("nvram_get", &["0", "lan_management_ipaddr"]),
-            &command_stdout("nvram_get", &["0", "pdn_data_ipaddr"]),
-            routes,
-        );
+        let local_ip = self.nvram_get_cached("lan_management_ipaddr");
+        let data_ip = self.nvram_get_cached("pdn_data_ipaddr");
+        let snat = sas_nat::needed(&local_ip, &data_ip, routes);
         let present = snat.and_then(|snat| {
             sas_nat::present(
                 &command_stdout("iptables", &["-t", "nat", "-S", "POSTROUTING"]),
@@ -1440,6 +1763,7 @@ impl Keeper {
             .any(|line| sas_nat::firewall_restart(line))
         {
             self.sas_watch.burst(self.now);
+            self.last_flood = 0;
         }
     }
 
@@ -1452,8 +1776,7 @@ impl Keeper {
         if !self.cbrs_gate.due(self.now) {
             return;
         }
-        let cache = fs::read(nvram_cache()).ok();
-        let gate = cbrs_gate::decide(cache.as_deref());
+        let gate = cbrs_gate::decide(self.read_nvram_cache());
         let (step, line) = self.cbrs_gate.observe(self.now, &gate);
         let changed = line.is_some();
         if let Some(line) = line {
@@ -1503,6 +1826,7 @@ impl Keeper {
                 // The vendor adds the SAS SNAT rule during this setup and its
                 // firewall restarts can drop it again. Check it every second.
                 self.sas_watch.burst(self.now);
+                self.last_flood = 0;
             }
             self.mode_checked = None;
             return;
@@ -1518,10 +1842,10 @@ impl Keeper {
         self.mode_checked = Some(self.now);
         // A failed or empty read keeps the last mode. Taking it for NAT stopped
         // the responder and removed the port filter, and the SQM under it.
-        if let Some(mode) = vendor_passthrough(&command_stdout("nvram_get", &["0", "router_disable"])) {
+        if let Some(mode) = vendor_passthrough(&self.nvram_get_cached("router_disable")) {
             self.passthrough = mode;
         }
-        let named = command_stdout("nvram_get", &["0", "pdn_data_ifname"]);
+        let named = self.nvram_get_cached("pdn_data_ifname");
         let named = named.rsplit(':').next().unwrap_or("").trim();
         if extdev::is_lte_bearer(named) {
             self.bearer = named.to_owned();
@@ -1542,6 +1866,9 @@ impl Keeper {
             if live && tk_flags::modem_loaded(&line) {
                 self.modem_restart_seen = true;
             }
+            if let Some(iid) = mgmt::assigned_iid(&line) {
+                self.mgmt_iid = Some(iid);
+            }
             if let Some(event) = extdev::parse(&line) {
                 self.ext_watch.note(event);
             }
@@ -1550,9 +1877,16 @@ impl Keeper {
                     self.sas_watch.burst(self.now);
                     // Bring management IPv6 up on this tick, not up to 10 s later.
                     self.last_mgmt = 0;
+                    self.mgmt_settled = false;
                 }
-                Some(_) => self.sas_watch.burst(self.now),
-                None if sas_nat::firewall_restart(&line) => self.sas_watch.burst(self.now),
+                Some(_) => {
+                    self.sas_watch.burst(self.now);
+                    self.last_flood = 0;
+                }
+                None if sas_nat::firewall_restart(&line) => {
+                    self.sas_watch.burst(self.now);
+                    self.last_flood = 0;
+                }
                 None => {}
             }
             if let Some(efc) = ethernet::efc(&line) {
@@ -1574,6 +1908,7 @@ impl Keeper {
             // Close the management bearer to advertisements now, so a second
             // one cannot set the external device again before the next check.
             self.last_mgmt = 0;
+            self.mgmt_settled = false;
         }
     }
 
@@ -1699,7 +2034,7 @@ impl Keeper {
             return;
         }
         let bearer_dns = if settings.targets.is_empty() {
-            command_stdout("nvram_get", &["0", "wan_get_dns"])
+            self.nvram_get_cached("wan_get_dns")
         } else {
             String::new()
         };
@@ -1722,12 +2057,14 @@ impl Keeper {
     /// committed to flash. An operator who turns this watchdog off keeps the
     /// vendor setting as saved.
     fn maintain_vendor_watchdog(&mut self, settings: &deaf::Settings) {
-        let cache = fs::read(nvram_cache()).unwrap_or_default();
-        let value = deaf::nvram_field(&cache, "detection_enable");
-        if !deaf::vendor_watchdog_must_stop(settings, value) {
+        let value = self
+            .read_nvram_cache()
+            .and_then(|cache| deaf::nvram_field(cache, "detection_enable"))
+            .map(str::to_owned);
+        if !deaf::vendor_watchdog_must_stop(settings, value.as_deref()) {
             return;
         }
-        let was = value.unwrap_or("").trim().to_owned();
+        let was = value.as_deref().unwrap_or("").trim().to_owned();
         let done = crate::nvram_set("detection_enable", "0").is_ok();
         // Something that keeps turning it back on must not fill the flash log.
         let quiet = self
@@ -1752,10 +2089,7 @@ impl Keeper {
             self.deaf_watch = deaf::Watch::default();
             return;
         }
-        let attached = deaf::attached(&command_stdout(
-            "nvram_get",
-            &["0", "sqns_connection_mediaState"],
-        ));
+        let attached = deaf::attached(&self.nvram_get_cached("sqns_connection_mediaState"));
         let path = state_dir().join("watchdog-strikes.txt");
         let strikes = deaf::parse_strikes(&read_file(&path.to_string_lossy()));
         match self
@@ -1878,7 +2212,8 @@ impl Keeper {
             return;
         }
         self.tk_last_round = Some(self.now);
-        let children = spawn_pings(&tk_targets());
+        let targets = self.tk_targets();
+        let children = spawn_pings(&targets);
         if children.is_empty() {
             self.tk_round(None);
             return;
@@ -2138,6 +2473,7 @@ impl Keeper {
             self.qctrl.up_since = Some(self.now);
         }
         let proc_text = read_file(&qctrl_io::proc_path());
+        let mut proc_fresh = true;
         match qctrl::loaded(&read_file(&qctrl_io::modules_path()), &proc_text) {
             QctrlLoaded::Other(name) => {
                 let (state, detail) = if config.mode == 0 {
@@ -2170,10 +2506,15 @@ impl Keeper {
                     return;
                 }
                 self.note(&format!("download clamp: loaded {} from the staged copy", qctrl::VERSION_LINE));
+                proc_fresh = false;
             }
             QctrlLoaded::Ours => {}
         }
-        let proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
+        let mut proc = if proc_fresh {
+            qctrl::parse_proc(&proc_text)
+        } else {
+            qctrl::parse_proc(&read_file(&qctrl_io::proc_path()))
+        };
         if !proc.ours {
             self.qctrl.failed_for = Some(config.clone());
             self.qctrl_status(
@@ -2188,8 +2529,8 @@ impl Keeper {
                 self.qctrl_status("failed", &err, &config);
                 return;
             }
+            proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
         }
-        let proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
         if !qctrl::matches(&config, &proc) {
             let shown = proc.mode.map_or_else(|| "nothing".to_owned(), |m| m.to_string());
             self.qctrl_status(
@@ -2256,13 +2597,21 @@ impl Keeper {
         }
         self.last_mgmt = self.now;
         if !carrier_up(mgmt::MGMT_DEV) {
+            self.mgmt_settled = false;
             return;
         }
         // An IPv4-only bearer: the modem turns IPv6 off here, and no address can be added.
         if read_file("/proc/sys/net/ipv6/conf/lte0pdn0/disable_ipv6").trim() == "1" {
+            self.mgmt_settled = false;
             return;
         }
-        let assigned = mgmt::assigned_iid(&kernel_messages());
+        if !self.mgmt_klog_checked || self.kernel_log.is_none() {
+            self.mgmt_klog_checked = true;
+            if let Some(iid) = mgmt::assigned_iid(&kernel_messages()) {
+                self.mgmt_iid = Some(iid);
+            }
+        }
+        let assigned = self.mgmt_iid;
         let cached = cached_mgmt_iid();
         let iid = match assigned.or(cached) {
             Some(iid) => iid,
@@ -2274,10 +2623,18 @@ impl Keeper {
                 format!("{}\n", iid.token()),
             );
         }
-        let addrs = command_stdout("ip", &["-6", "addr", "show", "dev", mgmt::MGMT_DEV]);
+        let addrs = proc_if_inet6_addrs(mgmt::MGMT_DEV);
         let accept = read_file("/proc/sys/net/ipv6/conf/lte0pdn0/accept_ra");
-        let routes = command_stdout("ip", &["-6", "route", "show"]);
         let up = mgmt::global_up(iid, &addrs);
+        if self.mgmt_settled
+            && up
+            && accept.trim() == "0"
+            && self.now.saturating_sub(self.last_mgmt_route_verify) < MGMT_ROUTE_VERIFY
+        {
+            self.scrub_mgmt_off_lan(&addrs);
+            return;
+        }
+        let routes = command_stdout("ip", &["-6", "route", "show"]);
         let steps = mgmt::plan(iid, &addrs, &accept, &routes);
         if up && !self.mgmt_up_logged {
             self.note(&format!(
@@ -2291,6 +2648,7 @@ impl Keeper {
         }
         if !up {
             self.mgmt_up_logged = false;
+            self.mgmt_settled = false;
             if self.now.saturating_sub(self.last_mgmt_log) >= MGMT_LOG_EVERY {
                 self.note(&format!(
                     "ue-mgmt has no global; soliciting from {} so the assigned prefix can come up",
@@ -2299,6 +2657,12 @@ impl Keeper {
                 self.last_mgmt_log = self.now;
             }
         }
+        if steps.is_empty() && up && accept.trim() == "0" {
+            self.mgmt_settled = true;
+            self.last_mgmt_route_verify = self.now;
+            return;
+        }
+        self.mgmt_settled = false;
         for step in steps {
             if step == Step::IgnoreAdvertisements {
                 self.note(
@@ -2407,7 +2771,7 @@ impl Keeper {
                 self.note("removed the unspecified IPv6 nameserver from resolv.conf");
             }
         }
-        let bridge = command_stdout("ip", &["-6", "addr", "show", "dev", BRIDGE]);
+        let bridge = proc_if_inet6_addrs(BRIDGE);
         for addr in mgmt::bridge_globals_in_prefix(&bridge, global) {
             let spec = format!("{addr}/128");
             match run_status("ip", &["-6", "addr", "del", &spec, "dev", BRIDGE]) {
@@ -2560,7 +2924,7 @@ impl Keeper {
         }
     }
 
-    fn save_budget(&self) -> bool {
+    fn save_budget(&mut self) -> bool {
         let path = state_dir().join("budget.txt");
         let text = format!(
             "link_drops={}\nwindow_start={}\nquiet_until={}\n",
@@ -2585,7 +2949,31 @@ impl Keeper {
                 return false;
             }
         }
-        read_file(&path.to_string_lossy()) == text
+        let ok = read_file(&path.to_string_lossy()) == text;
+        if ok {
+            self.saved_budget = Some(self.budget_tuple());
+        }
+        ok
+    }
+
+    /// The tk config's own targets, else the deaf watchdog's.
+    fn tk_targets(&mut self) -> Vec<std::net::IpAddr> {
+        let config = tk_dir()
+            .map(|dir| read_file(&dir.join("config").to_string_lossy()))
+            .unwrap_or_default();
+        let own = tk_boot::parse_targets(&config);
+        if !own.is_empty() {
+            return own;
+        }
+        let settings = deaf::parse_settings(&read_file(
+            &state_dir().join("watchdog.conf").to_string_lossy(),
+        ));
+        let bearer_dns = if settings.targets.is_empty() {
+            self.nvram_get_cached("wan_get_dns")
+        } else {
+            String::new()
+        };
+        deaf::targets(&settings, &bearer_dns)
     }
 }
 
@@ -2890,7 +3278,14 @@ fn checksum(src: &[u8; 16], dest: &[u8; 16], next: u8, body: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn open_packet(ifindex: i32, sniff: bool) -> Result<Packet, String> {
+fn open_protocol_packet<F>(
+    ifindex: i32,
+    protocol: libc::c_int,
+    install_filter: F,
+) -> Result<Packet, String>
+where
+    F: FnOnce(libc::c_int) -> Result<(), String>,
+{
     let fd = unsafe {
         libc::socket(
             libc::AF_PACKET,
@@ -2900,21 +3295,16 @@ fn open_packet(ifindex: i32, sniff: bool) -> Result<Packet, String> {
     };
     if fd < 0 {
         return Err(format!(
-            "customer port socket: {}",
+            "control packet socket ({protocol:#x}): {}",
             io::Error::last_os_error()
         ));
     }
     let socket = Packet { fd };
-    setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32)?;
-    crate::capture::install(fd, sniff)?;
-    if !sniff {
-        // Kernels with PACKET_IGNORE_OUTGOING skip the tap before cloning.
-        // Older kernels still apply the direction check in the socket filter.
-        let _ = setsockopt_int(fd, libc::SOL_PACKET, 23, 1);
-    }
+    let _ = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, CONTROL_RCVBUF);
+    install_filter(fd)?;
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as libc::sa_family_t;
-    addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+    addr.sll_protocol = (protocol as u16).to_be();
     addr.sll_ifindex = ifindex;
     let bound = unsafe {
         libc::bind(
@@ -2925,9 +3315,62 @@ fn open_packet(ifindex: i32, sniff: bool) -> Result<Packet, String> {
     };
     if bound != 0 {
         let err = io::Error::last_os_error();
-        return Err(format!("bind customer port: {err}"));
+        return Err(format!("bind bridge control socket ({protocol:#x}): {err}"));
     }
     Ok(socket)
+}
+
+/// Unbound protocol-0 AF_PACKET socket for sending marked IPv6 control frames
+/// out `eth0` without registering any receive tap.
+fn open_tx_ipv6() -> Result<Packet, String> {
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_PACKET,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "IPv6 send socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let socket = Packet { fd };
+    setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32)?;
+    Ok(socket)
+}
+
+/// Subscribe `br0` to All-Routers (`ff02::2`) and All-DHCP-Relay-Agents-and-Servers
+/// (`ff02::1:2`) so bridge MLD snooping never drops IPv6 PD control frames.
+fn join_ipv6_control_multicast(ifindex: i32) -> Option<Packet> {
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if fd < 0 {
+        return None;
+    }
+    let socket = Packet { fd };
+    let groups = [
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
+        Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2),
+    ];
+    for group in groups {
+        let mreq = libc::ipv6_mreq {
+            ipv6mr_multiaddr: libc::in6_addr {
+                s6_addr: group.octets(),
+            },
+            ipv6mr_interface: ifindex as u32,
+        };
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_ADD_MEMBERSHIP,
+                (&mreq as *const libc::ipv6_mreq).cast(),
+                std::mem::size_of::<libc::ipv6_mreq>() as libc::socklen_t,
+            )
+        };
+    }
+    Some(socket)
 }
 
 fn send_ipv6(
@@ -3260,33 +3703,52 @@ fn tk_dir() -> Option<PathBuf> {
     config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/tk"))
 }
 
-/// The tk config's own targets, else the deaf watchdog's.
-fn tk_targets() -> Vec<std::net::IpAddr> {
-    let config = tk_dir()
-        .map(|dir| read_file(&dir.join("config").to_string_lossy()))
-        .unwrap_or_default();
-    let own = tk_boot::parse_targets(&config);
-    if !own.is_empty() {
-        return own;
-    }
-    let settings = deaf::parse_settings(&read_file(
-        &state_dir().join("watchdog.conf").to_string_lossy(),
-    ));
-    let bearer_dns = if settings.targets.is_empty() {
-        command_stdout("nvram_get", &["0", "wan_get_dns"])
-    } else {
-        String::new()
-    };
-    deaf::targets(&settings, &bearer_dns)
-}
-
-/// The management bearer has an IPv4 or global IPv6 address.
+/// The management bearer has an IPv4 or global IPv6 address (checked via
+/// rtnetlink `getifaddrs` without spawning `ip`).
 fn mgmt_address_up() -> bool {
-    carrier_up(mgmt::MGMT_DEV)
-        && command_stdout("ip", &["addr", "show", "dev", mgmt::MGMT_DEV])
+    if !carrier_up(mgmt::MGMT_DEV) {
+        return false;
+    }
+    let mut head = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+        return command_stdout("ip", &["addr", "show", "dev", mgmt::MGMT_DEV])
             .lines()
             .map(str::trim)
-            .any(|line| line.starts_with("inet ") || (line.starts_with("inet6 ") && line.contains("scope global")))
+            .any(|line| {
+                line.starts_with("inet ")
+                    || (line.starts_with("inet6 ") && line.contains("scope global"))
+            });
+    }
+    let mut entry = head;
+    let mut found = false;
+    while !entry.is_null() {
+        let interface = unsafe { &*entry };
+        entry = interface.ifa_next;
+        if interface.ifa_addr.is_null() || interface.ifa_name.is_null() {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(interface.ifa_name) }.to_bytes();
+        if name.split(|&c| c == b':').next() != Some(mgmt::MGMT_DEV.as_bytes()) {
+            continue;
+        }
+        let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
+        if family == libc::AF_INET {
+            found = true;
+            break;
+        }
+        if family == libc::AF_INET6 {
+            let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in6>() };
+            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let o = ip.octets();
+            let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
+            if !link_local && !ip.is_loopback() && !ip.is_unspecified() {
+                found = true;
+                break;
+            }
+        }
+    }
+    unsafe { libc::freeifaddrs(head) };
+    found
 }
 
 /// Write through a synced temporary file, then sync the directory, so a power
@@ -3345,6 +3807,42 @@ fn gate_command(tool: GateTool, args: &[&str]) -> Result<String, String> {
     Err(if err.is_empty() { output.status.to_string() } else { err.to_owned() })
 }
 
+fn ebtables_list_forward() -> String {
+    let program = std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into());
+    command_stdout(&program, &["-L", "FORWARD"])
+}
+
+fn has_flag_pair(tokens: &[&str], flag: &str, expected: &[&str]) -> bool {
+    tokens
+        .windows(2)
+        .any(|pair| pair[0] == flag && expected.contains(&pair[1]))
+}
+
+/// True when `ebtables -L FORWARD` already carries both DHCP flood drop rules
+/// for `bearer` (ports 67 and 68). Handles both `ebtables -L` canonicalized
+/// `udp` and numeric `17`.
+fn flood_rules_present(listing: &str, bearer: &str) -> bool {
+    let mut has_67 = false;
+    let mut has_68 = false;
+    for line in listing.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if !has_flag_pair(&tokens, "-o", &[bearer])
+            || !has_flag_pair(&tokens, "-p", &["IPv4"])
+            || !has_flag_pair(&tokens, "--ip-proto", &["17", "udp"])
+            || !has_flag_pair(&tokens, "-j", &["DROP"])
+        {
+            continue;
+        }
+        if has_flag_pair(&tokens, "--ip-dport", &["67"]) {
+            has_67 = true;
+        }
+        if has_flag_pair(&tokens, "--ip-dport", &["68"]) {
+            has_68 = true;
+        }
+    }
+    has_67 && has_68
+}
+
 fn ebtables(args: &str) -> Result<(), String> {
     let program = std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into());
     let output = Command::new(program)
@@ -3360,6 +3858,101 @@ fn ebtables(args: &str) -> Result<(), String> {
     } else {
         Err(err.trim().into())
     }
+}
+
+fn cmdline_is_customer_dhcp(bytes: &[u8]) -> bool {
+    let args: Vec<&[u8]> = bytes
+        .split(|&b| b == 0)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let Some(first) = args.first() else {
+        return false;
+    };
+    let prog = first.rsplit(|&b| b == b'/').next().unwrap_or(first);
+    if prog != b"udhcpd" {
+        return false;
+    }
+    args.windows(2)
+        .any(|pair| pair[0] == b"-f" && pair[1] == b"/tmp/udhcpd.conf")
+}
+
+/// Scan `/proc/<pid>/cmdline` without forking `ps`. Returns `None` if `/proc`
+/// cannot be read so the caller can fall back to `ps`.
+fn customer_dhcp_running_proc() -> Option<bool> {
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if let Ok(cmdline) = fs::read(entry.path().join("cmdline")) {
+            if cmdline_is_customer_dhcp(&cmdline) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// Read one key from a NUL- or newline-delimited NVRAM cache snapshot,
+/// formatted the same way as `nvram_get 0 <key>`.
+fn nvram_get_from_cache(cache: &[u8], key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for record in cache.split(|&b| b == 0 || b == b'\n') {
+        let Some(rest) = record.strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        let value = String::from_utf8_lossy(rest);
+        return Some(format!("nvram_get success: {value}\n"));
+    }
+    None
+}
+
+/// Format `dev`'s IPv6 addresses from `/proc/net/if_inet6` in the same
+/// `inet6 <addr>/<prefix> scope <scope>` shape that `mgmt::plan` consumes,
+/// avoiding an `ip -6 addr show` fork.
+fn proc_if_inet6_addrs(dev: &str) -> String {
+    match fs::read_to_string("/proc/net/if_inet6") {
+        Ok(text) => proc_if_inet6_addrs_from(&text, dev),
+        Err(_) => command_stdout("ip", &["-6", "addr", "show", "dev", dev]),
+    }
+}
+
+fn proc_if_inet6_addrs_from(text: &str, dev: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(addr_hex), Some(_index), Some(prefix_hex), Some(scope_hex), Some(_flags), Some(name)) = (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ) else {
+            continue;
+        };
+        if name != dev {
+            continue;
+        }
+        let Some(octets) = parse_hex_addr(addr_hex) else {
+            continue;
+        };
+        let prefix = u8::from_str_radix(prefix_hex, 16).unwrap_or(128);
+        let scope = match scope_hex {
+            "00" => "global",
+            "20" => "link",
+            "10" => "host",
+            _ => "other",
+        };
+        let addr = Ipv6Addr::from(octets);
+        let _ = writeln!(out, "    inet6 {addr}/{prefix} scope {scope}");
+    }
+    out
 }
 
 /// PIDs of the customer DHCP server. The wifi server is also named udhcpd, and
@@ -3769,7 +4362,7 @@ mod tests {
         icmp[2] = 0;
         icmp[3] = 0;
         assert_eq!(checksum(&src, &dest, 58, &icmp), carried);
-        let packet = crate::capture::tests::captured(&packet, libc::ETH_P_IPV6, true, true);
+        let packet = crate::capture::tests::captured(&packet, libc::ETH_P_IPV6, true);
         assert_eq!(classify_ipv6(&packet, None, None), {
             let prefixes = ra::prefixes_of(&packet[40..]);
             Class::RouterAdvertisement {
@@ -3787,7 +4380,7 @@ mod tests {
         traffic[8..24].copy_from_slice(&block.delegated57().addr);
         traffic[23] = 1;
         // Bulk IPv6 stays in the kernel; the port's receive counter stands in.
-        assert!(crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false, false).is_empty());
+        assert!(crate::capture::tests::captured(&traffic, libc::ETH_P_IPV6, false).is_empty());
         // ICMPv6 from the delegated prefix, a host behind the router answering
         // a ping, is still captured and still counts.
         let mut echo = vec![0u8; 48];
@@ -3796,7 +4389,7 @@ mod tests {
         echo[8..24].copy_from_slice(&block.delegated57().addr);
         echo[23] = 1;
         echo[40] = 129;
-        let echo = crate::capture::tests::captured(&echo, libc::ETH_P_IPV6, false, false);
+        let echo = crate::capture::tests::captured(&echo, libc::ETH_P_IPV6, false);
         assert!(matches!(
             classify_ipv6(&echo, Some(block.delegated57()), None),
             Class::DelegatedTraffic
@@ -3964,5 +4557,83 @@ mod tests {
             vec![" 0:00:01 >|service.c 528 >|   info >| Restart service=[cbrs]".to_owned()]
         );
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn flood_rules_match_both_numeric_and_canonical_ebtables_listings() {
+        let canonical = "\
+Bridge table: filter
+
+Bridge chain: FORWARD, entries: 2, policy: ACCEPT
+-p IPv4 -o lte0pdn2 --ip-proto udp --ip-dport 67 -j DROP
+-p IPv4 -o lte0pdn2 --ip-proto udp --ip-dport 68 -j DROP
+";
+        assert!(flood_rules_present(canonical, "lte0pdn2"));
+        assert!(!flood_rules_present(canonical, "lte0pdn1"));
+        let stub = concat!(
+            "Bridge table: filter\n\n",
+            "Bridge chain: FORWARD, entries: 2, policy: ACCEPT\n",
+            "-o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 67 -j DROP \n",
+            "-o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 68 -j DROP \n",
+        );
+        assert!(flood_rules_present(stub, "lte0pdn1"));
+        let missing_68 = "-o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 67 -j DROP \n";
+        assert!(!flood_rules_present(missing_68, "lte0pdn1"));
+    }
+
+    #[test]
+    fn nvram_cache_lookup_handles_nul_and_newline_formats() {
+        let nul = b"router_disable=1\0pdn_data_ipaddr=172.20.64.152\0wan_get_dns=192.0.2.53\0";
+        assert_eq!(
+            nvram_get_from_cache(nul, "router_disable").as_deref(),
+            Some("nvram_get success: 1\n")
+        );
+        assert_eq!(
+            nvram_get_from_cache(nul, "pdn_data_ipaddr").as_deref(),
+            Some("nvram_get success: 172.20.64.152\n")
+        );
+        assert_eq!(nvram_get_from_cache(nul, "missing"), None);
+
+        let lines = b"detection_enable=1\nsqns_connection_mediaState=ATTACHED\n";
+        assert_eq!(
+            nvram_get_from_cache(lines, "sqns_connection_mediaState").as_deref(),
+            Some("nvram_get success: ATTACHED\n")
+        );
+    }
+
+    #[test]
+    fn proc_if_inet6_formats_global_and_link_local_for_mgmt_plan() {
+        let proc = "\
+fe8000000000000002005efffe400001 05 40 20 80 lte0pdn0
+20010db800e0009702005efffe400001 05 40 00 80 lte0pdn0
+20010db800e000970000000000000001 02 40 00 80 br0
+";
+        let mgmt_addrs = proc_if_inet6_addrs_from(proc, "lte0pdn0");
+        let iid = mgmt::parse_iid("200:5eff:fe40:1").unwrap();
+        assert!(mgmt::global_up(iid, &mgmt_addrs));
+        assert_eq!(
+            addrs_global_text(&mgmt_addrs).as_deref(),
+            Some("2001:db8:e0:97:200:5eff:fe40:1")
+        );
+        let bridge_addrs = proc_if_inet6_addrs_from(proc, "br0");
+        let global: Ipv6Addr = "2001:db8:e0:97:200:5eff:fe40:1".parse().unwrap();
+        assert_eq!(
+            mgmt::bridge_globals_in_prefix(&bridge_addrs, global),
+            vec!["2001:db8:e0:97::1".parse::<Ipv6Addr>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn proc_cmdline_identifies_only_the_customer_udhcpd() {
+        assert!(cmdline_is_customer_dhcp(
+            b"/usr/sbin/udhcpd\0-f\0/tmp/udhcpd.conf\0"
+        ));
+        assert!(cmdline_is_customer_dhcp(b"udhcpd\0-f\0/tmp/udhcpd.conf\0"));
+        assert!(!cmdline_is_customer_dhcp(
+            b"/usr/sbin/udhcpd\0-f\0/tmp/udhcpd_wifi.conf\0"
+        ));
+        assert!(!cmdline_is_customer_dhcp(
+            b"/bin/sh\0-c\0grep udhcpd.conf\0"
+        ));
     }
 }

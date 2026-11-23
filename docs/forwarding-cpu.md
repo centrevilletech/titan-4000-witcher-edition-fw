@@ -1,34 +1,48 @@
 # Forwarding CPU and keeper packet capture
 
-The customer port is a Linux bridge slave. The receive path delivers all-protocol
-taps before the bridge RX handler. A forwarded unicast consumed by the bridge
-never reaches the slave's EtherType-specific handler. The keeper needs that
-unicast for DHCP renews sent straight to the server.
+The customer port (`eth0`) and the customer bearer (`lte0pdn1` or `lte0pdn2`)
+are bridged under `br0`. Up to v1.0.15 the keeper bound a single `ETH_P_ALL`
+(`0x0003`) packet socket to `eth0`. On stock Linux 3.10, any entry in
+`ptype_all` causes `dev_queue_xmit_nit()` to `skb_clone()` every transmitted
+frame on the interface before the socket filter runs, and `PACKET_IGNORE_OUTGOING`
+is absent on 3.10. That clone-and-filter cost showed up directly in `ksoftirqd/0`
+during downloads.
 
-The keeper attaches classic BPF before binding its cooked socket to the port.
-At steady state it accepts inbound ARP, IPv4 UDP to the DHCP server (including
-IPv4 options), ICMPv6 and DHCPv6 requests. Since v1.0.13 it drops all other
-IPv6. Up to v1.0.12 it copied the first 40 bytes of every other IPv6 frame,
-each upload packet and download ACK, for the delegated-source check; the
-port's receive counter now stands in for that (see
-[IPv6 router health](ipv6-health.md#the-port-filter)). The existing userspace parsers still authenticate the meaning of a
-probe or lease. During the three-second RA sniff a replacement filter also
-admits outbound RAs. Leaving passthrough closes the receive socket. The marked
-raw sender uses protocol zero and registers no receive tap.
+The keeper no longer opens an `ETH_P_ALL` socket at all, neither in steady state
+nor during the three-second RA sniff. Instead it opens protocol-specific
+`AF_PACKET` `SOCK_DGRAM` (`ptype_base`) sockets bound to **`br0`** (the bridge
+master), each with a tight classic BPF filter attached before `bind()` and a
+64 KiB `SO_RCVBUF`:
 
-**Stock 3.10 still pays the transmit clone cost.** The keeper requests
-`PACKET_IGNORE_OUTGOING` on its steady-state socket. The stock kernel lacks
-that option and clones before the socket filter runs. The filter there saves
-queueing, copying and draining the discarded frames. An RX-only pre-bridge
-tap would be needed to recover the remaining cost. An EtherType-only socket
-on the slave would miss guard traffic.
+- **`ETH_P_ARP` (`0x0806`) on `br0`**: accepts ARP replies (`oper == 2`,
+  length >= 28) for the IPv4 local reachability watch.
+- **`ETH_P_IP` (`0x0800`) on `br0`**: accepts non-fragmented UDP packets to
+  DHCP server port 67 (including IPv4 options) for new-router DHCP detection.
+  Because DHCP discovers and unicast renews to `udhcpd` are addressed to the
+  bridge's MAC or broadcast, the bridge delivers them up to `br0` (`br_pass_frame_up`).
+- **`ETH_P_IPV6` (`0x86dd`) on `br0`**: opened **only when IPv6 prefix
+  delegation is enabled**. Accepts ICMPv6 control frames (excluding core RAs,
+  type 134, in steady state) and DHCPv6 server requests (UDP port 547). An
+  auxiliary `AF_INET6` socket joins `ff02::2` and `ff02::1:2` on `br0` so bridge
+  MLD snooping always delivers RS and DHCPv6 frames to `br0`. During the
+  three-second startup RA sniff the filter temporarily admits type 134 on the
+  same `br0` socket (core RAs are multicast to `ff02::1`, so the bridge delivers
+  them to `br0`).
+- **Marked sender**: an unbound protocol-0 `AF_PACKET` socket (`SO_MARK = filter::MARK`)
+  injects RAs and DHCPv6 replies out `eth0` and registers no receive tap.
+
+Because `ptype_all` stays empty, `dev_queue_xmit_nit()` does zero work on
+transmit. Because bridge-forwarded customer frames (`eth0` <-> `lte0pdn*`) are
+consumed inside `br_handle_frame()` before `ptype_base` runs, bulk IPv4 and IPv6
+customer traffic never hits `packet_rcv()` or any BPF filter. Leaving
+passthrough closes all control sockets.
 
 ## Background work
 
 | Component | Cadence and behavior |
 | --- | --- |
-| Keeper | The 200 ms guard tick and one-second IPv4 check retain their timing. The main route table and IPv6 globals come from procfs. Bridge IPv4 addresses, including aliases, come from rtnetlink via getifaddrs. Multiple distinct bearer blocks use the previous address dump order. |
-| Management IPv6 | The ten-second check reads the kernel ring in-process with a command fallback. The assigned-IID cache is written on change. The checks of the route lifetime and advertisement sysctl retain their timing. |
+| Keeper | Event-driven `poll()` on the control sockets and `/tmp/titan-kmsg` with a 1 s steady-state timeout (200 ms only while a ping probe is running or draining boot `kmsg`). Main routes, IPv6 addresses, and `/proc/<pid>/cmdline` customer-`udhcpd` liveness are read in-process without forking `ip` or `ps`. NVRAM lookups read `/tmp/nvram.cfg` once per second in-process (falling back to `nvram_get` only if a key is absent). `config.json` is stat-cached; `br0` probe IPv4 is cached for 10 s; DHCP flood rules are checked via `ebtables -L FORWARD` every 300 s (and immediately on bearer change or firewall restart) and only written if missing. |
+| Management IPv6 | Checks `/proc/net/if_inet6` and `accept_ra` every 10 s without forking `ip` or reading `klogctl` (live IID lines come from `/tmp/titan-kmsg`). Once settled (`accept_ra=0` and global up), `ip -6 route show` is verified every 300 s or immediately on `lte0pdn0` link/PDN events. |
 | Shell collector | One second as before. Exclusive shell redirection creates a readable snapshot under the root-owned directory. It needs a helper and rename, without a separate chmod and creation subshell per sample. |
 | Management access | Ten seconds as before. Each bridge chain gets one listing. The eight accepts are rebuilt only for chains whose leading four rules no longer cover the management ports. Vendor changes ahead of an accept still trigger repair. |
 | Web health supervisor | Checks service PIDs every ten seconds. Full identity and HTTP checks move from ten to sixty seconds while all PIDs live. Missing processes trigger the full check at the next ten-second tick. Startup checks stay immediate. A wedged process that still has a PID can take a minute to detect. |
