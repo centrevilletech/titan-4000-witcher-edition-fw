@@ -897,50 +897,64 @@ impl Watch {
             return out;
         }
 
-        if self.state != State::Uncovered {
+        let entered_uncovered = self.state != State::Uncovered;
+        let dry = config
+            .hide_grant
+            .map_or_else(String::new, |idx| format!(" dry-run hide_grant={idx}"));
+        let transition_prefix = format!(
+            "{missing_desc}; grants={}; mode={}{dry}",
+            format_grants(&self.last_grants),
+            config.mode.as_str()
+        );
+        if entered_uncovered {
             self.state = State::Uncovered;
             self.uncovered_events += 1;
             self.last_quiet_log = None;
             self.last_block_reason = None;
-            let dry = config
-                .hide_grant
-                .map_or_else(String::new, |idx| format!(" dry-run hide_grant={idx}"));
-            let msg = format!(
-                "carrier watch: uncovered ({missing_desc}; grants={}; mode={}{dry})",
-                format_grants(&self.last_grants),
-                config.mode.as_str()
-            );
             self.last_action = format!("uncovered ({missing_desc})");
-            out.logs.push(msg);
         }
 
         if config.mode != Mode::Regrant {
+            if entered_uncovered {
+                out.logs
+                    .push(format!("carrier watch: uncovered ({transition_prefix})"));
+            }
             return out;
         }
 
         // Dry-run hide_grant never forces a re-grant.
         if let Some(idx) = config.hide_grant {
-            self.log_block_once(
+            self.log_uncovered_block(
                 &mut out,
+                entered_uncovered,
+                &transition_prefix,
                 "dry-run",
-                format!("carrier watch: uncovered, dry-run hide_grant={idx}, not forcing re-grant"),
+                &format!("dry-run hide_grant={idx}, not forcing re-grant"),
             );
             return out;
         }
 
         // Wall clock must be sane before trusting transmit expiry or UTC quiet window.
         if !clock_sane(wall_now) {
-            self.log_block_once(
+            self.log_uncovered_block(
                 &mut out,
+                entered_uncovered,
+                &transition_prefix,
                 "clock",
-                "carrier watch: uncovered, clock not sane, waiting".to_owned(),
+                "clock not sane, waiting",
             );
             return out;
         }
 
         // CPAS quiet window.
         if config.quiet_utc.is_some_and(|w| w.contains(wall_now)) {
-            if self
+            if entered_uncovered {
+                self.last_quiet_log = Some(now);
+                self.last_action = "quiet window, waiting".to_owned();
+                out.logs.push(format!(
+                    "carrier watch: uncovered ({transition_prefix}; quiet window, waiting)"
+                ));
+            } else if self
                 .last_quiet_log
                 .is_none_or(|at| now.saturating_sub(at) >= QUIET_LOG_EVERY_SECS)
             {
@@ -955,11 +969,13 @@ impl Watch {
 
         // Per-day rate limit.
         if self.recent_regrants.len() >= MAX_REGRANTS_PER_DAY {
-            self.log_block_once(
+            self.log_uncovered_block(
                 &mut out,
+                entered_uncovered,
+                &transition_prefix,
                 "daily-limit",
-                format!(
-                    "carrier watch: uncovered, daily re-grant limit reached ({}/{MAX_REGRANTS_PER_DAY}), waiting",
+                &format!(
+                    "daily re-grant limit reached ({}/{MAX_REGRANTS_PER_DAY}), waiting",
                     self.recent_regrants.len()
                 ),
             );
@@ -969,25 +985,33 @@ impl Watch {
         // Cooldown / failure backoff.
         if now < self.next_allowed_at {
             let wait = self.next_allowed_at - now;
-            self.log_block_once(
+            self.log_uncovered_block(
                 &mut out,
+                entered_uncovered,
+                &transition_prefix,
                 "cooldown",
-                format!("carrier watch: uncovered, rate-limited, next re-grant in {wait}s"),
+                &format!("rate-limited, next re-grant in {wait}s"),
             );
             return out;
         }
 
         // Wait until `rcinit` is idle (`rc_signal_done=1`).
         if !nvram.rc_signal_done {
-            self.log_block_once(
+            self.log_uncovered_block(
                 &mut out,
+                entered_uncovered,
+                &transition_prefix,
                 "rc-busy",
-                "carrier watch: uncovered, waiting for rc_signal_done=1".to_owned(),
+                "waiting for rc_signal_done=1",
             );
             return out;
         }
 
         // All guards passed: trigger the vendor re-grant sequence.
+        if entered_uncovered {
+            out.logs
+                .push(format!("carrier watch: uncovered ({transition_prefix})"));
+        }
         self.state = State::RegrantPending { since: now };
         self.regrants_triggered += 1;
         self.recent_regrants.push(now);
@@ -1030,14 +1054,24 @@ impl Watch {
         format!("carrier watch: re-grant trigger failed ({err}); backoff {backoff}s")
     }
 
-    fn log_block_once(&mut self, out: &mut Outcome, key: &str, msg: String) {
-        if self.last_block_reason.as_deref() != Some(key) {
+    fn log_uncovered_block(
+        &mut self,
+        out: &mut Outcome,
+        entered_uncovered: bool,
+        transition_prefix: &str,
+        key: &str,
+        detail: &str,
+    ) {
+        if entered_uncovered {
             self.last_block_reason = Some(key.to_owned());
-            self.last_action = msg
-                .strip_prefix("carrier watch: ")
-                .unwrap_or(&msg)
-                .to_owned();
-            out.logs.push(msg);
+            self.last_action = format!("uncovered, {detail}");
+            out.logs.push(format!(
+                "carrier watch: uncovered ({transition_prefix}; {detail})"
+            ));
+        } else if self.last_block_reason.as_deref() != Some(key) {
+            self.last_block_reason = Some(key.to_owned());
+            self.last_action = format!("uncovered, {detail}");
+            out.logs.push(format!("carrier watch: uncovered, {detail}"));
         }
     }
 
@@ -1409,10 +1443,10 @@ mod tests {
         w.observe(2, t_quiet + 1, &cfg, &nvram, true, &grants);
         let out = w.observe(3, t_quiet + 2, &cfg, &nvram, true, &grants);
         assert_eq!(out.action, Action::None);
+        assert_eq!(out.logs.len(), 1, "transition must log once: {:?}", out.logs);
         assert!(
-            out.logs
-                .iter()
-                .any(|l| l == "carrier watch: uncovered, quiet window, waiting"),
+            out.logs[0].starts_with("carrier watch: uncovered (")
+                && out.logs[0].contains("quiet window, waiting"),
             "{:?}",
             out.logs
         );
@@ -1460,15 +1494,17 @@ mod tests {
             make_grant(1, 3680, 3700, WALL_OK + 100_000),
         ];
 
-        // Unsane 2013 clock blocks re-grant.
+        // Unsane 2013 clock blocks re-grant (logged once on transition).
         let out = w.observe(10, 1_371_700_000, &cfg, &nvram, true, &bad);
         assert_eq!(out.action, Action::None);
-        assert!(out.logs.iter().any(|l| l.contains("clock not sane")));
+        assert_eq!(out.logs.len(), 1, "{:?}", out.logs);
+        assert!(out.logs[0].contains("clock not sane"), "{:?}", out.logs);
 
         // Sane clock, but rc_signal_done=0: waits until it reads 1.
         let out = w.observe(11, WALL_OK, &cfg, &nvram, true, &bad);
         assert_eq!(out.action, Action::None);
-        assert!(out.logs.iter().any(|l| l.contains("rc_signal_done=1")));
+        assert_eq!(out.logs.len(), 1, "{:?}", out.logs);
+        assert!(out.logs[0].contains("rc_signal_done=1"), "{:?}", out.logs);
 
         nvram.rc_signal_done = true;
         let out = w.observe(12, WALL_OK + 1, &cfg, &nvram, true, &bad);
@@ -1535,6 +1571,15 @@ mod tests {
         let out = w.observe(10, WALL_OK, &dry_cfg, &nvram, true, &grants);
         assert_eq!(out.action, Action::None);
         assert_eq!(w.state(), State::Uncovered);
-        assert!(out.logs.iter().any(|l| l.contains("dry-run hide_grant=1")));
+        assert_eq!(out.logs.len(), 1, "transition must log once: {:?}", out.logs);
+        assert!(
+            out.logs[0].contains("dry-run hide_grant=1")
+                && out.logs[0].contains("not forcing re-grant"),
+            "{:?}",
+            out.logs
+        );
+        // Next tick while still uncovered and dry-run: silent.
+        let out2 = w.observe(11, WALL_OK + 1, &dry_cfg, &nvram, true, &grants);
+        assert!(out2.logs.is_empty(), "{:?}", out2.logs);
     }
 }

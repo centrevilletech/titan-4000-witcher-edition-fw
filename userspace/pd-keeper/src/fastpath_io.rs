@@ -178,14 +178,27 @@ fn read_proc_after_grant_open() -> Proc {
     fastpath::parse_proc(&read_text(Path::new(&proc_path())))
 }
 
+fn read_proc_after_grant_close() -> Proc {
+    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+    if proc.ours && proc.gate_open == Some(false) {
+        return proc;
+    }
+    thread::sleep(Duration::from_millis(50));
+    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
+}
+
 /// Fast path lifecycle and grant-lease state for one keeper process.
 #[derive(Default)]
 pub struct Watch {
     checked_at: Option<u64>,
     /// Both `eth0` and `lte0pdn2` were up and in `br0` in passthrough since then.
     up_since: Option<u64>,
-    /// Last logged `state: detail`, so status and log change only on news.
+    /// Last logged `state: detail`, so log lines emit only on state/detail change.
     shown: String,
+    /// Last rendered status body (without `updated=`), so the status file is
+    /// rewritten whenever state, detail, mode, active_mode, gate, qctrl_present,
+    /// wd_trips, or wd_reason changes.
+    status_body: String,
     /// A load failed for this config; not retried until config changes or reboot.
     failed_for: Option<Config>,
     refused_logged: Vec<String>,
@@ -222,6 +235,7 @@ impl Watch {
         let Some(cmd) = fastpath::lease_command(action) else {
             return;
         };
+        let prev_lease = self.lease_state;
         match write_proc_cmd(&cmd) {
             Ok(()) => match action {
                 LeaseAction::Renew(_) => self.lease_state = LeaseState::Open,
@@ -235,6 +249,11 @@ impl Watch {
                 self.lease_state = LeaseState::Unknown;
             }
             Err(_) => {}
+        }
+        if self.lease_state != prev_lease {
+            // Re-read /proc/k1fp on this same tick so witcher-fastpath.status
+            // reflects the new gate state immediately.
+            self.checked_at = None;
         }
     }
 
@@ -467,10 +486,12 @@ impl Watch {
             };
             self.active_for_lease = false;
             self.trip.note_paused();
-            self.revoke_if_open();
+            let revoked = self.revoke_if_open();
             let proc = if proc.mode != Some(0) {
                 let _ = write_proc_cmd("mode 0\n");
                 read_proc_after_mode_write(0)
+            } else if revoked {
+                read_proc_after_grant_close()
             } else {
                 proc
             };
@@ -491,7 +512,9 @@ impl Watch {
                 self.active_for_lease = config.mode > 0;
                 let mut proc = proc;
                 if config.mode == 0 {
-                    self.revoke_if_open();
+                    if self.revoke_if_open() {
+                        proc = read_proc_after_grant_close();
+                    }
                 } else if (adopted || self.lease_state != LeaseState::Open)
                     && self.renew_if_grant_held(nvram_cache_path)
                 {
@@ -549,7 +572,9 @@ impl Watch {
                 self.trip.note_applied(config.mode, &proc);
                 self.active_for_lease = config.mode > 0;
                 if config.mode == 0 {
-                    self.revoke_if_open();
+                    if self.revoke_if_open() {
+                        proc = read_proc_after_grant_close();
+                    }
                 } else if self.renew_if_grant_held(nvram_cache_path) {
                     proc = read_proc_after_grant_open();
                 }
@@ -628,10 +653,12 @@ impl Watch {
                 first_notice,
             } => {
                 self.active_for_lease = false;
-                self.revoke_if_open();
+                let revoked = self.revoke_if_open();
                 let proc = if proc.mode != Some(0) {
                     let _ = write_proc_cmd("mode 0\n");
                     read_proc_after_mode_write(0)
+                } else if revoked {
+                    read_proc_after_grant_close()
                 } else {
                     proc
                 };
@@ -649,10 +676,12 @@ impl Watch {
         }
     }
 
-    fn revoke_if_open(&mut self) {
+    fn revoke_if_open(&mut self) -> bool {
         if self.lease_state != LeaseState::Revoked && write_proc_cmd("grant 0\n").is_ok() {
             self.lease_state = LeaseState::Revoked;
+            return true;
         }
+        false
     }
 
     fn renew_if_grant_held(&mut self, nvram_cache_path: &Path) -> bool {
@@ -678,13 +707,6 @@ impl Watch {
         now: u64,
         note: &mut impl FnMut(&str),
     ) {
-        let key = format!("{state}: {detail}");
-        let changed = key != self.shown;
-        if !changed && !force_status {
-            return;
-        }
-        let quiet = state == "off" && self.shown.is_empty();
-        self.shown = key;
         let view = StatusView {
             state,
             detail,
@@ -696,8 +718,18 @@ impl Watch {
             wd_reason: proc.and_then(|p| p.wd_reason.as_deref()).unwrap_or("none"),
             now,
         };
-        let _ = fs::write(status_path(), fastpath::status(&view));
-        if changed && !quiet {
+        let key = format!("{state}: {detail}");
+        let body = fastpath::status_body(&view);
+        let log_changed = key != self.shown;
+        let status_changed = body != self.status_body;
+        if !log_changed && !status_changed && !force_status {
+            return;
+        }
+        let quiet = state == "off" && self.shown.is_empty();
+        self.shown = key;
+        self.status_body = body;
+        let _ = fs::write(status_path(), format!("{}updated={now}\n", self.status_body));
+        if log_changed && !quiet {
             note(&format!("fast path {state}: {detail}"));
         }
     }

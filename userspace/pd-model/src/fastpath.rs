@@ -532,8 +532,10 @@ pub struct StatusView<'a> {
     pub now: u64,
 }
 
-/// Format `/var/run/witcher-fastpath.status`.
-pub fn status(view: &StatusView<'_>) -> String {
+/// Stable body of `/var/run/witcher-fastpath.status` (without `updated=`) for
+/// change detection across state, detail, config mode, active mode, gate,
+/// `qctrl_present`, `wd_trips` and `wd_reason`.
+pub fn status_body(view: &StatusView<'_>) -> String {
     let active = view
         .active_mode
         .map_or_else(|| "none".to_owned(), |m| m.to_string());
@@ -548,14 +550,18 @@ pub fn status(view: &StatusView<'_>) -> String {
         None => "unknown",
     };
     format!(
-        "state={}\ndetail={}\nmode={}\nactive_mode={active}\ngate={gate}\nqctrl_present={qctrl}\nwd_trips={}\nwd_reason={}\nupdated={}\n",
+        "state={}\ndetail={}\nmode={}\nactive_mode={active}\ngate={gate}\nqctrl_present={qctrl}\nwd_trips={}\nwd_reason={}\n",
         view.state,
         view.detail,
         view.config.mode,
         view.wd_trips,
         view.wd_reason,
-        view.now
     )
+}
+
+/// Format `/var/run/witcher-fastpath.status`.
+pub fn status(view: &StatusView<'_>) -> String {
+    format!("{}updated={}\n", status_body(view), view.now)
 }
 
 #[cfg(test)]
@@ -946,20 +952,55 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
 
     #[test]
     fn status_formats_all_fields() {
-        let text = status(&StatusView {
+        let cfg = parse_config("mode=2\n");
+        let base = StatusView {
             state: "applied",
             detail: "mode 2 read back from /proc/k1fp",
-            config: &parse_config("mode=2\n"),
+            config: &cfg,
             active_mode: Some(2),
             gate_open: Some(true),
             qctrl_present: Some(true),
             wd_trips: 0,
             wd_reason: "none",
             now: 95,
-        });
+        };
+        let text = status(&base);
         assert_eq!(
             text,
             "state=applied\ndetail=mode 2 read back from /proc/k1fp\nmode=2\nactive_mode=2\ngate=open\nqctrl_present=1\nwd_trips=0\nwd_reason=none\nupdated=95\n"
+        );
+        // Changing only `now` leaves status_body identical; changing gate,
+        // active_mode, qctrl_present, or wd_trips changes status_body.
+        let later = StatusView { now: 200, ..base };
+        assert_eq!(status_body(&base), status_body(&later));
+        assert_ne!(
+            status_body(&base),
+            status_body(&StatusView {
+                gate_open: Some(false),
+                ..base
+            })
+        );
+        assert_ne!(
+            status_body(&base),
+            status_body(&StatusView {
+                active_mode: Some(0),
+                ..base
+            })
+        );
+        assert_ne!(
+            status_body(&base),
+            status_body(&StatusView {
+                qctrl_present: Some(false),
+                ..base
+            })
+        );
+        assert_ne!(
+            status_body(&base),
+            status_body(&StatusView {
+                wd_trips: 1,
+                wd_reason: "tx_stall",
+                ..base
+            })
         );
     }
 }
