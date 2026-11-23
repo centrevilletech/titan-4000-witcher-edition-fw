@@ -1,8 +1,10 @@
 # titan_qctrl: the download clamp module
 
 `payload/titan_qctrl.ko` is a Linux 3.10.0-uc0 kernel module for the Titan
-4000, version v0.2-o1b. It keeps the tower's download queue short by shrinking
-the TCP receive window that customer devices advertise. What it does, how the
+4000, version v0.3-q3. It keeps the tower's download queue short by shrinking
+the TCP receive window that customer devices advertise, and adds opt-in adaptive
+ACK thinning (`ack_adapt`) and low-burst window control (`ctrl_v3`) that are off
+by default so the default path matches v0.2-o1b. What it does, how the
 keeper loads it and how to turn it on: [docs/download-clamp.md](../../docs/download-clamp.md).
 
 It is not in the firmware image. An operator stages it per unit in

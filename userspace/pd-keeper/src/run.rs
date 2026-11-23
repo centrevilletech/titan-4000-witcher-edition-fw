@@ -2126,7 +2126,7 @@ impl Keeper {
         if config.refused != self.qctrl.refused_logged {
             for line in &config.refused {
                 self.note(&format!(
-                    "download clamp: ignored {line:?} in qctrl/config (allowed: mode=0|2|3|6, trough_ms=0..40, target_ms=4..80)"
+                    "download clamp: ignored {line:?} in qctrl/config (allowed: mode=0|2|3|6, trough_ms=0..40, target_ms=4..80, ack_adapt=0|1, ctrl_v3=0|1, ack_ms=1..10, ack_segs=2..32, ack_min_kbps=0..100000)"
                 ));
             }
             self.qctrl.refused_logged = config.refused.clone();
@@ -2201,10 +2201,15 @@ impl Keeper {
         }
         let state = if config.mode == 0 { "off" } else { "applied" };
         let detail = format!(
-            "mode {} read back from /proc/titan_qctrl{}{}",
+            "mode {} read back from /proc/titan_qctrl{}{}{}{}{}{}{}",
             config.mode,
             config.trough_ms.map_or_else(String::new, |ms| format!(", trough_ms {ms}")),
-            config.target_ms.map_or_else(String::new, |ms| format!(", target_ms {ms}"))
+            config.target_ms.map_or_else(String::new, |ms| format!(", target_ms {ms}")),
+            config.ack_adapt.map_or_else(String::new, |v| format!(", ack_adapt {v}")),
+            config.ctrl_v3.map_or_else(String::new, |v| format!(", ctrl_v3 {v}")),
+            config.ack_ms.map_or_else(String::new, |ms| format!(", ack_ms {ms}")),
+            config.ack_segs.map_or_else(String::new, |s| format!(", ack_segs {s}")),
+            config.ack_min_kbps.map_or_else(String::new, |k| format!(", ack_min_kbps {k}"))
         );
         self.qctrl_status(state, &detail, &config);
     }
