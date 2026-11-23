@@ -57,7 +57,7 @@ use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 
-use crate::{carrier_watch_io, log, log_ram, qctrl_io, tk_flags_io};
+use crate::{carrier_watch_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
@@ -265,6 +265,8 @@ struct Keeper {
     modem_restart_seen: bool,
     /// The staged download clamp (see `titan_pd_model::qctrl`).
     qctrl: QctrlWatch,
+    /// The staged passthrough bridge fast path (see `titan_pd_model::fastpath`).
+    fastpath: fastpath_io::Watch,
 }
 
 /// Carrier-watch state and incremental `/mnt/cbrslog0.txt` reader.
@@ -298,6 +300,8 @@ struct QctrlWatch {
     up_since: Option<u64>,
     /// The last status, so the file and the log change only on news.
     shown: String,
+    /// True while configured with a non-zero mode and still waiting to load.
+    waiting: bool,
     /// A load failed for this config. It is not retried until the config changes.
     failed_for: Option<qctrl::Config>,
     refused_logged: Vec<String>,
@@ -529,6 +533,7 @@ impl Keeper {
             tk_flags_refused: Vec::new(),
             modem_restart_seen: false,
             qctrl: QctrlWatch::default(),
+            fastpath: fastpath_io::Watch::default(),
         }
     }
 
@@ -668,6 +673,7 @@ impl Keeper {
         self.maintain_tk_confirm();
         self.maintain_tk_flags();
         self.maintain_qctrl();
+        self.maintain_fastpath();
         self.maintain_mgmt_v6();
         if !self.passthrough {
             self.sockets = None;
@@ -1023,6 +1029,8 @@ impl Keeper {
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
+            self.now = monotonic();
+            self.maintain_cbrs_gate();
             for event in self.collect_ipv6() {
                 if let Class::RouterAdvertisement {
                     prefixes,
@@ -1806,6 +1814,8 @@ impl Keeper {
         }
         let gate = cbrs_gate::decide(self.read_nvram_cache());
         let (step, line) = self.cbrs_gate.observe(self.now, &gate);
+        // Close or renew the fast-path grant lease before anything else in this tick.
+        self.fastpath.on_gate(&gate, step);
         let changed = line.is_some();
         if let Some(line) = line {
             self.note(&line);
@@ -2652,6 +2662,7 @@ impl Keeper {
     /// Write the clamp status file and log the change. A unit that never
     /// staged a clamp logs nothing.
     fn qctrl_status(&mut self, state: &str, detail: &str, config: &qctrl::Config) {
+        self.qctrl.waiting = state == "waiting";
         let key = format!("{state}: {detail}");
         if key == self.qctrl.shown {
             return;
@@ -2661,6 +2672,23 @@ impl Keeper {
         let _ = fs::write(qctrl_io::status_path(), qctrl::status(state, detail, config, self.now));
         if !quiet {
             self.note(&format!("download clamp {state}: {detail}"));
+        }
+    }
+
+    /// Load and maintain the staged passthrough bridge fast path after the
+    /// download clamp (see `titan_pd_model::fastpath`).
+    fn maintain_fastpath(&mut self) {
+        let now = self.now;
+        let passthrough = self.passthrough;
+        let qctrl_waiting = self.qctrl.waiting;
+        let cache = nvram_cache();
+        let mut lines = Vec::new();
+        self.fastpath
+            .maintain(now, passthrough, qctrl_waiting, &cache, |line| {
+                lines.push(line.to_owned());
+            });
+        for line in lines {
+            self.note(&line);
         }
     }
 

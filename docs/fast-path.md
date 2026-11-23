@@ -1,9 +1,11 @@
 # Passthrough bridge fast path (titan_k1fp 2.0)
 
 Status: off by default and not in the firmware image. An operator stages
-`titan_k1fp.ko` per unit, checks its SHA-256 against
-[`device/fastpath/SHA256SUMS`](../device/fastpath/SHA256SUMS), and loads
-it with `insmod`. On load it starts in `mode 0` (off).
+`titan_k1fp.ko` per unit in `/mnt/titan-api/fastpath/` with a `config` file;
+the keeper verifies its SHA-256 against
+[`device/fastpath/SHA256SUMS`](../device/fastpath/SHA256SUMS), loads it in IP
+passthrough once the links settle, and drives its SAS grant lease directly
+from the keeper's CBRS gate. On load the module starts in `mode 0` (off).
 
 ## Why
 
@@ -101,6 +103,89 @@ per second forever (~18 lines/s, wrapping the 256 KB dmesg buffer every
 - Stop an active timer live: `kern ipc -st`
 - Take a one-shot IPC snapshot without starting a timer: `kern ipc i`
 
+## Keeper-managed staging and lifecycle
+
+`scripts/stage-latency.sh` stages `titan_k1fp.ko` alongside the modem firmware
+and download clamp, or on its own:
+
+```sh
+scripts/stage-latency.sh --fastpath device/fastpath/payload/titan_k1fp.ko --fastpath-mode 2 <unit>
+```
+
+The script checks the local file's SHA-256 against `device/fastpath/SHA256SUMS`,
+copies it to `/mnt/titan-api/fastpath/titan_k1fp.ko`, verifies the SHA-256 on
+the unit, and writes `/mnt/titan-api/fastpath/config`:
+
+```ini
+mode=2
+```
+
+Allowed values are `mode=0`, `1`, `2`, or `3` (comments start with `#`; the
+last `mode=` line wins; an invalid `mode=` line resets to `mode=0` and is
+logged). With no config file or `mode=0` and no module loaded, the keeper loads
+nothing and logs nothing.
+
+Every 15 s the keeper:
+
+1. Reads `/mnt/titan-api/fastpath/config`.
+2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
+   `/proc/k1fp` reports a version string other than `titan_k1fp v2.0`. If
+   `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
+   exact pinned version line `titan_k1fp v2.0`, the keeper adopts it, logs
+   `fast path: adopted a loaded module`, and takes over its mode and grant
+   lease without running `insmod`.
+3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and
+   `lte0pdn2`, both have carrier for 30 s, and any configured download clamp
+   (`titan_qctrl`) has finished loading first.
+4. Copies `/mnt/titan-api/fastpath/titan_k1fp.ko` into its private RAM
+   directory (`/tmp/titan-pd-keeper/fastpath/`), verifies the RAM copy's
+   SHA-256 against the digest pinned at build time (`device/fastpath/SHA256SUMS`),
+   and runs `insmod` on that RAM copy.
+5. Reads `/proc/k1fp` and checks `ports_ok=1`, `lan_hooked=1`, and
+   `wan_hooked=1`. Anything else stays at `mode 0` and records why in the
+   status file.
+6. Writes `mode N` to `/proc/k1fp` and reads it back.
+7. Tracks `qctrl_present` in `/proc/k1fp` and logs if `titan_qctrl` is loaded
+   or unloaded later.
+
+### Grant lease from the CBRS gate
+
+The keeper drives `/proc/k1fp`'s SAS grant lease directly from its own CBRS
+gate state (`cbrs_mode_grant=1` and `cbrs_grant_state=2`, fail closed):
+
+- Once per second, while the gate is open and fast path is active, the keeper
+  does one small `write()` of `grant 5` directly to `/proc/k1fp` with no
+  process spawns (closing the fd immediately so `rmmod` is never blocked).
+- The moment the gate closes (clear loss, or after the confirm window when
+  CBRS keys are absent), the keeper writes `grant 0` first, before logging or
+  running `ebtables`/`ip6tables`.
+- The keeper never writes a lease while `cbrs_mode_grant` is not `1` (including
+  on a torn read or on a unit with no CBRS mode).
+- If the keeper stops or crashes, the module's 5-second lease counts down and
+  closes the gate on its own.
+
+### Watchdog awareness
+
+When the module's watchdog drops `mode` to `0` on an anomaly (or if the live
+mode in `/proc/k1fp` drifts from the applied config):
+
+- On the first drop in a boot, the keeper logs the reason (`wd_reason` and
+  `wd_trips`) once and re-arms the configured mode automatically.
+- On any second drop in the same boot, the keeper does not re-arm: it leaves
+  the module at `mode 0`, revokes the grant lease, logs once, and sets
+  `state=tripped` in `/var/run/witcher-fastpath.status` until
+  `/mnt/titan-api/fastpath/config` changes or the unit reboots.
+
+### Status and logs
+
+Status lives in `/var/run/witcher-fastpath.status` (`state` is `off`,
+`waiting`, `applied`, `tripped`, or `failed`, along with `detail`, `mode`,
+`active_mode`, `gate`, `qctrl_present`, `wd_trips`, `wd_reason`, and
+`updated`). Keeper log lines start with `fast path`. A unit without
+`fastpath/config` logs none. `scripts/stage-latency.sh --status <unit>` prints
+the status file, the first lines of `/proc/k1fp`, and recent `fast path` log
+lines.
+
 ## Build and host tests
 
 ```sh
@@ -110,12 +195,12 @@ device/fastpath/test/run.sh
 
 ## Rollback
 
-Live rollback needs no reboot:
+| Level | Action | Result |
+| --- | --- | --- |
+| Off now (keeper-managed) | Write `mode=0` to `/mnt/titan-api/fastpath/config` | The keeper writes `mode 0` and `grant 0` within 15 s and sets `state=off`. |
+| Off immediately (manual) | `echo "mode 0" > /proc/k1fp` | Immediate pass-through; set `mode=0` in `fastpath/config` too so the keeper does not re-arm once. |
+| Unload now | Set `mode=0` in `fastpath/config`, wait for `state=off`, then `rmmod titan_k1fp` | Module unloaded cleanly (`modref=0`). |
+| Off at boot | Delete `/mnt/titan-api/fastpath/config` (or keep `mode=0`) and reboot | Nothing is loaded and nothing is logged. |
 
-```sh
-echo "mode 0" > /proc/k1fp
-rmmod titan_k1fp
-```
-
-Because `titan_k1fp.ko` is never packed into the firmware image, a reboot
-also clears it completely.
+Because `titan_k1fp.ko` is never packed into the firmware image, deleting
+`fastpath/config` and rebooting clears it completely.

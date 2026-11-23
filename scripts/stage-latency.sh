@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Stage the v1.0.15 latency fixes on one Titan over the enrolled operator SSH
-# login (port 2222). Run it from a checkout on a workstation.
+# Stage the latency fixes on one Titan over the enrolled operator SSH login
+# (port 2222). Run it from a checkout on a workstation.
 #
 #   scripts/stage-latency.sh [options] <unit> <tk.gz> <titan_qctrl.ko>
+#   scripts/stage-latency.sh [options] --fastpath <titan_k1fp.ko> <unit>
 #
 # It copies the modem firmware image to /mnt/titan-api/tk/active.gz and writes
 # tk/config (enabled=1, its sha256, target= lines, wm= flag lines). It copies
 # the download clamp module to /mnt/titan-api/qctrl/ and writes qctrl/config.
-# Every copy is checked by SHA-256 on the unit before it replaces anything.
-# It never reboots the unit. See docs/tk-boot-loader.md and
-# docs/download-clamp.md.
+# With --fastpath it copies titan_k1fp.ko to /mnt/titan-api/fastpath/ and
+# writes fastpath/config. When --fastpath is given without <tk.gz>, only the
+# fast path is staged. Every copy is checked by SHA-256 on the unit before it
+# replaces anything. It never reboots the unit. See docs/tk-boot-loader.md,
+# docs/download-clamp.md, and docs/fast-path.md.
 #
 # Options:
 #   --target ADDR        Ping responder for the boot confirm (up to 4). Without
@@ -21,6 +24,8 @@
 #   --trough-ms N        Clamp knob, 0..40 (default: module default 4)
 #   --clamp-target-ms N  Clamp knob, 4..80 (default: module default 40)
 #   --no-clamp           Skip the clamp; the .ko argument may be left out
+#   --fastpath PATH      Stage titan_k1fp.ko and fastpath/config
+#   --fastpath-mode N    Fast path mode: 0, 1, 2 or 3 (default 2)
 #   --reset-strikes      strikes=0 and take this image out of quarantine
 #   --port N             SSH port (default 2222)
 #   --user NAME          SSH user (default root)
@@ -40,6 +45,8 @@ MODE=2
 TROUGH=
 CLAMP_TARGET=
 CLAMP=1
+FASTPATH=
+FASTPATH_MODE=2
 RESET=0
 STATUS_ONLY=0
 DRY=0
@@ -58,12 +65,14 @@ while [ $# -gt 0 ]; do
     --trough-ms) TROUGH=${2:?}; shift 2 ;;
     --clamp-target-ms) CLAMP_TARGET=${2:?}; shift 2 ;;
     --no-clamp) CLAMP=0; shift ;;
+    --fastpath) FASTPATH=${2:?--fastpath needs a path}; shift 2 ;;
+    --fastpath-mode) FASTPATH_MODE=${2:?}; shift 2 ;;
     --reset-strikes) RESET=1; shift ;;
     --port) PORT=${2:?}; shift 2 ;;
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -80,19 +89,23 @@ status() {
 show() { echo "== $1"; if [ -e "$1" ]; then cat "$1"; else echo "(none)"; fi; }
 echo "== /etc/witcher-release"; cat /etc/witcher-release 2>/dev/null || echo "(none)"
 for f in /var/run/witcher-tk.status /var/run/witcher-tk.result /var/run/witcher-tk.flags \
-         /var/run/witcher-qctrl.status /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
-         /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed /mnt/titan-api/qctrl/config; do
+         /var/run/witcher-qctrl.status /var/run/witcher-fastpath.status \
+         /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
+         /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed \
+         /mnt/titan-api/qctrl/config /mnt/titan-api/fastpath/config; do
   show "$f"
 done
 echo "== staged files"
-for f in /mnt/titan-api/tk/active.gz /mnt/titan-api/qctrl/titan_qctrl.ko; do
+for f in /mnt/titan-api/tk/active.gz /mnt/titan-api/qctrl/titan_qctrl.ko /mnt/titan-api/fastpath/titan_k1fp.ko; do
   [ -f "$f" ] && sha256sum "$f" || echo "(no $f)"
 done
 echo "== /proc/titan_qctrl"
 if [ -r /proc/titan_qctrl ]; then head -n 4 /proc/titan_qctrl; else echo "(not loaded)"; fi
-echo "== keeper.log (tk, flags, clamp)"
-{ grep -h -E 'tk boot|tk flags|download clamp' /tmp/titan-pd-keeper/keeper.log.1 /tmp/titan-pd-keeper/keeper.log 2>/dev/null ||
-  grep -h -E 'tk boot|tk flags|download clamp' /mnt/titan-api/pd/keeper.log 2>/dev/null; } | tail -n 15 || true
+echo "== /proc/k1fp"
+if [ -r /proc/k1fp ]; then head -n 9 /proc/k1fp; else echo "(not loaded)"; fi
+echo "== keeper.log (tk, flags, clamp, fast path)"
+{ grep -h -E 'tk boot|tk flags|download clamp|fast path' /tmp/titan-pd-keeper/keeper.log.1 /tmp/titan-pd-keeper/keeper.log 2>/dev/null ||
+  grep -h -E 'tk boot|tk flags|download clamp|fast path' /mnt/titan-api/pd/keeper.log 2>/dev/null; } | tail -n 15 || true
 EOS
 }
 
@@ -103,11 +116,26 @@ fi
 
 TK=${ARGS[1]:-}
 KO=${ARGS[2]:-}
-[ -n "$TK" ] || die "usage: $0 [options] <unit> <tk.gz> <titan_qctrl.ko>"
-[ -f "$TK" ] || die "no file $TK"
+STAGE_TK=1
+STAGE_FP=0
+if [ -n "$FASTPATH" ]; then
+  STAGE_FP=1
+  if [ -z "$TK" ]; then
+    STAGE_TK=0
+    CLAMP=0
+  fi
+fi
+
+if [ "$STAGE_TK" = 1 ]; then
+  [ -n "$TK" ] || die "usage: $0 [options] <unit> <tk.gz> <titan_qctrl.ko>"
+  [ -f "$TK" ] || die "no file $TK"
+fi
 if [ "$CLAMP" = 1 ]; then
   [ -n "$KO" ] || die "give the titan_qctrl.ko path, or --no-clamp"
   [ -f "$KO" ] || die "no file $KO"
+fi
+if [ "$STAGE_FP" = 1 ]; then
+  [ -f "$FASTPATH" ] || die "no file $FASTPATH"
 fi
 [ "${#TARGETS[@]}" -le 4 ] || die "at most 4 --target addresses"
 
@@ -123,18 +151,21 @@ hold=$(num "$HOLD") || die "--hold $HOLD is not a number"
 [ $((flags & ~0x15)) -eq 0 ] || die "--flags $FLAGS sets bits outside 0x15"
 [ "$hold" -le $((0x200)) ] || die "--hold $HOLD is over 0x200"
 case "$MODE" in 0|2|3|6) ;; *) die "--mode must be 0, 2, 3 or 6" ;; esac
+case "$FASTPATH_MODE" in 0|1|2|3) ;; *) die "--fastpath-mode must be 0, 1, 2 or 3" ;; esac
 if [ -n "$TROUGH" ]; then [[ "$TROUGH" =~ ^[0-9]+$ ]] && [ "$TROUGH" -le 40 ] || die "--trough-ms must be 0..40"; fi
 if [ -n "$CLAMP_TARGET" ]; then [[ "$CLAMP_TARGET" =~ ^[0-9]+$ ]] && [ "$CLAMP_TARGET" -ge 4 ] && [ "$CLAMP_TARGET" -le 80 ] || die "--clamp-target-ms must be 4..80"; fi
 for t in "${TARGETS[@]}"; do
   [[ "$t" =~ ^[0-9A-Fa-f.:]+$ ]] || die "--target $t is not an IP address"
 done
 
-size=$(wc -c < "$TK")
-[ "$size" -ge 1024 ] && [ "$size" -le $((7680 * 1024)) ] || die "$TK is $size bytes; the boot hook takes 1 KiB to 7.5 MiB"
-read -r m1 m2 m3 flg < <(od -An -tx1 -N4 "$TK")
-[ "$m1$m2$m3" = 1f8b08 ] || die "$TK is not a gzip (deflate) file"
-[ $((16#$flg & 0xe2)) -eq 0 ] || die "$TK has gzip header flags 0x$flg; the modem reader takes only FTEXT/FNAME"
-TK_SHA=$(sha256sum "$TK" | cut -d' ' -f1)
+if [ "$STAGE_TK" = 1 ]; then
+  size=$(wc -c < "$TK")
+  [ "$size" -ge 1024 ] && [ "$size" -le $((7680 * 1024)) ] || die "$TK is $size bytes; the boot hook takes 1 KiB to 7.5 MiB"
+  read -r m1 m2 m3 flg < <(od -An -tx1 -N4 "$TK")
+  [ "$m1$m2$m3" = 1f8b08 ] || die "$TK is not a gzip (deflate) file"
+  [ $((16#$flg & 0xe2)) -eq 0 ] || die "$TK has gzip header flags 0x$flg; the modem reader takes only FTEXT/FNAME"
+  TK_SHA=$(sha256sum "$TK" | cut -d' ' -f1)
+fi
 
 if [ "$CLAMP" = 1 ]; then
   KO_SHA=$(sha256sum "$KO" | cut -d' ' -f1)
@@ -143,16 +174,25 @@ if [ "$CLAMP" = 1 ]; then
   [ "$KO_SHA" = "$PINNED" ] || die "$KO has SHA-256 $KO_SHA; the keeper accepts only $PINNED (device/qctrl/SHA256SUMS)"
 fi
 
+if [ "$STAGE_FP" = 1 ]; then
+  FP_SHA=$(sha256sum "$FASTPATH" | cut -d' ' -f1)
+  FP_PINNED=$(awk '$2 == "titan_k1fp.ko" { print $1 }' "$REPO/device/fastpath/SHA256SUMS")
+  [ -n "$FP_PINNED" ] || die "no titan_k1fp.ko line in device/fastpath/SHA256SUMS"
+  [ "$FP_SHA" = "$FP_PINNED" ] || die "$FASTPATH has SHA-256 $FP_SHA; the keeper accepts only $FP_PINNED (device/fastpath/SHA256SUMS)"
+fi
+
 stamp=$(date -u +%Y-%m-%dT%H:%MZ)
-TK_CONFIG="# Written by scripts/stage-latency.sh at $stamp
+if [ "$STAGE_TK" = 1 ]; then
+  TK_CONFIG="# Written by scripts/stage-latency.sh at $stamp
 enabled=1
 sha256=$TK_SHA"
-for t in "${TARGETS[@]}"; do TK_CONFIG="$TK_CONFIG
+  for t in "${TARGETS[@]}"; do TK_CONFIG="$TK_CONFIG
 target=$t"; done
-if [ "$WRITE_FLAGS" = 1 ]; then
-  TK_CONFIG="$TK_CONFIG
+  if [ "$WRITE_FLAGS" = 1 ]; then
+    TK_CONFIG="$TK_CONFIG
 wm=0x84f93008:$(printf '0x%x' "$hold")
 wm=0x847ed604:$(printf '0x%x' "$flags")"
+  fi
 fi
 QCTRL_CONFIG="# Written by scripts/stage-latency.sh at $stamp
 mode=$MODE"
@@ -160,13 +200,19 @@ mode=$MODE"
 trough_ms=$TROUGH"
 [ -n "$CLAMP_TARGET" ] && QCTRL_CONFIG="$QCTRL_CONFIG
 target_ms=$CLAMP_TARGET"
+FASTPATH_CONFIG="# Written by scripts/stage-latency.sh at $stamp
+mode=$FASTPATH_MODE"
 
 echo "unit:        $SSH_USER@$UNIT port $PORT"
-echo "tk image:    $TK ($size bytes) sha256 $TK_SHA"
+[ "$STAGE_TK" = 1 ] && echo "tk image:    $TK ($size bytes) sha256 $TK_SHA"
 [ "$CLAMP" = 1 ] && echo "clamp:       $KO sha256 $KO_SHA"
-echo "--- tk/config"; echo "$TK_CONFIG"
+[ "$STAGE_FP" = 1 ] && echo "fast path:   $FASTPATH sha256 $FP_SHA"
+[ "$STAGE_TK" = 1 ] && { echo "--- tk/config"; echo "$TK_CONFIG"; }
 [ "$CLAMP" = 1 ] && { echo "--- qctrl/config"; echo "$QCTRL_CONFIG"; }
-[ "${#TARGETS[@]}" -gt 0 ] || echo "note: no --target; the boot confirm uses the deaf watchdog's targets"
+[ "$STAGE_FP" = 1 ] && { echo "--- fastpath/config"; echo "$FASTPATH_CONFIG"; }
+if [ "$STAGE_TK" = 1 ] && [ "${#TARGETS[@]}" -eq 0 ]; then
+  echo "note: no --target; the boot confirm uses the deaf watchdog's targets"
+fi
 if [ "$DRY" = 1 ]; then
   echo "dry run: nothing changed"
   exit 0
@@ -203,30 +249,38 @@ write_text() { # remote-final text
   [ "$back" = "$2" ] || die "$1 did not read back as written"
 }
 
-# The boot hook refuses a quarantined image and stops after 2 strikes.
-quarantined=$(remote "grep -ci '$TK_SHA' /mnt/titan-api/tk/quarantine 2>/dev/null || true")
-strikes=$(remote "sed -n 's/^strikes=\([0-9]*\).*/\1/p' /mnt/titan-api/tk/strikes 2>/dev/null | tail -n 1")
-if [ "$RESET" = 1 ]; then
-  remote "if [ -f /mnt/titan-api/tk/quarantine ]; then grep -vi '$TK_SHA' /mnt/titan-api/tk/quarantine > /mnt/titan-api/tk/.quarantine.new; mv -f /mnt/titan-api/tk/.quarantine.new /mnt/titan-api/tk/quarantine; fi"
-  write_text /mnt/titan-api/tk/strikes "strikes=0"
-  echo "strikes reset to 0; image taken out of quarantine"
-else
-  [ "${quarantined:-0}" = 0 ] || echo "WARNING: this image is in tk/quarantine; the hook will refuse it. Run again with --reset-strikes." >&2
-  [ "${strikes:-0}" -lt 2 ] || echo "WARNING: tk/strikes is ${strikes}; the hook will refuse to load. Run again with --reset-strikes." >&2
-fi
+if [ "$STAGE_TK" = 1 ]; then
+  # The boot hook refuses a quarantined image and stops after 2 strikes.
+  quarantined=$(remote "grep -ci '$TK_SHA' /mnt/titan-api/tk/quarantine 2>/dev/null || true")
+  strikes=$(remote "sed -n 's/^strikes=\([0-9]*\).*/\1/p' /mnt/titan-api/tk/strikes 2>/dev/null | tail -n 1")
+  if [ "$RESET" = 1 ]; then
+    remote "if [ -f /mnt/titan-api/tk/quarantine ]; then grep -vi '$TK_SHA' /mnt/titan-api/tk/quarantine > /mnt/titan-api/tk/.quarantine.new; mv -f /mnt/titan-api/tk/.quarantine.new /mnt/titan-api/tk/quarantine; fi"
+    write_text /mnt/titan-api/tk/strikes "strikes=0"
+    echo "strikes reset to 0; image taken out of quarantine"
+  else
+    [ "${quarantined:-0}" = 0 ] || echo "WARNING: this image is in tk/quarantine; the hook will refuse it. Run again with --reset-strikes." >&2
+    [ "${strikes:-0}" -lt 2 ] || echo "WARNING: tk/strikes is ${strikes}; the hook will refuse to load. Run again with --reset-strikes." >&2
+  fi
 
-put "$TK" /mnt/titan-api/tk/active.gz "$TK_SHA"
-write_text /mnt/titan-api/tk/config "$TK_CONFIG"
-echo "staged the tk image and tk/config"
+  put "$TK" /mnt/titan-api/tk/active.gz "$TK_SHA"
+  write_text /mnt/titan-api/tk/config "$TK_CONFIG"
+  echo "staged the tk image and tk/config"
+fi
 if [ "$CLAMP" = 1 ]; then
   put "$KO" /mnt/titan-api/qctrl/titan_qctrl.ko "$KO_SHA"
   write_text /mnt/titan-api/qctrl/config "$QCTRL_CONFIG"
   echo "staged titan_qctrl.ko and qctrl/config"
 fi
+if [ "$STAGE_FP" = 1 ]; then
+  put "$FASTPATH" /mnt/titan-api/fastpath/titan_k1fp.ko "$FP_SHA"
+  write_text /mnt/titan-api/fastpath/config "$FASTPATH_CONFIG"
+  echo "staged titan_k1fp.ko and fastpath/config"
+fi
 
 echo
 status
-cat <<EOF
+if [ "$STAGE_TK" = 1 ]; then
+  cat <<EOF
 
 Next: reboot the unit OUTSIDE 07:00 to 10:00 UTC (the SAS grants nothing then):
   ssh -p $PORT ${SSH_OPTS:-}${SSH_OPTS:+ }$SSH_USER@$UNIT reboot
@@ -236,3 +290,16 @@ After the boot, run this script with --status. Expect:
   witcher-tk.flags   state=applied (within about a minute of the confirm)
   witcher-qctrl.status state=applied (about 30 s after LTE comes up)
 EOF
+  if [ "$STAGE_FP" = 1 ]; then
+    echo "  witcher-fastpath.status state=applied (about 30 s after eth0 and lte0pdn2 are up in IP passthrough)"
+  fi
+else
+  cat <<EOF
+
+Next: no reboot is needed for the fast path. Within about 45 s (once eth0 and
+lte0pdn2 are up in IP passthrough and any configured clamp is loaded), run this
+script with --status. Expect:
+  witcher-fastpath.status state=applied
+  /proc/k1fp              mode=$FASTPATH_MODE ... ports_ok=1 ... gate=open
+EOF
+fi

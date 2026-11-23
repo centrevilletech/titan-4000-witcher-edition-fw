@@ -227,6 +227,9 @@ def main():
     # The download clamp module is staged per unit (docs/download-clamp.md).
     qctrl = [str(path.relative_to(d)) for path in Path(d).rglob('*qctrl*') if path.is_file()]
     check('no download clamp module in the rootfs (staged per unit)', not qctrl)
+    # The fast path module is staged per unit (docs/fast-path.md).
+    k1fp = [str(path.relative_to(d)) for path in Path(d).rglob('*k1fp*') if path.is_file()]
+    check('no fast path module in the rootfs (staged per unit)', not k1fp)
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)

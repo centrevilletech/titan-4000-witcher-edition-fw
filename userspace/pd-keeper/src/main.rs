@@ -21,6 +21,7 @@ use titan_pd_model::wear;
 mod bench;
 mod capture;
 mod carrier_watch_io;
+mod fastpath_io;
 mod radio;
 mod radio_modem;
 mod qctrl_io;
