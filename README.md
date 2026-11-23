@@ -106,6 +106,14 @@ Since v1.0.14 the keeper drops customer IPv6 to and from LTE whenever the unit
 has no grant, in every mode, and puts the rules back after each vendor
 firewall restart. See [Customer IPv6 without a SAS grant](docs/cbrs-sas-enforcement.md#customer-ipv6-without-a-sas-grant).
 
+The vendor SAS client only refreshes its channel mask after a re-attach or a
+PCell handover, so an uplink SCell added or swapped inside a connection can
+transmit outside the unit's held grants. The keeper's carrier watch compares
+active Band 48 transmit carriers against authorized grants in `/mnt/cbrslog0.txt`
+every second (`mode=log` by default), and can trigger the vendor re-grant
+sequence per unit when `mode=regrant` is enabled outside the daily CPAS quiet
+window. See [Carrier watch](docs/carrier-watch.md).
+
 A passthrough unit could stay attached but go deaf: the vendor kernel made the
 management bearer its external device, and the LTE driver then addressed
 management traffic to the customer router. The keeper watches the kernel log
@@ -179,6 +187,7 @@ components this repository builds from source.
 - [Component provenance and third-party licenses](THIRD_PARTY.md)
 - [Image format and flashing](docs/image-format.md)
 - [Spectrum enforcement changes](docs/cbrs-sas-enforcement.md)
+- [Carrier watch (SAS grant coverage)](docs/carrier-watch.md)
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
