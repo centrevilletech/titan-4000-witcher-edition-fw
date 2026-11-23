@@ -604,7 +604,7 @@ impl Keeper {
                 return cached_result.clone();
             }
         }
-        let loaded = config::load_config(&path);
+        let loaded = config::load_config(&path).map_err(|err| err.to_string());
         self.config_cache = Some((fp, loaded.clone()));
         loaded
     }

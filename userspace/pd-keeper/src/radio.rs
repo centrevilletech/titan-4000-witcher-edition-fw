@@ -142,7 +142,7 @@ pub fn supervise() {
                 let guard = if *guard == seen {
                     match cvar.wait_timeout(guard, wait) {
                         Ok((guard, _)) => guard,
-                        Err(poisoned) => poisoned.into_inner(),
+                        Err(poisoned) => poisoned.into_inner().0,
                     }
                 } else {
                     guard
