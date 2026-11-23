@@ -1,0 +1,121 @@
+# Passthrough bridge fast path (titan_k1fp 2.0)
+
+Status: off by default and not in the firmware image. An operator stages
+`titan_k1fp.ko` per unit, checks its SHA-256 against
+[`device/fastpath/SHA256SUMS`](../device/fastpath/SHA256SUMS), and loads
+it with `insmod`. On load it starts in `mode 0` (off).
+
+## Why
+
+At 133 to 146 Mbps in IP passthrough, the Titan 4000 CPU sits at 0 to 5 %
+idle with 66 to 72 % softirq, backlog drops, and time squeezes in
+`/proc/net/softnet_stat`. Every bridged IPv4 packet walks the bridge,
+ebtables, `br_netfilter`, iptables, and conntrack before reaching
+`dev_queue_xmit`. Saturated softirq also adds queueing delay under load.
+
+`titan_k1fp` (v2.0) short-circuits steady-state unicast IPv4 and IPv6
+TCP/UDP flows between `lte0pdn2` and `eth0` straight from the bridge port
+RX handler to `dev_queue_xmit`, after proving each flow through the full
+stock path first.
+
+## Operating modes
+
+Control and telemetry live in `/proc/k1fp`. Write one command per write:
+
+| Command | Meaning |
+| --- | --- |
+| `mode 0` | Off (default at load). Immediate pass-through to `br_handle_frame_hook`. |
+| `mode 1` | Observe. Classifies packets, proves flows on the stock path, and counts `would_fast` without changing forwarding. |
+| `mode 2` | Downlink fast path (`lte0pdn2 -> eth0`). Uplink stays on the stock path. |
+| `mode 3` | Both directions. When `titan_qctrl` is loaded on `NF_BR_FORWARD`, uplink TCP stays on stock so receive-window clamping and ACK thinning never get bypassed. |
+| `grant <0..60>` | Renew or revoke (`0`) the userspace SAS grant lease in seconds. |
+| `require_grant <0\|1>` | Default `1`. Fast path stays closed until a live grant lease is present. |
+| `v4 <0\|1>`, `v6 <0\|1>` | Enable or disable IPv4 or IPv6 fast-path eligibility (both default `1`). |
+| `lease_ms <10..1000>` | Per-flow lease lifetime (default `60` ms). |
+| `sample_ms <2..50>` | Periodic stock-path re-proof interval (default `20` ms, capped at `50` ms). |
+| `flush` | Clear all flow leases and bump the epoch. |
+| `zero` | Zero counters and re-baseline the watchdog. |
+
+## What stays on the stock path
+
+Every control, management, and non-steady-state frame stays on the normal
+bridge and netfilter path:
+
+- Non-IP frames: ARP, 802.1Q VLAN, 802.1ad QinQ, PPPoE.
+- Multicast, broadcast, invalid source MAC, IPv4 special ranges (`0/8`,
+  `127/8`, `224/4`, `240/4`), IPv6 multicast (`ff00::/8`), unspecified
+  (`::`), loopback (`::1`), and link-local (`fe80::/10`).
+- ICMP, IGMP, ICMPv6 (RS, RA, NS, NA, MLD, Packet Too Big), IPv6
+  extension headers, IPv4 options, IPv4 fragments, TTL/hop-limit 0, and
+  bad IPv4 header checksums.
+- TCP `SYN`, `FIN`, and `RST` packets (so conntrack, TCP MSS clamping,
+  and `titan_qctrl` window-scale tracking see every handshake and close).
+- DHCPv4 (UDP 67/68) and DHCPv6 (UDP 546/547).
+- Shared, loopback, VLAN-tagged, non-linear, or GSO/GRO skbs, packets
+  larger than the egress MTU, and frames addressed to `br0`, `eth0`, or
+  `lte0pdn2` MACs (local management traffic).
+- Any packet during a vendor bridge hold (`external_dev_stop` or queued
+  `brhook` frames), non-forwarding port state, or when `br0` does not have
+  exactly two ports.
+
+## Safety design
+
+- **Vendor router-MAC rewrite preserved**: `dlbypass` (the v1.2 `gdmlte`
+  live patch) is removed in 2.0. Downlink frames stay on the vendor
+  `netif_enqueue` path (`netifq_enabled=1`) so the driver always applies
+  its learned router MAC before bridge RX.
+- **CBRS and SAS enforcement (IPv4 and IPv6)**: IPv4 leases are granted
+  only at `NF_INET_POST_ROUTING` (`NF_IP_PRI_LAST`), after iptables
+  `FORWARD` and `SNAT`. IPv6 leases are granted only at
+  `NF_BR_POST_ROUTING` (`NF_BR_PRI_LAST`), after ebtables `FORWARD` and
+  `br_nf_post_routing`. When a grant drops, vendor IPv4 `iptables FORWARD
+  DROP` and Witcher IPv6 `ebtables FORWARD DROP` drop the next re-proof
+  sample within `sample_ms` (20 ms) and revoke the lease. In addition,
+  `require_grant=1` closes both families immediately when the grant feeder
+  writes `grant 0` or stops renewing.
+- **`titan_qctrl` coexistence**: `titan_k1fp` discovers a loaded
+  `titan_qctrl` hook live on `NF_BR_FORWARD` under softirq RCU without
+  holding stale pointers. On downlink fast path (modes 2 and 3), it calls
+  `titan_qctrl`'s hook directly so the clamp sees 100 % of downlink bytes,
+  timestamps, OWD, RTT, ECN marking, and UDP drop. On uplink TCP (modes 1
+  and 3), it yields to stock while `titan_qctrl` is loaded so RWND
+  clamping and ACK thinning run untouched.
+- **In-kernel watchdog (no kernel-log dependence)**: While `mode >= 2`, a
+  100 ms timer and inline proof checks drop `mode` to `0` on unexpected
+  header modifications or wrong-port proofs (`wd_mod`, default 20), lease
+  mismatch storms (`wd_mismatch`, default 64/s), persistent `eth0` TX ring
+  full (`wd_ringfull_ms`, default 500 ms), `eth0` TX stall (`wd_stall_ms`,
+  default 500 ms), invalid TX ring state, or bridge device removal. All
+  health counters live in `/proc/k1fp`.
+- **Kernel fingerprint verification**: On `insmod`, `titan_k1fp` hashes
+  the 8 kernel functions it relies on with freestanding SHA-256 and
+  refuses to load on any byte mismatch.
+
+## Stopping `[IPC ST]` kernel log spam
+
+Running `kern ipc st` on the unit starts a 1 Hz kernel timer
+(`start_ipc_timer`, default period 1 s) that calls `print_ipc_info` once
+per second forever (~18 lines/s, wrapping the 256 KB dmesg buffer every
+~3.5 minutes). Neither vendor daemons nor Witcher invoke it.
+
+- Stop an active timer live: `kern ipc -st`
+- Take a one-shot IPC snapshot without starting a timer: `kern ipc i`
+
+## Build and host tests
+
+```sh
+device/fastpath/source/build.sh /tmp/fastpath-out
+device/fastpath/test/run.sh
+```
+
+## Rollback
+
+Live rollback needs no reboot:
+
+```sh
+echo "mode 0" > /proc/k1fp
+rmmod titan_k1fp
+```
+
+Because `titan_k1fp.ko` is never packed into the firmware image, a reboot
+also clears it completely.
