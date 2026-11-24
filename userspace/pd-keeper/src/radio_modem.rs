@@ -84,13 +84,24 @@ pub fn console(cmd: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Seconds the modem may take to switch the radio before the read-back fails.
+/// On the bench a query 2 s after `AT+CFUN=0` still read `+CFUN: 1` while it
+/// detached (2026-11-24).
+const CFUN_SETTLE_SECS: u64 = 20;
+
 pub fn cfun(on: bool) -> io::Result<()> {
     let n = if on { 1 } else { 0 };
     console(&format!("AT+CFUN={n}"))?;
     let expected = format!("+CFUN: {n}");
-    if console("AT+CFUN?")?.lines().any(|s| s.trim() == expected) {
-        Ok(())
-    } else {
-        Err(io::Error::other("CFUN read-back failed"))
+    let start = std::time::Instant::now();
+    loop {
+        // A busy console during the detach is not a failure yet.
+        if console("AT+CFUN?").is_ok_and(|r| r.lines().any(|s| s.trim() == expected)) {
+            return Ok(());
+        }
+        if start.elapsed() >= Duration::from_secs(CFUN_SETTLE_SECS) {
+            return Err(io::Error::other("CFUN read-back failed"));
+        }
+        thread::sleep(Duration::from_secs(1));
     }
 }
