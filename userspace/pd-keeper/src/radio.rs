@@ -374,6 +374,10 @@ pub fn guard() -> io::Result<()> {
                 continue;
             }
         };
+        if desired.picker().is_none() {
+            // No stale picker state in the status once the picker is gone.
+            rm(ram("radio-pick"))?;
+        }
         if desired.actions.is_empty() {
             rollback()?;
             rm(ram("radio-blocked"))?;
@@ -593,7 +597,18 @@ fn set(a: &Action, stock: bool) -> io::Result<()> {
     Ok(())
 }
 fn count() -> io::Result<u32> {
-    failures(&console("rrc dm reest stat ?")?).ok_or_else(|| fail("missing RRC counter"))
+    // The keeper's modem flag writer shares the console. On the bench a reply
+    // cut short by its session right after a keeper restart reverted a
+    // profile (2026-11-24). Three misses in a row are a missing counter.
+    for attempt in 0..3 {
+        if let Some(n) = console("rrc dm reest stat ?").ok().and_then(|r| failures(&r)) {
+            return Ok(n);
+        }
+        if attempt < 2 {
+            pause(3);
+        }
+    }
+    Err(fail("missing RRC counter"))
 }
 fn rates(p: &Profile) -> Option<(u32, u32)> {
     p.actions.iter().find_map(|a| {
