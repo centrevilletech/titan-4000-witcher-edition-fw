@@ -84,23 +84,40 @@ pub fn console(cmd: &str) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Seconds the modem may take to switch the radio before the read-back fails.
-/// On the bench a query 2 s after `AT+CFUN=0` still read `+CFUN: 1` while it
-/// detached (2026-11-24).
-const CFUN_SETTLE_SECS: u64 = 20;
+/// Seconds the radio may take to go off before the switch fails.
+const OFF_SECS: u64 = 20;
 
+/// The vendor's attach state from its RAM configuration cache.
+pub fn media() -> String {
+    let raw = std::fs::read("/tmp/nvram.cfg").unwrap_or_default();
+    raw.split(|b| *b == 0 || *b == b'\n')
+        .find_map(|s| s.strip_prefix(b"sqns_connection_mediaState=".as_slice()))
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Switch the radio. `AT+CFUN?` is no read-back on this stack: on the bench it
+/// kept answering `+CFUN: 1` for the whole time the radio was off
+/// (2026-11-24). The modem's `OK` accepts the switch. Off is confirmed when the
+/// attach state leaves `ATTACHED` (about 5 s on the bench, then `DISCONNECTED`
+/// and `Not Searching`). On is confirmed by the attach the caller waits for
+/// (about 17 s on the bench).
 pub fn cfun(on: bool) -> io::Result<()> {
     let n = if on { 1 } else { 0 };
-    console(&format!("AT+CFUN={n}"))?;
-    let expected = format!("+CFUN: {n}");
+    let reply = console(&format!("AT+CFUN={n}"))?;
+    if !reply.lines().any(|s| s.trim() == "OK") {
+        return Err(io::Error::other("CFUN not accepted"));
+    }
+    if on {
+        return Ok(());
+    }
     let start = std::time::Instant::now();
     loop {
-        // A busy console during the detach is not a failure yet.
-        if console("AT+CFUN?").is_ok_and(|r| r.lines().any(|s| s.trim() == expected)) {
+        if media() != "ATTACHED" {
             return Ok(());
         }
-        if start.elapsed() >= Duration::from_secs(CFUN_SETTLE_SECS) {
-            return Err(io::Error::other("CFUN read-back failed"));
+        if start.elapsed() >= Duration::from_secs(OFF_SECS) {
+            return Err(io::Error::other("radio did not go off"));
         }
         thread::sleep(Duration::from_secs(1));
     }

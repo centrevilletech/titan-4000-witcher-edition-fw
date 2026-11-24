@@ -761,8 +761,10 @@ fn clear_pcell() -> io::Result<()> {
     Err(fail("PCell lock not cleared"))
 }
 
+/// An attached unit has its radio on. `AT+CFUN?` cannot tell: it reads 1
+/// while the radio is off (see `radio_modem::cfun`).
 fn radio_on() -> io::Result<()> {
-    if console("AT+CFUN?")?.lines().any(|s| s.trim() == "+CFUN: 1") {
+    if media() == "ATTACHED" {
         return Ok(());
     }
     cfun(true)
