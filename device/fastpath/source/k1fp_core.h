@@ -2,7 +2,7 @@
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
  * k1fp_core.h - Portable decision, classification, lease, watchdog, TX-ring,
- * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.1.
+ * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.2.
  *
  * No kernel headers here. The includer must provide u8/u16/u32/u64/s32 and
  * memcmp/memcpy/memset. The same header compiles into the ARMv7 kernel module
@@ -721,6 +721,53 @@ static inline int k1_hold_step(u32 stopped, u32 list_nr, u8 *in_hold)
 	if (*in_hold)
 		*in_hold = 0;
 	return K1H_NONE;
+}
+
+/*
+ * Device re-acquire (k1fp 2.2). A modem re-attach makes the vendor scripts
+ * delete and recreate br0 and lte0pdn2. NETDEV_UNREGISTER drops the module's
+ * pointer and reference; the 1 s housekeeping work then looks the missing
+ * devices up again by name, under RTNL.
+ *
+ * All or nothing: a missing device is adopted only once the whole shape is
+ * one that init_module would accept (eth0 and lte0pdn2 both registered, both
+ * stock bridge ports of the same bridge, and that bridge a real bridge
+ * device) and it agrees with every pointer the module still holds. Until
+ * then nothing is held and nothing changes.
+ */
+#define K1RA_LAN 1u
+#define K1RA_WAN 2u
+#define K1RA_BR  4u
+
+struct k1_reacq_in {
+	u8 have_lan, have_wan, have_br; /* pointers the module still holds */
+	u8 lan_found, wan_found;        /* name lookup found a registered device */
+	u8 lan_port, wan_port;          /* device is a stock bridge port */
+	u8 same_br;                     /* both ports belong to one bridge */
+	u8 br_valid;                    /* that bridge is a real bridge device */
+	u8 br_matches_held;             /* have_br only: it is the bridge we hold */
+};
+
+/* Returns the K1RA_* set to adopt now, or 0 to leave everything as it is. */
+static inline u32 k1_reacq_plan(const struct k1_reacq_in *in)
+{
+	u32 need = 0;
+
+	if (!in->have_lan)
+		need |= K1RA_LAN;
+	if (!in->have_wan)
+		need |= K1RA_WAN;
+	if (!in->have_br)
+		need |= K1RA_BR;
+	if (!need)
+		return 0;
+	if ((!in->have_lan && !in->lan_found) || (!in->have_wan && !in->wan_found))
+		return 0;
+	if (!in->lan_port || !in->wan_port || !in->same_br || !in->br_valid)
+		return 0;
+	if (in->have_br && !in->br_matches_held)
+		return 0;
+	return need;
 }
 
 /* eth0 TX ring descriptor helpers (gdm_eth) */

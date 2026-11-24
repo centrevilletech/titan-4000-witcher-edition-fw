@@ -1,7 +1,7 @@
-# titan_k1fp: the passthrough bridge fast path (v2.1)
+# titan_k1fp: the passthrough bridge fast path (v2.2)
 
 `payload/titan_k1fp.ko` is a Linux 3.10.0-uc0 kernel module for the Titan
-4000, version 2.1. It accelerates steady-state bridged IPv4 and IPv6
+4000, version 2.2. It accelerates steady-state bridged IPv4 and IPv6
 TCP/UDP flows between `lte0pdn2` and `eth0` while proving every flow
 through the stock bridge and netfilter path first. What it does, how it
 coexists with `titan_qctrl` and CBRS SAS gates, and how to test or roll
@@ -38,7 +38,7 @@ digest matches only with the same GCC build
 
 ## Host tests
 
-Run the userspace classifier, lease, CBRS, `titan_qctrl`, watchdog, TX
+Run the userspace classifier, lease, CBRS, `titan_qctrl`, watchdog, device re-acquire, TX
 ring, SHA-256, and fuzz tests under AddressSanitizer and UndefinedBehaviorSanitizer:
 
 ```sh

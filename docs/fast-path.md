@@ -1,4 +1,4 @@
-# Passthrough bridge fast path (titan_k1fp 2.1)
+# Passthrough bridge fast path (titan_k1fp 2.2)
 
 Status: off by default and not in the firmware image. An operator stages
 `titan_k1fp.ko` per unit in `/mnt/titan-api/fastpath/` with a `config` file;
@@ -15,7 +15,7 @@ idle with 66 to 72 % softirq, backlog drops, and time squeezes in
 ebtables, `br_netfilter`, iptables, and conntrack before reaching
 `dev_queue_xmit`. Saturated softirq also adds queueing delay under load.
 
-`titan_k1fp` (v2.1) short-circuits steady-state unicast IPv4 and IPv6
+`titan_k1fp` (v2.2) short-circuits steady-state unicast IPv4 and IPv6
 TCP/UDP flows between `lte0pdn2` and `eth0` straight from the bridge port
 RX handler to `dev_queue_xmit`, after proving each flow through the full
 stock path first.
@@ -101,12 +101,25 @@ bridge and netfilter path:
   sliding `wd_mod_win_ms` window, default 10 s), lease mismatch storms
   (`wd_mismatch`, default 64/s), persistent `eth0` TX ring full
   (`wd_ringfull_ms`, default 500 ms), `eth0` TX stall (`wd_stall_ms`,
-  default 500 ms), invalid TX ring state, or bridge device removal. The
+  default 500 ms), or invalid TX ring state. The
   last 16 mismatches are recorded in a bounded header-only ring (`diag:`
   in `/proc/k1fp`, at most `min(hdrlen, 64)` bytes before and after plus a
   field diff summary, with zero payload bytes beyond transport headers),
   readable after a trip and cleared by `zero`. All health counters live in
   `/proc/k1fp`.
+- **Device loss and re-acquire (v2.2)**: A modem re-attach makes the vendor
+  scripts delete and recreate `br0` and `lte0pdn2`. When `eth0`,
+  `lte0pdn2`, or the bridge is unregistered, the module drops its pointer
+  and reference, sets `mode 0`, and counts `dev_gone` (line `devices:` in
+  `/proc/k1fp`). This is not a watchdog trip. Its 1 s housekeeping work
+  then looks the missing devices up again by name under RTNL. It adopts
+  them only once `eth0` and `lte0pdn2` are both stock ports of one bridge
+  again, the same test the module applies at load, and only if that agrees
+  with every device it still holds. It then counts `reacq`, bumps the
+  epoch so every flow proves itself again, and stays at `mode 0` until
+  userspace writes the mode. Up to v2.1 the module never looked again:
+  after a re-attach `/proc/k1fp` showed `br=- br_ports=-1 ports_ok=0`
+  until someone reloaded it.
 - **Kernel fingerprint verification**: On `insmod`, `titan_k1fp` hashes
   the 8 kernel functions it relies on with freestanding SHA-256 and
   refuses to load on any byte mismatch.
@@ -147,9 +160,9 @@ Every 15 s the keeper:
 
 1. Reads `/mnt/titan-api/fastpath/config`.
 2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
-   `/proc/k1fp` reports a version string other than `titan_k1fp v2.1`. If
+   `/proc/k1fp` reports a version string other than `titan_k1fp v2.2`. If
    `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
-   exact pinned version line `titan_k1fp v2.1`, the keeper adopts it, logs
+   exact pinned version line `titan_k1fp v2.2`, the keeper adopts it, logs
    `fast path: adopted a loaded module`, and takes over its mode and grant
    lease without running `insmod`.
 3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and
@@ -193,6 +206,14 @@ mode in `/proc/k1fp` drifts from the applied config):
   the module at `mode 0`, revokes the grant lease, logs once, and sets
   `state=tripped` in `/var/run/witcher-fastpath.status` until
   `/mnt/titan-api/fastpath/config` changes or the unit reboots.
+
+A lost bridge device is not a drop in this sense. When `dev_gone` in
+`/proc/k1fp` has moved since the keeper's last look and `wd_trips` has
+not, the keeper logs it once and writes the configured mode again as soon
+as `ports_ok=1 lan_hooked=1 wan_hooked=1` read back. This does not use the
+re-arm budget, so any number of re-attaches in one boot leave the fast
+path on. The keeper checks every 15 s, so the fast path is back at most
+about 16 s after the vendor scripts finish rebuilding the bridge.
 
 ### Status and logs
 

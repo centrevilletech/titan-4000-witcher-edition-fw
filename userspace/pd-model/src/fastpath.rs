@@ -1,4 +1,4 @@
-//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.1).
+//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.2).
 //!
 //! At 130+ Mbps in IP passthrough, softirq saturates the CPU and adds queueing
 //! delay. `titan_k1fp` short-circuits steady-state unicast IPv4 and IPv6
@@ -24,12 +24,17 @@
 //!   never writing a lease while `cbrs_mode_grant` is not 1);
 //! - tracks watchdog trips (`wd_trips`, `wd_reason`) and unexpected mode drops,
 //!   re-arming automatically at most once per boot before holding at mode 0 in
-//!   `state=tripped` until the config changes or the unit reboots.
+//!   `state=tripped` until the config changes or the unit reboots;
+//! - treats a lost bridge device as a pause, not a trip. A modem re-attach
+//!   makes the vendor scripts recreate `br0` and `lte0pdn2`; the module drops
+//!   to mode 0, counts `dev_gone`, and takes the new devices by itself. The
+//!   keeper writes the configured mode again once the bridge is ready, and
+//!   that does not use the re-arm budget.
 
 use crate::cbrs_gate::{Gate, Step as GateStep};
 
 /// The first line of `/proc/k1fp` for the allowed build.
-pub const VERSION_LINE: &str = "titan_k1fp v2.1";
+pub const VERSION_LINE: &str = "titan_k1fp v2.2";
 /// The module's name in `/proc/modules`.
 pub const MODULE: &str = "titan_k1fp";
 /// The file in the staging directory and in the manifest.
@@ -124,6 +129,11 @@ pub struct Proc {
     pub wd_trips: Option<u32>,
     pub wd_reason: Option<String>,
     pub gate_closed: Option<u32>,
+    /// Times the module lost `eth0`, `lte0pdn2` or the bridge
+    /// (`NETDEV_UNREGISTER`). Each loss sets mode 0 without a watchdog trip.
+    pub dev_gone: Option<u32>,
+    /// Times the module took recreated devices again.
+    pub reacq: Option<u32>,
 }
 
 impl Proc {
@@ -215,6 +225,10 @@ pub fn parse_proc(text: &str) -> Proc {
             }
         } else if let Some(v) = word.strip_prefix("gate_closed=") {
             proc.gate_closed = proc.gate_closed.or_else(|| v.parse().ok());
+        } else if let Some(v) = word.strip_prefix("dev_gone=") {
+            proc.dev_gone = proc.dev_gone.or_else(|| v.parse().ok());
+        } else if let Some(v) = word.strip_prefix("reacq=") {
+            proc.reacq = proc.reacq.or_else(|| v.parse().ok());
         }
     }
     proc
@@ -371,6 +385,10 @@ pub struct TripWatch {
     tripped_for: Option<Config>,
     /// Reason recorded when entering `state=tripped`.
     tripped_reason: Option<String>,
+    /// Last observed `dev_gone` count from `/proc/k1fp`.
+    last_dev_gone: Option<u32>,
+    /// A device loss was seen and not yet reported with `take_device_event`.
+    device_event: bool,
 }
 
 /// Mode action decided from config and `/proc/k1fp`.
@@ -405,6 +423,22 @@ impl TripWatch {
     pub fn evaluate(&mut self, config: &Config, proc: &Proc) -> TripAction {
         let first_observation = !self.observed;
         self.observed = true;
+
+        // The module lost a bridge device since the last look (a modem
+        // re-attach recreates `br0` and `lte0pdn2`) and set mode 0 itself.
+        // That is a pause, not a trip: forget the applied mode so the
+        // configured mode is written again without using the re-arm budget.
+        // A unit already held in `state=tripped` stays there.
+        if let Some(count) = proc.dev_gone {
+            if self.last_dev_gone.is_some_and(|prev| prev != count) {
+                self.device_event = true;
+                // A watchdog trip in the same interval still counts.
+                if proc.wd_trips.unwrap_or(0) <= self.last_wd_trips {
+                    self.applied_mode = None;
+                }
+            }
+            self.last_dev_gone = Some(count);
+        }
 
         if config.mode == 0 {
             self.applied_mode = None;
@@ -510,6 +544,11 @@ impl TripWatch {
         self.applied_mode = None;
     }
 
+    /// True once after the module reported a lost bridge device.
+    pub fn take_device_event(&mut self) -> bool {
+        std::mem::take(&mut self.device_event)
+    }
+
     pub fn rearms(&self) -> u32 {
         self.rearms
     }
@@ -571,8 +610,9 @@ mod tests {
 
     // Real `/proc/k1fp` output captured on the bench unit (mode 2, download running).
     const BENCH_PROC: &str = "\
-titan_k1fp v2.1
+titan_k1fp v2.2
 mode=2 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1
+devices: dev_gone=0 reacq=0
 require_grant=1 grant_left_ms=4290 gate=open v4=1 v6=1 lease_ms=60 sample_ms=20
 qctrl: qctrl_present=1 qctrl_dl_calls=242513 qctrl_dl_drop=0 qctrl_dl_stolen=0 qctrl_ul_stock=0
 watchdog: wd_armed=1 wd_trips=0 wd_reason=none wd_mod=20 wd_mismatch=64 wd_stall_ms=500 wd_ringfull_ms=500
@@ -634,6 +674,8 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
                 wd_trips: Some(0),
                 wd_reason: Some("none".into()),
                 gate_closed: Some(0),
+                dev_gone: Some(0),
+                reacq: Some(0),
             }
         );
         assert!(proc.bridge_ready());
@@ -655,10 +697,10 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert!(unhooked_wan.bridge_issue().contains("wan_hooked=0"));
 
         // Different version string is rejected.
-        let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.1", "titan_k1fp v1.2"));
+        let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v1.2"));
         assert!(!v1.ours);
         assert!(!matches(&parse_config("mode=2\n"), &v1));
-        let v21 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.1", "titan_k1fp v2.1-dev"));
+        let v21 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.2-dev"));
         assert!(!v21.ours);
         assert!(!parse_proc("").ours);
     }
@@ -669,7 +711,7 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert_eq!(loaded("", ""), Loaded::None);
         assert_eq!(loaded(MODULES, BENCH_PROC), Loaded::Ours);
         assert_eq!(
-            loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.1", "titan_k1fp v2.2")),
+            loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.1")),
             Loaded::Other("titan_k1fp (titan_k1fp v2.2)".into())
         );
         assert_eq!(
@@ -948,6 +990,76 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         let mut tw4 = TripWatch::default();
         assert_eq!(tw4.evaluate(&cfg2, &proc2), TripAction::Normal);
         assert!(matches!(tw4.evaluate(&cfg2, &proc0), TripAction::Rearm { .. }));
+    }
+
+    #[test]
+    fn device_loss_is_a_pause_and_never_spends_the_rearm_budget() {
+        let cfg = Config { mode: 2, refused: vec![] };
+        let mut at = parse_proc(BENCH_PROC);
+        assert_eq!((at.dev_gone, at.reacq), (Some(0), Some(0)));
+        let mut watch = TripWatch::default();
+        assert_eq!(watch.evaluate(&cfg, &at), TripAction::Normal);
+        assert!(!watch.take_device_event());
+
+        // Ten re-attaches in a row. Each time the module has already taken the
+        // new devices by the next look: mode 0, bridge ready, counters up,
+        // watchdog untouched. The keeper writes the mode again every time.
+        for n in 1..=10u32 {
+            at.mode = Some(0);
+            at.dev_gone = Some(2 * n);
+            at.reacq = Some(n);
+            assert!(at.bridge_ready());
+            assert_eq!(watch.evaluate(&cfg, &at), TripAction::Apply, "re-attach {n}");
+            assert!(watch.take_device_event());
+            assert!(!watch.take_device_event());
+            at.mode = Some(2);
+            watch.note_applied(2, &at);
+            assert_eq!(watch.evaluate(&cfg, &at), TripAction::Normal);
+            assert_eq!(watch.rearms(), 0);
+            assert!(!watch.is_tripped());
+        }
+
+        // A real watchdog trip afterwards still gets its one re-arm, then holds.
+        at.mode = Some(0);
+        at.wd_trips = Some(1);
+        at.wd_reason = Some("modified".into());
+        assert!(matches!(watch.evaluate(&cfg, &at), TripAction::Rearm { .. }));
+        at.mode = Some(2);
+        watch.note_applied(2, &at);
+        at.mode = Some(0);
+        at.wd_trips = Some(2);
+        assert!(matches!(
+            watch.evaluate(&cfg, &at),
+            TripAction::Tripped { first_notice: true, .. }
+        ));
+        // A device loss does not release a tripped unit.
+        at.dev_gone = Some(99);
+        assert!(matches!(
+            watch.evaluate(&cfg, &at),
+            TripAction::Tripped { first_notice: false, .. }
+        ));
+        assert!(watch.is_tripped());
+
+        // A keeper that starts after a device loss sees no watchdog trip and
+        // simply applies the mode.
+        let mut fresh = TripWatch::default();
+        let mut after = parse_proc(BENCH_PROC);
+        after.mode = Some(0);
+        after.dev_gone = Some(4);
+        after.reacq = Some(2);
+        assert_eq!(fresh.evaluate(&cfg, &after), TripAction::Apply);
+        assert_eq!(fresh.rearms(), 0);
+
+        // A trip and a device loss in the same interval: the trip still counts
+        // on the next drop, because the watchdog counter moved.
+        let mut both = TripWatch::default();
+        let mut p = parse_proc(BENCH_PROC);
+        assert_eq!(both.evaluate(&cfg, &p), TripAction::Normal);
+        p.mode = Some(0);
+        p.dev_gone = Some(1);
+        p.wd_trips = Some(1);
+        p.wd_reason = Some("tx_stall".into());
+        assert!(matches!(both.evaluate(&cfg, &p), TripAction::Rearm { .. }));
     }
 
     #[test]

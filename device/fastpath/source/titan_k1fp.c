@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
- * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.1) for the Global
+ * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.2) for the Global
  * Telecom Titan 4000 (GDM7243AP, Linux 3.10.0-uc0, UP ARMv7, PREEMPT_NONE).
  *
  * Built standalone against titan_k310_abi.h (no 3.10 kernel tree required).
@@ -39,6 +39,15 @@
  *   mismatches are captured in a bounded 16-entry header-only ring readable
  *   from /proc/k1fp after a trip and cleared by "zero".
  *
+ * Device loss and re-acquire:
+ *   NETDEV_UNREGISTER of eth0, lte0pdn2 or the bridge drops that pointer and
+ *   its reference, sets mode 0 and counts dev_gone. It is not a watchdog
+ *   trip: a modem re-attach makes the vendor scripts recreate br0 and
+ *   lte0pdn2. The 1 s housekeeping work looks the missing devices up again
+ *   by name under RTNL and adopts them only once eth0 and lte0pdn2 are stock
+ *   ports of one bridge again (the test init_module applies), counts reacq
+ *   and bumps the epoch. The mode stays 0 until userspace writes it again.
+ *
  * Note: dlbypass (gdmlte live text patch) is intentionally absent so
  * the vendor netif_enqueue router-MAC rewrite is always preserved.
  */
@@ -47,7 +56,7 @@
 #include "k1fp_core.h"
 #include "k1_fp.h"
 
-#define K1_VERSION "titan_k1fp v2.1"
+#define K1_VERSION "titan_k1fp v2.2"
 
 /* ---------- Module metadata matching stock 3.10.0-uc0 ELF ABI ---------- */
 int init_module(void);
@@ -137,6 +146,8 @@ static struct {
 	u32 epoch, seed;
 	volatile int unloading;
 	int nports, ports_ok;
+	/* device loss and re-acquire; not cleared by "zero" */
+	u32 dev_gone, reacq;
 	/* watchdog */
 	struct k1_wd_cfg wd_cfg;
 	struct k1_wd_state wd;
@@ -848,12 +859,151 @@ static void k1_ports_update(void)
 	g.ports_ok = ok;
 }
 
+/*
+ * A bridge port in the state br_add_if leaves it, or NULL. With quiet == 0
+ * it logs why not (init_module).
+ */
+static void *k1_stock_port(struct net_device *d, int quiet)
+{
+	unsigned long h = (unsigned long)d->rx_handler;
+	void *p;
+
+	if (h != (unsigned long)g.orig_rx) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s rx_handler = %08lx, expected %08x\n",
+			       d->name, h, FP_BR_HANDLE_FRAME_HOOK_VA);
+		return NULL;
+	}
+	if (!(d->priv_flags & IFF_BRIDGE_PORT)) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s priv_flags = %08x, IFF_BRIDGE_PORT not set\n",
+			       d->name, d->priv_flags);
+		return NULL;
+	}
+	p = d->rx_handler_data;
+	if (!p) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s rx_handler_data is NULL\n", d->name);
+		return NULL;
+	}
+	if (RD32((unsigned long)p + BRP_DEV_OFF) != (u32)(unsigned long)d) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s bridge port dev mismatch\n", d->name);
+		return NULL;
+	}
+	if (!RD32((unsigned long)p + BRP_BR_OFF)) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s bridge port has no bridge\n", d->name);
+		return NULL;
+	}
+	return p;
+}
+
+/* The bridge device both ports belong to, or NULL. */
+static struct net_device *k1_port_bridge(void *pl, void *pw, int quiet)
+{
+	u32 brl = RD32((unsigned long)pl + BRP_BR_OFF);
+	u32 brw = RD32((unsigned long)pw + BRP_BR_OFF);
+	struct net_device *bd;
+
+	if (brl != brw) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: eth0 and lte0pdn2 are on different bridges\n");
+		return NULL;
+	}
+	bd = (struct net_device *)(unsigned long)RD32(brl + BR_DEV_OFF);
+	if (!bd || (u32)(unsigned long)netdev_priv_ptr(bd) != brl) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: bridge dev mismatch\n");
+		return NULL;
+	}
+	if (!bd->netdev_ops || (unsigned long)bd->netdev_ops->ndo_start_xmit != VA_BR_DEV_XMIT) {
+		if (!quiet)
+			printk(KERN_ERR "k1fp: %s is not a bridge device\n", bd->name);
+		return NULL;
+	}
+	return bd;
+}
+
+/*
+ * Under RTNL. Look up by name the devices NETDEV_UNREGISTER took away, and
+ * adopt them once the shape is one init_module would accept. A device the
+ * module still holds may carry k1_rx as its handler; k1_try_hook checked its
+ * port data when it put the handler there.
+ *
+ * RTNL makes this safe against a concurrent unregister: a device leaves the
+ * name table before its NETDEV_UNREGISTER, both under RTNL, so a device found
+ * here is registered, and its later unregister reaches k1_netdev_event, which
+ * drops the reference taken here.
+ */
+static void k1_reacquire(void)
+{
+	struct net_device *l = g.lan, *w = g.wan, *nl = NULL, *nw = NULL, *bd = NULL;
+	struct k1_reacq_in in;
+	void *pl = NULL, *pw = NULL;
+	u32 plan;
+
+	if (l && w && g.br)
+		return;
+	memset(&in, 0, sizeof(in));
+	in.have_lan = l != NULL;
+	in.have_wan = w != NULL;
+	in.have_br = g.br != NULL;
+	if (!l)
+		l = nl = dev_get_by_name(&init_net, "eth0");
+	if (!w)
+		w = nw = dev_get_by_name(&init_net, "lte0pdn2");
+	in.lan_found = nl != NULL;
+	in.wan_found = nw != NULL;
+	if (l && w) {
+		pl = (l->rx_handler == k1_rx && (l->priv_flags & IFF_BRIDGE_PORT)) ?
+			l->rx_handler_data : k1_stock_port(l, 1);
+		pw = (w->rx_handler == k1_rx && (w->priv_flags & IFF_BRIDGE_PORT)) ?
+			w->rx_handler_data : k1_stock_port(w, 1);
+		in.lan_port = pl != NULL;
+		in.wan_port = pw != NULL;
+		if (pl && pw) {
+			in.same_br = RD32((unsigned long)pl + BRP_BR_OFF) ==
+				     RD32((unsigned long)pw + BRP_BR_OFF);
+			bd = k1_port_bridge(pl, pw, 1);
+			in.br_valid = bd != NULL;
+			in.br_matches_held = bd && bd == g.br;
+		}
+	}
+	plan = k1_reacq_plan(&in);
+	if (!plan) {
+		if (nl)
+			dev_put(nl);
+		if (nw)
+			dev_put(nw);
+		return;
+	}
+	if (plan & K1RA_BR)
+		dev_hold(bd);
+	local_bh_disable();
+	g.mode = K1_MODE_OFF;
+	g.wd.armed = 0;
+	if (plan & K1RA_LAN)
+		g.lan = nl;
+	if (plan & K1RA_WAN)
+		g.wan = nw;
+	if (plan & K1RA_BR)
+		g.br = bd;
+	g.reacq++;
+	local_bh_enable();
+	k1_epoch_bump();
+	printk(KERN_INFO "k1fp: re-acquired%s%s%s, mode=0 (off)\n",
+	       (plan & K1RA_LAN) ? " eth0" : "", (plan & K1RA_WAN) ? " lte0pdn2" : "",
+	       (plan & K1RA_BR) ? " bridge" : "");
+}
+
 static void k1_hk(struct work_struct *w)
 {
 	(void)w;
 	if (g.unloading)
 		return;
 	rtnl_lock();
+	k1_reacquire();
 	g.lan_hooked = k1_try_hook(g.lan);
 	g.wan_hooked = k1_try_hook(g.wan);
 	k1_ports_update();
@@ -885,9 +1035,12 @@ static int k1_netdev_event(struct notifier_block *nb, unsigned long ev, void *pt
 		} else {
 			k1_unhook(d);
 		}
+		/* Not a watchdog trip: a modem re-attach recreates br0 and
+		 * lte0pdn2. Mode 0 until userspace sets it again. */
 		local_bh_disable();
-		k1_wd_trip(K1_WD_DEVGONE);
 		g.mode = K1_MODE_OFF;
+		g.wd.armed = 0;
+		g.dev_gone++;
 		if (d == g.lan)
 			g.lan = NULL;
 		else if (d == g.wan)
@@ -895,6 +1048,7 @@ static int k1_netdev_event(struct notifier_block *nb, unsigned long ev, void *pt
 		else if (d == g.br)
 			g.br = NULL;
 		local_bh_enable();
+		k1_ports_update();
 		k1_epoch_bump();
 		dev_put(d);
 		break;
@@ -1218,6 +1372,7 @@ static int k1_show(struct seq_file *m, void *v)
 		   g.mode, g.lan ? g.lan->name : "-", g.lan_hooked,
 		   g.wan ? g.wan->name : "-", g.wan_hooked,
 		   g.br ? g.br->name : "-", g.nports, g.ports_ok);
+	seq_printf(m, "devices: dev_gone=%u reacq=%u\n", g.dev_gone, g.reacq);
 	seq_printf(m, "require_grant=%d grant_left_ms=%u gate=%s v4=%d v6=%d lease_ms=%u sample_ms=%u\n",
 		   g.require_grant,
 		   (g.grant_set && k1_before(now, g.grant_until)) ?
@@ -1478,60 +1633,6 @@ static const struct file_operations k1_fops = {
 
 /* ---------- Module init / exit ---------- */
 
-static int k1_check_port(struct net_device *d, void **pport)
-{
-	unsigned long h = (unsigned long)d->rx_handler;
-	void *p;
-
-	if (h != (unsigned long)g.orig_rx) {
-		printk(KERN_ERR "k1fp: %s rx_handler = %08lx, expected %08x\n",
-		       d->name, h, FP_BR_HANDLE_FRAME_HOOK_VA);
-		return -ENODEV;
-	}
-	if (!(d->priv_flags & IFF_BRIDGE_PORT)) {
-		printk(KERN_ERR "k1fp: %s priv_flags = %08x, IFF_BRIDGE_PORT not set\n",
-		       d->name, d->priv_flags);
-		return -ENODEV;
-	}
-	p = d->rx_handler_data;
-	if (!p) {
-		printk(KERN_ERR "k1fp: %s rx_handler_data is NULL\n", d->name);
-		return -ENODEV;
-	}
-	if (RD32((unsigned long)p + BRP_DEV_OFF) != (u32)(unsigned long)d) {
-		printk(KERN_ERR "k1fp: %s bridge port dev mismatch\n", d->name);
-		return -ENODEV;
-	}
-	if (!RD32((unsigned long)p + BRP_BR_OFF)) {
-		printk(KERN_ERR "k1fp: %s bridge port has no bridge\n", d->name);
-		return -ENODEV;
-	}
-	*pport = p;
-	return 0;
-}
-
-static struct net_device *k1_check_bridge(void *pl, void *pw)
-{
-	u32 brl = RD32((unsigned long)pl + BRP_BR_OFF);
-	u32 brw = RD32((unsigned long)pw + BRP_BR_OFF);
-	struct net_device *bd;
-
-	if (brl != brw) {
-		printk(KERN_ERR "k1fp: eth0 and lte0pdn2 are on different bridges\n");
-		return NULL;
-	}
-	bd = (struct net_device *)(unsigned long)RD32(brl + BR_DEV_OFF);
-	if (!bd || (u32)(unsigned long)netdev_priv_ptr(bd) != brl) {
-		printk(KERN_ERR "k1fp: bridge dev mismatch\n");
-		return NULL;
-	}
-	if (!bd->netdev_ops || (unsigned long)bd->netdev_ops->ndo_start_xmit != VA_BR_DEV_XMIT) {
-		printk(KERN_ERR "k1fp: %s is not a bridge device\n", bd->name);
-		return NULL;
-	}
-	return bd;
-}
-
 int init_module(void)
 {
 	struct net_device *l, *w, *bd;
@@ -1579,8 +1680,11 @@ int init_module(void)
 
 	rtnl_lock();
 	bd = NULL;
-	if (!k1_check_port(l, &pl) && !k1_check_port(w, &pw))
-		bd = k1_check_bridge(pl, pw);
+	pl = k1_stock_port(l, 0);
+	if (pl)
+		pw = k1_stock_port(w, 0);
+	if (pl && pw)
+		bd = k1_port_bridge(pl, pw, 0);
 	if (!bd) {
 		rtnl_unlock();
 		printk(KERN_ERR "k1fp: eth0 and lte0pdn2 are not ports of one bridge\n");
