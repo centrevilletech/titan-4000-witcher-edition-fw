@@ -100,8 +100,6 @@ jobs:
         run: |
           cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
           python3 scripts/test-ipv4-recovery-network.py
-      - name: Carrier picker probe server
-        run: python3 scripts/test-carrier-probe-server.py
       - name: UI dependencies
         run: npm ci --prefix web --no-audit --no-fund
       - name: Install browser

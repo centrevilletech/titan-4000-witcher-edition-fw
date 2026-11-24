@@ -46,8 +46,8 @@ prevents activation.
 | | `cycle_hours` 6 to 168, optional | Opt-in enforcement re-attach. See below. Absent: the radio is never cycled for the cap. |
 | | `nudge` `{earfcn, pci}`, optional | Band 48 primary cell held only during an enforcement re-attach. Needs `cycle_hours`. |
 | sqm | `upload_kbit` 64 to 50000, `download_kbit` 64 to 250000 | Bidirectional CAKE on the passthrough path. |
-| carrier_pick | `arms` (2 to 6 of `{earfcn, pci, carriers}`), `probe` (`a.b.c.d:port`) | Surveys the arms and holds the best. Replaces `carrier_aggregation`. See [the carrier picker](#carrier-picker). |
-| | `survey_hours` 24 to 336 (72), `window_utc` `HH:MM-HH:MM` (`10:45-12:30`), `ul_weight` 0 to 20 (4) | Optional. |
+| carrier_pick | `arms` (2 to 6 of `{earfcn, pci, carriers}`) | Surveys the arms and holds the best. Needs no server. Replaces `carrier_aggregation`. See [the carrier picker](#carrier-picker). |
+| | `survey_hours` 24 to 336 (72), `window_utc` `HH:MM-HH:MM` (`10:45-12:30`), `ul_weight` 0 to 20 (4), `ul_sink` IPv4 (`management_probe`) | Optional. |
 
 The keeper accepts each kind once. Version 1 permits 4096 bytes and rejects
 unknown fields and unknown kinds. The socket API uses one JSON document per
@@ -110,7 +110,7 @@ unit best and holds it. Each arm is a primary cell and a carrier cap:
   "version": 1,
   "management_probe": "<management ping responder>",
   "actions": [
-    {"kind": "carrier_pick", "probe": "<probe server>:5310",
+    {"kind": "carrier_pick",
      "arms": [{"earfcn": 55440, "pci": 199, "carriers": 2},
               {"earfcn": 56440, "pci": 208, "carriers": 3},
               {"earfcn": 56638, "pci": 217, "carriers": 2}]}
@@ -125,17 +125,33 @@ the unit attaches, or after 90 s if it does not. The tower still chooses the
 secondary carriers. The arm the unit is already on is measured without a
 cycle. After each attach the picker waits up to 10 minutes for SAS grants that
 cover the new primary and uplink secondary carrier, then 15 s more, and
-measures three things through the management bearer and the probe server:
+scores the arm. It needs no server:
 
-- Download: the server sends a 3 s UDP burst offering 300 Mbps to an open
-  socket on the unit that is never read. The rate is the median of the
-  management bearer's receive counter over 100 ms steps, after the first
-  half second. On the bench a TCP download through `wget` read 53 Mbps,
-  limited by the CPU. The burst read 133 to 145 Mbps on the same bearer,
-  which matched a 133 Mbps speed test from the customer side.
-- Upload: the unit sends a 3 s UDP burst offering 45 Mbps, and the server
-  counts what arrives.
-- Round trip: five pings.
+- Download, estimated. The Titan cannot measure its own download without a
+  sender: its CPU caps a TCP download on the unit near 53 Mbps. Instead the
+  picker reads the SINR the modem reports for every serving carrier once a
+  second for 20 s, takes each carrier's median and the median rank, and sums a
+  per-carrier capacity: Shannon with a 4.6 dB implementation gap, 256QAM at
+  most, over the downlink share of TDD configuration 2. There is no rate cap
+  beyond that. On the bench the estimate read 128 Mbps for c5 at 11 dB with c9
+  at 15 dB, where a speed test read 130.7, and 185 Mbps for three carriers at
+  12, 14 and 12 dB, where the modem's own high-water mark read 196. At 17 dB
+  on three carriers it gives about 270 Mbps. The estimate sees radio quality,
+  not how busy each carrier is, so it ranks arms rather than promising rates.
+- Upload, measured. Over the same 20 s the unit sends a UDP burst offering
+  45 Mbps through the management bearer to the discard port (UDP 9) of
+  `management_probe`, or of `ul_sink` when the action sets one. Any host
+  works: nothing needs to listen, and a firewall that drops the packets is
+  fine. Set `ul_sink` when the management probe is a router, so the burst
+  stays off its control plane. The rate is the modem's own upload report
+  (`sqns_radio_ulThroughput`), which refreshes about every 6.5 s. On the bench
+  it read 13.8 Mbps where the far end counted 11.2 to 12.2 Mbps of payload.
+  Every arm carries the same bias, so the ranking holds.
+- Round trip: five pings to `management_probe`, before the burst.
+
+A visit sends about 35 to 75 MB to the sink. With three arms and
+the default 72-hour survey interval, that is at most about 75 MB a day per
+unit.
 
 Each arm scores `download + ul_weight x upload`. Only a visit that attached on
 its arm's primary cell, within its cap, counts. The arm the unit is on keeps
@@ -167,21 +183,12 @@ Every visit costs the customer one re-attach, 30 to 60 s, plus the wait for
 grants, which took 15 s on the bench at 19:00 UTC. That is why visits wait for
 an idle customer.
 
-### Probe server
+### Status and requests
 
-`scripts/carrier-probe-server.py` needs only the Python standard library. Run
-it on a host the units reach through the management bearer, such as the core:
-
-```sh
-python3 carrier-probe-server.py --listen 0.0.0.0:5310 --allow <management pool> --ul-port 5311
-```
-
-Open TCP 5310 and UDP 5311 to the management pool. The server sends a download
-burst only to the address that opened the control connection, caps bursts at
-5 s and 400 Mbps, and runs two at once at most. A management APN with a lower
-AMBR than the data APN would understate every arm equally. Status shows the
-survey state and every visit's numbers under `pick`. To survey now, outside
-the window:
+Status shows the survey state and every visit under `pick`: the SINR of each
+carrier, the download estimate, the measured upload, the round trip, the
+score, and the modem's own download and upload high-water marks for the
+record. To survey now, outside the window:
 
 ```sh
 /tmp/titan-pd-keeper/titan-pd-keeper radio-profile survey

@@ -1039,7 +1039,8 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
 
 fn pick_measure(p: &Profile, arm: usize) -> io::Result<()> {
     let picker = p.picker().ok_or_else(|| fail("no carrier picker"))?;
-    let m = carrier_pick_io::measure(picker.probe, arm)?;
+    let probe = p.management_probe.ok_or_else(|| fail("no management probe"))?;
+    let m = carrier_pick_io::measure(probe, picker.ul_sink.unwrap_or(probe), arm)?;
     atomic(&ram("radio-pick-measure"), &serde_json::to_vec(&m)?)
 }
 
@@ -1276,10 +1277,10 @@ impl PickWatch {
     }
 
     /// One visit's measurement. A failed measurement is logged and the arm
-    /// counts as visited, so a broken probe server cannot stall a survey.
+    /// counts as visited, so a failed measurement cannot stall a survey.
     fn measure(&mut self, arm: usize) {
         let _ = rm(ram("radio-pick-measure"));
-        let result = run_worker(&format!("pick-measure-{arm}"), 45).and_then(|()| {
+        let result = run_worker(&format!("pick-measure-{arm}"), 60).and_then(|()| {
             serde_json::from_slice::<Measure>(&fs::read(ram("radio-pick-measure"))?)
                 .map_err(|_| fail("unreadable measurement"))
         });
@@ -1289,11 +1290,14 @@ impl PickWatch {
         survey.done.push(arm);
         match result {
             Ok(m) => {
+                let sinr: Vec<String> = m.sinr_db.iter().chain(&m.scc_sinr_db).map(i32::to_string).collect();
                 crate::log(&format!(
-                    "carrier picker: arm {arm} on EARFCN {} PCI {} with {} carriers: {}.{} down, {}.{} up Mbps, {} ms",
+                    "carrier picker: arm {arm} on EARFCN {} PCI {} with {} carriers (SINR {} dB): \
+                     {}.{} down estimated, {}.{} up Mbps, {} ms",
                     m.pcell.earfcn,
                     m.pcell.pci,
                     m.carriers,
+                    sinr.join("/"),
                     m.dl_kbps / 1000,
                     m.dl_kbps % 1000 / 100,
                     m.ul_kbps / 1000,
@@ -1314,9 +1318,10 @@ impl PickWatch {
                     .iter()
                     .map(|m| {
                         json!({"arm":m.arm,"earfcn":m.pcell.earfcn,"pci":m.pcell.pci,"carriers":m.carriers,
-                            "ul_scc":m.ul_scc,"sinr_db":m.sinr_db,"rsrp_dbm":m.rsrp_dbm,"down_kbps":m.dl_kbps,
-                            "up_kbps":m.ul_kbps,"rtt_ms":m.rtt_ms,"score":pick::score(m, p.ul_weight),
-                            "held":m.held(&p.arms)})
+                            "ul_scc":m.ul_scc,"sinr_db":m.sinr_db,"scc_sinr_db":m.scc_sinr_db,"rsrp_dbm":m.rsrp_dbm,
+                            "down_estimate_kbps":m.dl_kbps,"up_kbps":m.ul_kbps,"rtt_ms":m.rtt_ms,
+                            "modem_max_down_kbps":m.dl_max_kbps,"modem_max_up_kbps":m.ul_max_kbps,
+                            "score":pick::score(m, p.ul_weight),"held":m.held(&p.arms)})
                     })
                     .collect()
             })

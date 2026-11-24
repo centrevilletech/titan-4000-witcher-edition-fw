@@ -2,26 +2,30 @@
 //!
 //! Bench, 2026-11-24 (one unit, one Nokia sector, four 20 MHz band 48 carriers):
 //! the same unit measured 126.78/7.78 Mbps with c6 as primary and three
-//! carriers, and 132.94/6.52 Mbps with 16 ms ping on c5 with two. Earlier the
-//! same pair reached 14 to 15 Mbps up when the unit sat 5 dB closer in path
-//! loss. Which combination wins depends on the unit's aim, the other users of
-//! each carrier and the time of day, so the picker measures instead of
-//! guessing from signal readings.
+//! carriers, and 132.94/6.52 Mbps with 16 ms ping on c5 with two. Upload was
+//! power-limited on both: each carrier sat near 23 dBm. Which combination wins
+//! depends on the unit's aim, the other users of each carrier and the time of
+//! day, so the picker visits each combination ("arm") the operator lists and
+//! scores it there. It needs no server.
 //!
-//! A survey visits every combination ("arm") the operator lists. Each visit is
-//! one radio cycle through the existing nudge: radio off, carrier cap, PCell
-//! lock, radio on, attach, lock cleared at once. The tower still picks the
-//! secondary carriers. Then the picker waits for SAS grants that cover the new
-//! primary and uplink secondary carrier, and measures:
+//! A visit is one radio cycle through the existing nudge: radio off, carrier
+//! cap, PCell lock, radio on, attach, lock cleared at once. The tower still
+//! picks the secondary carriers. After SAS grants cover the new primary and
+//! uplink secondary carrier, the picker scores the arm:
 //!
-//! - download: the probe server sends a UDP burst above any carrier rate to the
-//!   management bearer, and the keeper reads the bearer's receive counter. No
-//!   payload reaches user space, so the single-core CPU does not cap the
-//!   result (a TCP download through `wget` read 53 Mbps where the burst read
-//!   133 to 145 Mbps on the same bearer).
-//! - upload: the keeper sends a paced UDP burst and the server counts what
-//!   arrives.
-//! - idle round trip: five pings over the management bearer.
+//! - download, estimated: every serving carrier's SINR as the modem reports it
+//!   in that arm, through `dl_estimate_kbps`. The Titan cannot measure its own
+//!   download without a sender: its CPU caps a local TCP download near 53 Mbps.
+//!   The estimate matched the bench: 128 Mbps for c5 (11 dB) with c9 (15 dB)
+//!   against 130.7 measured, and about 185 Mbps for three carriers against the
+//!   modem's own 196 Mbps high-water mark.
+//! - upload, measured: a 20 s UDP burst to the discard port of the profile's
+//!   management probe, the operator's own ping responder. The packets cross the
+//!   radio and the probe drops them. The rate is the modem's own upload report
+//!   (`sqns_radio_ulThroughput`), which refreshes about every 6.5 s and read
+//!   13.8 Mbps where the far end counted 11.2 to 12.2 Mbps of payload: every
+//!   arm gets the same bias, so the ranking holds.
+//! - idle round trip: five pings to the same responder.
 //!
 //! The best arm by `download + ul_weight x upload` is held; the arm the unit
 //! is on keeps its place unless another beats it by `SWITCH_MARGIN_PCT`.
@@ -34,7 +38,6 @@
 
 use crate::radio::Cell;
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddrV4;
 
 /// One combination the operator lets the picker try: a primary cell held by a
 /// nudge during the attach, and a carrier cap.
@@ -78,13 +81,12 @@ pub const IDLE_KBPS: u64 = 2000;
 pub const IDLE_SECS: u64 = 120;
 /// Another arm must beat the arm the unit is on by this much to move it.
 pub const SWITCH_MARGIN_PCT: u64 = 5;
-pub const DL_BURST_MS: u32 = 3000;
-/// Above any 3- or 4-carrier band 48 rate on TDD configuration 2.
-pub const DL_OFFER_KBPS: u32 = 300_000;
-pub const UL_BURST_MS: u32 = 3000;
+/// The upload burst: long enough for at least two fresh modem reports.
+pub const UL_BURST_SECS: u64 = 20;
 /// Above a 2-carrier uplink on TDD configuration 2 (about 30 Mbps).
 pub const UL_OFFER_KBPS: u32 = 45_000;
-pub const PROBE_MAGIC: &str = "WITCHER-PROBE 1";
+/// The discard port on the management probe.
+pub const UL_SINK_PORT: u16 = 9;
 
 const BAND48_EARFCN: std::ops::RangeInclusive<u32> = 55_240..=56_739;
 
@@ -116,16 +118,7 @@ pub fn overlaps(a: (u16, u16), b: (u16, u16)) -> bool {
 }
 
 /// The operator's settings, checked. `None` when out of range.
-pub fn validate(
-    arms: &[Arm],
-    probe: SocketAddrV4,
-    survey_hours: Option<u16>,
-    window: Option<&str>,
-    ul_weight: Option<u8>,
-) -> bool {
-    let probe_ok = !matches!(probe.ip().octets()[0], 0 | 127 | 224..=255)
-        && !probe.ip().is_link_local()
-        && probe.port() != 0;
+pub fn validate(arms: &[Arm], survey_hours: Option<u16>, window: Option<&str>, ul_weight: Option<u8>) -> bool {
     let arms_ok = (MIN_ARMS..=MAX_ARMS).contains(&arms.len())
         && arms.iter().all(|a| {
             BAND48_EARFCN.contains(&a.earfcn) && a.pci <= 503 && (1..=4).contains(&a.carriers)
@@ -138,8 +131,7 @@ pub fn validate(
         None => true,
         Some(text) => parse_window(text).is_some_and(|w| !overlaps(w, NO_CYCLE)),
     };
-    probe_ok
-        && arms_ok
+    arms_ok
         && window_ok
         && survey_hours.is_none_or(|h| (MIN_SURVEY_HOURS..=MAX_SURVEY_HOURS).contains(&h))
         && ul_weight.is_none_or(|w| w <= MAX_UL_WEIGHT)
@@ -200,20 +192,82 @@ pub fn covered(pcell: u32, ul_scc: Option<u32>, bw_khz: u64, grants: &[(u64, u64
     inside(pcell) && ul_scc.is_none_or(inside)
 }
 
-/// The delivered rate of a burst in kbit/s: the median of the interval rates
-/// between consecutive counter samples `(seconds, bytes)` that start at least
-/// half a second after `start` (the queue fills first) and end by `end`.
-pub fn burst_kbps(samples: &[(f64, u64)], start: f64, end: f64) -> Option<u32> {
-    let mut rates: Vec<f64> = samples
-        .windows(2)
-        .filter(|w| w[0].0 >= start + 0.5 && w[1].0 <= end && w[1].0 > w[0].0 && w[1].1 >= w[0].1)
-        .map(|w| (w[1].1 - w[0].1) as f64 * 8.0 / (w[1].0 - w[0].0) / 1000.0)
-        .collect();
-    if rates.len() < 5 {
-        return None;
+/// Per-layer download capacity of one carrier in kbit/s, for SINR from -10 to
+/// 40 dB: `10.7 MHz x min(log2(1 + snr / 2.9), 7.4 bit/s/Hz)`. A table keeps
+/// soft-float `pow` and `log2` out of the ARM build;
+/// `the_capacity_table_is_the_model` recomputes it.
+const PER_LAYER_KBPS: [u32; 51] = [
+    523, 656, 821, 1027, 1282, 1598, 1986, 2461, 3039, 3737, //
+    4573, 5566, 6731, 8082, 9631, 11383, 13338, 15493, 17838, 20359, //
+    23040, 25863, 28812, 31867, 35013, 38236, 41521, 44858, 48238, 51653, //
+    55095, 58560, 62042, 65540, 69049, 72567, 76092, 79180, 79180, 79180, //
+    79180, 79180, 79180, 79180, 79180, 79180, 79180, 79180, 79180, 79180, //
+    79180,
+];
+
+/// Download capacity of one 20 MHz band 48 carrier on TDD configuration 2
+/// (special subframe 7) at `sinr_db`, with `layers` spatial layers, in kbit/s.
+/// Shannon with a 4.6 dB implementation gap per layer, capped at 256QAM, over
+/// 10.7 MHz of effective bandwidth (the downlink share of the frame and the
+/// control and reference overhead). Fitted on the bench, 2026-11-24 (see the
+/// module notes); one unit, so treat it as a ranking tool, not a promise.
+pub fn carrier_kbps(sinr_db: i32, layers: u8) -> u32 {
+    let i = usize::try_from(sinr_db.clamp(-10, 40) + 10).unwrap_or(0);
+    PER_LAYER_KBPS[i] * u32::from(layers.clamp(1, 4))
+}
+
+/// The arm's download estimate: the sum over its serving carriers.
+pub fn dl_estimate_kbps(sinr_db: &[i32], layers: u8) -> u32 {
+    sinr_db.iter().map(|s| carrier_kbps(*s, layers)).sum()
+}
+
+/// SINR of each secondary carrier from `sqns_connection_downlinkSccEx`, a
+/// header (`dl_mcs,dl_freq,bw,...,sinr,...:`) and `;`-separated entries.
+pub fn scc_sinr_db(value: &str) -> Vec<i32> {
+    let Some((header, data)) = value.split_once(':') else {
+        return vec![];
+    };
+    let Some(col) = header.split(',').position(|h| h.trim() == "sinr") else {
+        return vec![];
+    };
+    data.split(';')
+        .filter_map(|entry| entry.split(',').nth(col)?.trim().parse::<f64>().ok())
+        .map(|v| v.round() as i32)
+        .collect()
+}
+
+/// The middle of `v` once sorted (the upper middle of an even count).
+pub fn median<T: Ord + Copy>(v: &[T]) -> Option<T> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v.get(v.len() / 2).copied()
+}
+
+/// Each serving carrier's SINR from the samples a visit took once a second:
+/// the primary's median, then the median of each secondary position, up to
+/// `carriers - 1` of them. A position no sample reported is left out.
+pub fn serving_sinr(pcell: &[i32], scc: &[Vec<i32>], carriers: u8) -> Option<Vec<i32>> {
+    let mut out = vec![median(pcell)?];
+    for i in 0..usize::from(carriers.saturating_sub(1)) {
+        let at: Vec<i32> = scc.iter().filter_map(|s| s.get(i).copied()).collect();
+        if let Some(m) = median(&at) {
+            out.push(m);
+        }
     }
-    rates.sort_by(f64::total_cmp);
-    Some(rates[rates.len() / 2].round() as u32)
+    Some(out)
+}
+
+/// The upload rate from the modem's own reports during a burst: the highest
+/// report taken after the burst started that differs from the one before it.
+/// `samples` are `(seconds, bits_per_second)`; `None` without a fresh report.
+pub fn ul_from_reports(samples: &[(f64, u64)], start: f64) -> Option<u32> {
+    let before = samples.iter().rev().find(|s| s.0 < start).map(|s| s.1);
+    samples
+        .iter()
+        .filter(|s| s.0 >= start && Some(s.1) != before)
+        .map(|s| s.1)
+        .max()
+        .map(|bps| u32::try_from(bps / 1000).unwrap_or(u32::MAX))
 }
 
 /// What one visit to an arm measured.
@@ -227,9 +281,20 @@ pub struct Measure {
     pub ul_scc: Option<u32>,
     pub sinr_db: Option<i32>,
     pub rsrp_dbm: Option<i32>,
+    /// Download estimate from the serving carriers' SINR (`dl_estimate_kbps`).
     pub dl_kbps: u32,
+    /// Upload as the modem reported it during the burst.
     pub ul_kbps: u32,
     pub rtt_ms: Option<u32>,
+    /// SINR of each secondary carrier, as the estimate used it.
+    #[serde(default)]
+    pub scc_sinr_db: Vec<i32>,
+    /// The modem's own high-water marks (`sqns_radio_dlMaxThroughput`,
+    /// `sqns_radio_ulMaxThroughput`) at the end of the visit, for the record.
+    #[serde(default)]
+    pub dl_max_kbps: Option<u32>,
+    #[serde(default)]
+    pub ul_max_kbps: Option<u32>,
     /// Unix time of the measurement.
     pub at: u64,
 }
@@ -330,50 +395,6 @@ pub fn idle(samples: &[(u64, u64, u64)], now: u64) -> bool {
     })
 }
 
-/// The probe server's control protocol, one line each way.
-pub fn dl_request(ms: u32, kbps: u32, udp_port: u16) -> String {
-    format!("{PROBE_MAGIC} DL {ms} {kbps} {udp_port}\n")
-}
-
-pub fn ul_request(ms: u32) -> String {
-    format!("{PROBE_MAGIC} UL {ms}\n")
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Reply {
-    /// `OK` before a download burst; `OK <udp_port>` to send an upload to.
-    Ok(Option<u16>),
-    /// `DONE <bytes_sent>` after a download burst.
-    Done(u64),
-    /// `RESULT <bytes> <first_to_last_ms>` after an upload burst.
-    Counted { bytes: u64, span_ms: u32 },
-    Refused(String),
-}
-
-pub fn parse_reply(line: &str) -> Option<Reply> {
-    let mut words = line.split_whitespace();
-    match words.next()? {
-        "OK" => match words.next() {
-            None => Some(Reply::Ok(None)),
-            Some(p) => p.parse().ok().filter(|p| *p != 0).map(|p| Reply::Ok(Some(p))),
-        },
-        "DONE" => words.next()?.parse().ok().map(Reply::Done),
-        "RESULT" => {
-            let bytes = words.next()?.parse().ok()?;
-            let span_ms = words.next()?.parse().ok()?;
-            Some(Reply::Counted { bytes, span_ms })
-        }
-        "ERR" => Some(Reply::Refused(words.collect::<Vec<_>>().join(" "))),
-        _ => None,
-    }
-}
-
-/// An upload rate from the server's count, when the span is long enough to
-/// mean something.
-pub fn ul_kbps(bytes: u64, span_ms: u32) -> Option<u32> {
-    (span_ms >= 1000).then(|| u32::try_from(bytes * 8 / u64::from(span_ms)).unwrap_or(u32::MAX))
-}
-
 /// `round-trip min/avg/max = 14.2/16.0/19.9 ms` from BusyBox ping.
 pub fn ping_avg_ms(output: &str) -> Option<u32> {
     let stats = output.lines().find(|l| l.contains("min/avg/max"))?;
@@ -411,15 +432,10 @@ pub struct Record {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::Ipv4Addr;
 
     const C5: Arm = Arm { earfcn: 55440, pci: 199, carriers: 2 };
     const C6: Arm = Arm { earfcn: 56440, pci: 208, carriers: 3 };
     const C9: Arm = Arm { earfcn: 56638, pci: 217, carriers: 2 };
-
-    fn probe() -> SocketAddrV4 {
-        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 5310)
-    }
 
     fn measure(arm: usize, a: Arm, dl: u32, ul: u32, rtt: Option<u32>) -> Measure {
         Measure {
@@ -432,6 +448,9 @@ mod tests {
             dl_kbps: dl,
             ul_kbps: ul,
             rtt_ms: rtt,
+            scc_sinr_db: vec![],
+            dl_max_kbps: None,
+            ul_max_kbps: None,
             at: 1,
         }
     }
@@ -447,24 +466,22 @@ mod tests {
         assert!(!in_window(120, (1320, 120)));
         assert!(overlaps((360, 420), NO_CYCLE));
         assert!(!overlaps((645, 750), NO_CYCLE));
-        assert!(!validate(&[C5, C6], probe(), None, Some("06:00-07:00"), None));
-        assert!(!validate(&[C5, C6], probe(), None, Some("23:00-07:00"), None));
-        assert!(validate(&[C5, C6], probe(), None, Some("23:00-06:30"), None));
+        assert!(!validate(&[C5, C6], None, Some("06:00-07:00"), None));
+        assert!(!validate(&[C5, C6], None, Some("23:00-07:00"), None));
+        assert!(validate(&[C5, C6], None, Some("23:00-06:30"), None));
     }
 
     #[test]
     fn settings_are_bounded() {
-        assert!(validate(&[C5, C6, C9], probe(), Some(24), None, Some(4)));
-        assert!(!validate(&[C5], probe(), None, None, None));
-        assert!(!validate(&[C5, C5], probe(), None, None, None));
-        assert!(!validate(&[C5, Arm { earfcn: 55239, ..C6 }], probe(), None, None, None));
-        assert!(!validate(&[C5, Arm { pci: 504, ..C6 }], probe(), None, None, None));
-        assert!(!validate(&[C5, Arm { carriers: 5, ..C6 }], probe(), None, None, None));
-        assert!(!validate(&[C5, C6], probe(), Some(23), None, None));
-        assert!(!validate(&[C5, C6], probe(), None, None, Some(21)));
-        assert!(!validate(&[C5, C6], SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5310), None, None, None));
-        assert!(!validate(&[C5, C6], SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 10), 0), None, None, None));
-        assert!(!validate(&[C5, C6, C9, C5, C6, C9, C5], probe(), None, None, None));
+        assert!(validate(&[C5, C6, C9], Some(24), None, Some(4)));
+        assert!(!validate(&[C5], None, None, None));
+        assert!(!validate(&[C5, C5], None, None, None));
+        assert!(!validate(&[C5, Arm { earfcn: 55239, ..C6 }], None, None, None));
+        assert!(!validate(&[C5, Arm { pci: 504, ..C6 }], None, None, None));
+        assert!(!validate(&[C5, Arm { carriers: 5, ..C6 }], None, None, None));
+        assert!(!validate(&[C5, C6], Some(23), None, None));
+        assert!(!validate(&[C5, C6], None, None, Some(21)));
+        assert!(!validate(&[C5, C6, C9, C5, C6, C9, C5], None, None, None));
     }
 
     #[test]
@@ -490,19 +507,62 @@ noise
     }
 
     #[test]
-    fn burst_rate_is_the_median_after_the_queue_fills() {
-        // 0.1 s samples at 140 Mbps from 0.3 s to 3.0 s, slow before and after.
-        let mut s = vec![];
-        let mut bytes = 0u64;
-        for i in 0..40 {
-            let t = f64::from(i) * 0.1;
-            s.push((t, bytes));
-            let mbps = if (3..30).contains(&i) { 140.0 } else { 5.0 };
-            bytes += (mbps * 1e6 / 8.0 * 0.1) as u64;
+    fn the_download_model_matches_the_bench() {
+        // c5 at 11 dB with c9 at 15 dB, 2 layers: 130.7 Mbps measured.
+        let two = dl_estimate_kbps(&[11, 15], 2);
+        assert!((120_000..=140_000).contains(&two), "{two}");
+        // c6, c9, c12 at 12, 14, 12 dB: the modem's high-water mark read 196 Mbps.
+        let three = dl_estimate_kbps(&[12, 14, 12], 2);
+        assert!((170_000..=200_000).contains(&three), "{three}");
+        // A single carrier at 14 dB: 66 to 75 Mbps on the bench (2026-11-22).
+        let one = dl_estimate_kbps(&[14], 2);
+        assert!((60_000..=78_000).contains(&one), "{one}");
+        // More signal or more layers never lower it; 256QAM caps each carrier.
+        assert!(carrier_kbps(20, 2) > carrier_kbps(15, 2));
+        assert!(carrier_kbps(15, 4) > carrier_kbps(15, 2));
+        assert_eq!(carrier_kbps(40, 2), carrier_kbps(60, 2));
+        assert_eq!(dl_estimate_kbps(&[], 2), 0);
+    }
+
+    #[test]
+    fn the_capacity_table_is_the_model() {
+        for (i, kbps) in PER_LAYER_KBPS.iter().enumerate() {
+            let snr = 10f64.powf((i as f64 - 10.0) / 10.0);
+            let per_layer = (1.0 + snr / 2.9).log2().min(7.4);
+            assert_eq!(*kbps, (10.7 * per_layer * 1000.0).round() as u32, "{} dB", i as i32 - 10);
         }
-        assert_eq!(burst_kbps(&s, 0.0, 3.6), Some(140_000));
-        assert_eq!(burst_kbps(&s[..6], 0.0, 3.6), None);
-        assert_eq!(burst_kbps(&[(0.0, 10), (1.0, 5)], 0.0, 3.0), None);
+        assert_eq!(carrier_kbps(-30, 2), carrier_kbps(-10, 2));
+        assert_eq!(carrier_kbps(11, 0), carrier_kbps(11, 1));
+    }
+
+    #[test]
+    fn visit_samples_reduce_to_one_sinr_per_carrier() {
+        assert_eq!(median(&[3, 1, 2]), Some(2));
+        assert_eq!(median(&[4, 1, 3, 2]), Some(3));
+        assert_eq!(median::<u8>(&[]), None);
+        // One noisy sample neither lifts nor sinks a carrier.
+        let scc = vec![vec![15, 12], vec![15, 12], vec![30, 2], vec![14]];
+        assert_eq!(serving_sinr(&[10, 10, 25], &scc, 3), Some(vec![10, 15, 12]));
+        // A cap of two keeps one secondary; extra reported ones are ignored.
+        assert_eq!(serving_sinr(&[10], &scc, 2), Some(vec![10, 15]));
+        assert_eq!(serving_sinr(&[10], &[], 3), Some(vec![10]));
+        assert_eq!(serving_sinr(&[], &scc, 3), None);
+    }
+
+    #[test]
+    fn secondary_sinr_and_modem_upload_reports_parse() {
+        let scc = "dl_mcs,dl_freq,bw,rssi,rsrp,rsrq,sinr,tx_power,pci,cinr,cell_id,mcc,mnc:\
+0,3689.0,20,-86.0/-83.0,-112.0/-109.0,-6.0/-6.0,16,14,217,16.0/17.0,-,901,70;\
+0,3570.0,20,-89.0/-85.0,-116.0/-111.0,-6.0/-5.0,11,-,199,11.0/16.0,-,901,70";
+        assert_eq!(scc_sinr_db(scc), vec![16, 11]);
+        assert_eq!(scc_sinr_db("-"), Vec::<i32>::new());
+        assert_eq!(scc_sinr_db("a,b:1,2"), Vec::<i32>::new());
+        // The bench burst: one stale report, then 4.7 and 13.8 Mbps.
+        let reports = [(0.0, 636_256), (1.0, 4_749_352), (7.5, 13_840_816), (8.0, 13_840_816)];
+        assert_eq!(ul_from_reports(&reports, 0.5), Some(13_840));
+        // Nothing fresh after the burst started: no reading.
+        assert_eq!(ul_from_reports(&[(0.0, 636_256), (5.0, 636_256)], 0.5), None);
+        assert_eq!(ul_from_reports(&[], 0.0), None);
     }
 
     #[test]
@@ -587,18 +647,7 @@ noise
     }
 
     #[test]
-    fn the_probe_protocol_round_trips() {
-        assert_eq!(dl_request(3000, 300_000, 40123), "WITCHER-PROBE 1 DL 3000 300000 40123\n");
-        assert_eq!(ul_request(3000), "WITCHER-PROBE 1 UL 3000\n");
-        assert_eq!(parse_reply("OK\n"), Some(Reply::Ok(None)));
-        assert_eq!(parse_reply("OK 41000"), Some(Reply::Ok(Some(41000))));
-        assert_eq!(parse_reply("OK 0"), None);
-        assert_eq!(parse_reply("DONE 112500000"), Some(Reply::Done(112_500_000)));
-        assert_eq!(parse_reply("RESULT 5000000 2950"), Some(Reply::Counted { bytes: 5_000_000, span_ms: 2950 }));
-        assert_eq!(parse_reply("ERR busy"), Some(Reply::Refused("busy".into())));
-        assert_eq!(parse_reply("HELLO"), None);
-        assert_eq!(ul_kbps(5_000_000, 2950), Some(13_559));
-        assert_eq!(ul_kbps(5_000_000, 999), None);
+    fn ping_averages_parse() {
         assert_eq!(ping_avg_ms("5 packets\nround-trip min/avg/max = 14.2/16.4/19.9 ms\n"), Some(16));
         assert_eq!(ping_avg_ms("100% packet loss"), None);
     }

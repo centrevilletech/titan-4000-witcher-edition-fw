@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     mem::discriminant,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::Ipv4Addr,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -65,8 +65,6 @@ pub enum Action {
     /// `titan_pd_model::carrier_pick`. Replaces `carrier_aggregation`.
     CarrierPick {
         arms: Vec<Arm>,
-        /// The probe server, reached through the management bearer.
-        probe: SocketAddrV4,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         survey_hours: Option<u16>,
         /// `HH:MM-HH:MM` UTC. It may not touch the SAS coordination window.
@@ -74,17 +72,28 @@ pub enum Action {
         window_utc: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ul_weight: Option<u8>,
+        /// Where the upload burst goes, to UDP port 9 (discard). Defaults to
+        /// the management probe. Set it when the probe is a router whose
+        /// control plane should not take the burst.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ul_sink: Option<Ipv4Addr>,
     },
+}
+
+/// An address a unit may probe: not unspecified, loopback, multicast,
+/// reserved, broadcast or link-local.
+pub fn unicast(ip: Ipv4Addr) -> bool {
+    !matches!(ip.octets()[0], 0 | 127 | 224..=255) && !ip.is_link_local()
 }
 
 /// The picker's settings with defaults filled in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Picker {
     pub arms: Vec<Arm>,
-    pub probe: SocketAddrV4,
     pub survey_hours: u16,
     pub window: (u16, u16),
     pub ul_weight: u8,
+    pub ul_sink: Option<Ipv4Addr>,
 }
 
 /// Shortest allowed spacing of enforcement cycles.
@@ -104,11 +113,7 @@ impl Profile {
         if profile.version != 1 {
             return Err("unsupported profile version");
         }
-        if !profile.actions.is_empty()
-            && !profile.management_probe.is_some_and(|ip| {
-                !matches!(ip.octets()[0], 0 | 127 | 224..=255) && !ip.is_link_local()
-            })
-        {
+        if !profile.actions.is_empty() && !profile.management_probe.is_some_and(unicast) {
             return Err("enabled profile needs a unicast management probe");
         }
         let mut kinds = HashSet::new();
@@ -142,11 +147,14 @@ impl Profile {
                 } => (64..=50000).contains(upload_kbit) && (64..=250000).contains(download_kbit),
                 Action::CarrierPick {
                     arms,
-                    probe,
                     survey_hours,
                     window_utc,
                     ul_weight,
-                } => carrier_pick::validate(arms, *probe, *survey_hours, window_utc.as_deref(), *ul_weight),
+                    ul_sink,
+                } => {
+                    carrier_pick::validate(arms, *survey_hours, window_utc.as_deref(), *ul_weight)
+                        && ul_sink.is_none_or(unicast)
+                }
             };
             if !ok {
                 return Err("action outside supported range");
@@ -172,13 +180,13 @@ impl Profile {
         self.actions.iter().find_map(|a| match a {
             Action::CarrierPick {
                 arms,
-                probe,
                 survey_hours,
                 window_utc,
                 ul_weight,
+                ul_sink,
             } => Some(Picker {
                 arms: arms.clone(),
-                probe: *probe,
+                ul_sink: *ul_sink,
                 survey_hours: survey_hours.unwrap_or(carrier_pick::DEFAULT_SURVEY_HOURS),
                 window: window_utc
                     .as_deref()
@@ -434,7 +442,7 @@ mod tests {
 
     #[test]
     fn the_picker_parses_with_defaults_and_replaces_the_cap() {
-        let pick = serde_json::json!({"kind":"carrier_pick","probe":"192.0.2.10:5310","arms":[
+        let pick = serde_json::json!({"kind":"carrier_pick","arms":[
             {"earfcn":55440,"pci":199,"carriers":2},{"earfcn":56440,"pci":208,"carriers":3}]});
         let p = parse_actions(serde_json::json!([pick.clone()])).unwrap();
         let picker = p.picker().unwrap();
@@ -454,8 +462,15 @@ mod tests {
         tuned["window_utc"] = "19:00-23:30".into();
         tuned["survey_hours"] = 24.into();
         tuned["ul_weight"] = 8.into();
-        let t = parse_actions(serde_json::json!([tuned])).unwrap().picker().unwrap();
-        assert_eq!((t.window, t.survey_hours, t.ul_weight), ((1140, 1410), 24, 8));
+        let t = parse_actions(serde_json::json!([tuned.clone()])).unwrap().picker().unwrap();
+        assert_eq!((t.window, t.survey_hours, t.ul_weight, t.ul_sink), ((1140, 1410), 24, 8, None));
+        tuned["ul_sink"] = "198.51.100.9".into();
+        let t = parse_actions(serde_json::json!([tuned.clone()])).unwrap().picker().unwrap();
+        assert_eq!(t.ul_sink, Some(Ipv4Addr::new(198, 51, 100, 9)));
+        for bad in ["127.0.0.1", "224.0.0.9", "255.255.255.255", "169.254.1.1", "0.0.0.0"] {
+            tuned["ul_sink"] = bad.into();
+            assert!(parse_actions(serde_json::json!([tuned.clone()])).is_err(), "{bad}");
+        }
         assert_eq!(
             Profile::parse(&serde_json::to_vec(&parse_actions(serde_json::json!([]))
                 .unwrap()).unwrap()).unwrap().picker(),
