@@ -67,6 +67,12 @@ pub fn granted() -> bool {
     pick::covered(cell.earfcn, pick::ul_scc(&nvram("sqns_connection_uplinkScc")), bw, &grants)
 }
 
+/// The customer bearer's interface, as the vendor names it.
+pub fn customer_dev() -> String {
+    let dev = nvram("pdn_data_ifname");
+    if dev.starts_with("lte0pdn") { dev } else { "lte0pdn2".into() }
+}
+
 /// Receive and transmit byte counters of an interface.
 pub fn counters(dev: &str) -> Option<(u64, u64)> {
     let read = |name: &str| {
@@ -135,8 +141,12 @@ fn mgmt_socket() -> io::Result<UdpSocket> {
 /// `UL_BURST_SECS`, through the management bearer. The sink drops the
 /// packets; the modem's own report rates the radio. Unconnected, so a sink
 /// that answers port unreachable cannot fail the sends. The radio is sampled
-/// once a second meanwhile, which also feeds the download estimate.
+/// once a second meanwhile, which also feeds the download estimate. The burst
+/// stops with `CUSTOMER_BUSY` as soon as the customer bearer carries traffic.
 fn burst(sink: Ipv4Addr) -> io::Result<Samples> {
+    let customer = customer_dev();
+    let mut seen = counters(&customer);
+    let mut seen_at = Instant::now();
     let udp = mgmt_socket()?;
     let sink = (sink, pick::UL_SINK_PORT);
     let payload = [0u8; 1200];
@@ -156,6 +166,14 @@ fn burst(sink: Ipv4Addr) -> io::Result<Samples> {
         if start.elapsed() >= next_sample {
             samples.take(start.elapsed().as_secs_f64());
             next_sample += Duration::from_secs(1);
+            let now = counters(&customer);
+            if let (Some(before), Some(after)) = (seen, now) {
+                let millis = u64::try_from(seen_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if pick::busy(before, after, millis) {
+                    return Err(fail(pick::CUSTOMER_BUSY));
+                }
+            }
+            (seen, seen_at) = (now, Instant::now());
         }
         let due = Duration::from_millis(2 * tick);
         if let Some(wait) = due.checked_sub(start.elapsed()) {

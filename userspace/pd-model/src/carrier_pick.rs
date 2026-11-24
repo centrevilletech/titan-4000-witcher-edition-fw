@@ -16,15 +16,17 @@
 //! - download, estimated: every serving carrier's SINR as the modem reports it
 //!   in that arm, through `dl_estimate_kbps`. The Titan cannot measure its own
 //!   download without a sender: its CPU caps a local TCP download near 53 Mbps.
-//!   The estimate matched the bench: 128 Mbps for c5 (11 dB) with c9 (15 dB)
-//!   against 130.7 measured, and about 185 Mbps for three carriers against the
-//!   modem's own 196 Mbps high-water mark.
+//!   The estimate matched UDP bursts from the core on the bench: 128 Mbps for
+//!   c5 (11 dB) with c9 (15 dB) against 130.7 measured, and 180 Mbps for c6
+//!   (10 dB) with c9 (15 dB) and c5 (12 dB) against 176.8.
 //! - upload, measured: a 20 s UDP burst to the discard port of the profile's
 //!   management probe, the operator's own ping responder. The packets cross the
 //!   radio and the probe drops them. The rate is the modem's own upload report
 //!   (`sqns_radio_ulThroughput`), which refreshes about every 6.5 s and read
 //!   13.8 Mbps where the far end counted 11.2 to 12.2 Mbps of payload: every
-//!   arm gets the same bias, so the ranking holds.
+//!   arm gets the same bias, so the ranking holds. The burst stops when the
+//!   customer starts moving traffic (`busy`), and that arm waits to be
+//!   measured again.
 //! - idle round trip: five pings to the same responder.
 //!
 //! The best arm by `download + ul_weight x upload` is held; the arm the unit
@@ -87,6 +89,10 @@ pub const UL_BURST_SECS: u64 = 20;
 pub const UL_OFFER_KBPS: u32 = 45_000;
 /// The discard port on the management probe.
 pub const UL_SINK_PORT: u16 = 9;
+/// The measurement worker's error when the customer starts moving traffic
+/// during the upload burst. The burst stops at once and the guard measures
+/// that arm again once the customer is idle.
+pub const CUSTOMER_BUSY: &str = "customer traffic during the measurement";
 
 const BAND48_EARFCN: std::ops::RangeInclusive<u32> = 55_240..=56_739;
 
@@ -395,6 +401,13 @@ pub fn idle(samples: &[(u64, u64, u64)], now: u64) -> bool {
     })
 }
 
+/// Whether the customer bearer moved `IDLE_KBPS` or more either way between
+/// two `(rx_bytes, tx_bytes)` readings `millis` apart.
+pub fn busy(before: (u64, u64), after: (u64, u64), millis: u64) -> bool {
+    let kbps = |a: u64, b: u64| b.saturating_sub(a) * 8 / millis.max(1);
+    kbps(before.0, after.0) >= IDLE_KBPS || kbps(before.1, after.1) >= IDLE_KBPS
+}
+
 /// `round-trip min/avg/max = 14.2/16.0/19.9 ms` from BusyBox ping.
 pub fn ping_avg_ms(output: &str) -> Option<u32> {
     let stats = output.lines().find(|l| l.contains("min/avg/max"))?;
@@ -511,9 +524,9 @@ noise
         // c5 at 11 dB with c9 at 15 dB, 2 layers: 130.7 Mbps measured.
         let two = dl_estimate_kbps(&[11, 15], 2);
         assert!((120_000..=140_000).contains(&two), "{two}");
-        // c6, c9, c12 at 12, 14, 12 dB: the modem's high-water mark read 196 Mbps.
-        let three = dl_estimate_kbps(&[12, 14, 12], 2);
-        assert!((170_000..=200_000).contains(&three), "{three}");
+        // c6 at 10 dB with c9 at 15 and c5 at 12: 176.8 Mbps measured.
+        let three = dl_estimate_kbps(&[10, 15, 12], 2);
+        assert!((170_000..=190_000).contains(&three), "{three}");
         // A single carrier at 14 dB: 66 to 75 Mbps on the bench (2026-11-22).
         let one = dl_estimate_kbps(&[14], 2);
         assert!((60_000..=78_000).contains(&one), "{one}");
@@ -644,6 +657,19 @@ noise
         busy[20].1 += 5_000_000;
         assert!(!idle(&busy, 120));
         assert!(!idle(&[], 120));
+    }
+
+    #[test]
+    fn customer_traffic_stops_a_burst() {
+        // 2 Mbps either way in one second is the customer, not background.
+        assert!(busy((0, 0), (250_000, 0), 1000));
+        assert!(busy((0, 0), (0, 250_000), 1000));
+        assert!(!busy((0, 0), (249_000, 249_000), 1000));
+        assert!(!busy((0, 0), (300_000, 0), 1500));
+        // A counter that went backwards (an interface reset) is no traffic.
+        assert!(!busy((500_000, 500_000), (0, 0), 1000));
+        // A zero interval does not divide by zero.
+        assert!(!busy((0, 0), (1, 0), 0));
     }
 
     #[test]

@@ -134,10 +134,11 @@ scores the arm. It needs no server:
   per-carrier capacity: Shannon with a 4.6 dB implementation gap, 256QAM at
   most, over the downlink share of TDD configuration 2. There is no rate cap
   beyond that. On the bench the estimate read 128 Mbps for c5 at 11 dB with c9
-  at 15 dB, where a speed test read 130.7, and 185 Mbps for three carriers at
-  12, 14 and 12 dB, where the modem's own high-water mark read 196. At 17 dB
-  on three carriers it gives about 270 Mbps. The estimate sees radio quality,
-  not how busy each carrier is, so it ranks arms rather than promising rates.
+  at 15 dB, where a UDP burst from the core measured 130.7, and 180 Mbps for
+  c6 at 10 dB with c9 and c5 at 15 and 12 dB, where the burst measured 176.8.
+  At 17 dB on three carriers it gives about 270 Mbps. The estimate sees radio
+  quality, not how busy each carrier is, so it ranks arms rather than
+  promising rates.
 - Upload, measured. Over the same 20 s the unit sends a UDP burst offering
   45 Mbps through the management bearer to the discard port (UDP 9) of
   `management_probe`, or of `ul_sink` when the action sets one. Any host
@@ -146,7 +147,10 @@ scores the arm. It needs no server:
   stays off its control plane. The rate is the modem's own upload report
   (`sqns_radio_ulThroughput`), which refreshes about every 6.5 s. On the bench
   it read 13.8 Mbps where the far end counted 11.2 to 12.2 Mbps of payload.
-  Every arm carries the same bias, so the ranking holds.
+  Every arm carries the same bias, so the ranking holds. The burst only starts
+  while the customer is idle, and it stops at once when the customer bearer
+  carries 2 Mbps either way in a second. That arm is measured again once the
+  customer has been idle for 2 minutes.
 - Round trip: five pings to `management_probe`, before the burst.
 
 A visit sends about 35 to 75 MB to the sink. With three arms and

@@ -1113,9 +1113,7 @@ fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(),
 impl PickWatch {
     fn tick(&mut self, p: &Picker) -> io::Result<()> {
         let now = crate::run::monotonic();
-        let data = nvram_field(b"pdn_data_ifname=");
-        let data = if data.starts_with("lte0pdn") { data } else { "lte0pdn2".into() };
-        if let Some((rx, tx)) = carrier_pick_io::counters(&data) {
+        if let Some((rx, tx)) = carrier_pick_io::counters(&carrier_pick_io::customer_dev()) {
             self.traffic.push((now, rx, tx));
         }
         self.traffic.retain(|s| now.saturating_sub(s.0) <= pick::IDLE_SECS + 30);
@@ -1135,6 +1133,14 @@ impl PickWatch {
         let here = carrier_pick_io::attach();
         let current = here.and_then(|(cell, n)| pick::arm_of(&p.arms, cell, n));
         let say = |phase: &str, detail: String| Ok((phase.to_string(), detail));
+        if self.survey.as_ref().is_some_and(|s| now.saturating_sub(s.started) > SURVEY_STALE) {
+            self.survey = None;
+            if self.visit.as_ref().is_some_and(|v| v.purpose == Purpose::Survey) {
+                self.visit = None;
+            }
+            crate::log("carrier picker: survey abandoned unfinished after 6 hours");
+            return say("stopped", "survey abandoned".into());
+        }
         // An arm just re-attached to: wait for grants and the settle time.
         if let Some(visit) = self.visit.as_mut() {
             if visit.granted_at.is_none() && carrier_pick_io::granted() {
@@ -1171,22 +1177,25 @@ impl PickWatch {
                 ));
                 return say("off-arm", format!("re-attach for arm {} landed elsewhere", visit.arm));
             }
-            self.measure(visit.arm);
-            return say("surveying", format!("arm {} measured", visit.arm));
+            // The burst would crowd the customer: measure only while idle,
+            // and again later when the customer interrupts it.
+            let arm = visit.arm;
+            if !idle || !self.measure(arm) {
+                self.visit = Some(visit);
+                return say("paused", format!("arm {arm}: waiting for an idle customer"));
+            }
+            return say("surveying", format!("arm {arm} measured"));
         }
         if let Some(survey) = &self.survey {
-            if now.saturating_sub(survey.started) > SURVEY_STALE {
-                self.survey = None;
-                crate::log("carrier picker: survey abandoned unfinished after 6 hours");
-                return say("stopped", "survey abandoned".into());
-            }
             let forced = survey.forced;
             match pick::next_arm(&p.arms, &survey.done, current) {
                 Some(i) if Some(i) == current => {
                     if !idle || !carrier_pick_io::granted() {
                         return say("paused", "waiting for an idle customer and covering grants".into());
                     }
-                    self.measure(i);
+                    if !self.measure(i) {
+                        return say("paused", format!("arm {i}: customer traffic during the measurement"));
+                    }
                     return say("surveying", format!("arm {i} measured in place"));
                 }
                 Some(i) => {
@@ -1278,14 +1287,19 @@ impl PickWatch {
 
     /// One visit's measurement. A failed measurement is logged and the arm
     /// counts as visited, so a failed measurement cannot stall a survey.
-    fn measure(&mut self, arm: usize) {
+    /// False when the customer interrupted it: the arm stays to measure again.
+    fn measure(&mut self, arm: usize) -> bool {
         let _ = rm(ram("radio-pick-measure"));
         let result = run_worker(&format!("pick-measure-{arm}"), 60).and_then(|()| {
             serde_json::from_slice::<Measure>(&fs::read(ram("radio-pick-measure"))?)
                 .map_err(|_| fail("unreadable measurement"))
         });
+        if result.as_ref().is_err_and(|e| e.to_string() == pick::CUSTOMER_BUSY) {
+            crate::log(&format!("carrier picker: arm {arm}: the customer started traffic; burst stopped, measuring later"));
+            return false;
+        }
         let Some(survey) = self.survey.as_mut() else {
-            return;
+            return true;
         };
         survey.done.push(arm);
         match result {
@@ -1308,6 +1322,7 @@ impl PickWatch {
             }
             Err(e) => crate::log(&format!("carrier picker: arm {arm} not measured: {e}")),
         }
+        true
     }
 
     fn show(&mut self, phase: &str, detail: &str, p: &Picker) -> io::Result<()> {
