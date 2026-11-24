@@ -373,28 +373,6 @@ for line in sys.stdin:
         assert bearer_arp().count(correction)==sent, 'corrected again with no new forwarding'
         run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
         print('PASS: forwarded IPv6 in passthrough sent the router\'s ARP out the bearer once, and nothing more while quiet.',flush=True)
-        # Router swap. The vendor kernel addresses the bearer's IPv4 to the MAC
-        # it stored at boot, the router's here, so with the bearer bridged the
-        # keeper runs nothing. Then the log shows another MAC, as after a swap
-        # to a router the kernel never stores: the keeper points it at the router
-        # that holds the lease with the vendor's own command, once.
-        assert hostmac_actions()==[], hostmac_actions()
-        run(ip, 'link', 'set', 'lte0pdn1', 'master', 'br0')
-        until=time.monotonic()+4
-        wait_for(lambda:time.monotonic()>=until,8)
-        assert hostmac_actions()==[], hostmac_actions()
-        with open('/tmp/kmsg','a') as kmsg:
-            kmsg.write('6,120,4,-;usb0 set host mac: 02:00:5e:00:53:01\n')
-        swapped=time.monotonic()
-        pointed='router swap: the vendor kernel addressed customer IPv4 to 02:00:5e:00:53:01; pointed it at '+peer_mac_text
-        wait_for(lambda:hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text] and pointed in log(),15)
-        took=time.monotonic()-swapped
-        until=time.monotonic()+8
-        wait_for(lambda:time.monotonic()>=until,12)
-        assert hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text], hostmac_actions()
-        assert log().count('router swap:')==1, log()
-        run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
-        print('PASS: after a router swap the keeper pointed the vendor IPv4 host MAC at the leased router in %.1f s, once.'%took,flush=True)
         if mgmt_ready:
             # One advertisement was taken. The keeper closes the bearer to more
             # and takes the expiry off the learned default.
@@ -647,6 +625,29 @@ for line in sys.stdin:
         assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
         assert 'download clamp waiting' in log() and 'download clamp failed' in log(), log()
         print('PASS: the clamp waited for the links and refused a module that is not the pinned build.',flush=True)
+        # Router swap, last, so no timed step above moves against the deaf
+        # watchdog's rounds. The vendor kernel addresses the bearer's IPv4 to the MAC
+        # it stored at boot, the router's here, so with the bearer bridged the
+        # keeper runs nothing. Then the log shows another MAC, as after a swap
+        # to a router the kernel never stores: the keeper points it at the router
+        # that holds the lease with the vendor's own command, once.
+        assert hostmac_actions()==[], hostmac_actions()
+        run(ip, 'link', 'set', 'lte0pdn1', 'master', 'br0')
+        until=time.monotonic()+4
+        wait_for(lambda:time.monotonic()>=until,8)
+        assert hostmac_actions()==[], hostmac_actions()
+        with open('/tmp/kmsg','a') as kmsg:
+            kmsg.write('6,120,4,-;usb0 set host mac: 02:00:5e:00:53:01\n')
+        swapped=time.monotonic()
+        pointed='router swap: the vendor kernel addressed customer IPv4 to 02:00:5e:00:53:01; pointed it at '+peer_mac_text
+        wait_for(lambda:hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text] and pointed in log(),15)
+        took=time.monotonic()-swapped
+        until=time.monotonic()+8
+        wait_for(lambda:time.monotonic()>=until,12)
+        assert hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text], hostmac_actions()
+        assert log().count('router swap:')==1, log()
+        run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
+        print('PASS: after a router swap the keeper pointed the vendor IPv4 host MAC at the leased router in %.1f s, once.'%took,flush=True)
         print(log(),flush=True)
     finally:
         keeper.terminate();keeper.wait(timeout=5)
