@@ -10,6 +10,9 @@ kernel. The external-device guard reads a file standing in for the kernel log
 and runs a recording `kern` stub. The deaf watchdog runs against ping,
 modem-state and reboot stubs. The LTE driver MAC correction reads a file
 standing in for /proc/net/snmp6 and is checked on the wire of a dummy bearer.
+The router swap reads the vendor kernel's `set host mac` line from that kernel
+log file and runs a recording `kern netif hmac` stub that logs the line back:
+this proves when the keeper points the IPv4 host MAC, not the vendor rewrite.
 The 802.3x flow control change runs a recording `kern eth` stub that prints
 the kernel's report: this proves when the keeper runs it, not the register.
 The vendor ping watchdog runs against a file standing in for the vendor's RAM
@@ -81,6 +84,7 @@ def main():
     for name in ('lo', 'br0', 'eth0', 'lte0pdn1'):
         run(ip, 'link', 'set', name, 'up')
     peer_mac = bytes.fromhex(json.loads(subprocess.check_output([ip,'-n','witcher-peer','-j','link','show','router0']))[0]['address'].replace(':',''))
+    peer_mac_text = ':'.join('%02x' % b for b in peer_mac)
     def exe(path, text):
         p=Path(path);p.write_text('#!/bin/sh\n'+text+'\n');p.chmod(0o755)
     exe('/tmp/bin/ip', 'exec /tmp/bin/real-ip "$@"')
@@ -161,11 +165,15 @@ for line in sys.stdin:
         'echo "iptables $*" >> /tmp/sas-actions\n'
         'if [ "$*" = "-t nat -I POSTROUTING -s 10.1.1.1 -j SNAT --to-source 172.20.64.152" ]; then echo "'+sas_rule+'" >> /tmp/nat-rules; exit 0; fi\nexit 1')
     # `kern netif extdev <dev> down` prints external_dev=NULL to the kernel log on a Titan,
+    # `kern netif hmac <hostif> <mac>` prints the stored IPv4 host MAC,
     # and `kern eth -fc` prints the flow control report.
-    exe('/tmp/bin/kern', 'if [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; '
+    exe('/tmp/bin/kern', 'if [ "$1 $2" = "netif hmac" ]; then echo "kern $*" >> /tmp/hostmac-actions; echo "4,250,3,-;$3 set host mac: $4" >> /tmp/kmsg; '
+        'elif [ "$1" = netif ]; then echo "kern $*" >> /tmp/extdev-actions; echo "4,200,2,-;external_dev=NULL" >> /tmp/kmsg; '
         'elif [ "$1" = eth ]; then echo "kern $*" >> /tmp/eth-actions; echo "4,300,5,-;  dma ctrl(00203206): efc=0 rfa=1(fill=2KB) rfd=2(fill=1KB)" >> /tmp/kmsg; '
         'else echo "kern $*" >> /tmp/sas-actions; fi')
-    Path('/tmp/kmsg').write_text('6,1,1,-;booting\n')
+    # At boot the vendor kernel stores the first eth0 frame's MAC as its IPv4
+    # host MAC: here the fixture's router.
+    Path('/tmp/kmsg').write_text('6,1,1,-;booting\n6,2,2,-;usb0 set host mac: '+peer_mac_text+'\n')
     Path('/tmp/snmp6').write_text('Ip6InReceives 1\nIp6OutForwDatagrams 0\n')
     Path('/tmp/nat-rules').write_text(sas_rule+'\n')
     # Both FORWARD chains, one rule a line. Listings match ebtables v2.0.10-4
@@ -231,6 +239,8 @@ for line in sys.stdin:
         raise AssertionError('Timed out: '+log()+'\nARP '+repr(packets)+'\ncarrier '+repr([Path('/sys/class/net/'+n+'/carrier').read_text() for n in ['eth0','lte0pdn1']])+'\nIP '+subprocess.check_output([ip,'-4','-o','addr','show','dev','br0']).decode()+'\nlease '+Path('/tmp/udhcpd.leases').read_bytes().hex())
     def eth_actions():
         p=Path('/tmp/eth-actions');return p.read_text().splitlines() if p.exists() else []
+    def hostmac_actions():
+        p=Path('/tmp/hostmac-actions');return p.read_text().splitlines() if p.exists() else []
     def nvram_actions():
         p=Path('/tmp/nvram-actions');return p.read_text().splitlines() if p.exists() else []
     try:
@@ -363,6 +373,28 @@ for line in sys.stdin:
         assert bearer_arp().count(correction)==sent, 'corrected again with no new forwarding'
         run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
         print('PASS: forwarded IPv6 in passthrough sent the router\'s ARP out the bearer once, and nothing more while quiet.',flush=True)
+        # Router swap. The vendor kernel addresses the bearer's IPv4 to the MAC
+        # it stored at boot, the router's here, so with the bearer bridged the
+        # keeper runs nothing. Then the log shows another MAC, as after a swap
+        # to a router the kernel never stores: the keeper points it at the router
+        # that holds the lease with the vendor's own command, once.
+        assert hostmac_actions()==[], hostmac_actions()
+        run(ip, 'link', 'set', 'lte0pdn1', 'master', 'br0')
+        until=time.monotonic()+4
+        wait_for(lambda:time.monotonic()>=until,8)
+        assert hostmac_actions()==[], hostmac_actions()
+        with open('/tmp/kmsg','a') as kmsg:
+            kmsg.write('6,120,4,-;usb0 set host mac: 02:00:5e:00:53:01\n')
+        swapped=time.monotonic()
+        pointed='router swap: the vendor kernel addressed customer IPv4 to 02:00:5e:00:53:01; pointed it at '+peer_mac_text
+        wait_for(lambda:hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text] and pointed in log(),15)
+        took=time.monotonic()-swapped
+        until=time.monotonic()+8
+        wait_for(lambda:time.monotonic()>=until,12)
+        assert hostmac_actions()==['kern netif hmac usb0 '+peer_mac_text], hostmac_actions()
+        assert log().count('router swap:')==1, log()
+        run(ip, 'link', 'set', 'lte0pdn1', 'nomaster')
+        print('PASS: after a router swap the keeper pointed the vendor IPv4 host MAC at the leased router in %.1f s, once.'%took,flush=True)
         if mgmt_ready:
             # One advertisement was taken. The keeper closes the bearer to more
             # and takes the expiry off the learned default.

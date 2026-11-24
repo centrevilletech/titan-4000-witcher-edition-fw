@@ -95,6 +95,11 @@ Ethernet renegotiation. Recovery is bounded and does not reboot the Titan or
 reset LTE. A router that still answers ARP while its internet forwarding is
 broken needs a different diagnostic.
 
+A router swapped in while the Titan runs gets IPv4 without a reboot. The
+vendor kernel kept sending IPv4 to the first router it saw after boot. The
+keeper now moves that to the router that holds the DHCP lease. See
+[router swaps](docs/ipv4-recovery.md#router-swaps).
+
 In passthrough the keeper also keeps the vendor NAT rule that lets the Titan's
 own SAS client reach the SAS. A vendor firewall restart after an LTE handover
 removes it, and the Block Channel patch removes the vendor's way of putting it

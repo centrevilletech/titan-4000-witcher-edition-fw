@@ -43,6 +43,7 @@ use titan_pd_model::driver_mac::{self, Action as DriverAction};
 use titan_pd_model::ethernet;
 use titan_pd_model::extdev::{self, Action as ExtAction};
 use titan_pd_model::filter;
+use titan_pd_model::host_mac::{self, Action as HostMacAction};
 use titan_pd_model::health::{self, Decision, Health, Phase, View};
 use titan_pd_model::ipv4::{self, Ipv4Plan};
 use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Armed, Peer, Traffic};
@@ -191,6 +192,10 @@ struct Keeper {
     /// Corrections since the last log line, and when that line was written.
     driver_fixes: u32,
     driver_logged_at: Option<u64>,
+    /// The vendor kernel's IPv4 host MAC, read from its log and kept on the
+    /// router that holds the customer lease. See `titan_pd_model::host_mac`.
+    host_mac_watch: host_mac::Watch,
+    host_mac_logged_at: Option<u64>,
     flow_watch: ethernet::Watch,
     flow_checked: Option<u64>,
     /// The kernel log was read to its end once, so a flow control report
@@ -423,6 +428,8 @@ impl Keeper {
             driver_watch: driver_mac::Watch::default(),
             driver_fixes: 0,
             driver_logged_at: None,
+            host_mac_watch: host_mac::Watch::default(),
+            host_mac_logged_at: None,
             flow_watch: ethernet::Watch::default(),
             flow_checked: None,
             kmsg_drained: false,
@@ -462,6 +469,7 @@ impl Keeper {
             self.ipv4_peer = None;
             self.sas_watch.reset();
             self.driver_watch.reset();
+            self.host_mac_watch.reset_attempts();
             if self.serving {
                 self.stop_serving("left IP passthrough");
             }
@@ -486,6 +494,7 @@ impl Keeper {
         self.maintain_ipv4(&routes);
         self.maintain_ipv4_link(&routes);
         self.maintain_driver_mac();
+        self.maintain_host_mac();
         self.maintain_sas_nat(&routes);
 
         let loaded = config::load_config(&state_dir().join("config.json"));
@@ -1361,6 +1370,64 @@ impl Keeper {
         }
     }
 
+    /// The vendor kernel addresses the bearer's IPv4 to one MAC it learns once
+    /// per boot, so after a router swap the new router got no IPv4 until a
+    /// reboot. Point it at the router that holds the customer DHCP lease with
+    /// the vendor's own command. See `titan_pd_model::host_mac`.
+    fn maintain_host_mac(&mut self) {
+        let router = self
+            .ipv4_peer
+            .filter(|(_, seen)| self.now.saturating_sub(*seen) <= PEER_HOLD)
+            .map(|(peer, _)| peer.mac);
+        let ready = self.passthrough && self.bridged && self.kmsg_drained;
+        // Nothing to compare on most ticks: skip the sysfs reads then.
+        let settled = !ready
+            || router.is_none()
+            || self.host_mac_watch.stored().is_some_and(|stored| Some(stored.mac) == router);
+        let own: Vec<[u8; 6]> = if settled {
+            Vec::new()
+        } else {
+            [CUSTOMER, BRIDGE, self.bearer.as_str()]
+                .into_iter()
+                .filter_map(interface_mac)
+                .collect()
+        };
+        match self.host_mac_watch.decide(self.now, ready, router, &own) {
+            HostMacAction::Hold => {}
+            HostMacAction::Point { hostif, from, to } => {
+                let (program, args) = host_mac::command(&hostif, to);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                let result = run_status(program, &args);
+                // keeper.log is on flash: one line a minute at most.
+                if self
+                    .host_mac_logged_at
+                    .is_some_and(|at| self.now.saturating_sub(at) < 60)
+                {
+                    return;
+                }
+                self.host_mac_logged_at = Some(self.now);
+                let to = ipv4::mac_text(to);
+                match result {
+                    Ok(()) => {
+                        let from = from.map_or_else(|| "a MAC its log no longer shows".to_owned(), ipv4::mac_text);
+                        self.note(&format!(
+                            "router swap: the vendor kernel addressed customer IPv4 to {from}; pointed it at {to}, the router that holds the DHCP lease (kern netif hmac {hostif})"
+                        ));
+                    }
+                    Err(err) => self.note(&format!(
+                        "router swap: could not point the vendor kernel's IPv4 host MAC at {to}: {err}"
+                    )),
+                }
+            }
+            HostMacAction::GiveUp { to } => self.note(&format!(
+                "router swap: the kernel log still does not show {} as the IPv4 host MAC after {} commands; trying again in {} s",
+                ipv4::mac_text(to),
+                host_mac::TRIES,
+                host_mac::PAUSE
+            )),
+        }
+    }
+
     /// Keep the vendor SNAT rule for the unit's own SAS traffic. A vendor
     /// firewall restart after a handover removes it, and in this build nothing
     /// else puts it back. Restores only after missing checks in a row, checked
@@ -1544,6 +1611,9 @@ impl Keeper {
             }
             if let Some(event) = extdev::parse(&line) {
                 self.ext_watch.note(event);
+            }
+            if let Some(stored) = host_mac::parse(&line) {
+                self.host_mac_watch.note(stored);
             }
             match sas_nat::pdn_up(&line) {
                 Some(dev) if dev == mgmt::MGMT_DEV => {
