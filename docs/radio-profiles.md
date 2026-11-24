@@ -46,13 +46,15 @@ prevents activation.
 | | `cycle_hours` 6 to 168, optional | Opt-in enforcement re-attach. See below. Absent: the radio is never cycled for the cap. |
 | | `nudge` `{earfcn, pci}`, optional | Band 48 primary cell held only during an enforcement re-attach. Needs `cycle_hours`. |
 | sqm | `upload_kbit` 64 to 50000, `download_kbit` 64 to 250000 | Bidirectional CAKE on the passthrough path. |
+| carrier_pick | `arms` (2 to 6 of `{earfcn, pci, carriers}`), `probe` (`a.b.c.d:port`) | Surveys the arms and holds the best. Replaces `carrier_aggregation`. See [the carrier picker](#carrier-picker). |
+| | `survey_hours` 24 to 336 (72), `window_utc` `HH:MM-HH:MM` (`10:45-12:30`), `ul_weight` 0 to 20 (4) | Optional. |
 
 The keeper accepts each kind once. Version 1 permits 4096 bytes and rejects
 unknown fields and unknown kinds. The socket API uses one JSON document per
 Unix stream connection at `/tmp/titan-pd-keeper/radio.sock` in the root-owned
-mode 0700 directory. Send `{"op":"get"}`, `{"op":"status"}` or
-`{"op":"set","profile":...}`, then shut down the write half and read the JSON
-`result` or `error`. The native web listener has no radio-profile route.
+mode 0700 directory. Send `{"op":"get"}`, `{"op":"status"}`,
+`{"op":"set","profile":...}` or `{"op":"survey"}`, then shut down the write
+half and read the JSON `result` or `error`. The native web listener has no radio-profile route.
 
 ### Settings this firmware will not apply
 
@@ -97,6 +99,94 @@ cleared with `AT%GLOCKPCELL=1,0,0` as soon as the unit attaches, or after 90 s,
 attached or not. A lock that does not read back cleared fails the check and
 reverts the profile. Status shows the carrier count, the cap, how long the
 unit has been over it, and why enforcement is or is not due.
+
+## Carrier picker
+
+The `carrier_pick` action measures which combination of carriers serves this
+unit best and holds it. Each arm is a primary cell and a carrier cap:
+
+```json
+{
+  "version": 1,
+  "management_probe": "<management ping responder>",
+  "actions": [
+    {"kind": "carrier_pick", "probe": "<probe server>:5310",
+     "arms": [{"earfcn": 55440, "pci": 199, "carriers": 2},
+              {"earfcn": 56440, "pci": 208, "carriers": 3},
+              {"earfcn": 56638, "pci": 217, "carriers": 2}]}
+  ]
+}
+```
+
+A survey visits every arm once. A visit is one radio cycle through the same
+nudge as the enforcement re-attach. The radio goes off, the arm's cap and
+PCell lock are written, the radio comes on, and the lock is cleared as soon as
+the unit attaches, or after 90 s if it does not. The tower still chooses the
+secondary carriers. The arm the unit is already on is measured without a
+cycle. After each attach the picker waits up to 10 minutes for SAS grants that
+cover the new primary and uplink secondary carrier, then 15 s more, and
+measures three things through the management bearer and the probe server:
+
+- Download: the server sends a 3 s UDP burst offering 300 Mbps to an open
+  socket on the unit that is never read. The rate is the median of the
+  management bearer's receive counter over 100 ms steps, after the first
+  half second. On the bench a TCP download through `wget` read 53 Mbps,
+  limited by the CPU. The burst read 133 to 145 Mbps on the same bearer,
+  which matched a 133 Mbps speed test from the customer side.
+- Upload: the unit sends a 3 s UDP burst offering 45 Mbps, and the server
+  counts what arrives.
+- Round trip: five pings.
+
+Each arm scores `download + ul_weight x upload`. Only a visit that attached on
+its arm's primary cell, within its cap, counts. The arm the unit is on keeps
+its place unless another scores 5% higher. Within 2%, the lower round trip
+wins. The result goes to `/mnt/titan-api/radio/pick.json`. The keeper logs one
+line per visit and one per survey.
+
+A radio cycle starts only when all of these hold, read fresh each time:
+
+- The time is outside 06:30 to 10:30 UTC, which is CPAS with 30 minutes on
+  each side. No new SAS grants are issued in that window, and a carrier change
+  gives back every grant.
+- The time is inside `window_utc`. An operator request through `survey` lifts
+  this one rule.
+- The unit is attached and holds its SAS grant (`cbrs_mode_grant` 1,
+  `cbrs_grant_state` 2).
+- The customer bearer has carried under 2 Mbps each way for 2 minutes.
+- No keeper recovery is pending.
+
+A survey runs at most once per `survey_hours`. One that is still unfinished
+after 6 hours is dropped. When no covering grant arrives within 10 minutes of
+a visit, the survey stops and the unit stays where it is. If the unit leaves
+the held arm (a reboot, the tower), the picker returns to the arm with one
+cycle, at most every 6 hours, outside the survey window too. A failed cycle
+reverts the profile like a failed enforcement. Removing the action restores
+the stock cap and clears any lock, without a radio cycle.
+
+Every visit costs the customer one re-attach, 30 to 60 s, plus the wait for
+grants, which took 15 s on the bench at 19:00 UTC. That is why visits wait for
+an idle customer.
+
+### Probe server
+
+`scripts/carrier-probe-server.py` needs only the Python standard library. Run
+it on a host the units reach through the management bearer, such as the core:
+
+```sh
+python3 carrier-probe-server.py --listen 0.0.0.0:5310 --allow <management pool> --ul-port 5311
+```
+
+Open TCP 5310 and UDP 5311 to the management pool. The server sends a download
+burst only to the address that opened the control connection, caps bursts at
+5 s and 400 Mbps, and runs two at once at most. A management APN with a lower
+AMBR than the data APN would understate every arm equally. Status shows the
+survey state and every visit's numbers under `pick`. To survey now, outside
+the window:
+
+```sh
+/tmp/titan-pd-keeper/titan-pd-keeper radio-profile survey
+/tmp/titan-pd-keeper/titan-pd-keeper radio-profile status
+```
 
 ## Application and recovery
 

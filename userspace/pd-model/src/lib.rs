@@ -8,9 +8,10 @@
 //! customer router, 802.3x flow control on the customer port, which keeper
 //! writes reach flash, the self-revert of a setting change, the drop of
 //! customer IPv6 while the unit holds no SAS grant, the boot confirm for a
-//! staged modem firmware image, its modem feature flags, and the staged
-//! download clamp module.
+//! staged modem firmware image, its modem feature flags, the staged
+//! download clamp module, and the carrier picker.
 
+pub mod carrier_pick;
 pub mod cbrs_gate;
 pub mod config;
 pub mod deaf;
