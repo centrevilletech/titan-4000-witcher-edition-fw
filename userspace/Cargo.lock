@@ -100,6 +100,7 @@ dependencies = [
  "serde_json",
  "titan-pd-model",
  "titan-sys",
+ "witcher-tk-patch",
 ]
 
 [[package]]
@@ -130,6 +131,18 @@ dependencies = [
  "libc",
  "serde_json",
  "titan-sys",
+]
+
+[[package]]
+name = "witcher-tk-patch"
+version = "0.1.0"
+
+[[package]]
+name = "witcher-tk-patch-cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "witcher-tk-patch",
 ]
 
 [[package]]

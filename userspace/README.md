@@ -22,9 +22,14 @@ its bundled linker. Image verification compares them with the source build.
 - `firstboot`: the first-boot service.
 - `sys` (`titan-sys`): the only crate allowed `unsafe`. It wraps the Linux
   calls std does not offer (packet sockets, `getifaddrs`, `poll`, signals,
-  the `fork`-to-`exec` hooks, the kernel log ring) in typed safe functions,
-  and every `unsafe` block carries a `// SAFETY:` comment that CI's clippy
-  checks. The other crates are `#![forbid(unsafe_code)]`.
+  the `fork`-to-`exec` hooks, the kernel log ring, a flash partition's bad
+  block table) in typed safe functions, and every `unsafe` block carries a
+  `// SAFETY:` comment that CI's clippy checks. The other crates are
+  `#![forbid(unsafe_code)]`.
+- `tk-patch`: the `no_std` core the keeper uses to build the patched modem
+  image on a unit, with no dependencies. `tk-patch-cli` is its host tool
+  (`tk-patch`), which turns `tkpatch.py` specs into manifests. See [building
+  the modem image on the unit](../docs/tk-patch.md).
 
 CI's `sizes` job prints the stripped armv7 size of both programs on every
 pull request; the rootfs has little room to spare.

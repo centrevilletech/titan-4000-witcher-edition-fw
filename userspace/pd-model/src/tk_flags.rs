@@ -3563,7 +3563,7 @@ wm=0x8418ff08:0x1
         assert_eq!(magic_refusal(magic_spec(MagicGroup::M1), M1_BENCH_DUMP), None);
         // Another build, stock bytes, no header or a lost row: nothing is read.
         for text in [
-            M1_BENCH_DUMP.replace("20 26 11 25", "20 26 11 26"),
+            M1_BENCH_DUMP.replace("20 26 11 25", "20 26 11 99"),
             M1_BENCH_DUMP.replace("4d 31 50 49", "68 1a d1 0d"),
             M1_BENCH_DUMP.replace(HEADER, ""),
             M1_BENCH_DUMP

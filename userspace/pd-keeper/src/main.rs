@@ -6,6 +6,8 @@
 //! `solicit-mgmt` is a diagnostic: it sends one router solicitation on the
 //! management bearer, to check that the answer no longer reaches the vendor
 //! stack once the keeper has closed the bearer to advertisements.
+//! `tk-build` builds the patched modem image on the unit from its stock
+//! firmware (docs/tk-patch.md); only an operator runs it.
 //!
 //! The keeper has no `unsafe` code: its system calls go through the audited
 //! wrappers in `titan-sys`.
@@ -28,6 +30,7 @@ mod fastpath_io;
 mod files;
 mod filter_probe;
 mod logging;
+mod mtd;
 mod netdev;
 mod nvram;
 mod paths;
@@ -39,6 +42,7 @@ mod revert;
 mod run;
 mod staged;
 mod status_file;
+mod tk_build_io;
 mod tk_flags_io;
 
 pub(crate) use logging::{log, log_ram};
@@ -70,6 +74,7 @@ fn main() {
         }
         Some("guard") => std::process::exit(revert::guard(&args.collect::<Vec<_>>())),
         Some("confirm") => std::process::exit(revert::confirm(&args.collect::<Vec<_>>())),
+        Some("tk-build") => std::process::exit(tk_build_io::main(&args.collect::<Vec<_>>())),
         Some("filter-probe") => std::process::exit(filter_probe::probe()),
         Some("filter-undo") => std::process::exit(filter_probe::undo(&args.collect::<Vec<_>>())),
         Some("solicit-mgmt") => match run::solicit_once() {
@@ -103,7 +108,7 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|solicit-mgmt|status"
+                "usage: titan-pd-keeper run|guard|confirm|filter-probe|filter-undo|solicit-mgmt|status|tk-build"
             );
             std::process::exit(64);
         }

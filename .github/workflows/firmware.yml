@@ -154,6 +154,45 @@ jobs:
             echo "$binary $(stat -c %s "$out/$binary") bytes (armv7-unknown-linux-musleabi, release, stripped)"
           done | tee -a "$GITHUB_STEP_SUMMARY"
 
+  tk-patch:
+    name: Modem image builder against the bench images
+    # The stock image is the vendor's public download, as in the prg job. No
+    # modem firmware is stored here or in the job's outputs.
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential python3 git ca-certificates curl
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+      - name: Fetch the stock image
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --max-time 180 \
+            https://theedgemile.com/wp-content/uploads/2026/05/GTCGR_TITAN4K_V1.6.0P0_R3882-4172-CBRS.prg \
+            -o "$RUNNER_TEMP/stock.prg"
+          echo "ec18547470302cec65529c501f06971075a06516f7c10f03b8573e18138ea04a  $RUNNER_TEMP/stock.prg" \
+            | sha256sum -c
+      - name: Rebuild the bench images; cross-check against Python's zlib; run tk-build end to end
+        env:
+          WITCHER_REQUIRE_STOCK: '1'
+        run: |
+          set -euo pipefail
+          export WITCHER_STOCK_PRG="$RUNNER_TEMP/stock.prg"
+          cargo test --locked --manifest-path userspace/Cargo.toml -p witcher-tk-patch -p witcher-tk-patch-cli
+          cargo build --locked --release --manifest-path userspace/Cargo.toml -p witcher-tk-patch-cli
+          TK_PATCH=userspace/target/release/tk-patch python3 scripts/test-tk-patch.py
+          cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
+          TITAN_PD_KEEPER=userspace/target/debug/titan-pd-keeper python3 scripts/test-tk-build.py
+      - name: Remove the stock download
+        if: always()
+        run: rm -f "$RUNNER_TEMP/stock.prg"
+
   prg:
     name: Build and verify firmware
     # PRs run public tests only. Packaging and its private denylist are trusted.

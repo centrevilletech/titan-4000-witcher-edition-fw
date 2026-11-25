@@ -26,6 +26,12 @@ pub fn volume_dir(env: &str, name: &str) -> Option<PathBuf> {
     config::persistent_volume_mounted().then(|| Path::new("/mnt/titan-api").join(name))
 }
 
+/// The boot loader's files on the persistent volume (`tk/`), only while it
+/// is mounted, or `TITAN_TK_DIR` (tests).
+pub fn tk_dir() -> Option<PathBuf> {
+    volume_dir("TITAN_TK_DIR", "tk")
+}
+
 /// The variable `env` (set by tests), else `default`.
 pub fn env_or(env: &str, default: &str) -> String {
     env::var(env).unwrap_or_else(|_| default.to_owned())
