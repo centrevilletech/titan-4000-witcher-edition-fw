@@ -506,7 +506,9 @@ for line in sys.stdin:
         assert not Path('/tmp/hang-ip6tables').exists(), 'the gate never ran ip6tables'
         assert 8<=took<25, took
         assert 'did not finish within 10 s; stopping it' in ram(), ram()
-        assert alive()!=beat, 'the heartbeat stopped: '+alive()
+        # The gate closes in the same tick as the stopped call; the heartbeat
+        # is rewritten at the top of the next one.
+        wait_for(lambda:alive()!=beat,15)
         hung=[line for line in subprocess.check_output(['/tmp/bin/real-ps','-eo','pid,stat,args']).decode().splitlines() if 'sleep 3600' in line]
         assert not hung, ('the hung child was not stopped and reaped', hung)
         set_grant(['cbrs_mode_grant=1','cbrs_grant_state=2'])
