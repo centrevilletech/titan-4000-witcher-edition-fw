@@ -625,6 +625,8 @@ fn trial(p: &Profile) -> io::Result<bool> {
         }
         return Ok(false);
     }
+    // The workers read the profile they work on from here.
+    store(&ram("radio-target"), p)?;
     // Stock settings (or the profile this one replaces) must work first.
     // Otherwise nothing is tried or counted: a tower or core outage, a boot in
     // the CPAS window or a slow LTE stack only delays the trial.
@@ -638,7 +640,6 @@ fn trial(p: &Profile) -> io::Result<bool> {
         return Ok(false);
     }
     fs::create_dir_all(disk_dir())?;
-    store(&ram("radio-target"), p)?;
     // Counted before the first write, so a trial cut short (a power cut, a
     // crash) still spaces the next one.
     store_strikes(p, record.started())?;
@@ -776,6 +777,11 @@ fn fall_back(p: &Profile, failure: &Failure) -> io::Result<()> {
     let wait = next.failed(monotonic());
     store_retry(&next)?;
     let detail = format!("{}; {judged}; trying again in {wait} s", failure.error);
+    if !restored {
+        // The restore's own status says how it is going.
+        crate::log(&format!("radio profile: rolling back: {detail}"));
+        return Ok(());
+    }
     crate::log(&format!("radio profile: stock settings back: {detail}"));
     status("reverted", &detail)
 }

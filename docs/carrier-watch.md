@@ -55,9 +55,11 @@ In `mode=regrant`, the keeper never forces a re-grant when any of these hold:
 
 - **CPAS quiet window:** Google's SAS issues no new grants during daily CPAS
   (07:00-10:00 UTC). Dropping grants then can leave the PCell ungranted for
-  hours. Default `quiet_utc=06:45-10:00` blocks forced re-grants during the
-  window, logs `carrier watch: uncovered, quiet window, waiting` once every
-  10 minutes, and re-checks at 10:00 UTC.
+  hours. Forced re-grants wait out 06:45-10:15 UTC, the window every keeper
+  reboot and radio cycle waits out (`tk_boot::CPAS_QUIET`). The config cannot
+  turn it off. The keeper logs `carrier watch: uncovered, quiet window,
+  waiting` once every 10 minutes and re-checks at 10:15 UTC. Up to v1.0.16 the
+  window ended at 10:00, and an empty `quiet_utc=` removed it.
 - **Vendor re-grant already in flight:** `cbrs_mode_grant=0` suppresses
   detection and forced re-grants.
 - **Unsane clock:** before NTP corrects the Titan's 2013 boot clock, forced
@@ -66,6 +68,10 @@ In `mode=regrant`, the keeper never forces a re-grant when any of these hold:
 - **Rate limits and backoff:** at most one forced re-grant per 5 minutes and
   at most 6 in any 24-hour window. Each failed or timed-out re-grant doubles
   the wait before the next attempt (10 min, 20 min, 40 min, capped at 60 min).
+  Since v1.0.17 the day's re-grants and the failure count are kept in
+  `/mnt/titan-api/carrier-watch/regrants` (written durably on each change),
+  so a crash-looping keeper or flapping power cannot reset the limits. A
+  keeper takes them over once the clock is set.
 - **Dry-run guard:** when `hide_grant=<idx>` is set, forced re-grants are
   always suppressed, even if `mode=regrant` is also present.
 
@@ -77,7 +83,7 @@ keeper restart is needed.
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `mode` | `off`, `log`, `regrant` | `log` | Policy when a transmit carrier leaves the held grants. |
-| `quiet_utc` | `HH:MM-HH:MM` or empty | `06:45-10:00` | Daily UTC window that blocks forced re-grants (supports crossing midnight). Empty disables. |
+| `quiet_utc` | `HH:MM-HH:MM` or empty | none | An extra daily UTC window that blocks forced re-grants, on top of the CPAS window (supports crossing midnight). Empty means none. The CPAS window always applies. |
 | `debounce_secs` | `1` to `60` | `3` | Consecutive uncovered seconds before entering `uncovered`. |
 | `hide_grant` | `0` to `7` or `none` | `none` | Test-only dry-run option. Hides one grant slot from the comparator and suppresses forced re-grants. |
 
@@ -86,7 +92,8 @@ keeper restart is needed.
 
 ## Status and logs
 
-- Status file: `/var/run/witcher-carrier.status` (state, mode, quiet window,
+- Status file: `/var/run/witcher-carrier.status` (state, mode, the quiet
+  windows in force (`quiet_utc=06:45-10:15`, then any extra one),
   `cbrs_mode_grant`, PCell and UL SCell spans, held grants, `hide_grant`,
   `last_action`, and counters).
 - Log lines: `/mnt/titan-api/pd/keeper.log` (and `/tmp/titan-pd-keeper/keeper.log`),
@@ -115,7 +122,7 @@ ssh -p 2222 root@<unit> 'rm -f /mnt/titan-api/carrier-watch/config'
 To enable forced re-grants on one unit:
 
 ```sh
-ssh -p 2222 root@<unit> 'mkdir -p /mnt/titan-api/carrier-watch && printf "mode=regrant\nquiet_utc=06:45-10:00\n" > /mnt/titan-api/carrier-watch/config && sync'
+ssh -p 2222 root@<unit> 'mkdir -p /mnt/titan-api/carrier-watch && printf "mode=regrant\n" > /mnt/titan-api/carrier-watch/config && sync'
 ```
 
 Rollback (live, takes effect within 5 seconds, no reboot):
