@@ -127,8 +127,10 @@ such process it touches none.
 A keeper that dies while the loop is paused would leave the unit with no
 reset button. Three things bound that:
 
-- the supervisor in `/etc/init.d/titan-pd-keeper` restarts the keeper, and a
-  keeper that starts always sends one `SIGCONT` before anything else;
+- the supervisor in `/etc/init.d/titan-pd-keeper` checks the keeper every
+  10 s and sends `SIGCONT` as soon as it finds it gone, before it waits to
+  start it again. A keeper that starts always sends one `SIGCONT` before
+  anything else;
 - `/etc/init.d/titan-pd-keeper stop` sends `SIGCONT` itself;
 - a reboot starts a fresh loop.
 

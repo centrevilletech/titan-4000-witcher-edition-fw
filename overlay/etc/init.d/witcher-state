@@ -13,18 +13,34 @@ lock=/tmp/witcher-state.lock
 
 mounted() { awk -v point="$state" '$2==point && $3=="ubifs" && $1=="ubi1:data" && index(","$4",", ",rw,") { found=1 } END { exit !found }' "$mounts"; }
 fail() { echo "Witcher state: $*" >&2; exit 1; }
-waited=0
-until mkdir "$lock" 2>/dev/null; do
- [ "$waited" -lt 30 ] || fail 'storage is busy; existing state was left untouched'
- sleep 1; waited=$((waited+1))
-done
-trap 'rmdir "$lock"' EXIT
-trap 'exit 1' HUP INT TERM
+# mkdir is atomic and the holder writes its PID at once. A lock with no live
+# owner at two checks a second apart was left by a killed holder: take it over.
+take_lock() {
+ waited=0 stale=0 seen=
+ until mkdir "$lock" 2>/dev/null; do
+  owner=$(cat "$lock/pid" 2>/dev/null) || owner=0
+  case "$owner" in ''|*[!0-9]*) owner=0;; esac
+  if [ "$owner" -gt 1 ] && kill -0 "$owner" 2>/dev/null; then stale=0
+  elif [ "$owner" = "$seen" ]; then stale=$((stale+1))
+  else stale=1
+  fi
+  seen=$owner
+  if [ "$stale" -ge 2 ]; then rm -rf "$lock" || :; stale=0; continue; fi
+  [ "$waited" -lt "$1" ] || return 1
+  sleep 1; waited=$((waited+1))
+ done
+ echo $$ > "$lock/pid"
+}
+# Wait for the vendor volume before the lock: callers started together (shell,
+# keeper, web) then each wait for it as long as the first one does.
 waited=0
 until awk '$2=="/mnt" && $3=="ubifs" && ($1=="ubi1:cbrs" || $1=="ubi1_0" || $1=="/dev/ubi1_0") && index(","$4",", ",rw,") { found=1 } END { exit !found }' "$mounts"; do
  [ "$waited" -lt 90 ] || fail 'vendor storage did not mount'
  sleep 2; waited=$((waited+2))
 done
+take_lock 120 || fail 'storage is busy; existing state was left untouched'
+trap 'rm -rf "$lock"' EXIT
+trap 'exit 1' HUP INT TERM
 [ "$(cat "$sys/ubi1/mtd_num")" = 20 ] || fail 'unexpected UBI partition'
 grep -Eq '^mtd20: [0-9a-fA-F]+ [0-9a-fA-F]+ "user"$' /proc/mtd || fail 'partition is not user storage'
 [ "$(cat "$sys/ubi1_0/name")" = cbrs ] || fail 'vendor volume identity changed'

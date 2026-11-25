@@ -4,6 +4,7 @@
 #
 #   boot       mount the persistent volume, then keep the listener running
 #   start      the same on a running unit
+#   ensure     start it unless an operator stopped it (the boot watchdog)
 #   stop       stop the listener; sessions already open stay connected
 #   restart | status
 #   mount      mount the persistent volume only (the web service uses it too)
@@ -17,7 +18,7 @@ bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
 runtime=/tmp/titan-sshd
 log=/tmp/titan-sshd-boot.log
 ram_copy=/tmp/titan-sshd-control.sh
-lock=/tmp/titan-data.lock
+lock=/tmp/titan-sshd-start.lock
 config=/etc/titan-api.conf
 installed=/etc/titan-sshd
 # The vendor mounts its own volume of this flash partition at /mnt; the mount
@@ -58,6 +59,16 @@ volume_exists() {
  return 1
 }
 mount_state() { /bin/sh /etc/init.d/witcher-state mount; }
+# Whole seconds since boot in $now; the wall clock is not set early in boot.
+clock() { read -r now _ < /proc/uptime; now=${now%%.*}; }
+# While the volume is missing: try 60 s after the supervisor starts, then
+# doubling to 30 min. Never gives up.
+retry_mount() {
+ if mounted || [ "$now" -lt "$retry_at" ]; then return 0; fi
+ retry=$((retry * 2)); [ "$retry" -le 1800 ] || retry=1800
+ mount_state >> "$log" 2>&1 || note "Persistent volume not mounted; trying again in $retry s."
+ clock; retry_at=$((now + retry))
+}
 
 owned() {
  # $1 PID, $2 the command line that identifies it; a recycled PID never matches.
@@ -74,21 +85,57 @@ listener() {
  pid=$(cat "$runtime/listener.pid" 2> /dev/null)
  owned "$pid" "$runtime/titan-sshd listen" && echo "$pid"
 }
+# A process that has exited, reaped or still a zombie. Where sleep is a shell
+# builtin nothing may have reaped our own child yet, and kill -0 still succeeds.
+exited() {
+ stat=; { read -r stat < "/proc/$1/stat"; } 2> /dev/null
+ case "${stat##*) }" in ''|[ZX]*) return 0;; esac
+ return 1
+}
+# TERM, then KILL after 10 s. The listener only stops accepting; each session
+# is its own process and stays connected.
+end_process() {
+ kill "$1" 2> /dev/null
+ waited=0
+ while ! exited "$1" && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
+ exited "$1" || kill -9 "$1" 2> /dev/null
+}
+# mkdir is atomic and the holder writes its PID at once. A lock with no live
+# owner at two checks a second apart was left by a killed holder: take it over.
+take_lock() {
+ waited=0 stale=0 seen=
+ until mkdir "$lock" 2> /dev/null; do
+  owner=$(cat "$lock/pid" 2> /dev/null) || owner=0
+  case "$owner" in ''|*[!0-9]*) owner=0;; esac
+  if [ "$owner" -gt 1 ] && kill -0 "$owner" 2> /dev/null; then stale=0
+  elif [ "$owner" = "$seen" ]; then stale=$((stale + 1))
+  else stale=1
+  fi
+  seen=$owner
+  if [ "$stale" -ge 2 ]; then rm -rf "$lock"; stale=0; continue; fi
+  [ "$waited" -lt "$1" ] || return 1
+  sleep 1; waited=$((waited + 1))
+ done
+ echo $$ > "$lock/pid"
+}
 stop() {
  [ -d "$runtime" ] || return 0
  : > "$runtime/stopped"
  pid=$(supervisor) && kill "$pid" 2> /dev/null
- # The listener only stops accepting; each session is its own process.
- pid=$(listener) && kill "$pid" 2> /dev/null
- waited=0
- while [ -n "$(listener)" ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
- pid=$(listener) && kill -9 "$pid" 2> /dev/null
+ pid=$(listener) && end_process "$pid"
  rm -f "$runtime/supervisor.pid"
  return 0
 }
 start() {
  [ -z "$(supervisor)" ] || { echo 'Shell service is already running.'; return 0; }
  [ -f "$bundle/titan-sshd" ] && [ -x "$bundle/titan-sshd" ] || { note 'Shell service binary is missing.'; return 1; }
+ # One start at a time: the boot watchdog can meet a boot start that is still
+ # waiting for the volume.
+ take_lock 2 || { echo 'Shell service is already starting.'; return 0; }
+ trap 'rm -rf "$lock"' EXIT
+ trap 'exit 1' HUP INT TERM
+ [ -z "$(supervisor)" ] || { echo 'Shell service is already running.'; return 0; }
+ # The supervisor keeps trying to mount it and then restarts the listener.
  mount_state || note 'Starting without persistent state: temporary host key, installed keys only.'
  if [ ! -e "$runtime" ]; then mkdir "$runtime" || return 1; fi
  [ -d "$runtime" ] && [ ! -L "$runtime" ] || { note "$runtime is not a directory."; return 1; }
@@ -111,6 +158,11 @@ start() {
 
 case "${1:-}" in
  boot|start) [ "$#" = 1 ] || exit 64; start;;
+ ensure)
+  [ "$#" = 1 ] || exit 64
+  # An operator stop stays stopped.
+  [ -e "$runtime/stopped" ] || [ -n "$(supervisor)" ] || start
+  exit 0;;
  stop) [ "$#" = 1 ] || exit 64; stop;;
  restart) [ "$#" = 1 ] || exit 64; stop; start;;
  mount) [ "$#" = 1 ] || exit 64; mount_state;;
@@ -139,12 +191,41 @@ case "${1:-}" in
   [ -z "${TITAN_SSH_PORT:-}" ] || export TITAN_SSH_PORT
   [ -z "${TITAN_SSH_DENY_INTERFACES:-}" ] || export TITAN_SSH_DENY_INTERFACES
   echo $$ > "$runtime/supervisor.pid"
+  # One listener only: stop one that a killed supervisor left running.
+  if pid=$(listener); then
+   note 'Stopping a listener left without its supervisor.'
+   end_process "$pid"
+  fi
+  backoff=5
+  clock; retry=60; retry_at=$((now + retry))
   while [ ! -e "$runtime/stopped" ]; do
-   "$runtime/titan-sshd" listen > /dev/null 2>&1 < /dev/null
+   with_volume=0; ! mounted || with_volume=1
+   "$runtime/titan-sshd" listen > /dev/null 2>&1 < /dev/null &
+   pid=$!
+   clock; started=$now
+   planned=0
+   # Every 10 s. A listener started without the volume has a temporary host
+   # key: once the volume is mounted it starts again with the persistent one.
+   while sleep 10; ! exited "$pid"; do
+    clock
+    retry_mount
+    if [ "$with_volume" = 0 ] && mounted; then
+     note 'Persistent volume mounted; restarting the listener with the persistent host key.'
+     end_process "$pid"
+     planned=1
+     break
+    fi
+   done
+   wait "$pid"
    result=$?
    [ ! -e "$runtime/stopped" ] || break
-   note "Listener exited with status $result; starting it again."
-   sleep 5
+   [ "$planned" = 0 ] || continue
+   # Quick exits back off from 5 s to 5 min; a run of a minute or more resets.
+   clock
+   [ $((now - started)) -lt 60 ] || backoff=5
+   note "Listener exited with status $result after $((now - started)) s; starting it again in $backoff s."
+   sleep "$backoff"
+   backoff=$((backoff * 2)); [ "$backoff" -le 300 ] || backoff=300
   done;;
- *) echo 'Usage: titan-sshd boot|start|stop|restart|status|mount' >&2; exit 64;;
+ *) echo 'Usage: titan-sshd boot|start|ensure|stop|restart|status|mount' >&2; exit 64;;
 esac

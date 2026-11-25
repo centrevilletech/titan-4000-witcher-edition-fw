@@ -6,12 +6,26 @@ set -eu
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 case "${1:-}" in all|80|8081) ;; *) exit 64;; esac
 lock=/tmp/witcher-management-access.lock
-waited=0
-until mkdir "$lock" 2>/dev/null; do
- [ "$waited" -lt 10 ] || exit 75
- sleep 1; waited=$((waited+1))
-done
-trap 'rmdir "$lock"' EXIT
+# mkdir is atomic and the holder writes its PID at once. A lock with no live
+# owner at two checks a second apart was left by a killed holder: take it over.
+take_lock() {
+ waited=0 stale=0 seen=
+ until mkdir "$lock" 2>/dev/null; do
+  owner=$(cat "$lock/pid" 2>/dev/null) || owner=0
+  case "$owner" in ''|*[!0-9]*) owner=0;; esac
+  if [ "$owner" -gt 1 ] && kill -0 "$owner" 2>/dev/null; then stale=0
+  elif [ "$owner" = "$seen" ]; then stale=$((stale+1))
+  else stale=1
+  fi
+  seen=$owner
+  if [ "$stale" -ge 2 ]; then rm -rf "$lock" || :; stale=0; continue; fi
+  [ "$waited" -lt "$1" ] || return 1
+  sleep 1; waited=$((waited+1))
+ done
+ echo $$ > "$lock/pid"
+}
+take_lock 10 || exit 75
+trap 'rm -rf "$lock"' EXIT
 trap 'exit 1' HUP INT TERM
 iptables=/bin/iptables
 restore=/bin/iptables-restore

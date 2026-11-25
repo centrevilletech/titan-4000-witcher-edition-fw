@@ -42,6 +42,31 @@ empty:
 Every writer opens these files for append, so emptying one in place is safe
 while its process runs.
 
+## Services that stop, and a late volume
+
+Nothing here gives up for the rest of the boot:
+
+- **Restarts.** The shell and keeper supervisors check their process every
+  10 s. One that exits starts again after 5 s. While each run lasts less than
+  a minute the wait doubles, up to 5 min; a longer run resets it to 5 s.
+- **A hung keeper.** The keeper rewrites `/tmp/titan-pd-keeper/alive` at least
+  every 10 s. When that file has not changed for 180 s, the supervisor kills
+  the keeper and starts it again.
+- **A supervisor that dies.** The minute check in `witcher-boot` also runs
+  `titan-sshd ensure` and `titan-pd-keeper ensure`, which start a supervisor
+  that died. A service an operator stopped stays stopped. The management loop
+  and the recovery loop each start the other again if it dies, and the
+  recovery page restarts with the same backoff.
+- **A late Witcher volume.** The keeper's state is on the volume once it is
+  mounted, and in `/tmp` before. While it is missing, the two supervisors and
+  the web service try to mount it again after 60 s, doubling to 30 min. Once
+  it mounts, the keeper starts again so its start-up checks see it, the shell
+  listener starts again with its persistent host key (open sessions stay
+  connected), and the native web interface replaces the factory one.
+- **Stale locks.** The volume mount, the management rules and each service
+  start take a lock that records its owner. A lock whose owner was killed is
+  taken over.
+
 ## A setting change and a reboot
 
 Saving the prefix delegation setting re-attaches LTE. A guard process puts the

@@ -34,27 +34,64 @@ cap_logs() {
   : > "$file"
  done
 }
+# Whole seconds since boot in $now; the wall clock is not set early in boot.
+clock() { read -r now _ < /proc/uptime; now=${now%%.*}; }
+running() {
+ owner=$(cat "$1" 2> /dev/null)
+ case "$owner" in ''|*[!0-9]*) return 1;; esac
+ kill -0 "$owner" 2> /dev/null
+}
 # An inherited pipe must never keep rcS waiting for these long-lived services.
+start_management() {
+ management_loop </dev/null >/dev/null 2>&1 &
+ echo $! > /tmp/witcher-management-loop.pid
+}
+start_recovery() {
+ recovery_loop </dev/null >/dev/null 2>&1 &
+ echo $! > /tmp/witcher-recovery-loop.pid
+}
 # Vendor startup and re-attachments can rebuild their tables. Keep management
 # available independently of panel startup, APN provisioning and saved flags.
-(
+# Once a minute this loop is also the watchdog: it starts a shell or keeper
+# supervisor that died (not one an operator stopped) and the recovery loop.
+management_loop() {
  tick=0
  while :; do
   /bin/sh /etc/init.d/witcher-management-access all >> /tmp/witcher-management.log 2>&1
   tick=$((tick + 1))
-  if [ "$tick" -ge 6 ]; then tick=0; cap_logs; fi
+  if [ "$tick" -ge 6 ]; then
+   tick=0
+   cap_logs
+   /bin/sh /etc/init.d/titan-sshd ensure >> /tmp/titan-sshd-boot.log 2>&1
+   /bin/sh /etc/init.d/titan-pd-keeper ensure >> /tmp/titan-pd-keeper-boot.log 2>&1
+   running /tmp/witcher-recovery-loop.pid || start_recovery
+  fi
   sleep 10
  done
-) </dev/null >/dev/null 2>&1 &
+}
+# The recovery listener starts again after 5 s, doubling to 5 min while it
+# keeps exiting within a minute. This loop restarts the management loop.
+recovery_loop() {
+ delay=5
+ while :; do
+  clock; started=$now
+  "$bundle/witcher-firstboot" recovery >> /tmp/witcher-recovery.log 2>&1 &
+  listener=$!
+  while sleep 10; kill -0 "$listener" 2> /dev/null; do
+   running /tmp/witcher-management-loop.pid || start_management
+  done
+  wait "$listener"
+  clock
+  [ $((now - started)) -lt 60 ] || delay=5
+  sleep "$delay"
+  delay=$((delay * 2)); [ "$delay" -le 300 ] || delay=300
+ done
+}
+start_management
 # This supervisor waits for kernel entropy if needed. It does not wait for TLS
 # generation or native web health; existing enrolled keys remain usable.
 /bin/sh /etc/init.d/titan-sshd boot </dev/null >> /tmp/titan-sshd-boot.log 2>&1 &
 # IPv4 repair and IPv6 delegation must survive a failed web/TLS startup.
 /bin/sh /etc/init.d/titan-pd-keeper start </dev/null >> /tmp/titan-pd-keeper-boot.log 2>&1 &
-(
- while :; do
-  "$bundle/witcher-firstboot" recovery >> /tmp/witcher-recovery.log 2>&1
-  sleep 5
- done
-) </dev/null >/dev/null 2>&1 &
+start_recovery
 /bin/sh /etc/init.d/titan-api boot </dev/null >> /tmp/titan-api-boot.log 2>&1
