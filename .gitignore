@@ -23,6 +23,7 @@ web/dist-device/
 web/test-results/
 
 userspace/target/
+device/modem-rust/*/target/
 
 # Local credentials and audit backups must never enter public source.
 .env
