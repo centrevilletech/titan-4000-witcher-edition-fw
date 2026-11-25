@@ -9,6 +9,7 @@ use titan_pd_model::ipv4;
 use crate::command::run_status;
 use crate::files::read_file;
 use crate::netdev::{interface_index, interface_mac};
+use crate::paths::env_or;
 
 use super::{BRIDGE, CUSTOMER, Keeper};
 use super::ipv4_repair::PEER_HOLD;
@@ -20,7 +21,7 @@ impl Keeper {
     /// own ARP request, sent out the bearer, puts the driver back. See
     /// `titan_pd_model::driver_mac`.
     pub(super) fn maintain_driver_mac(&mut self) {
-        let path = std::env::var("TITAN_SNMP6").unwrap_or_else(|_| "/proc/net/snmp6".into());
+        let path = env_or("TITAN_SNMP6", "/proc/net/snmp6");
         let count = driver_mac::forwarded(&read_file(&path));
         let peer = self
             .ipv4_peer

@@ -7,47 +7,32 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use titan_pd_model::config;
 use titan_pd_model::cpu_trims::{self, Config, LedPacer, LedState, LedStep, StatusView};
 use titan_sys::process::{self, Signal};
+
+use crate::paths::{env_path_or, volume_config};
 
 /// Seconds between log lines about the LED loop changing state.
 const LED_LOG_EVERY: u64 = 60;
 /// Seconds between status file rewrites while only the counters move.
 const STATUS_EVERY: u64 = 60;
 
-/// `cpu-trims/config` lives here, only while the volume is mounted.
-pub fn config_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("TITAN_CPU_TRIMS_DIR") {
-        return Some(PathBuf::from(path));
-    }
-    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/cpu-trims"))
-}
-
 pub fn status_path() -> PathBuf {
-    std::env::var_os("TITAN_CPU_TRIMS_STATUS").map_or_else(
-        || PathBuf::from("/var/run/witcher-cpu-trims.status"),
-        PathBuf::from,
-    )
+    env_path_or("TITAN_CPU_TRIMS_STATUS", "/var/run/witcher-cpu-trims.status")
 }
 
 fn proc_root() -> PathBuf {
-    std::env::var_os("TITAN_PROC_ROOT").map_or_else(|| PathBuf::from("/proc"), PathBuf::from)
+    env_path_or("TITAN_PROC_ROOT", "/proc")
 }
 
 fn button_mask() -> PathBuf {
-    std::env::var_os("TITAN_BUTTON_MASK")
-        .map_or_else(|| PathBuf::from(cpu_trims::BUTTON_MASK), PathBuf::from)
+    env_path_or("TITAN_BUTTON_MASK", cpu_trims::BUTTON_MASK)
 }
 
+/// `cpu-trims/config` on the volume, or the defaults.
 fn load_config() -> Config {
-    let Some(dir) = config_dir() else {
-        return Config::default();
-    };
-    let Ok(text) = fs::read_to_string(dir.join("config")) else {
-        return Config::default();
-    };
-    cpu_trims::parse_config(&text)
+    volume_config("TITAN_CPU_TRIMS_DIR", "cpu-trims")
+        .map_or_else(Config::default, |text| cpu_trims::parse_config(&text))
 }
 
 fn pids(root: &Path) -> Vec<i32> {

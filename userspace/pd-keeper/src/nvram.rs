@@ -16,7 +16,7 @@ const VENDOR_CACHE: &str = "/tmp/nvram.cfg";
 
 /// The vendor's RAM configuration cache.
 pub fn cache_path() -> PathBuf {
-    std::env::var_os("TITAN_NVRAM_CACHE").map_or_else(|| PathBuf::from("/tmp/nvram.cfg"), PathBuf::from)
+    crate::paths::env_path_or("TITAN_NVRAM_CACHE", VENDOR_CACHE)
 }
 
 /// Read one key from a NUL- or newline-delimited NVRAM cache snapshot,

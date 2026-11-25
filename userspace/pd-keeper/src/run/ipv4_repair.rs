@@ -12,7 +12,7 @@ use titan_pd_model::ipv4_health::{self, Action as Ipv4Action, Peer, Traffic};
 use titan_sys::ifaddrs::InterfaceAddrs;
 
 use crate::clock::unix_now;
-use crate::command::command_stdout;
+use crate::command::{command_stdout, ebtables_program};
 use crate::files::read_file;
 use crate::netdev::{carrier_up, interface_index, interface_mac, rx_packets};
 
@@ -385,7 +385,7 @@ fn bridge_probe_address(bearer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr
 }
 
 fn ebtables_list_forward() -> String {
-    let program = std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into());
+    let program = ebtables_program();
     command_stdout(&program, &["-L", "FORWARD"])
 }
 
@@ -421,7 +421,7 @@ fn flood_rules_present(listing: &str, bearer: &str) -> bool {
 }
 
 fn ebtables(args: &str) -> Result<(), String> {
-    let program = std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into());
+    let program = ebtables_program();
     let output = Command::new(program)
         .args(args.split_whitespace())
         .output()

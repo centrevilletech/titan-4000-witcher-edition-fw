@@ -10,7 +10,7 @@ use titan_pd_model::mgmt;
 
 use crate::{log, nvram};
 use crate::files::read_file;
-use crate::paths::state_dir;
+use crate::paths::{env_or, state_dir};
 
 use super::Keeper;
 
@@ -194,7 +194,7 @@ impl Keeper {
 }
 
 fn reboot_program() -> String {
-    std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
+    env_or("TITAN_REBOOT", "reboot")
 }
 
 /// One ping to each target, collected on later ticks.
@@ -204,7 +204,7 @@ pub(super) fn spawn_pings(targets: &[std::net::IpAddr]) -> Vec<std::process::Chi
         .filter_map(|target| {
             let program = if target.is_ipv6() { "ping6" } else { "ping" };
             let address = target.to_string();
-            Command::new(std::env::var("TITAN_PING").unwrap_or_else(|_| program.into()))
+            Command::new(env_or("TITAN_PING", program))
                 .args(["-c", "1", "-W", "4", address.as_str()])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())

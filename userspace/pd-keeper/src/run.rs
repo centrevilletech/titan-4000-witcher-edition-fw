@@ -56,7 +56,7 @@ use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, tk_flags_io};
 use crate::clock::{monotonic, unix_now};
 use crate::command::command_stdout;
 use crate::files::read_file;
-use crate::paths::state_dir;
+use crate::paths::{env_or, env_path_or, state_dir};
 
 use self::carrier::CarrierWatch;
 use self::clamp::QctrlWatch;
@@ -252,7 +252,7 @@ pub fn serve() -> Result<(), String> {
 }
 
 pub fn tc_apply(lines: &[String]) -> Result<(), String> {
-    let program = std::env::var("TITAN_TC").unwrap_or_else(|_| "tc".into());
+    let program = env_or("TITAN_TC", "tc");
     for line in lines {
         let output = Command::new(&program)
             .args(line.split_whitespace())
@@ -304,10 +304,7 @@ impl Keeper {
             ipv6_router: None,
             eth0_down_since: None,
             ipv4_conf_good: None,
-            rcinit_log: FileTail::new(
-                std::env::var_os("TITAN_RCINIT_LOG")
-                    .map_or_else(|| PathBuf::from("/tmp/rcinit.log"), PathBuf::from),
-            ),
+            rcinit_log: FileTail::new(env_path_or("TITAN_RCINIT_LOG", "/tmp/rcinit.log")),
             rcinit_read_at: None,
             last_action: String::new(),
             last_action_at: 0,

@@ -1,6 +1,7 @@
 //! Where the keeper keeps its files.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use titan_pd_model::config;
@@ -13,8 +14,7 @@ pub fn state_dir() -> PathBuf {
 
 /// The keeper's RAM directory (`/tmp` is RAM on the Titan). Hot files live here.
 pub fn runtime_dir() -> PathBuf {
-    env::var_os("TITAN_PD_RUNTIME")
-        .map_or_else(|| PathBuf::from("/tmp/titan-pd-keeper"), PathBuf::from)
+    env_path_or("TITAN_PD_RUNTIME", "/tmp/titan-pd-keeper")
 }
 
 /// `/mnt/titan-api/<name>` while the persistent volume is mounted, or the
@@ -29,4 +29,15 @@ pub fn volume_dir(env: &str, name: &str) -> Option<PathBuf> {
 /// The variable `env` (set by tests), else `default`.
 pub fn env_or(env: &str, default: &str) -> String {
     env::var(env).unwrap_or_else(|_| default.to_owned())
+}
+
+/// The path the variable `env` names (tests), else `default`.
+pub fn env_path_or(env: &str, default: &str) -> PathBuf {
+    env::var_os(env).map_or_else(|| PathBuf::from(default), PathBuf::from)
+}
+
+/// The text of `config` in a volume directory (see `volume_dir`), when the
+/// volume is mounted and the file can be read.
+pub fn volume_config(env: &str, name: &str) -> Option<String> {
+    fs::read_to_string(volume_dir(env, name)?.join("config")).ok()
 }

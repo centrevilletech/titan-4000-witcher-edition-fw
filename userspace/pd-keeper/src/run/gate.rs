@@ -5,6 +5,9 @@ use std::process::Command;
 
 use titan_pd_model::cbrs_gate::{self, Step as GateStep, Tool as GateTool};
 
+use crate::command::ebtables_program;
+use crate::paths::env_or;
+
 use super::Keeper;
 
 impl Keeper {
@@ -54,10 +57,10 @@ impl Keeper {
 fn gate_command(tool: GateTool, args: &[&str]) -> Result<String, String> {
     let program = match tool {
         GateTool::Ebtables => {
-            std::env::var("TITAN_EBTABLES").unwrap_or_else(|_| "/usr/bin/ebtables".into())
+            ebtables_program()
         }
         GateTool::Ip6tables => {
-            std::env::var("TITAN_IP6TABLES").unwrap_or_else(|_| "ip6tables".into())
+            env_or("TITAN_IP6TABLES", "ip6tables")
         }
     };
     let output = Command::new(program)

@@ -27,6 +27,11 @@ pub fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// `ebtables` (`TITAN_EBTABLES` in tests).
+pub fn ebtables_program() -> String {
+    crate::paths::env_or("TITAN_EBTABLES", "/usr/bin/ebtables")
+}
+
 /// What `program` printed, when it exited 0.
 pub fn stdout_if_success(program: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(program).args(args).output().ok()?;
