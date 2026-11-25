@@ -1,6 +1,7 @@
 //! The gate every reboot the keeper starts goes through (v1.0.17): the boot
 //! confirm's comparison with stock firmware, the verdict's way back onto the
-//! image, and the deaf watchdog's.
+//! image, the deaf watchdog's, and the radio profile guard's last resort when
+//! a stock restore keeps failing (`run/radio_reboot.rs`).
 //!
 //! - None while the SAS CPAS window is open, and none with the clock unset on
 //!   a unit that may hold a grant: one that heard an answer through the core
@@ -37,13 +38,15 @@ pub(super) enum Kind {
     Back,
     /// The deaf watchdog's.
     Deaf,
+    /// The radio profile guard's, when stock settings will not go back.
+    Radio,
 }
 
 impl Kind {
     fn slots(self) -> usize {
         match self {
             Kind::Back => reboots::SLOTS_BACK,
-            Kind::Away | Kind::Deaf => reboots::SLOTS_AWAY,
+            Kind::Away | Kind::Deaf | Kind::Radio => reboots::SLOTS_AWAY,
         }
     }
 
@@ -52,6 +55,7 @@ impl Kind {
             Kind::Away => "away",
             Kind::Back => "back",
             Kind::Deaf => "deaf",
+            Kind::Radio => "radio",
         }
     }
 }

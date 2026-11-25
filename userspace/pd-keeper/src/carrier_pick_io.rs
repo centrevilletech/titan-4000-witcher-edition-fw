@@ -44,7 +44,7 @@ pub fn granted() -> bool {
     if nvram::read_value("cbrs_mode_grant") != "1" || nvram::read_value("cbrs_grant_state") != "2" {
         return false;
     }
-    let log = fs::read("/mnt/cbrslog0.txt").unwrap_or_default();
+    let log = fs::read(crate::carrier_watch_io::cbrslog_path()).unwrap_or_default();
     let grants = pick::grants(&String::from_utf8_lossy(&log));
     let bw = nvram::read_value("sqns_radio_bandwidthDl").parse().unwrap_or(20_000);
     pick::covered(cell.earfcn, pick::ul_scc(&nvram::read_value("sqns_connection_uplinkScc")), bw, &grants)

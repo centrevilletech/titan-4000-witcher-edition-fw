@@ -13,8 +13,9 @@
 //! feature flags, building that image on the unit and its default build at
 //! boot and whether its rollbacks were the image's or the network's, the
 //! download clamp module, the passthrough bridge fast path, the
-//! off switches for those latency features, the carrier picker, the opt-in
-//! CPU trims, and the sign-in limits of the web service and recovery page.
+//! off switches for those latency features, the carrier picker, the radio
+//! profile guard's trial, strike and retry rules, the opt-in CPU trims, and
+//! the sign-in limits of the web service and recovery page.
 #![forbid(unsafe_code)]
 
 pub mod carrier_pick;
@@ -56,3 +57,4 @@ pub mod wear;
 pub use config::{Config, Report, load_config, shown_choice, store_config};
 pub use prefix::Block;
 pub mod radio;
+pub mod radio_guard;

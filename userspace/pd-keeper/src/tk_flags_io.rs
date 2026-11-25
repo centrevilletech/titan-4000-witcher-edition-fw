@@ -8,7 +8,6 @@
 //! counters (`tk_flags::STATUS`) writes them to `/var/run/witcher-tk.<layer>`.
 use std::fs;
 use std::io::{Read, Write as _};
-use std::path::Path;
 use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -21,14 +20,8 @@ use titan_pd_model::tk_flags::{self, Console, MagicGroup, Outcome, Plan};
 const OUTPUT_CAP: usize = 1 << 20;
 /// A whole session takes about 30 s. Past this the session stops sending.
 const SESSION_LIMIT: Duration = Duration::from_secs(90);
-/// Set by the radio profile while its own DM session may be open.
-const RADIO_CONSOLE: &str = "/tmp/titan-pd-keeper/radio-console-open";
 /// A console session's name among the children set aside (`command::stop`).
 const STUCK_NAME: &str = "lted_cli";
-
-fn cli_path() -> String {
-    crate::paths::env_or("TITAN_LTED_CLI", "/usr/lte/lted_cli")
-}
 
 /// `/var/run/witcher-tk.m1` for M1; `TITAN_TK_M1` overrides it.
 fn layer_status_path(group: MagicGroup) -> String {
@@ -85,17 +78,19 @@ impl Console for Cli {
 }
 
 /// Run one session to the end. Never panics; a console that cannot start is
-/// no reply.
+/// no reply. The session holds the modem console from start to end
+/// (`console_lock`), and never waits for it: while a radio worker holds it,
+/// the session is `Busy`, which spends no attempt.
 pub fn run(plan: &Plan) -> (Outcome, bool) {
-    if Path::new(RADIO_CONSOLE).exists() {
+    let Some(_console) = crate::console_lock::try_hold() else {
         return (Outcome::Busy, false);
-    }
+    };
     // An earlier console that never exited (stuck in the kernel): no reply,
     // so the writer looks again later without piling up consoles.
     if crate::command::still_stuck(STUCK_NAME) {
         return (Outcome::NoReply, false);
     }
-    let spawned = crate::radio_modem::spawn_console(&cli_path());
+    let spawned = crate::radio_modem::spawn_console(&crate::radio_modem::cli_path());
     let Ok(mut child) = spawned else {
         return (Outcome::NoReply, false);
     };

@@ -35,10 +35,11 @@ keeper=/tmp/titan-pd-keeper/titan-pd-keeper
 printf '%s\n' '{"version":1,"actions":[]}' | "$keeper" radio-profile set
 ```
 
-Saving the empty action list restores stock. Wait for `off` before rearming
-a locked profile. A replacement nonempty list reconciles changed and removed
-actions together. A missing setting means off. A missing persistent mount
-prevents activation.
+Saving the empty action list restores stock. Saving a profile, even the same
+one again, clears its strikes and its wait, so it is tried at once: that is
+how to clear a locked profile. A replacement nonempty list reconciles changed
+and removed actions together. A missing setting means off. A persistent volume
+that mounts late delays activation until it mounts.
 
 | Action kind | Fields | Setting |
 | --- | --- | --- |
@@ -92,6 +93,12 @@ when all of this holds:
   re-attach, or since boot.
 - `cbrs_mode_grant` is 1 and `cbrs_grant_state` is 2, read right before the
   cycle. No re-attach while a grant request is pending or the grant is gone.
+- The clock is set and the time is outside 06:30 to 10:30 UTC: the SAS CPAS
+  window every keeper reboot waits out (06:45 to 10:15) with 15 minutes on
+  each side, so the grants a carrier change gives back can come again before
+  it opens. Up to v1.0.16 enforcement had no time-of-day check at all.
+- Fewer than 8 radio cycles (enforcement and picker together) ran in the last
+  24 hours, counted in `/mnt/titan-api/radio/cycles` and kept across reboots.
 
 Each cycle is counted before it starts and logged in `keeper.log` before and
 after. With a `nudge`, the PCell lock is set while the radio is off and
@@ -168,23 +175,38 @@ line per visit and one per survey.
 
 A radio cycle starts only when all of these hold, read fresh each time:
 
-- The time is outside 06:30 to 10:30 UTC, which is CPAS with 30 minutes on
-  each side. No new SAS grants are issued in that window, and a carrier change
-  gives back every grant.
+- The clock is set and the time is outside 06:30 to 10:30 UTC: the SAS CPAS
+  window every keeper reboot waits out (06:45 to 10:15, `tk_boot::CPAS_QUIET`)
+  with 15 minutes on each side. No new SAS grants are issued in that window,
+  and a carrier change gives back every grant.
 - The time is inside `window_utc`. An operator request through `survey` lifts
   this one rule.
 - The unit is attached and holds its SAS grant (`cbrs_mode_grant` 1,
   `cbrs_grant_state` 2).
 - The customer bearer has carried under 2 Mbps each way for 2 minutes.
-- No keeper recovery is pending.
+- No keeper recovery is pending: an IP family change in its first 10 minutes,
+  or a deaf-watchdog restart in the first hour after boot.
+- Fewer than 8 radio cycles ran in the last 24 hours, with one kept free for
+  a way back (below).
 
 A survey runs at most once per `survey_hours`. One that is still unfinished
 after 6 hours is dropped. When no covering grant arrives within 10 minutes of
-a visit, the survey stops and the unit stays where it is. If the unit leaves
-the held arm (a reboot, the tower), the picker returns to the arm with one
-cycle, at most every 6 hours, outside the survey window too. A failed cycle
-reverts the profile like a failed enforcement. Removing the action restores
-the stock cap and clears any lock, without a radio cycle.
+a visit, the survey stops and the picker goes straight back to where the unit
+was before the visit, which held its grants then: that arm, or that primary
+cell with the stock cap. That way back has no grant to protect, so it waits
+for no grant and not for the customer, and only for the keeper's own reboot
+window (06:45 to 10:15 UTC, without the 15-minute margin), the clock and the
+daily cap. A visit starts before 06:30 and its grant wait ends before 06:45,
+so the way back is not held for hours. It is skipped when grants cover the
+unit where it is by then. Up to v1.0.16 the unit stayed on the ungranted arm,
+and the grant check kept it from ever coming back. If the unit leaves the held
+arm (a reboot, the tower), the picker returns to the arm with one cycle, at
+most every 6 hours, outside the survey window too. A cycle that does not attach within 90 s is
+not a failure: the nudge is cleared and the radio is on, so the unit attaches
+where the tower lets it, and the grant wait and the way back take it from
+there. A cycle whose nudge does not clear reverts the profile like a failed
+enforcement. Removing the action restores the stock cap and clears any lock,
+without a radio cycle.
 
 Every visit costs the customer one re-attach, 30 to 60 s, plus the wait for
 grants, which took 15 s on the bench at 19:00 UTC. That is why visits wait for
@@ -207,29 +229,81 @@ record. To survey now, outside the window:
 After the Witcher volume mounts, a separate keeper guard waits for lted,
 lteatcm, ucid, the HCI socket, and the band's board identity and media state.
 It checks the baseline before taking ownership. The worker uses interactive
-lted_cli stdin and restores `arm1log 1` after each console session. Bench
-operators sharing a console should expect that every 30 s.
+lted_cli stdin and restores `arm1log 1` after each console session.
 
-The guard records a strike on the persistent volume before the trial and a
-rollback journal in RAM before writes. Its 180-second deadline covers the
-worker and its children. Confirmation requires setting read-backs, attached
-media, a management bearer address and successful bound pings over a
-30-second settle period. A SAS grant loss neither blocks confirmation nor
-reverts a profile, because the profile does not cycle the radio; the
-enforcement gate handles grants. While attached, a confirmed profile keeps
-checking management reachability and RRC reconfiguration-failure deltas. A
-detached unit is not judged until it attaches again. Two failures
-in one sample or single increases observed within a minute trigger rollback.
-A decreasing or unreadable counter also fails the check.
+**One console owner.** Every modem console session holds
+`/tmp/titan-pd-keeper/console.lock` (`flock`) for its whole length: each radio
+worker from start to end, so nothing slips between a cycle's steps, and each
+session of the modem flag writer. The flag writer never waits: a held console
+makes its session `Busy`, which costs it nothing. A radio check waits up to
+15 s and a radio change up to 100 s, longer than a whole flag session; past
+that the guard skips the step and judges nothing. The kernel drops the lock
+when its holder exits or dies. Up to v1.0.16 only the flag writer looked (for
+a marker file), and on the bench the two cut each other's replies short:
+once a flag session reverted a profile, once the radio checks made the flag
+writer give up.
+
+These rules (v1.0.17, `titan_pd_model::radio_guard`) make sure that no
+transient condition keeps a profile off once it clears:
+
+- **A trial needs a working stock baseline.** A trial starts only once the
+  unit is attached, its management probe answers, the LTE stack is up and no
+  keeper recovery is pending. A tower or core outage, a boot inside the CPAS
+  window, a slow SAS grant or a busy console is "not tried": nothing is
+  written or counted, and the guard looks again 30 s later. Up to v1.0.16 a
+  tower outage at boot cost a strike.
+- **Confirmation** requires setting read-backs, attached media, a management
+  bearer address and successful bound pings over a 30-second settle period
+  within 90 s. A SAS grant loss neither blocks confirmation nor reverts a
+  profile, because the profile does not cycle the radio; the enforcement gate
+  handles grants.
+- **A running profile** is checked every 30 s, and 20 s after each attach. It
+  is rolled back for management only after 5 minutes of failed checks while
+  attached, as the deaf watchdog waits. A lost ping, a core blip, a probe that
+  drops ICMP for a while, a detach or a busy console changes nothing. Up to
+  v1.0.16 two pings 3 s apart, about 7 s of loss, reverted it for the rest of
+  the boot. RRC reconfiguration failures still roll it back at once: two in
+  one sample, or single increases within a minute. A counter that goes down
+  (the modem restarted) or a lost baseline gets a fresh baseline, and a check
+  the console returns no counter for is skipped. Neither is a failure.
+- **Only a comparison with stock counts against a profile.** After a
+  management failure the guard puts stock settings back and runs the same
+  30-in-90 s test on them. Management answering on stock is a strike. When
+  stock does not answer either, the network failed and nothing is counted.
+  Other failures (a setting that does not read back, RRC trouble, the SQM
+  tools) are rolled back but never counted.
+- **Nothing gives up.** After any rollback the profile is tried again after 5
+  minutes, doubling to an hour, forever. Three strikes with no confirmed
+  trial between them lock the profile (status `locked`). The lock clears
+  itself on a new firmware or a changed profile, and saving the profile again
+  clears it too. Strikes live in `/mnt/titan-api/radio/strikes`, stamped with
+  the profile and the firmware they were counted under. A record written
+  before v1.0.17, or a damaged one, reads as none.
+- **Power cuts only delay.** A trial is counted on flash before its first
+  write and cleared once it is judged. A trial that a power cut, a crash or a
+  restarted guard cut short stays counted, and the next boot waits 5 minutes
+  of uptime for each such trial, doubling to an hour, before it tries again.
+  Flapping power never locks a profile. A profile that crashed the unit would
+  run at most once an hour.
+- **A restarted guard** keeps a profile it had confirmed and checks it as
+  usual. Anything cut short in the middle (an apply, a radio cycle, a restore)
+  goes back to stock and is tried again after a backoff.
 
 Rollback writes the stock values (`AT%GCACTRL=3,4`, which applies at the next
 attach), removes SQM, and never cycles the radio. After an interrupted
 enforcement re-attach it turns the radio back on and clears the nudge. A
-failed trial stays blocked for the rest of the boot. A cold boot clears the
-RAM changes and retries the saved profile up to three consecutive
-unsuccessful trials. Confirmation clears strikes. If in-place rollback fails,
-the guard persists Off before requesting a restart. Status and counters live
-in RAM. The keeper's ordinary packet loop runs independently of modem I/O.
+restore that does not confirm is tried again after 30 s, doubling to 10
+minutes. After 10 minutes of failed restores the guard asks the keeper for a
+restart, which clears modem RAM and the qdiscs. The restart goes through the
+keeper's reboot gate: never inside 06:45 to 10:15 UTC, never with the clock
+unset, at most within the daily reboot cap, and cancelled if a restore works
+first. The saved profile is never touched. Up to v1.0.16 one failed restore
+overwrote it with an empty profile and rebooted at once, at any hour.
+
+Status (`radio-profile status`) shows the phase and its reason, the strikes
+and the unjudged trials counted for the saved profile, and the counters.
+Status, counters and the retry schedule live in RAM. The keeper's ordinary
+packet loop runs independently of modem I/O.
 
 ## Smart queue management
 
@@ -291,7 +365,11 @@ The download clamp, on by default since v1.0.17, stands aside (mode 0) while
    the nudge clear. Test a stuck CLI, failed attach, unreachable probe and a
    counter reset. Verify the radio comes back on, the lock is cleared, stock
    values return, processes are cleaned up and the failure detail is recorded.
-7. Power-cycle three times during unconfirmed trials. On boot four verify zero
-   profile writes, stock attach and a locked status. Save Off, wait for off,
-   then confirm a fresh trial. Exercise rollback failure and check that the
-   subsequent boot leaves the profile disabled.
+7. Power-cycle three times during unconfirmed trials. On boot four verify
+   that the trial waits 20 minutes of uptime (`unjudged_trials` 3 in status),
+   then runs and confirms, and that no lock is set. Boot with the tower down:
+   status says `not tried`, nothing is counted, and the profile applies within
+   30 s of the attach. Exercise a rollback failure (a console that refuses
+   `AT%GCACTRL`): the restore is retried, `keeper.log` shows the restart
+   request and, inside 06:45 to 10:15 UTC, that the restart waits, and the
+   saved profile is unchanged after the restart.

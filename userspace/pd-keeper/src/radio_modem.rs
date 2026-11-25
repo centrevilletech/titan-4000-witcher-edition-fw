@@ -1,5 +1,7 @@
 //! The CLI needs a live stdin while responses arrive. Drain asynchronous modem
 //! text concurrently and bound the capture even when diagnostic logging is busy.
+//! Every session holds the console (`console_lock`); a radio worker holds it
+//! for its whole run, so its own sessions nest.
 use std::{
     io::{self, Read, Write},
     process::{Child, Command, Stdio},
@@ -18,13 +20,21 @@ pub fn spawn_console(program: &str) -> io::Result<Child> {
         .spawn()
 }
 
+/// The vendor's modem console (`TITAN_LTED_CLI` in tests).
+pub fn cli_path() -> String {
+    crate::paths::env_or("TITAN_LTED_CLI", "/usr/lte/lted_cli")
+}
+
 pub fn console(cmd: &str) -> io::Result<String> {
+    let _console = crate::console_lock::hold(crate::console_lock::RADIO_WAIT)?;
     let dm = !cmd.starts_with("AT") && cmd != "arm1log 1";
-    let marker = "/tmp/titan-pd-keeper/radio-console-open";
+    // A hint for bench tools, and how a later restore knows a DM query was
+    // cut short with the console still logging.
+    let marker = std::path::Path::new(crate::radio::RAM).join("radio-console-open");
     if dm {
-        std::fs::write(marker, b"1")?;
+        std::fs::write(&marker, b"1")?;
     }
-    let mut child = spawn_console("/usr/lte/lted_cli")?;
+    let mut child = spawn_console(&cli_path())?;
     let mut out = child.stdout.take().unwrap();
     let capture = thread::spawn(move || -> io::Result<Vec<u8>> {
         let mut buf = [0; 4096];
@@ -85,7 +95,7 @@ pub fn console(cmd: &str) -> io::Result<String> {
         return Err(io::Error::other("console did not close cleanly"));
     }
     if dm || cmd == "arm1log 1" {
-        let _ = std::fs::remove_file(marker);
+        let _ = std::fs::remove_file(&marker);
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }

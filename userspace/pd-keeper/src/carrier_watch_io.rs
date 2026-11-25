@@ -3,17 +3,19 @@
 //! Reads `/mnt/cbrslog0.txt` incrementally (never re-reading megabytes per
 //! tick, handling log rotation and partial last lines), loads
 //! `/mnt/titan-api/carrier-watch/config`, writes `/var/run/witcher-carrier.status`,
-//! and runs the vendor handover re-grant trigger (`sqns_network_cbrs=1` +
-//! `SIGUSR1` to `rcinit`) only when policy permits.
+//! keeps the re-grant rate limits in `carrier-watch/regrants`, and runs the
+//! vendor handover re-grant trigger (`sqns_network_cbrs=1` + `SIGUSR1` to
+//! `rcinit`) only when policy permits.
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use titan_pd_model::carrier_watch::{self, Config, LogParser};
+use titan_pd_model::carrier_watch::{self, Config, LogParser, Memory};
 
-use crate::paths::{env_path_or, volume_config};
+use crate::files::{read_file, write_durably};
+use crate::paths::{env_path_or, volume_config, volume_dir};
 
 /// Maximum bytes read on the very first open of `/mnt/cbrslog0.txt`.
 /// The vendor rotates at about 128 KB, so this reads a full live file once at
@@ -36,6 +38,28 @@ pub fn status_path() -> PathBuf {
 pub fn load_config() -> Config {
     volume_config("TITAN_CARRIER_DIR", "carrier-watch")
         .map_or_else(Config::default, |text| carrier_watch::parse_config(&text))
+}
+
+/// `carrier-watch/regrants`: the re-grant rate limits (`carrier_watch::Memory`).
+fn memory_path() -> Option<PathBuf> {
+    volume_dir("TITAN_CARRIER_DIR", "carrier-watch").map(|dir| dir.join("regrants"))
+}
+
+/// The rate limits an earlier keeper or boot kept; none without the volume.
+pub fn load_memory() -> Memory {
+    memory_path().map_or_else(Memory::default, |path| Memory::parse(&read_file(path)))
+}
+
+/// Keep the rate limits durably, so flapping power or a crash-looping keeper
+/// cannot reset them. Without the volume or the directory they stay in RAM,
+/// as before v1.0.17.
+pub fn store_memory(memory: &Memory) {
+    let Some(path) = memory_path() else {
+        return;
+    };
+    if path.parent().is_some_and(Path::is_dir) {
+        let _ = write_durably(&path, &path.with_extension("tmp"), memory.render().as_bytes());
+    }
 }
 
 /// Trigger the proven vendor re-grant sequence: `nvram_set 0 sqns_network_cbrs 1`

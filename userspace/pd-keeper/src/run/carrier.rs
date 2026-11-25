@@ -20,6 +20,9 @@ pub(super) struct CarrierWatch {
     config_at: Pace,
     refused_logged: Vec<String>,
     status: StatusFile,
+    /// The rate limits as last kept on flash, once taken over (that needs a
+    /// sane clock).
+    memory: Option<carrier_watch::Memory>,
 }
 
 impl CarrierWatch {
@@ -31,6 +34,7 @@ impl CarrierWatch {
             config_at: Pace::default(),
             refused_logged: Vec::new(),
             status: StatusFile::default(),
+            memory: None,
         }
     }
 }
@@ -44,7 +48,9 @@ impl Keeper {
             return;
         }
         if self.carrier_watch.config_at.ready(self.now, carrier_watch::CONFIG_EVERY) {
-            let cfg = carrier_watch_io::load_config();
+            let mut cfg = carrier_watch_io::load_config();
+            // The one CPAS window every keeper reboot and radio cycle waits out.
+            cfg.cpas_utc = super::reboot::cpas_window();
             if cfg.refused != self.carrier_watch.refused_logged {
                 for line in &cfg.refused {
                     self.note(&format!(
@@ -62,6 +68,12 @@ impl Keeper {
             self.carrier_watch.log_tail.poll();
         }
         let wall = unix_now();
+        // The day's re-grants and the backoff an earlier keeper or boot kept.
+        if self.carrier_watch.memory.is_none() && carrier_watch::clock_sane(wall) {
+            let saved = carrier_watch_io::load_memory();
+            self.carrier_watch.watch.remember(&saved, self.now, wall);
+            self.carrier_watch.memory = Some(saved);
+        }
         let grants = self
             .carrier_watch
             .log_tail
@@ -86,6 +98,13 @@ impl Keeper {
                     .watch
                     .regrant_dispatch_failed(self.now, &err);
                 self.note(&line);
+            }
+        }
+        if let Some(kept) = &self.carrier_watch.memory {
+            let memory = self.carrier_watch.watch.memory();
+            if &memory != kept {
+                carrier_watch_io::store_memory(&memory);
+                self.carrier_watch.memory = Some(memory);
             }
         }
         let now = self.now;

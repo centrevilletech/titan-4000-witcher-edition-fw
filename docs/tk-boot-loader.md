@@ -521,7 +521,9 @@ writes or 10-minute checks, put the keeper in hands-off mode in either way:
 While hands-off is active, the keeper opens no console sessions, runs no
 periodic checks, writes no modem words, and reports `state=hands-off` in
 `/var/run/witcher-tk.flags`. Removing the hold resumes management immediately
-with a fresh read of every configured word.
+with a fresh read of every configured word. For a short session by hand, a
+bench tool can instead hold the keeper's console lock around it, where the
+unit has `flock(1)`: `flock /tmp/titan-pd-keeper/console.lock lted_cli`.
 
 ### Retries and failure
 
@@ -533,7 +535,7 @@ with a fresh read of every configured word.
 | A read-back missing or wrong | Tries again after 20 s. After 3 failed sessions in a row, if any write went out since the last modem restart, it rolls every managed word back to its documented off value (`0x4000`/`0x6000` for N4 PDCP limits, `0` for N5 tunables, flags and hold; magic still required, disabling flags first) and reads them back. The off values are where it waits, not where it stops (`state=retrying`): it writes the wanted values again after 5 minutes, doubling to 1 hour for each round that fails again, forever. A rollback that does not read back is tried again after 15 s, doubling to 10 minutes. Once the words read back the backoff starts again at 5 minutes. Before v1.0.17 it stopped here until the next modem restart. |
 | Applied | A read-only check every 10 minutes. A word that reads back wrong is written again. Three checks with no reply start a write session, which resets the console. |
 | Modem restart | The kernel log shows `read from nand` or `read from fs` after the keeper started. It starts over 30 s later. A crash reload runs stock NAND firmware, which never shows the magic, so nothing is written then. |
-| Another console session | The radio profile's marker file is present: the keeper waits 20 s and counts no failure. A console that never exited (stuck in the kernel) is not waited for: no new one starts until it is gone, and the keeper looks again later. |
+| Another console session | A radio profile worker holds the modem console (`/tmp/titan-pd-keeper/console.lock`, `flock`): the session does not start, waits 20 s and counts no failure. Since v1.0.17 every console session holds that lock, so the two never cut each other's replies short. A console that never exited (stuck in the kernel) is not waited for: no new one starts until it is gone, and the keeper looks again later. |
 | Hands-off (`manage=off` or `/var/run/witcher-tk.hands-off`) | Stops all console sessions and checks; status says `state=hands-off`. Removing it resumes with a fresh read. |
 | `tk/config` changed | Read every 15 s. New values are written at once (or queued while hands-off). `enabled=0`, a deleted file, or dropped `wm=` lines roll those managed words back to their documented off values. |
 
