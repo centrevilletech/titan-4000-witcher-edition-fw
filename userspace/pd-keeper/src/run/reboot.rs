@@ -3,19 +3,26 @@
 //! image, and the deaf watchdog's.
 //!
 //! - None while the SAS CPAS window is open, and none with the clock unset on
-//!   a boot that heard an answer through the core
-//!   (`titan_pd_model::tk_boot::reboot_hold`).
+//!   a unit that may hold a grant: one that heard an answer through the core
+//!   this boot, or whose vendor cache shows a SAS grant held
+//!   (`titan_pd_model::tk_boot::reboot_hold`, `cbrs_gate::decide`).
 //! - At most `reboots::CAP` in a day (`titan_pd_model::reboots`), with the
 //!   last slot kept for a reboot back onto the image.
+//!
+//! The API other lanes use, kept stable: `Keeper::reboot_blocked(kind)`,
+//! `Keeper::keeper_reboot(kind)`, `Keeper::reboot_held()`,
+//! `Keeper::heard_through_core()`, and for code outside the keeper loop (a
+//! radio worker) `hold_now()` and the one shared window `cpas_window()`.
 
 use std::fs;
 use std::path::PathBuf;
 
 use titan_pd_model::carrier_watch::QuietWindow;
-use titan_pd_model::{reboots, tk_boot};
+use titan_pd_model::{cbrs_gate, reboots, tk_boot};
 
 use crate::clock::{monotonic, unix_now};
 use crate::files::{read_file, write_durably};
+use crate::nvram;
 use crate::paths::{runtime_dir, state_dir};
 
 use super::Keeper;
@@ -59,10 +66,6 @@ impl Keeper {
         }
     }
 
-    fn heard_since_boot(&self) -> bool {
-        self.heard_this_boot || heard_marker().exists()
-    }
-
     /// Why a reboot of `kind` must wait now, or `None` when it may go.
     pub(super) fn reboot_blocked(&mut self, kind: Kind) -> Option<String> {
         if let Some(why) = self.reboot_held() {
@@ -83,7 +86,10 @@ impl Keeper {
     /// The CPAS window and clock part of the gate only: for a reboot already
     /// counted against the cap, which an earlier keeper process asked for.
     pub(super) fn reboot_held(&self) -> Option<&'static str> {
-        tk_boot::reboot_hold(cpas_window(), unix_now(), self.heard_since_boot())
+        if self.heard_this_boot {
+            return tk_boot::reboot_hold(cpas_window(), unix_now(), true);
+        }
+        hold_now()
     }
 
     /// Count a reboot of `kind` and start it. The caller asked
@@ -102,9 +108,26 @@ impl Keeper {
 }
 
 /// The SAS CPAS window every keeper reboot waits out (`TITAN_TK_QUIET_UTC` in
-/// tests: `HH:MM-HH:MM`, or empty for none).
-pub(super) fn cpas_window() -> Option<QuietWindow> {
+/// tests: `HH:MM-HH:MM`, or empty for none). The one window for every
+/// reboot, re-attach and radio cycle the keeper starts.
+pub(crate) fn cpas_window() -> Option<QuietWindow> {
     tk_boot::quiet_window(std::env::var("TITAN_TK_QUIET_UTC").ok().as_deref())
+}
+
+/// `Keeper::reboot_held` from files alone, for code outside the keeper loop:
+/// why a reboot or radio cycle must wait for the window or the clock now.
+/// It does not count against the cap.
+pub(crate) fn hold_now() -> Option<&'static str> {
+    tk_boot::reboot_hold(cpas_window(), unix_now(), heard_marker().exists() || grant_held())
+}
+
+/// The vendor cache shows a SAS grant held (`cbrs_mode_grant=1`,
+/// `cbrs_grant_state=2`): with the clock unset, a reboot must not risk it.
+fn grant_held() -> bool {
+    matches!(
+        cbrs_gate::decide(std::fs::read(nvram::cache_path()).ok().as_deref()),
+        cbrs_gate::Gate::Open(_)
+    )
 }
 
 /// The reboot log as this boot can judge it (`reboots::settle`); it is

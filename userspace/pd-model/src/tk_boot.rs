@@ -50,6 +50,9 @@ pub const RECHECK_SECS: u64 = 86_400;
 /// The most one gap between probe rounds adds to a clock, so a keeper that
 /// was paused does not count the pause.
 const MAX_STEP: u64 = 60;
+/// Seconds the image must run without a modem crash before its crash count
+/// is history (`tk_verdict::Verdict::healthy`).
+pub const CRASH_CLEAR_SECS: u64 = 86_400;
 /// Staged boots without a confirm before the hook keeps stock firmware.
 pub const STRIKE_LIMIT: u32 = 2;
 /// Seconds between probe rounds while a confirm is pending.
@@ -84,19 +87,20 @@ pub fn quiet_window(text: Option<&str>) -> Option<QuietWindow> {
 /// reboot then can leave the unit without one for hours.
 ///
 /// - The clock is set: the window decides.
-/// - The clock is unset and something answered through the core this boot:
-///   the unit may hold a grant, so the reboot waits for the clock.
-/// - The clock is unset and nothing answered this boot: the unit has had no
-///   data path, so it holds no grant, and its clock cannot be set (the Titan
-///   has no battery clock and boots at 2013 until NTP sets it). Waiting
-///   would strand an image that breaks the data path, so it goes.
-pub fn reboot_hold(window: Option<QuietWindow>, wall: u64, heard_this_boot: bool) -> Option<&'static str> {
+/// - The clock is unset and the unit may hold a grant (`may_hold_grant`:
+///   something answered through the core this boot, or the vendor cache
+///   shows a grant held): the reboot waits for the clock.
+/// - The clock is unset and neither: the unit has had no data path and shows
+///   no grant, and its clock cannot be set (the Titan has no battery clock
+///   and boots at 2013 until NTP sets it). Waiting would strand an image that
+///   breaks the data path, so it goes.
+pub fn reboot_hold(window: Option<QuietWindow>, wall: u64, may_hold_grant: bool) -> Option<&'static str> {
     if wall >= CLOCK_SET_AFTER {
         window
             .is_some_and(|w| w.contains(wall))
             .then_some("the SAS CPAS window is open")
     } else {
-        heard_this_boot.then_some("the clock is not set yet")
+        may_hold_grant.then_some("the clock is not set yet")
     }
 }
 
@@ -407,6 +411,20 @@ impl Confirm {
         match self.searching_since {
             Some(since) if now.saturating_sub(since) >= self.timing.search => Action::Rollback(Why::Search),
             _ => Action::Hold,
+        }
+    }
+
+    /// A round skipped because the radio guard is cycling the radio on
+    /// purpose: no clock runs for the time since the last round, and a stock
+    /// watch's deadline moves on by as much.
+    pub fn pause(&mut self, now: u64) {
+        let step = self.last.map_or(0, |last| now.saturating_sub(last).min(MAX_STEP));
+        self.last = Some(now);
+        if let Mode::Stock { deadline } = &mut self.mode {
+            *deadline = deadline.saturating_add(step);
+        }
+        if let Some(since) = &mut self.searching_since {
+            *since = since.saturating_add(step);
         }
     }
 
@@ -845,6 +863,35 @@ mod tests {
         assert_eq!(run(&mut ahead, 100, 10_000, |_| false).1, 100 + CONFIRM_SECS);
         let mut answered = Confirm::watch(A, Some(40), 100, Timing::default());
         assert_eq!(answered.observe(110, true, Some(true), false), Action::Confirmed);
+    }
+
+    #[test]
+    fn the_radio_guards_own_radio_cycles_stop_every_clock() {
+        // A cell and no answer, but the radio guard cycles the radio for
+        // most of it: those rounds count nothing.
+        let mut confirm = image(60);
+        let mut now = 60;
+        while now < 60 + 10 * CONFIRM_SECS {
+            let action = if (now / 100) % 4 == 0 {
+                confirm.observe(now, true, Some(false), true)
+            } else {
+                confirm.pause(now);
+                Action::Hold
+            };
+            if action != Action::Hold {
+                break;
+            }
+            now += PROBE_EVERY;
+        }
+        assert!(now > 60 + 3 * CONFIRM_SECS, "{now}: paused time counted");
+        // A stock watch's deadline moves on by the paused time.
+        let mut watch = Confirm::watch(A, Some(100), 100, Timing::default());
+        for t in (100..=400).step_by(PROBE_EVERY as usize) {
+            watch.pause(t);
+        }
+        assert_eq!(watch.observe(415, false, None, false), Action::Hold);
+        assert_eq!(watch.observe(430, false, None, false), Action::Hold);
+        assert_eq!(watch.observe(100 + CONFIRM_SECS + 300, false, None, false), Action::Rollback(Why::Blind));
     }
 
     #[test]

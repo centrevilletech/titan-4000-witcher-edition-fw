@@ -150,15 +150,20 @@ fn create(path: &Path) -> io::Result<File> {
 
 /// Why a build from one bank stopped.
 pub(crate) struct Failure {
-    /// The bank does not hold the stock image the manifest pins: a property
-    /// of the unit, not of this attempt.
+    /// The bytes read are not the stock image the manifest pins. One read
+    /// is not proof: Linux 3.10 hands NAND data with an uncorrectable ECC
+    /// error back as data, so the default build reads again before it
+    /// judges (`crate::tk_default_io`).
     pub stock: bool,
+    /// An I/O error (reading the bank, writing or syncing the image): a
+    /// property of this attempt, never of the unit.
+    pub io: bool,
     pub text: String,
 }
 
 impl From<String> for Failure {
     fn from(text: String) -> Self {
-        Self { stock: false, text }
+        Self { stock: false, io: true, text }
     }
 }
 
@@ -174,13 +179,14 @@ pub(crate) fn build(m: &Manifest, part: &Mtd, dir: Option<&Path>) -> Result<(Bui
             err,
             Error::Site(_) | Error::Stock(_) | Error::Gzip(_) | Error::Inflate(_) | Error::Truncated
         );
+        let io = matches!(err, Error::Read | Error::Write);
         let text = match err {
             Error::Read => format!("reading the bank: {}", src.error.take().map_or("?".into(), |e| e.to_string())),
             Error::Write => format!("writing the image: {}", sink_error.map_or("?".into(), |e| e.to_string())),
             Error::Site(i) => format!("not the stock image: site {} differs", m.sites[i].name),
             other => other.to_string(),
         };
-        Failure { stock, text }
+        Failure { stock, io, text }
     };
     let Some(dir) = dir else {
         let built = pipeline::from_gzip(m, &mut src, &mut Discard).map_err(|e| explain(e, &mut src, None))?;
@@ -262,19 +268,31 @@ mod tests {
     use witcher_tk_patch::manifest::Manifest;
     use witcher_tk_patch::manifests;
 
-    /// `stage` writes the release image, N6H + R4's Rust N4 + R1's PIE. It
-    /// carries R1's M1 block, version 0x20261126, and the keeper must manage
-    /// that version: otherwise its PIE selector is never written and the
-    /// image runs N4's AQM.
+    /// `stage` writes the release image, N6H + R4's Rust N4 + R1's PIE with
+    /// v1.0.17's uplink AQM defaults. It carries R1's M1 block, version
+    /// 0x20261126, and the keeper must manage that version: otherwise its PIE
+    /// selector is never written and the image runs N4's AQM.
     #[test]
     fn the_release_image_carries_r1s_m1_block_which_the_keeper_manages() {
         let m = Manifest::parse(manifests::RELEASE).unwrap();
-        assert_eq!(m.name, "n6h-r4-r1");
+        assert_eq!(m.name, "n6h-r4-r1-s3");
         let block = m.replacement_at(M1_MAGIC_ADDR, 8).expect("the release image carries the M1 block");
         let word = |at: usize| u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
         // The console prints the word most significant byte first: "M1PI".
         assert_eq!(word(0).to_be_bytes(), *b"M1PI");
         assert_eq!(word(4), 0x2026_1126, "R1's M1 block version");
         assert!(M1_VERSIONS.contains(&word(4)), "the keeper does not manage M1 block version {:#x}", word(4));
+    }
+
+    /// v1.0.17 ships the uplink AQM's bench step S3 (lanes-20261125/AB3) as
+    /// the image's own defaults: PIE drop budget 5% and ceiling 35 ms
+    /// (v1.0.16's image: 2% and 50 ms). They are not managed words: only the
+    /// selector in the M1 block is ever written.
+    #[test]
+    fn the_release_image_carries_the_s3_uplink_aqm_defaults() {
+        let m = Manifest::parse(manifests::RELEASE).unwrap();
+        let words = m.replacement_at(0x841b_5934, 8).expect("the M1 block's PIE words");
+        let word = |at: usize| u32::from_le_bytes([words[at], words[at + 1], words[at + 2], words[at + 3]]);
+        assert_eq!((word(0), word(4)), (0x000c_cccd, 0x23));
     }
 }

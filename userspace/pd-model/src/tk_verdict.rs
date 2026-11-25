@@ -29,6 +29,14 @@
 //!   power cut, a crash, a reboot by hand) leave the strikes at the limit and
 //!   no rollback recorded. The next stock boot records them as one rollback
 //!   (`stopped`) and judges it the same way.
+//! - A modem crash while the image runs reloads stock firmware from NAND. The
+//!   keeper records it like a rollback (`crashed`) and judges it on the same
+//!   boot, by watching stock firmware the same way. Stock answers: the
+//!   image's crash (`crashes`); otherwise the network's. Either way but at the
+//!   limit, the unit goes straight back onto the image. A confirmed boot does
+//!   not clear the crash count (a crashing image can confirm first); a day of
+//!   running without a crash does (`healthy`). Two crashes in a row stick like
+//!   two failures.
 //!
 //! Every record names the firmware build that wrote it (`firmware`). A
 //! record, quarantine or strike count from another build, or for another
@@ -60,6 +68,11 @@ pub struct Verdict {
     /// The last verdict was the network's: the image waits for the network
     /// and is not compared again until it confirms.
     pub outage: bool,
+    /// Modem crashes of the image after which stock firmware answered, since
+    /// the image last ran a day without one.
+    pub crashes: u32,
+    /// The pending judgement is a modem crash's (`crashed`), not a rollback's.
+    pub crash: bool,
 }
 
 /// What a stock boot made of the pending rollback.
@@ -70,13 +83,19 @@ pub enum Judgement {
     /// Stock firmware answered: the image's `count`th failure. At
     /// `GENUINE_LIMIT` the quarantine sticks.
     Genuine { count: u32, sticks: bool },
+    /// Stock firmware answered after the image's modem crash: its `count`th
+    /// crash. At `GENUINE_LIMIT` the quarantine sticks.
+    Crash { count: u32, sticks: bool },
 }
 
 impl Judgement {
     /// The quarantine comes off and the keeper reboots onto the image at
     /// once: after a network verdict, or a genuine failure below the limit.
     pub fn back_to_image(self) -> bool {
-        !matches!(self, Judgement::Genuine { sticks: true, .. })
+        !matches!(
+            self,
+            Judgement::Genuine { sticks: true, .. } | Judgement::Crash { sticks: true, .. }
+        )
     }
 }
 
@@ -97,6 +116,8 @@ impl Verdict {
                 "network" => verdict.network = value.parse().unwrap_or(0),
                 "pending" => verdict.pending = value == "1",
                 "outage" => verdict.outage = value == "1",
+                "crashes" => verdict.crashes = value.parse().unwrap_or(GENUINE_LIMIT),
+                "crash" => verdict.crash = value == "1",
                 _ => {}
             }
         }
@@ -105,13 +126,15 @@ impl Verdict {
 
     pub fn render(&self) -> String {
         format!(
-            "gzip={}\nfirmware={}\ngenuine={}\nnetwork={}\npending={}\noutage={}\n",
+            "gzip={}\nfirmware={}\ngenuine={}\nnetwork={}\npending={}\noutage={}\ncrashes={}\ncrash={}\n",
             self.gzip,
             self.firmware,
             self.genuine,
             self.network,
             u8::from(self.pending),
-            u8::from(self.outage)
+            u8::from(self.outage),
+            self.crashes,
+            u8::from(self.crash)
         )
     }
 
@@ -145,6 +168,24 @@ impl Verdict {
         };
         next.pending = true;
         next.outage = false;
+        next.crash = false;
+        next
+    }
+
+    /// The record after a modem crash of `sha` (stock firmware now runs): a
+    /// rollback this boot judges, counted as a crash.
+    pub fn crashed(&self, sha: &str, firmware: &str) -> Self {
+        let mut next = self.rolled_back(sha, firmware);
+        next.crash = true;
+        next
+    }
+
+    /// `sha` ran a day without a modem crash: its crashes are history.
+    pub fn healthy(&self, sha: &str) -> Self {
+        let mut next = self.clone();
+        if next.gzip.eq_ignore_ascii_case(sha) {
+            next.crashes = 0;
+        }
         next
     }
 
@@ -166,7 +207,15 @@ impl Verdict {
     pub fn judge(&self, answered: bool) -> (Self, Judgement) {
         let mut next = self.clone();
         next.pending = false;
-        let judgement = if answered {
+        next.crash = false;
+        let judgement = if answered && self.crash {
+            next.crashes = next.crashes.saturating_add(1);
+            next.outage = false;
+            Judgement::Crash {
+                count: next.crashes,
+                sticks: next.crashes >= GENUINE_LIMIT,
+            }
+        } else if answered {
             next.genuine = next.genuine.saturating_add(1);
             next.outage = false;
             Judgement::Genuine {
@@ -184,7 +233,7 @@ impl Verdict {
     /// The image's quarantine sticks until an operator retries it, or the
     /// image or the firmware build changes.
     pub fn sticks(&self) -> bool {
-        self.genuine >= GENUINE_LIMIT
+        self.genuine >= GENUINE_LIMIT || self.crashes >= GENUINE_LIMIT
     }
 
     /// A stock boot found the strikes for `sha`, the default image, at the
@@ -289,10 +338,8 @@ mod tests {
             Verdict {
                 gzip: IMAGE.into(),
                 firmware: "fedcba9876543210".into(),
-                genuine: 0,
-                network: 0,
                 pending: true,
-                outage: false
+                ..Verdict::default()
             }
         );
         assert_eq!(Verdict::parse(&fresh.render()), fresh);
@@ -319,14 +366,57 @@ mod tests {
     }
 
     #[test]
+    fn modem_crashes_count_apart_from_failures_and_a_confirm_does_not_clear_them() {
+        // A crash while the image runs, and stock answers afterwards.
+        let crashed = Verdict::default().crashed(IMAGE, BUILD);
+        assert!(crashed.pending && crashed.crash && crashed.holds(IMAGE, BUILD));
+        let (once, first) = crashed.judge(true);
+        assert_eq!(
+            first,
+            Judgement::Crash {
+                count: 1,
+                sticks: false
+            }
+        );
+        assert!(first.back_to_image() && !once.crash && once.genuine == 0);
+        // The image confirms on the way back, then crashes again: two in a row.
+        let back = once.confirmed(IMAGE);
+        assert_eq!(
+            back.crashes, 1,
+            "a confirm does not prove the image stays up"
+        );
+        let (twice, second) = back.crashed(IMAGE, BUILD).judge(true);
+        assert_eq!(
+            second,
+            Judgement::Crash {
+                count: 2,
+                sticks: true
+            }
+        );
+        assert!(!second.back_to_image() && twice.sticks() && twice.holds(IMAGE, BUILD));
+        // A day without a crash clears them; stock getting no answer after a
+        // crash blames the network, and no crash is counted.
+        assert_eq!(once.healthy(IMAGE).crashes, 0);
+        assert_eq!(once.healthy(&"cd".repeat(32)).crashes, 1);
+        let (net, judged) = once.crashed(IMAGE, BUILD).judge(false);
+        assert_eq!(judged, Judgement::Network);
+        assert_eq!(
+            (net.crashes, net.network, net.outage, net.crash),
+            (1, 1, true, false)
+        );
+        assert_eq!(Verdict::parse(&twice.render()), twice);
+        assert!(Verdict::parse(&format!("gzip={IMAGE}\nfirmware={BUILD}\ncrashes=x\n")).sticks());
+    }
+
+    #[test]
     fn boots_cut_short_before_their_confirm_are_judged_as_one_rollback() {
         let once = Verdict {
             gzip: IMAGE.into(),
             firmware: BUILD.into(),
             genuine: 1,
             network: 2,
-            pending: false,
             outage: true,
+            ..Verdict::default()
         };
         // Two boots died after their strikes: one rollback, counts kept.
         let recorded = once.stopped(IMAGE, BUILD, true, false).expect("judged");

@@ -16,18 +16,23 @@ and hashes, and writes the gzip file the loader stages.
 
 ## The release image
 
-`n6h-r4-r1`, the only manifest the keeper carries (`manifests::RELEASE`):
+`n6h-r4-r1-s3`, the only manifest the keeper carries (`manifests::RELEASE`):
 
 | Layer | From | What it adds |
 | --- | --- | --- |
 | N6H | lane N6H | The latency image: N4's uplink AQM v2 and grant hold, N5's sparse-flow lane, the IMG2 to IMG4 data-path patches, U2's LNK-FIX filter, baked radio stability defaults. |
 | R4 | lane R4, PR #39 | N4's uplink engine rewritten in Rust (`no_std`, Thumb-2). |
 | R1 | lane R1, PR #42 | M1's Rust PIE uplink AQM, hardened, with the overload latch. M1 block version `0x20261126`. |
+| S3 | v1.0.17, lanes-20261125/AB3 | The uplink AQM defaults of bench step S3 in the M1 block: PIE drop budget 5% (`0x841b5934` = `0xccccd`, was `0x51eb8`) and ceiling 35 ms (`0x841b5938` = `0x23`, was `0x32`). |
 
-Lane R1 built and verified it as `build-combined`: R4's stack spec with its two
-`m1_*` sites replaced by R1's. The spec is `becd500c…`, `tk.bin` is
-`f1aa8add…`, and `tk.gz` is `3348aa36…`. The unit's build reproduces both
-files byte for byte (see [Tests](#tests)). Every feature boots off. The keeper
+Lane R1 built and verified v1.0.16's `n6h-r4-r1` as `build-combined`: R4's
+stack spec with its two `m1_*` sites replaced by R1's. The spec is
+`becd500c…`, `tk.bin` is `f1aa8add…`, and `tk.gz` is `3348aa36…`. v1.0.17's
+`n6h-r4-r1-s3` changes those two words only: `tk.bin` `36c5c383…`, `tk.gz`
+`564d918b…` (4656027 bytes), from the same Python steps the tests use. The
+unit's build reproduces both files byte for byte (see [Tests](#tests)). The
+S3 values are image constants, not managed words: the keeper still writes
+only the PIE selector in the M1 block. Every feature boots off. The keeper
 turns on the ones `tk/config` lists after the boot confirm, and it manages
 the PIE selector of M1 block `0x20261126` (see
 [Modem feature flags](tk-boot-loader.md#modem-feature-flags)).
@@ -53,8 +58,8 @@ grants 07:00 to 10:00 UTC; avoid 06:45 to 10:15). From there the loader takes
 over: the strike count, the boot confirm and the rollback to stock firmware.
 
 ```text
-manifest n6h-r4-r1: 71 sites; image f1aa8add…; gzip 3348aa36… (4656029 bytes)
-tk (mtd17, 0 bad blocks skipped): stock 555362d9…; built image f1aa8add…, gzip 3348aa36… (4656029 bytes)
+manifest n6h-r4-r1-s3: 71 sites; image 36c5c383…; gzip 564d918b… (4656027 bytes)
+tk (mtd17, 0 bad blocks skipped): stock 555362d9…; built image 36c5c383…, gzip 564d918b… (4656027 bytes)
 staged /mnt/titan-api/tk/active.gz: the next boot loads it (reboot outside the SAS window)
 ```
 
@@ -66,7 +71,7 @@ wait for it.
 | Input | How |
 | --- | --- |
 | The stock image | The NAND banks named `tk` and `tk2` in `/proc/mtd` (`mtd17`, `mtd18`): a gzip stream at offset 0, then `0xff` padding. It reads `/dev/mtdN` read-only, erase block by erase block, and skips blocks the bad block table marks bad, as the vendor kernel does for `modem.ko`. The only ioctl is `MEMGETBADBLOCK`. Either bank serves if it holds the exact stock image. |
-| The manifest | Built into the keeper: `userspace/tk-patch/manifests/n6h-r4-r1.manifest` (`manifests::RELEASE`). The other manifests in the tree (N6H, M1, R1, R4) are not in the keeper, because each would cost about 20 KiB of flash. They build on a host with `tk-patch build`, and CI proves them. |
+| The manifest | Built into the keeper: `userspace/tk-patch/manifests/n6h-r4-r1-s3.manifest` (`manifests::RELEASE`). The other manifests in the tree (N6H, M1, R1, R4, v1.0.16's N6H-R4-R1) are not in the keeper, because each would cost about 20 KiB of flash. They build on a host with `tk-patch build`, and CI proves them. |
 
 ## What it checks
 
@@ -124,7 +129,8 @@ opens but does not decompress is not a fallback (see
 | `m1` | `cd7effdd…` | `e47b0435…` (4655664 bytes) |
 | `r1` | `f434277d…` | `186697f3…` (4655738 bytes) |
 | `r4` | `60ab8fe7…` | `4ced9782…` (4655937 bytes) |
-| `n6h-r4-r1` (release) | `f1aa8add…` | `3348aa36…` (4656029 bytes) |
+| `n6h-r4-r1` (v1.0.16) | `f1aa8add…` | `3348aa36…` (4656029 bytes) |
+| `n6h-r4-r1-s3` (release) | `36c5c383…` | `564d918b…` (4656027 bytes) |
 
 ## The manifest
 
@@ -249,5 +255,7 @@ not manage (`tk_flags::M1_VERSIONS`).
   - a bank that is not the stock image, or an inactive bank that is, builds
     nothing;
   - an operator config, or an image without a config, is left alone;
-  - a failed build keeps stock firmware and stops after 3 builds;
+  - a stock mismatch is judged on two reads, and a bank flip builds again;
+  - an unreadable bank is transient: every boot tries again, and it never
+    uses up the cap;
   - what a killed build leaves is cleaned up and built again.

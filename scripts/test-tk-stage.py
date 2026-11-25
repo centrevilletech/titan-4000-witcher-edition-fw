@@ -759,8 +759,16 @@ class RealDefaultImage(unittest.TestCase):
         self.assertEqual(self.files(), ['active.gz', 'config', 'default', 'strikes'])
         self.assertEqual(hashlib.sha256((unit.tk / 'active.gz').read_bytes()).hexdigest(), self.release)
         config = (unit.tk / 'config').read_text()
-        self.assertTrue(config.startswith('# witcher-default n6h-r4-r1 '), config)
-        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '1', 'result': 'built'})
+        self.assertTrue(config.startswith('# witcher-default n6h-r4-r1-s3 '), config)
+        self.assertEqual(self.record(), {'gzip': self.release, 'firmware': 'unknown', 'bank': 'tk2', 'builds': '1',
+                                         'failures': '0', 'result': 'built'})
+        # v1.0.16's hook loads only enabled=1 (its awk value()): a unit
+        # flashed back keeps stock modem firmware instead of loading the
+        # image under that firmware's one-strike rule.
+        v1016 = subprocess.run(['awk', '-v', 'k=enabled', 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } '
+                                'END { sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); print v }', str(unit.tk / 'config')],
+                               capture_output=True, text=True, timeout=10).stdout.strip()
+        self.assertEqual(v1016, 'default')
         # The words are what stage-latency.sh --profile latency writes for this image.
         staged = subprocess.run(['bash', str(REPO / 'scripts/stage-latency.sh'), '--dry-run', '--no-clamp',
                                  '--profile', 'latency', '192.0.2.1', str(unit.tk / 'active.gz')],
@@ -859,11 +867,21 @@ class RealDefaultImage(unittest.TestCase):
         self.assertEqual((unit.status()['reason'], unit.status()['build']), ('stock-mismatch', 'stock-mismatch'))
         self.assertEqual(self.files(), ['default'])
         self.assertEqual(self.record()['result'], 'stock-mismatch')
+        # Judged on two reads of the bank: one bad NAND read is not proof.
+        log = (unit.root / 'var/run/witcher-tk.build').read_text()
+        self.assertIn('reading the bank again', log)
+        self.assertIn('the second read failed the same way', log)
         # Later boots decide from the record, on the read-only mount.
         self.assertEqual(unit.boot()['firmware'], 'nand')
         self.assertEqual(unit.status()['reason'], 'stock-mismatch')
         self.assertFalse(any('remount' in a for a in unit.actions()), unit.actions())
         self.assertEqual(self.record()['builds'], '1')
+        unit.assert_stock_after(self)
+        # A firmware update flips banks: the record holds for its bank only,
+        # so the stock image in the other bank builds and loads.
+        (unit.root / 'proc/cmdline').write_text('root=ubi0:rootfs ro rootfstype=ubifs ubi.mtd=16,2048 active=linux,rootfs,tk\n')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual((self.record()['bank'], self.record()['result']), ('tk', 'built'))
         unit.assert_stock_after(self)
 
     def test_only_the_active_bank_counts(self):
@@ -899,23 +917,24 @@ class RealDefaultImage(unittest.TestCase):
         self.assertEqual(hashlib.sha256((unit.tk / 'active.gz').read_bytes()).hexdigest(), digest)
         unit.assert_stock_after(self)
 
-    def test_a_failed_build_keeps_stock_with_a_reason_and_stops_after_three(self):
+    def test_a_bank_that_cannot_be_read_is_transient_and_never_uses_up_the_cap(self):
         unit = self.unit
         self.bank(unit.root, 'mtd18', None)
-        for n in (1, 2, 3):
+        # Read errors are this attempt's, not the unit's: every boot tries
+        # again, and no failure counts (v1.0.17 before this stopped at 3).
+        for n in range(1, 6):
             self.assertEqual(unit.boot()['firmware'], 'nand')
             self.assertEqual((unit.status()['reason'], unit.status()['build']), ('build', 'build'))
-            self.assertEqual(self.record(), {'gzip': self.release, 'builds': str(n), 'result': 'failed'})
+            self.assertEqual(self.record(), {'gzip': self.release, 'firmware': 'unknown', 'bank': 'tk2',
+                                             'builds': str(n), 'failures': '0', 'result': 'transient'})
             self.assertEqual(self.files(), ['default'])
-        self.assertEqual(unit.boot()['firmware'], 'nand')
-        self.assertEqual(unit.status()['reason'], 'build-limit')
-        self.assertFalse(any('remount' in a for a in unit.actions()), unit.actions())
         log = (unit.root / 'var/run/witcher-tk.build').read_text()
         self.assertIn('reading the bank', log)
-        # Deleting the record lets it try again.
+        self.assertIn('(transient; the next boot tries again)', log)
+        # Once the bank reads, the next boot builds, with nothing cleared by hand.
         self.bank(unit.root, 'mtd18', self.good)
-        (unit.tk / 'default').unlink()
         self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual((self.record()['result'], self.record()['failures']), ('built', '0'))
         unit.assert_stock_after(self)
 
     def test_a_build_that_died_is_cleaned_up_and_done_again_next_boot(self):
@@ -925,20 +944,25 @@ class RealDefaultImage(unittest.TestCase):
         # the hook's time limit with a stand-in keeper.)
         unit = self.unit
         unit.tk.mkdir()
-        (unit.tk / 'default').write_text(f'gzip={self.release}\nbuilds=1\nresult=started\n')
+        started = lambda n: (f'gzip={self.release}\nfirmware=unknown\nbank=tk2\nbuilds={n}\nfailures=0\n'
+                             'result=started\n')
+        (unit.tk / 'default').write_text(started(1))
         (unit.tk / '.active.gz.tk-build').write_bytes(b'\x1f\x8b\x08\x00' + b'half' * 1000)
         (unit.tk / '.default.tk-build').write_text('builds=')
         self.assertEqual(unit.boot()['firmware'], self.release)
         self.assertEqual(unit.status()['build'], 'built')
-        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '2', 'result': 'built'})
+        # A build that never ended counts no failure.
+        self.assertEqual(self.record(), {'gzip': self.release, 'firmware': 'unknown', 'bank': 'tk2', 'builds': '2',
+                                         'failures': '0', 'result': 'built'})
         self.assertEqual(self.files(), ['active.gz', 'config', 'default', 'strikes'])
         unit.assert_stock_after(self)
         # The same, stopped after the image and before its config: still ours.
         (unit.tk / 'config').unlink()
-        (unit.tk / 'default').write_text(f'gzip={self.release}\nbuilds=2\nresult=started\n')
+        (unit.tk / 'default').write_text(started(2))
         (unit.tk / 'strikes').write_text('strikes=0\n')
         self.assertEqual(unit.boot()['firmware'], self.release)
-        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '3', 'result': 'built'})
+        self.assertEqual(self.record(), {'gzip': self.release, 'firmware': 'unknown', 'bank': 'tk2', 'builds': '3',
+                                         'failures': '0', 'result': 'built'})
         unit.assert_stock_after(self)
 
 class Build(unittest.TestCase):

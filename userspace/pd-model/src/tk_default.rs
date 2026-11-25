@@ -33,10 +33,19 @@
 //!   older firmware keeps it off. Quarantine lines for other images (an
 //!   operator's) are left alone and do not block the default.
 //! - A bank that is not the pinned stock image builds nothing, now or on a
-//!   later boot of the same release image (`stock-mismatch` is recorded).
-//! - Each build is recorded before it starts, so a build that is killed or
-//!   loses power still counts. After `MAX_BUILDS` builds of one release
-//!   image nothing is built for it again.
+//!   later boot of the same release image, bank and firmware build
+//!   (`stock-mismatch` is recorded). Linux 3.10 returns NAND data with an
+//!   uncorrectable ECC error as data, so the build reads the bank a second
+//!   time before it judges: only a failure that repeats the same way counts.
+//! - Each build is recorded before it starts. Only failures that repeat on
+//!   that second read count (`failures`); a build that is killed, loses power
+//!   or meets a full volume or a read error is transient and counts nothing.
+//!   After `MAX_FAILURES` of them nothing is built for that release image,
+//!   bank and firmware build, until one of them changes or Retry.
+//! - The default config switches itself on with `enabled=default`, which the
+//!   v1.0.17 hook reads as on and v1.0.16's hook as off. A unit flashed back
+//!   to v1.0.16 therefore keeps stock modem firmware instead of loading the
+//!   image under that firmware's one-strike, CPAS-unaware rule.
 use crate::sha256;
 use crate::tk_boot::{self, STRIKE_LIMIT};
 use crate::tk_verdict::Verdict;
@@ -44,8 +53,9 @@ use crate::tk_verdict::Verdict;
 /// The first line of a config the firmware wrote, followed by the manifest
 /// name and the SHA-256 of the rest of the file.
 pub const MARKER: &str = "# witcher-default ";
-/// Builds of one release image before the firmware stops trying.
-pub const MAX_BUILDS: u32 = 3;
+/// Failures of one release image's build (each repeated by a second read)
+/// before the firmware stops trying for that image, bank and firmware build.
+pub const MAX_FAILURES: u32 = 3;
 
 /// The latency profile for the release image (N6H + R4's Rust N4 + R1's
 /// PIE), in the order `scripts/stage-latency.sh --profile latency` writes it
@@ -96,7 +106,8 @@ pub fn config_text(name: &str, gzip: &str) -> String {
         "# Built at boot from this unit's own stock modem firmware (docs/tk-boot-loader.md).\n\
          # Edit any line and this config is yours: no firmware rewrites it. enabled=0 keeps\n\
          # stock modem firmware from the next boot; modem=off in latency/config turns the words off now.\n\
-         enabled=1\n",
+         # enabled=default is on for v1.0.17 and later, off for older firmware.\n\
+         enabled=default\n",
     );
     body.push_str(&format!("sha256={gzip}\n"));
     for (addr, value) in WORDS {
@@ -175,11 +186,11 @@ pub fn plan(i: &Inputs<'_>) -> Plan {
         return Plan::Ready;
     }
     let record = Record::parse(i.record.unwrap_or(""));
-    if record.gzip == i.release {
+    if i.bank.is_some_and(|bank| record.applies(i.release, i.firmware, bank)) {
         if record.result == "stock-mismatch" {
             return Plan::Stock("stock-mismatch");
         }
-        if record.builds >= MAX_BUILDS {
+        if record.failures >= MAX_FAILURES {
             return Plan::Stock("build-limit");
         }
     }
@@ -240,22 +251,61 @@ pub fn clear(i: &Inputs<'_>) -> Cleared {
     cleared
 }
 
-/// `tk/default`: the release image the last build was for, how many builds
-/// of it have started, and how the last one ended (`started` until then).
+/// One build attempt, as the record judges it (`build_result`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Attempt<'a> {
+    Built,
+    /// An I/O error (reading the bank, writing the image): this attempt's,
+    /// never the unit's.
+    Io(&'a str),
+    /// The bytes read are not the stock image the manifest pins.
+    Stock(&'a str),
+    /// Any other failure.
+    Other(&'a str),
+}
+
+/// What the record says after a build: the `first` attempt, and `second`,
+/// the bank read again in the same run after a first failure that was not
+/// I/O. Only a failure that repeats the same way is the unit's
+/// (`stock-mismatch`) or counts (`failed`); a second read that builds means
+/// the first one was bad, and anything else is `transient`.
+pub fn build_result(first: Attempt<'_>, second: Option<Attempt<'_>>) -> &'static str {
+    match (first, second) {
+        (Attempt::Built, _) | (_, Some(Attempt::Built)) => "built",
+        (Attempt::Stock(a), Some(Attempt::Stock(b))) if a == b => "stock-mismatch",
+        (Attempt::Other(a), Some(Attempt::Other(b))) if a == b => "failed",
+        _ => "transient",
+    }
+}
+
+/// `tk/default`: the release image the last build was for, the firmware
+/// build and modem bank it ran under, how many builds of it have started,
+/// how many failed for good (`failures`, each repeated by a second read),
+/// and how the last one ended: `started` until then, then `built`, `failed`
+/// (counted), `transient` (not counted: killed, a read or write error, a
+/// read that did not repeat) or `stock-mismatch`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Record {
     pub gzip: String,
+    pub firmware: String,
+    pub bank: String,
     pub builds: u32,
+    pub failures: u32,
     pub result: String,
 }
 
 impl Record {
+    /// An unreadable count reads as 0: the record repairs itself at the next
+    /// build rather than stopping builds for good.
     pub fn parse(text: &str) -> Self {
         let mut record = Self::default();
         for line in text.lines() {
             match line.split_once('=') {
                 Some(("gzip", v)) => record.gzip = v.trim().to_ascii_lowercase(),
-                Some(("builds", v)) => record.builds = v.trim().parse().unwrap_or(MAX_BUILDS),
+                Some(("firmware", v)) => record.firmware = v.trim().to_owned(),
+                Some(("bank", v)) => record.bank = v.trim().to_owned(),
+                Some(("builds", v)) => record.builds = v.trim().parse().unwrap_or(0),
+                Some(("failures", v)) => record.failures = v.trim().parse().unwrap_or(0),
                 Some(("result", v)) => record.result = v.trim().to_owned(),
                 _ => {}
             }
@@ -268,20 +318,50 @@ impl Record {
         self.gzip == release && self.result == "started"
     }
 
-    /// The record to write before a build of `release` starts.
-    pub fn start(text: &str, release: &str) -> Self {
-        let old = Self::parse(text);
-        let builds = if old.gzip == release { old.builds.saturating_add(1) } else { 1 };
-        Self { gzip: release.to_owned(), builds, result: "started".into() }
+    /// The record is about `release` built from `bank` by this firmware
+    /// build. Anything else starts afresh.
+    pub fn applies(&self, release: &str, firmware: &str, bank: &str) -> bool {
+        self.gzip == release && self.firmware == firmware && self.bank == bank
     }
 
+    /// The record to write before a build of `release` from `bank` starts.
+    /// The failure count carries over for the same image, bank and build;
+    /// an earlier build that never ended (power, the time limit) counts
+    /// nothing.
+    pub fn start(text: &str, release: &str, firmware: &str, bank: &str) -> Self {
+        let old = Self::parse(text);
+        let (builds, failures) = if old.applies(release, firmware, bank) {
+            (old.builds.saturating_add(1), old.failures)
+        } else {
+            (1, 0)
+        };
+        Self {
+            gzip: release.to_owned(),
+            firmware: firmware.to_owned(),
+            bank: bank.to_owned(),
+            builds,
+            failures,
+            result: "started".into(),
+        }
+    }
+
+    /// How the build ended. `built` clears the failure count and `failed`
+    /// adds one; `transient` and `stock-mismatch` leave it.
     pub fn finish(mut self, result: &str) -> Self {
+        match result {
+            "built" => self.failures = 0,
+            "failed" => self.failures = self.failures.saturating_add(1),
+            _ => {}
+        }
         self.result = result.to_owned();
         self
     }
 
     pub fn render(&self) -> String {
-        format!("gzip={}\nbuilds={}\nresult={}\n", self.gzip, self.builds, self.result)
+        format!(
+            "gzip={}\nfirmware={}\nbank={}\nbuilds={}\nfailures={}\nresult={}\n",
+            self.gzip, self.firmware, self.bank, self.builds, self.failures, self.result
+        )
     }
 }
 
@@ -303,9 +383,11 @@ mod tests {
         let text = config_text("n6h-r4-r1", RELEASE);
         assert!(text.starts_with("# witcher-default n6h-r4-r1 "));
         assert_eq!(default_sha(&text).as_deref(), Some(RELEASE));
-        assert!(tk_flags::enabled(&text));
-        // The hook reads the same switch and allow-list lines.
-        assert_eq!(text.lines().filter(|l| l.starts_with("enabled=")).collect::<Vec<_>>(), ["enabled=1"]);
+        // The hook reads the same switch and allow-list lines. v1.0.17's hook
+        // reads `enabled=default` as on; v1.0.16's wants exactly 1, so a unit
+        // flashed back keeps stock modem firmware.
+        assert_eq!(text.lines().filter(|l| l.starts_with("enabled=")).collect::<Vec<_>>(), ["enabled=default"]);
+        assert!(!tk_flags::enabled(&text), "the v1.0.16 reading of enabled= is off");
         let wm: Vec<&str> = text.lines().filter(|l| l.starts_with("wm=")).collect();
         assert_eq!(
             wm,
@@ -336,7 +418,7 @@ mod tests {
     fn any_edit_makes_the_config_the_operators() {
         let text = config_text("n6h-r4-r1", RELEASE);
         for edited in [
-            text.replace("enabled=1", "enabled=0"),
+            text.replace("enabled=default", "enabled=0"),
             text.replace("wm=0x841b5908:0x1\n", ""),
             format!("{text}target=192.0.2.1\n"),
             text.replacen("# witcher-default ", "# witcher-defaults ", 1),
@@ -355,11 +437,11 @@ mod tests {
     fn an_image_without_a_config_is_left_alone_unless_our_build_stopped_halfway() {
         assert_eq!(owner(None, false, None, RELEASE), Owner::Firmware);
         assert_eq!(owner(None, true, None, RELEASE), Owner::Operator);
-        let started = Record::start("", RELEASE).render();
+        let started = Record::start("", RELEASE, BUILD, "tk2").render();
         assert_eq!(owner(None, true, Some(&started), RELEASE), Owner::Firmware);
-        let built = Record::start("", RELEASE).finish("built").render();
+        let built = Record::start("", RELEASE, BUILD, "tk2").finish("built").render();
         assert_eq!(owner(None, true, Some(&built), RELEASE), Owner::Operator, "an operator deleted the config");
-        let other = Record::start("", &"cd".repeat(32)).render();
+        let other = Record::start("", &"cd".repeat(32), BUILD, "tk2").render();
         assert_eq!(owner(None, true, Some(&other), RELEASE), Owner::Operator);
     }
 
@@ -426,24 +508,59 @@ mod tests {
     }
 
     #[test]
-    fn a_build_runs_once_per_release_and_stops_for_good_on_another_stock_image() {
+    fn a_stock_mismatch_holds_for_one_image_bank_and_firmware_build() {
         assert_eq!(plan(&inputs()), Plan::Build);
         assert_eq!(plan(&Inputs { cached: true, ..inputs() }), Plan::Ready);
         assert_eq!(plan(&Inputs { bank: None, ..inputs() }), Plan::Stock("bank-unknown"));
-        let mismatch = Record::start("", RELEASE).finish("stock-mismatch").render();
+        let mismatch = Record::start("", RELEASE, BUILD, "tk2").finish("stock-mismatch").render();
         assert_eq!(plan(&Inputs { record: Some(&mismatch), ..inputs() }), Plan::Stock("stock-mismatch"));
-        // A new release image tries again.
+        // A new release image, the other bank (a firmware update flips banks)
+        // or a new firmware build tries again.
         let new = "ef".repeat(32);
         assert_eq!(plan(&Inputs { record: Some(&mismatch), release: &new, ..inputs() }), Plan::Build);
-        // Builds that die (time limit, power) count before they start.
+        assert_eq!(plan(&Inputs { record: Some(&mismatch), bank: Some("tk"), ..inputs() }), Plan::Build);
+        assert_eq!(plan(&Inputs { record: Some(&mismatch), firmware: "fedcba9876543210", ..inputs() }), Plan::Build);
+    }
+
+    #[test]
+    fn a_bad_read_is_told_from_another_image_by_reading_again() {
+        let site = "not the stock image: site m1_rust_pie_block differs";
+        // Linux 3.10 hands NAND data with an uncorrectable ECC error back as
+        // data: the first read looks like another image, the second builds.
+        assert_eq!(build_result(Attempt::Stock(site), Some(Attempt::Built)), "built");
+        assert_eq!(build_result(Attempt::Stock(site), Some(Attempt::Stock(site))), "stock-mismatch");
+        assert_eq!(build_result(Attempt::Stock(site), Some(Attempt::Stock("inflate: bad code"))), "transient");
+        assert_eq!(build_result(Attempt::Stock(site), Some(Attempt::Io("reading the bank: EIO"))), "transient");
+        assert_eq!(build_result(Attempt::Other("x"), Some(Attempt::Other("x"))), "failed");
+        assert_eq!(build_result(Attempt::Other("x"), Some(Attempt::Stock("x"))), "transient");
+        // I/O is never read again and never counts; a build that worked is built.
+        assert_eq!(build_result(Attempt::Io("writing the image: ENOSPC"), None), "transient");
+        assert_eq!(build_result(Attempt::Built, None), "built");
+    }
+
+    #[test]
+    fn only_failures_that_repeat_count_and_transient_ones_never_use_up_the_cap() {
+        // Builds killed by power or the time limit, a full volume, a read
+        // error or a read that did not repeat: retried at every boot.
         let mut record = String::new();
-        for n in 1..=MAX_BUILDS {
+        for n in 1..=10 {
             assert_eq!(plan(&Inputs { record: Some(&record), ..inputs() }), Plan::Build, "build {n}");
-            record = Record::start(&record, RELEASE).render();
-            assert_eq!(Record::parse(&record).builds, n);
+            let started = Record::start(&record, RELEASE, BUILD, "tk2");
+            record = if n % 2 == 0 { started.render() } else { started.finish("transient").render() };
+        }
+        assert_eq!(Record::parse(&record).failures, 0);
+        // Failures that a second read repeated count; a success clears them.
+        for n in 1..=MAX_FAILURES {
+            assert_eq!(plan(&Inputs { record: Some(&record), ..inputs() }), Plan::Build, "failure {n}");
+            record = Record::start(&record, RELEASE, BUILD, "tk2").finish("failed").render();
         }
         assert_eq!(plan(&Inputs { record: Some(&record), ..inputs() }), Plan::Stock("build-limit"));
         assert_eq!(plan(&Inputs { record: Some(&record), cached: true, ..inputs() }), Plan::Ready);
-        assert_eq!(Record::parse("builds=x\n").builds, MAX_BUILDS, "an unreadable count is spent");
+        assert_eq!(plan(&Inputs { record: Some(&record), firmware: "fedcba9876543210", ..inputs() }), Plan::Build);
+        let built = Record::start(&record, RELEASE, BUILD, "tk2").finish("built");
+        assert_eq!((built.failures, built.result.as_str()), (0, "built"));
+        // A damaged record repairs itself instead of stopping builds.
+        assert_eq!(Record::parse("builds=x\nfailures=y\n").failures, 0);
+        assert_eq!(Record::parse(&built.render()), built);
     }
 }

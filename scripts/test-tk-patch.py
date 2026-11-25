@@ -48,6 +48,9 @@ BENCH = {
     # The release image (lane R1, build-combined): N6H + R4's Rust N4 + R1's PIE.
     'n6h-r4-r1': ('f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42',
                   '3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb'),
+    # v1.0.17's release: n6h-r4-r1 with the S3 uplink AQM defaults (two words).
+    'n6h-r4-r1-s3': ('36c5c383a645addbaa07511fce48980a2d51e67623eb43c9fa953547d65e08d4',
+                     '564d918b4280511749cc68ae9c227e6d8ed1642f79f25316d5be8810d5d5503b'),
 }
 failures = []
 

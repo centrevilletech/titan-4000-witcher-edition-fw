@@ -968,6 +968,62 @@ for line in sys.stdin:
         assert quarantined() and verdict()==record(2,0,0,0), verdict()
         assert reboots()==['away','back','away'], reboots()
         print('PASS: a genuinely bad image went straight back once after stock answered, and its quarantine stuck at the second failure in a row.',flush=True)
+        # A modem crash while the default image runs reloads stock firmware
+        # from NAND. Inside the confirm it must never confirm the image when
+        # stock answers afterwards: it is judged like a rollback, on the same
+        # boot, and the unit goes straight back onto the image. A confirm does
+        # not clear the crash count, so the next crash in a row sticks.
+        fresh_budget();radio(True);core(True);answers()
+        Path('/tmp/tk/verdict').unlink(missing_ok=True)
+        Path('/tmp/tk/quarantine').write_text(bad+'\n')
+        before=image_boot()
+        wait_for(lambda:'time with no cell is waiting' in log()[before:],30)
+        with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,950,1,-;read from nand mtd=tk0\n')
+        wait_for(lambda:'crashed and the modem reloaded stock firmware' in log()[before:],30)
+        assert quarantined() and verdict()['crash']=='1' and verdict()['pending']=='1', verdict()
+        answers(ping=True)
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        assert 'tk boot confirmed' not in log()[before:], 'the image confirmed after its modem crash'
+        assert 'crash 1 of 2' in log()[before:], log()[before:]
+        assert verdict()['crashes']=='1' and verdict()['genuine']=='0' and not quarantined(), verdict()
+        before=image_boot()
+        wait_for(lambda:'tk boot confirmed:' in log()[before:],30)
+        answers()
+        assert verdict()['crashes']=='1', verdict()
+        with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,951,1,-;read from nand mtd=tk0\n')
+        wait_for(lambda:'crashed and the modem reloaded stock firmware' in log()[before:],30)
+        answers(ping=True)
+        wait_for(lambda:'crash 2 of 2 in a row' in log()[before:],60)
+        quiet(5)
+        answers()
+        assert quarantined() and verdict()['crashes']=='2', verdict()
+        assert reboots()==['back'], reboots()
+        print('PASS: a modem crash inside the confirm was judged, not confirmed, and the unit went straight back onto the image; a second crash after a confirm stuck.',flush=True)
+        # The radio guard cycles the radio on purpose: the confirm's clocks
+        # stop meanwhile, as the deaf watchdog's do.
+        fresh_budget();radio(True);core(True);answers()
+        Path('/tmp/tk/verdict').unlink()
+        Path('/tmp/tk/quarantine').write_text(bad+'\n')
+        Path('/tmp/titan-pd-keeper').mkdir(exist_ok=True)
+        Path('/tmp/titan-pd-keeper/radio-transition').write_text(str(int(time.monotonic())+150))
+        before=image_boot()
+        quiet(45)
+        Path('/tmp/titan-pd-keeper/radio-transition').unlink()
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),60)
+        assert 'a cell in view for 20 s without a management answer' in log()[before:], log()[before:]
+        print('PASS: a radio cycle of the radio guard paused the confirm; the comparison came only after it.',flush=True)
+        # A strikes file that cannot be read keeps the hook on stock modem
+        # firmware. The stock boot's keeper counts it as the limit, judges it,
+        # repairs it, and the unit goes back onto the image.
+        fresh_budget();radio(False);core(False);answers()
+        Path('/tmp/tk/verdict').unlink(missing_ok=True)
+        Path('/tmp/tk/quarantine').write_text(bad+'\n')
+        Path('/tmp/tk/strikes').write_text('strikes=lots\n')
+        before=stock_boot()
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        assert 'ended before their boot confirm decided' in log()[before:], log()[before:]
+        assert Path('/tmp/tk/strikes').read_text()==strikes(0)
+        print('PASS: an unreadable strikes file was judged on the stock boot, repaired, and the unit went back onto the image.',flush=True)
         # The keeper's daily cap: with three reboots in the last day, a
         # comparison (which needs a second slot for the way back) waits on the
         # image and records nothing.

@@ -8,8 +8,10 @@ use witcher_tk_patch::manifest::Manifest;
 use witcher_tk_patch::{Discard, manifests, pipeline, prg};
 
 /// The Python-built bench images (tkpatch.py), from the lanes' SHA256SUMS:
-/// manifest, tk.bin SHA-256, tk.gz SHA-256.
-const BENCH: [(&str, &str, &str); 5] = [
+/// manifest, tk.bin SHA-256, tk.gz SHA-256. N6H_R4_R1_S3's come from the same
+/// Python steps (scripts/test-tk-patch.py's apply and test-tk-build.py's
+/// gzip) on the stock image: its two words differ from N6H_R4_R1's.
+const BENCH: [(&str, &str, &str); 6] = [
     (
         manifests::N6H,
         "a2fc899439b938ec4e16ee2c8519587c4e2fffedee52b8a3bb5cdf33daff8168",
@@ -34,6 +36,11 @@ const BENCH: [(&str, &str, &str); 5] = [
         manifests::N6H_R4_R1,
         "f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42",
         "3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb",
+    ),
+    (
+        manifests::N6H_R4_R1_S3,
+        "36c5c383a645addbaa07511fce48980a2d51e67623eb43c9fa953547d65e08d4",
+        "564d918b4280511749cc68ae9c227e6d8ed1642f79f25316d5be8810d5d5503b",
     ),
 ];
 

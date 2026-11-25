@@ -101,7 +101,7 @@ mod mac;
 mod mgmt_v6;
 mod mode;
 mod packet;
-mod reboot;
+pub(crate) mod reboot;
 mod routes;
 mod sas;
 mod tk;
@@ -254,6 +254,10 @@ struct Keeper {
     tk_away_owed: bool,
     /// The reboot back onto this image after a verdict (`tk_verdict`).
     tk_back_owed: Option<String>,
+    /// The default image's modem crashed this boot (stock firmware runs).
+    tk_crashed: bool,
+    /// When this boot's image confirmed, for its crash count to clear.
+    tk_confirmed_at: Option<u64>,
     /// Modem feature flags after a confirmed staged boot (see
     /// `titan_pd_model::tk_flags`), and the DM session running for them.
     tk_flags: Option<tk_flags::Control>,
@@ -401,6 +405,8 @@ impl Keeper {
             tk_hold_noted: None,
             tk_away_owed: false,
             tk_back_owed: None,
+            tk_crashed: false,
+            tk_confirmed_at: None,
             tk_flags: None,
             tk_flags_job: None,
             tk_flags_config_at: Pace::default(),

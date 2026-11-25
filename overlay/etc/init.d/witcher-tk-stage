@@ -25,7 +25,8 @@
 # firmware.
 #
 # Files on the Witcher volume (ubi1:data, seen as /mnt/titan-api/tk later):
-#   config      enabled=1, one sha256=<64 hex> line per allowed image,
+#   config      enabled=1 (or the default config's enabled=default), one
+#               sha256=<64 hex> line per allowed image,
 #               optional target=<address> lines for the boot confirm. The
 #               keeper's default config starts with "# witcher-default ".
 #   active.gz   the staged image: the keeper's default, or an operator's
@@ -223,7 +224,10 @@ stage() {
 
  [ -L "$dir" ] || default_image || return 1
  [ -d "$dir" ] && [ ! -L "$dir" ] && regular "$dir/config" || { why='off'; return 1; }
- [ "$(value enabled "$dir/config")" = 1 ] || { why='off'; return 1; }
+ # enabled=default is the firmware's default config: on here, and off for a
+ # hook before v1.0.17, which wants exactly 1 (a unit flashed back keeps
+ # stock modem firmware rather than load the image under the old rules).
+ case "$(value enabled "$dir/config")" in 1|default) ;; *) why='off'; return 1;; esac
  strikes=0
  if [ -e "$dir/strikes" ]; then
   strikes=$(value strikes "$dir/strikes")

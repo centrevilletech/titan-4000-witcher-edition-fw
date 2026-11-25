@@ -9,13 +9,17 @@ always wins, and `enabled=0` there keeps stock firmware. This firmware still
 ships no modem firmware bytes. See [latency features](latency-switches.md)
 for the switches.
 
-The release image is `n6h-r4-r1`:
+The release image is `n6h-r4-r1-s3`:
 
 - N6H;
 - lane R4's Rust N4 uplink engine;
-- lane R1's hardened Rust PIE uplink AQM (M1 block version `0x20261126`).
+- lane R1's hardened Rust PIE uplink AQM (M1 block version `0x20261126`),
+  with v1.0.17's defaults from bench step S3 (lanes-20261125/AB3): PIE drop
+  budget 5% (`0x841b5934` = `0xccccd`) and ceiling 35 ms (`0x841b5938` =
+  `0x23`). v1.0.16's `n6h-r4-r1` had 2% and 50 ms; every other byte is the
+  same.
 
-Its gzip SHA-256 is `3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb`.
+Its gzip SHA-256 is `564d918b4280511749cc68ae9c227e6d8ed1642f79f25316d5be8810d5d5503b`.
 [Building the modem image on the unit](tk-patch.md) describes the builder.
 
 ## Why
@@ -91,6 +95,7 @@ read-only mount and writes nothing:
 | `strikes` at 2 counted by this firmware build, or unreadable | `reason=strikes` or `strikes-unreadable`: stock firmware, nothing built. The stock boot's keeper then judges those boots. |
 | The release image's quarantine line, strikes at 2 or a `verdict` left by another firmware build (or before v1.0.17), or a `verdict` for another image | `build`, and with `--write` they are cleared (`cleared`), then the image loads. Quarantine lines for an operator's other images stay and do not block the default. |
 | The default config and `active.gz` holding exactly the release image | `cached`: the usual checks load it. |
+| A build that failed | Only a failure that a second read of the bank in the same run repeats counts: one bad NAND read (Linux 3.10 returns uncorrectable ECC errors as data) is not proof. A read or write error, a full volume or a build that never ended (power, the time limit) is `transient` and counts nothing; the next boot tries again. After 3 counted failures, or a `stock-mismatch` read twice, nothing is built for that release image, bank and firmware build, until one of them changes or Retry. |
 | The same, but with a default config an earlier firmware wrote (other words or comments) | `build`, and with `--write` only the config is rewritten as this firmware writes it (`updated`), with no rebuild. |
 | Nothing, or a default config for another image | `build`, unless the build record stops it (below). |
 
@@ -117,8 +122,8 @@ the image in 17.5 s.
 | Build outcome | Next boots |
 | --- | --- |
 | `built` | `cached`. |
-| `stock-mismatch` (the active bank is not the pinned stock image) | Recorded: nothing is built for this release image again. Stock firmware. |
-| A failure (`build`: read or write error, the time limit, a crash) | Stock firmware this boot; the next boot tries again, up to 3 builds of one release image (`build-limit` after that). |
+| `stock-mismatch` (the active bank is not the pinned stock image, on two reads in the same run) | Recorded for this release image, bank and firmware build: nothing is built for them again until one changes, or Retry. Stock firmware. |
+| A failure (`build`) | Stock firmware this boot; the next boot tries again. A read or write error, a full volume, the time limit or a power cut is transient and counts nothing. Only a failure that a second read repeats counts, and after 3 of those nothing is built for that release image, bank and firmware build (`build-limit`). |
 | `bank-unknown` (no `active=` tk bank on `/proc/cmdline`) | Stock firmware. |
 
 A firmware update with another release image builds again: the record counts
@@ -159,6 +164,12 @@ lines and the `wm=` lines of [Modem feature flags](#modem-feature-flags). A
 `#` starts a comment. Without `target=` lines the boot confirm uses the deaf
 watchdog's targets (see [the deaf-unit fault](deaf-watchdog.md)).
 
+**For the default image, put confirm targets in
+`/mnt/titan-api/pd/watchdog.conf`, never in `tk/config`.** Any edit to the
+default config, a `target=` line included, makes it an operator's config
+under the one-strike rule. The confirm also asks every target a DNS
+question, so carrier DNS servers that ignore ping still confirm a boot.
+
 To try an image again after a rollback, take its hash out of `quarantine` and
 write `strikes=0` to `strikes`.
 
@@ -196,7 +207,7 @@ not work, the command does not run and the check after it keeps stock.
 | --- | --- |
 | `off` | No `config`, or `enabled` is not 1: an operator turned it off. |
 | `stock-mismatch` | The active modem bank is not the stock image the release image is built from. Recorded; never retried for this image. |
-| `build`, `build-limit` | Building the default image failed this boot; or 3 builds of this image failed or died. |
+| `build`, `build-limit` | Building the default image failed this boot; or 3 builds of this image failed, each the same way twice. |
 | `bank-unknown` | `/proc/cmdline` names no active `tk` bank. |
 | `no-volume` | No Witcher volume yet (first boot after flashing). |
 | `strikes` | Two staged boots without a boot confirm. |
@@ -313,6 +324,29 @@ default image (not an operator's) a rollback is only a comparison:
   and no rollback. The stock boot that follows records them as one rollback
   and judges it the same way.
 - An unreadable record never clears a quarantine.
+
+- **A modem crash while the default image runs.** The modem reloads stock
+  firmware from NAND. The keeper never confirms the image after that, even
+  if stock firmware answers. It records the crash like a rollback (`crash=1`
+  pending in `tk/verdict`, the quarantine line and `strikes=2`) and judges
+  it on the same boot, by watching stock firmware for 300 s.
+  - Stock answers: a crash of the image (`crashes=`). Below 2, the unit goes
+    straight back onto the image.
+  - Stock gets no answer: the network's, and the unit goes back onto the
+    image too.
+  - Two crashes in a row stick like two failures. A confirmed boot does not
+    clear the count, since a crashing image can confirm first; a day of
+    running without a crash does.
+- **The radio guard's own radio cycles** (a picker hold, an enforcement
+  re-attach) stop every confirm clock while they run, as they stop the deaf
+  watchdog's.
+- **A strikes file that cannot be read** keeps the hook on stock firmware
+  for that boot. The keeper then counts it as the limit, judges it like
+  boots cut short, and repairs it.
+- **A unit flashed back to v1.0.16** keeps stock modem firmware: the default
+  config says `enabled=default`, which this hook reads as on and v1.0.16's
+  hook (which wants exactly `1`) as off. So no older rule ever runs the
+  default image.
 
 `keeper.log` lines start with `tk boot verdict`. Retry clears `quarantine`,
 `verdict` and the build record and writes `strikes=0`, so the next boot
@@ -570,8 +604,8 @@ On the Witcher volume, `/mnt/titan-api/tk/` once mounted:
 | --- | --- | --- |
 | `config` | The keeper's default build, or an operator | `enabled=1`, `sha256=` lines, optional `target=` and `wm=` lines. The default config starts with `# witcher-default <image> <checksum>`. |
 | `active.gz` | The keeper's default build, or an operator | The staged image |
-| `default` | The keeper's default build | `gzip=` (the release image), `builds=`, `result=` (`started`, `built`, `failed`, `stock-mismatch`) |
-| `verdict` | Keeper (rollbacks of the default image, stock boot verdicts); Retry removes it; cleared at boot when another firmware build wrote it | `gzip=` (the image), `firmware=` (the build that wrote it), `genuine=` (failures in a row where stock answered, since its last confirmed boot), `network=` (rollbacks blamed on the network), `pending=` (a rollback waits for a stock boot), `outage=` (the image waits for the network) |
+| `default` | The keeper's default build | `gzip=` (the release image), `firmware=` and `bank=` (the build and modem bank it ran under), `builds=` (started), `failures=` (counted: each repeated by a second read), `result=` (`started`, `built`, `failed`, `transient`, `stock-mismatch`) |
+| `verdict` | Keeper (rollbacks and modem crashes of the default image, stock boot verdicts); Retry removes it; cleared at boot when another firmware build wrote it | `gzip=` (the image), `firmware=` (the build that wrote it), `genuine=` (failures in a row where stock answered, since its last confirmed boot), `network=` (rollbacks blamed on the network), `pending=` (a rollback waits for a stock boot), `outage=` (the image waits for the network), `crashes=` (modem crashes in a row where stock then answered, since a day without one), `crash=` (the pending judgement is a crash's) |
 | `strikes` | Hook (+1 before each load), keeper (0 on confirm, 2 on rollback) | `strikes=N` and `firmware=<id>`, the build that counted them |
 | `quarantine` | Keeper | One hash per line |
 | `confirmed` | Keeper | `sha256=<hash>` of the last confirmed image |
@@ -610,15 +644,16 @@ In RAM:
   layer's patch magic in the same session (N4 through
   `titan_pd_model::tk_boot::flag_writes_allowed`). A new word needs a code
   change and its own bench test.
-- **No crash quarantine.** A modem crash after a confirmed boot reloads stock
-  NAND firmware without a reboot, but the next boot loads the image again.
+- **An operator image's modem crash** reloads stock NAND firmware until the
+  next boot, as before. The default image's crash is judged (below).
 - **One image built on the unit.** `tk-build` builds only the release image
-  `n6h-r4-r1` (N6H + R4's Rust N4 + R1's PIE; [tk-patch.md](tk-patch.md)).
-  Any other image is staged by hand.
+  `n6h-r4-r1-s3` (N6H + R4's Rust N4 + R1's PIE with the S3 defaults;
+  [tk-patch.md](tk-patch.md)). Any other image is staged by hand.
 - **The modem words wait for an answer.** They are written only after the
   boot confirm. On a network where no confirm target answers ping or DNS,
   the default image loads and waits there, but its words stay off until
-  one answers. Give such units `target=` lines that answer.
+  one answers. Give such units `target=` lines in
+  `/mnt/titan-api/pd/watchdog.conf` (not `tk/config`) that answer.
 - **An image that fails only now and then** never sticks: each confirmed
   boot clears its count. Each failure costs that boot 300 s and two reboots.
 - **An image broken in a way an outage hid.** If the comparison happens

@@ -8,8 +8,10 @@
 //! waiting for the network. A rollback of the default image is a comparison
 //! with stock firmware: the next stock boot judges whether the image or the
 //! network failed (see `titan_pd_model::tk_verdict`), and a network verdict
-//! goes straight back onto the image. Every reboot here passes the keeper's
-//! reboot gate (`super::reboot`).
+//! goes straight back onto the image. A modem crash while the default image
+//! runs is judged the same way, on the same boot. The clocks pause while the
+//! radio guard cycles the radio on purpose. Every reboot here passes the
+//! keeper's reboot gate (`super::reboot`).
 
 use std::fs;
 use std::io::ErrorKind;
@@ -45,6 +47,12 @@ impl Keeper {
             self.tk_checked = true;
             self.tk_start();
         }
+        // The kernel log was read earlier this tick; the flag writer takes the
+        // signal after this.
+        if self.modem_restart_seen {
+            self.tk_modem_reloaded();
+        }
+        self.maintain_tk_healthy();
         if self.reboot_asked_at.is_none() {
             self.maintain_tk_owed_reboots();
         }
@@ -110,8 +118,15 @@ impl Keeper {
                 );
         }
         if let Some(sha) = result.strip_prefix("back=") {
-            if status.staged.is_none() {
-                self.tk_back_owed = Some(sha.to_owned());
+            self.tk_back_owed = Some(sha.to_owned());
+        }
+        // An earlier keeper process saw the default image's modem crash this
+        // boot: stock firmware runs now, so judge the crash, never confirm.
+        if let (Some(sha), Some(_)) = (result.strip_prefix("crashed="), tk_dir()) {
+            self.tk_crashed = true;
+            self.tk_confirm = None;
+            if verdict.pending && verdict.crash && verdict.gzip == sha {
+                self.tk_confirm = Some(tk_boot::Confirm::watch(sha, None, self.now, self.tk_timing));
             }
         }
         self.tk_status = status.clone();
@@ -198,6 +213,14 @@ impl Keeper {
         let Some(mut confirm) = self.tk_confirm.take() else {
             return;
         };
+        // The radio guard cycles the radio on purpose (a picker hold, an
+        // enforcement re-attach): no clock runs meanwhile, as for the deaf
+        // watchdog.
+        if crate::radio::transition_in_progress(self.now) {
+            confirm.pause(self.now);
+            self.tk_confirm = Some(confirm);
+            return;
+        }
         let cell = self.cell_seen();
         let action = confirm.observe(self.now, mgmt_address_up(), heard, cell);
         match (action, confirm.judging()) {
@@ -234,8 +257,13 @@ impl Keeper {
     /// never a quarantine nothing judges.
     fn tk_record_stopped(&mut self, dir: &Path, verdict: &Verdict) -> Option<Verdict> {
         let sha = tk_default::default_sha(&read_file(dir.join("config")))?;
-        let strikes = tk_boot::parse_strikes(&read_file(dir.join("strikes")));
-        let at_limit = strikes.is_some_and(|n| n >= tk_boot::STRIKE_LIMIT);
+        // A strikes file that cannot be read (a flash error, a hand edit)
+        // counts as the limit: judged and repaired here, never stock for good.
+        let path = dir.join("strikes");
+        let at_limit = match tk_boot::parse_strikes(&read_file(&path)) {
+            Some(n) => n >= tk_boot::STRIKE_LIMIT,
+            None => fs::symlink_metadata(&path).is_ok(),
+        };
         let path = dir.join("quarantine");
         let quarantine = read_file(&path);
         let quarantined = tk_boot::parse_quarantine(&quarantine).contains(&sha);
@@ -301,6 +329,12 @@ impl Keeper {
             Judgement::Genuine { count, sticks: true } => format!(
                 "tk boot verdict: stock modem firmware answered where modem firmware {short} did not: failure {count} of {GENUINE_LIMIT} in a row; it stays quarantined until Retry under Network -> Latency, or a new firmware"
             ),
+            Judgement::Crash { count, sticks: false } => format!(
+                "tk boot verdict: stock modem firmware answered after modem firmware {short} crashed: crash {count} of {GENUINE_LIMIT}; it is out of quarantine, so the unit goes straight back onto it"
+            ),
+            Judgement::Crash { count, sticks: true } => format!(
+                "tk boot verdict: stock modem firmware answered after modem firmware {short} crashed: crash {count} of {GENUINE_LIMIT} in a row; it stays quarantined until Retry under Network -> Latency, or a new firmware"
+            ),
         });
         if judgement.back_to_image() {
             if recorded {
@@ -314,7 +348,89 @@ impl Keeper {
         }
     }
 
+    /// The modem driver loaded firmware again (`modem_restart_seen`). On a
+    /// boot that loaded the default image, stock firmware from NAND runs now:
+    /// the image crashed. Never confirm it after that; record the crash and
+    /// judge it like a rollback, by watching stock firmware on this boot
+    /// (`Verdict::crashed`). A second load while judging is stock firmware
+    /// crashing too: not the image's fault, so the judgement goes to the
+    /// network and the unit back onto the image. An operator's image keeps
+    /// its old rule (stock until the next boot).
+    fn tk_modem_reloaded(&mut self) {
+        let Some(sha) = self.tk_status.staged.clone() else {
+            return;
+        };
+        let short = tk_boot::short(&sha).to_owned();
+        if self.tk_crashed {
+            if self.tk_confirm.as_ref().is_some_and(|c| c.judging()) {
+                self.note(&format!(
+                    "tk boot verdict: stock modem firmware restarted as well, so the crash of modem firmware {short} was not the image's"
+                ));
+                self.tk_confirm = None;
+                self.tk_probe = None;
+                self.tk_judged(&sha, false);
+            }
+            return;
+        }
+        let Some(dir) = tk_dir() else {
+            return;
+        };
+        if tk_default::default_sha(&read_file(dir.join("config"))).as_deref() != Some(sha.as_str()) {
+            return;
+        }
+        self.tk_crashed = true;
+        self.tk_confirm = None;
+        self.tk_probe = None;
+        let _ = fs::write(tk_result_path(), format!("crashed={sha}\n"));
+        // The record first, as for a rollback; the quarantine keeps a boot
+        // before the judgement on stock firmware.
+        let next = Verdict::parse(&read_file(dir.join(VERDICT))).crashed(&sha, &self.tk_firmware);
+        let written = write_atomic(&dir.join(VERDICT), next.render().as_bytes())
+            && Verdict::parse(&read_file(dir.join(VERDICT))) == next;
+        if !written {
+            self.note(&format!(
+                "tk boot: modem firmware {short} crashed and stock firmware runs now, but the crash could not be recorded; the next boot loads the image again"
+            ));
+            return;
+        }
+        let quarantine = dir.join("quarantine");
+        let _ = write_atomic(&quarantine, tk_boot::add_quarantine(&read_file(&quarantine), &sha).as_bytes());
+        let _ = write_atomic(
+            &dir.join("strikes"),
+            tk_boot::format_strikes(tk_boot::STRIKE_LIMIT, &self.tk_firmware).as_bytes(),
+        );
+        self.note(&format!(
+            "tk boot: modem firmware {short} crashed and the modem reloaded stock firmware; this boot judges the crash by watching stock firmware for {} s",
+            self.tk_timing.confirm
+        ));
+        self.tk_confirm = Some(tk_boot::Confirm::watch(&sha, Some(self.now), self.now, self.tk_timing));
+    }
+
+    /// The default image ran a day on this boot after its confirm, without a
+    /// modem crash: its crash count is history (`Verdict::healthy`).
+    fn maintain_tk_healthy(&mut self) {
+        let Some(since) = self.tk_confirmed_at else {
+            return;
+        };
+        if self.tk_crashed || self.now.saturating_sub(since) < tk_boot::CRASH_CLEAR_SECS {
+            return;
+        }
+        self.tk_confirmed_at = None;
+        let (Some(sha), Some(dir)) = (self.tk_status.staged.clone(), tk_dir()) else {
+            return;
+        };
+        let verdict = Verdict::parse(&read_file(dir.join(VERDICT)));
+        let next = verdict.healthy(&sha);
+        if next != verdict && write_atomic(&dir.join(VERDICT), next.render().as_bytes()) {
+            self.note(&format!(
+                "tk boot: modem firmware {} ran a day without a modem crash; its crash count is cleared",
+                tk_boot::short(&sha)
+            ));
+        }
+    }
+
     fn tk_confirmed(&mut self, sha: &str) {
+        self.tk_confirmed_at = Some(self.now);
         self.tk_confirmed_record(sha);
         // Only now, and only for the image the hook staged, may flags be written.
         if let Some(armed) = tk_flags::armed_sha(&self.tk_status, &format!("confirmed={sha}\n")) {
@@ -380,6 +496,22 @@ impl Keeper {
             ));
             return false;
         }
+        // The default image's comparison is recorded first: without its
+        // verdict the quarantine would be a leftover the hook clears, and a
+        // bad image could come back at every boot. If it cannot be written,
+        // nothing is, and the watch goes on.
+        let default = tk_default::default_sha(&read_file(dir.join("config"))).as_deref() == Some(sha);
+        if default {
+            let next = Verdict::parse(&read_file(dir.join(VERDICT))).rolled_back(sha, &self.tk_firmware);
+            let written = write_atomic(&dir.join(VERDICT), next.render().as_bytes())
+                && Verdict::parse(&read_file(dir.join(VERDICT))) == next;
+            if !written {
+                self.note_tk_hold(&format!(
+                    "tk boot confirm: {reason}, but the rollback record could not be written; not rebooting, and the watch goes on"
+                ));
+                return false;
+            }
+        }
         let _ = fs::write(tk_result_path(), format!("rollback={sha}\n"));
         let quarantine = dir.join("quarantine");
         let strikes = dir.join("strikes");
@@ -403,16 +535,7 @@ impl Keeper {
         // The default image's quarantine is provisional: the next stock boot
         // judges whether the image or the network failed. An operator's
         // image stays quarantined as before.
-        let default = tk_default::default_sha(&read_file(dir.join("config"))).as_deref() == Some(sha);
-        let provisional = default
-            && write_atomic(
-                &dir.join(VERDICT),
-                Verdict::parse(&read_file(dir.join(VERDICT)))
-                    .rolled_back(sha, &self.tk_firmware)
-                    .render()
-                    .as_bytes(),
-            );
-        let quarantined = if provisional {
+        let quarantined = if default {
             "quarantined it for now (the next stock boot tells whether the image or the network failed)"
         } else {
             "quarantined it"

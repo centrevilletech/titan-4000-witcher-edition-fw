@@ -32,13 +32,13 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use titan_pd_model::tk_build;
-use titan_pd_model::tk_default::{self, Cleared, Inputs, Owner, Plan, Record};
+use titan_pd_model::tk_default::{self, Attempt, Cleared, Inputs, Owner, Plan, Record};
 use witcher_tk_patch::manifest::Manifest;
 use witcher_tk_patch::manifests;
 
 use crate::files::write_durably;
 use crate::paths::{env_path_or, firmware_id, tk_dir};
-use crate::tk_build_io::{self, TMP_CONFIG, TMP_IMAGE};
+use crate::tk_build_io::{self, Failure, TMP_CONFIG, TMP_IMAGE};
 
 /// The build record (`tk_default::Record`) and its temporary file.
 const RECORD: &str = "default";
@@ -149,7 +149,7 @@ fn boot(write: bool) -> Outcome {
         }
         (Plan::Build, None) => Outcome::Stock("bank-unknown"),
         (Plan::Build, Some(_)) if !write => Outcome::Build,
-        (Plan::Build, Some(bank)) => build(&dir, &m, bank, record.as_deref()),
+        (Plan::Build, Some(bank)) => build(&dir, &m, bank, record.as_deref(), &firmware),
     }
 }
 
@@ -233,6 +233,17 @@ fn save(dir: &Path, record: &Record) -> io::Result<()> {
     write_durably(&dir.join(RECORD), &dir.join(TMP_RECORD), record.render().as_bytes())
 }
 
+/// How the record judges one failed attempt.
+fn attempt_of(failure: &Failure) -> Attempt<'_> {
+    if failure.io {
+        Attempt::Io(&failure.text)
+    } else if failure.stock {
+        Attempt::Stock(&failure.text)
+    } else {
+        Attempt::Other(&failure.text)
+    }
+}
+
 /// Record how the build ended, then hand the hook its answer.
 fn finish(dir: &Path, record: Record, result: &str, outcome: Outcome) -> Outcome {
     if let Err(err) = save(dir, &record.finish(result)) {
@@ -242,15 +253,23 @@ fn finish(dir: &Path, record: Record, result: &str, outcome: Outcome) -> Outcome
 }
 
 /// Build the release image from `bank` into `dir`, then write its default
-/// config. The build is recorded before it starts, so one that is killed
-/// still counts; any failure leaves no image and no default config behind.
-fn build(dir: &Path, m: &Manifest, bank: &str, record: Option<&str>) -> Outcome {
+/// config. The build is recorded before it starts; any failure leaves no
+/// image and no default config behind.
+///
+/// Only a failure that repeats counts (`Record::finish`). An I/O error or a
+/// killed build is transient. Any other failure is read again once in this
+/// run before it is judged: Linux 3.10 hands NAND data with an
+/// uncorrectable ECC error back as data, so one bad read looks like another
+/// image. If the second read builds, the first was a bad read; if it fails
+/// the same way, the record says so (`stock-mismatch` for a bank that is not
+/// the stock image, else `failed`).
+fn build(dir: &Path, m: &Manifest, bank: &str, record: Option<&str>, firmware: &str) -> Outcome {
     if let Err(err) = prepare(dir) {
         eprintln!("tk-build boot: {}: {err}", dir.display());
         return Outcome::Stock("build");
     }
     let release = m.gzip.sha256.to_string();
-    let record = Record::start(record.unwrap_or(""), &release);
+    let record = Record::start(record.unwrap_or(""), &release, firmware, bank);
     if let Err(err) = save(dir, &record) {
         // Unrecorded, a build that dies could repeat at every boot.
         eprintln!("tk-build boot: recording the build: {err}");
@@ -259,17 +278,45 @@ fn build(dir: &Path, m: &Manifest, bank: &str, record: Option<&str>) -> Outcome 
     let proc_mtd = fs::read_to_string(env_path_or("TITAN_TK_PROC_MTD", "/proc/mtd")).unwrap_or_default();
     let Some(part) = tk_build::find_mtd(&proc_mtd, bank) else {
         eprintln!("tk-build boot: /proc/mtd has no {bank} partition");
-        return finish(dir, record, "failed", Outcome::Stock("bank-unknown"));
+        return finish(dir, record, "transient", Outcome::Stock("bank-unknown"));
     };
-    let (built, skipped) = match tk_build_io::build(m, &part, Some(dir)) {
+    let attempt = || tk_build_io::build(m, &part, Some(dir));
+    let (built, skipped) = match attempt() {
         Ok(done) => done,
-        Err(failure) => {
-            eprintln!("tk-build boot: {bank} (mtd{}): {}", part.index, failure.text);
-            return if failure.stock {
-                finish(dir, record, "stock-mismatch", Outcome::Stock("stock-mismatch"))
-            } else {
-                finish(dir, record, "failed", Outcome::Stock("build"))
-            };
+        Err(first) if first.io => {
+            eprintln!("tk-build boot: {bank} (mtd{}): {} (transient; the next boot tries again)", part.index, first.text);
+            let result = tk_default::build_result(attempt_of(&first), None);
+            return finish(dir, record, result, Outcome::Stock("build"));
+        }
+        Err(first) => {
+            eprintln!("tk-build boot: {bank} (mtd{}): {}; reading the bank again", part.index, first.text);
+            match attempt() {
+                Ok(done) => {
+                    eprintln!("tk-build boot: the second read built it: the first was a bad read");
+                    done
+                }
+                Err(second) => {
+                    let result = tk_default::build_result(attempt_of(&first), Some(attempt_of(&second)));
+                    let outcome = match result {
+                        "stock-mismatch" => {
+                            eprintln!("tk-build boot: the second read failed the same way");
+                            Outcome::Stock("stock-mismatch")
+                        }
+                        "failed" => {
+                            eprintln!("tk-build boot: the second read failed the same way");
+                            Outcome::Stock("build")
+                        }
+                        _ => {
+                            eprintln!(
+                                "tk-build boot: the second read failed otherwise ({}): a bad read, not this unit's firmware; the next boot tries again",
+                                second.text
+                            );
+                            Outcome::Stock("build")
+                        }
+                    };
+                    return finish(dir, record, result, outcome);
+                }
+            }
         }
     };
     let config = tk_default::config_text(m.name, &release);
@@ -282,8 +329,9 @@ fn build(dir: &Path, m: &Manifest, bank: &str, record: Option<&str>) -> Outcome 
         })
     });
     if let Err(why) = placed {
-        eprintln!("tk-build boot: {why}");
-        return finish(dir, record, "failed", Outcome::Stock("build"));
+        // A full volume or a write that did not read back: this attempt's.
+        eprintln!("tk-build boot: {why} (transient; the next boot tries again)");
+        return finish(dir, record, "transient", Outcome::Stock("build"));
     }
     eprintln!(
         "tk-build boot: built {} from {bank} (mtd{}, {skipped} bad blocks skipped): gzip {} ({} bytes)",
