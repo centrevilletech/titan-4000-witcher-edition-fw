@@ -24,7 +24,9 @@
 //! - M1 (`0x841b5900` = `4d 31 50 49` `"M1PI"`, then a build version in
 //!   `M1_VERSIONS` at `0x841b5904`):
 //!   - `0x841b5908` `M1_SELECT` (0 N4 AQM v2, the boot value and rollback; 1 Rust
-//!     PIE; 2 no AQM). The block's counters are read, never written (`STATUS`).
+//!     PIE; 2 no AQM; 3 lane Q1's CoDel with the second-carrier floor, on builds
+//!     `0x20261127` and later, while earlier builds run N4 v2 for it). The block's
+//!     counters are read, never written (`STATUS`).
 //!
 //! Forbidden addresses (TRCP, W5, UHQ, U3T, R17, X4/HRB, DSR, U14, PHR, RF,
 //! power, MPR, calibration, the M1 tunables, state and counters, and every
@@ -95,7 +97,7 @@ pub const M1_MAGIC_ADDR: u32 = 0x841b_5900;
 /// M1 builds whose selector and counters sit where `TABLE` and `STATUS` say
 /// (`device/modem-rust/src/pie.rs`, `M1Block`). A build not on this list
 /// writes nothing.
-pub const M1_VERSIONS: [u32; 2] = [0x2026_1125, 0x2026_1126];
+pub const M1_VERSIONS: [u32; 3] = [0x2026_1125, 0x2026_1126, 0x2026_1127];
 
 pub const MAGICS: [MagicSpec; 5] = [
     MagicSpec {
@@ -457,7 +459,7 @@ pub const TABLE: [WordSpec; 19] = [
         addr: M1_SELECT_ADDR,
         magic: MagicGroup::M1,
         kind: Kind::Flag,
-        allowed: AllowedValues::Range { min: 0, max: 2 },
+        allowed: AllowedValues::Range { min: 0, max: 3 },
         off_value: 0,
         boot_default: 0,
     },
@@ -3450,13 +3452,13 @@ wm=0x8418ff08:0x1
 
     #[test]
     fn the_m1_selector_is_bounded_and_the_rest_of_its_block_is_never_written() {
-        for v in 0..=2 {
+        for v in 0..=3 {
             assert!(value_ok(M1_SELECT_ADDR, v), "{v}");
         }
-        for v in [3, 4, 0x10, u32::MAX] {
+        for v in [4, 7, 0x10, u32::MAX] {
             assert!(!value_ok(M1_SELECT_ADDR, v), "{v}");
         }
-        let parsed = parse_writes("enabled=1\nwm=0x841b5908:0x2\nwm=0x841b5908:3\n");
+        let parsed = parse_writes("enabled=1\nwm=0x841b5908:0x2\nwm=0x841b5908:4\n");
         assert_eq!(
             parsed.writes,
             vec![Write {
@@ -3467,8 +3469,8 @@ wm=0x8418ff08:0x1
         assert_eq!(
             parsed.refused_reasons,
             vec![(
-                "wm=0x841b5908:3".to_owned(),
-                "M1_SELECT value 3 outside allowed range 0..=2".to_owned()
+                "wm=0x841b5908:4".to_owned(),
+                "M1_SELECT value 4 outside allowed range 0..=3".to_owned()
             )]
         );
         assert_eq!(off_value(M1_SELECT_ADDR), Some(0));
@@ -3667,7 +3669,7 @@ wm=0x8418ff08:0x1
         let line = drive(&mut control, &mut fake, 0).unwrap();
         assert!(
             line.contains(
-                "the M1 patch at 0x841b5900 shows version 0x20261199; this keeper accepts 0x20261125, 0x20261126; nothing written"
+                "the M1 patch at 0x841b5900 shows version 0x20261199; this keeper accepts 0x20261125, 0x20261126, 0x20261127; nothing written"
             ),
             "{line}"
         );

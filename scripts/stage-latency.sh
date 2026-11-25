@@ -233,7 +233,7 @@ CHECKS = [
 ]
 # M1 builds the keeper accepts: M1_VERSIONS in userspace/pd-model/src/tk_flags.rs
 # (scripts/test-tk-stage.py checks that both lists match).
-M1_VERSIONS = (0x20261125, 0x20261126)
+M1_VERSIONS = (0x20261125, 0x20261126, 0x20261127)
 with gzip.open(sys.argv[1], "rb") as fh:
     data = fh.read()
 

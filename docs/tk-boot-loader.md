@@ -218,7 +218,7 @@ layer's magic word:
 | N5 | `0x84489a8c` | `N5_PDCP_K_Q4` | `0..=64` | `0` | Adaptive PDCP multiplier in Q4 |
 | N5 | `0x84489a6c` | `N5_FLAGS` | `0..=3` (bit `0x4` refused) | `0` | `0x1` sparse flow lane, `0x2` N5 PDCP staging override (requires `N4_FLAGS` bit `0x1`), `0x3` both |
 | N6 (`0x8418ff00`: `55 32 48 46`) | `0x8418ff08` | `U2_FLAGS` | `0` or `1` | `0` | LNK-FIX post-ACK filter + per-carrier counters (same magic on N6 and N6H; `0x8418ff04` distinguishes N6 `4e 36 00 00` from N6H `4e 36 48 03`) |
-| M1 (`0x841b5900`: `4d 31 50 49`, then an accepted build version at `0x841b5904`: `20 26 11 25`) | `0x841b5908` | `M1_SELECT` | `0..=2` | `0` | Uplink AQM: `0` N4 AQM v2 (the boot value), `1` Rust PIE, `2` no AQM. `1` and `2` act only while `N4_FLAGS` has bits `0x5`; without them the modem enqueues as with the N4 AQM off. |
+| M1 (`0x841b5900`: `4d 31 50 49`, then an accepted build version at `0x841b5904`: `20 26 11 25`) | `0x841b5908` | `M1_SELECT` | `0..=3` | `0` | Uplink AQM: `0` N4 AQM v2 (the boot value), `1` Rust PIE, `2` no AQM, `3` CoDel with the second-carrier floor (build `0x20261127` and later; earlier builds run N4 AQM v2 for `3`). `1` to `3` act only while `N4_FLAGS` has bits `0x5`; without them the modem enqueues as with the N4 AQM off. |
 
 **Never on the allow-list (always refused and logged):** IMG4 words `TRCP`
 (`0x847ecf1c/20/24`), `W5` (`0x847ece88..94`), `UHQ` (`0x847ecff0`), `U3T`
@@ -302,7 +302,7 @@ logged with the reason.
    line reads the magic and the version together: `vm 0x841b5900 8`.
 3. It writes only if every required magic reads back in the same session (N4
    through `tk_boot::flag_writes_allowed`), and for M1 only if the version is
-   one this keeper accepts (`tk_flags::M1_VERSIONS`, today `0x20261125` and `0x20261126`). The
+   one this keeper accepts (`tk_flags::M1_VERSIONS`, today `0x20261125`, `0x20261126` and `0x20261127`). The
    N4 magic appears only after the first uplink transport block. Until then
    the keeper writes nothing and asks again after 15 s, then 30 s, doubling up
    to 10 minutes. An unaccepted M1 build waits the same way: nothing is
@@ -412,8 +412,8 @@ session as the read-back:
 
 | Line | Values |
 | --- | --- |
-| `version` | The M1 build, `0x20261125` (lane M1) or `0x20261126` (lane R1: overload latch, time-based ceiling) |
-| `selector` | `0` N4 AQM v2, `1` Rust PIE, `2` no AQM |
+| `version` | The M1 build, `0x20261125` (lane M1), `0x20261126` (lane R1: overload latch, time-based ceiling) or `0x20261127` (lane Q1: selector 3) |
+| `selector` | `0` N4 AQM v2, `1` Rust PIE, `2` no AQM, `3` CoDel with the second-carrier floor |
 | `seen` | Packets the PIE evaluated (`+0x60`) |
 | `pie_drops` | Probabilistic PIE drops (`+0x68`) |
 | `ce_marks` | ECN CE marks (`+0x6c`) |
