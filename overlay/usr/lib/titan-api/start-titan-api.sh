@@ -102,15 +102,35 @@ case "$command_name" in
  identity) [ "$#" = 1 ] || exit 64; check_identity; exit 0;;
  restore-routes-loop)
   [ "$#" = 1 ] || exit 64
-  route_attempt=0
-  # Routes need the bearer; registration and grant can take several minutes.
-  while [ "$route_attempt" -lt 40 ]; do
-   "$runtime/titan-api" --restore-routes && exit 0
-   route_attempt=$((route_attempt + 1))
+  # Routes need their bearer, and Linux deletes a route when its interface
+  # or address goes: every PDN release, re-attach or tower outage takes the
+  # saved ones away. For as long as the service runs, look at the routing
+  # table every 15 s and run --restore-routes, which adds only what is
+  # missing, whenever it changed. After a failure, try again when the table
+  # changes (the bearer is back) or after a wait that doubles to 30 min.
+  seen=
+  wait=15
+  due=
+  while :; do
+   table=$(cat /proc/net/route 2> /dev/null) || table=
+   read -r now _ < /proc/uptime || now=0
+   now=${now%%.*}
+   if [ "$table" != "$seen" ] || { [ -n "$due" ] && [ "$now" -ge "$due" ]; }; then
+    if "$runtime/titan-api" --restore-routes; then
+     [ -z "$due" ] || echo 'Configured routes are restored.'
+     due=
+     wait=15
+     table=$(cat /proc/net/route 2> /dev/null) || table=
+    else
+     echo "Configured routes are not all restored; trying again in $wait s or when the routing table changes." >&2
+     due=$((now + wait))
+     wait=$((wait * 2))
+     [ "$wait" -le 1800 ] || wait=1800
+    fi
+    seen=$table
+   fi
    sleep 15
-  done
-  echo 'Configured routes could not be restored after 40 attempts.' >&2
-  exit 1;;
+  done;;
  stop) [ "$#" = 1 ] || exit 64; stop_all; exit;;
  status)
   [ "$#" = 1 ] || exit 64
