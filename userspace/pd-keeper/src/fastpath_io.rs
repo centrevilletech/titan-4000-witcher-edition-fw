@@ -87,7 +87,7 @@ pub struct Watch {
     /// A load failed for this config; not retried until config changes or reboot.
     failed_for: Option<Config>,
     refused_logged: Vec<String>,
-    /// True while our `titan_k1fp v2.2` module is loaded.
+    /// True while our `titan_k1fp` module (the pinned version) is loaded.
     module_loaded: bool,
     /// True once `maintain()` has loaded or adopted the currently loaded module.
     managed: bool,

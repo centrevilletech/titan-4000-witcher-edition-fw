@@ -11,12 +11,14 @@ behind it, so ping and every interactive flow slow down. On the bench
 
 ## What it does
 
-`titan_qctrl.ko` (v0.3-q3) is a small kernel module. It sits on the bridge
+`titan_qctrl.ko` (v0.4) is a small kernel module. It sits on the bridge
 between the customer bearer (`lte0pdn2`) and the customer port (`eth0`). It
 lowers the TCP receive window that the customer's devices advertise, so each
-sender keeps only a short queue at the tower. With no new knobs set, v0.3-q3
+sender keeps only a short queue at the tower. With no new knobs set, it
 executes the exact v0.2-o1b control and ACK-thinning paths so operators can
-A-B-B-A old against new in a single loaded module.
+A-B-B-A old against new in a single loaded module. v0.4 adds the
+[upload clamp](upload-clamp.md) (mode bit 16); with that bit clear it forwards
+exactly what v0.3-q3 did.
 
 - It measures the tower queue from the server's own TCP timestamp clock. A
   server without a usable timestamp clock falls back to round-trip time.
@@ -59,7 +61,7 @@ port and LTE are up.
 
 | Line | Values | Meaning |
 | --- | --- | --- |
-| `mode=` | `0`, `2`, `3`, `6` | 0 off (pass-through). 2 receive-window clamp (the bench setting). 3 adds ACK thinning, 6 adds downlink ECN marks. |
+| `mode=` | `0`, `2`, `3`, `6`, `16`, `18`, `19`, `22` | 0 off (pass-through). 2 receive-window clamp (the bench setting). 3 adds ACK thinning, 6 adds downlink ECN marks. Adding 16 turns on the [upload clamp](upload-clamp.md). |
 | `trough_ms=` | 0 to 40 | Standing queue the loop keeps. Module default 4. A bursty uplink may need 8 or 12 for full speed. |
 | `target_ms=` | 4 to 80 | Cap on the mean queue. Module default 40. |
 | `ack_adapt=` | `0`, `1` | 0 off (v0.2-o1b thinning path, default). 1 adaptive safe ACK thinning when mode bit 0 is set (per-flow time/segment budget, SACK/dupACK recovery cooldown, slow-start and rate-floor bypass, automatic rate-drop backoff, evenly staggered flush grid). |
@@ -67,6 +69,7 @@ port and LTE are up.
 | `ack_ms=` | 1 to 10 | Per-flow ACK time budget in ms when `ack_adapt=1`. Module default 6. |
 | `ack_segs=` | 2 to 32 | Per-flow ACK segment budget when `ack_adapt=1`. Module default 18. |
 | `ack_min_kbps=` | 0 to 100000 | Per-flow DL rate floor in kbps below which `ack_adapt=1` never thins. Module default 2000. |
+| `ul_target_ms=`, `ul_pulse_kb=`, `ul_pulse_ms=` | see [upload clamp](upload-clamp.md) | Upload clamp knobs. |
 
 A `#` starts a comment. The last line for a key wins. A bad `mode=` line
 leaves the clamp off, and a bad knob line leaves the module default. Either
@@ -86,7 +89,8 @@ Every 15 s, in every mode:
    SHA-256 against the digest built into the keeper, then runs `insmod` on
    that copy. The module starts in mode 0 (observe only).
 5. Writes any configured knobs (`trough_ms`, `target_ms`, `ack_adapt`,
-   `ctrl_v3`, `ack_ms`, `ack_segs`, `ack_min_kbps`), then `mode`, to
+   `ctrl_v3`, `ack_ms`, `ack_segs`, `ack_min_kbps`, `ul_target_ms`,
+   `ul_pulse_kb`, `ul_pulse_ms`), then `mode`, to
    `/proc/titan_qctrl`, one line per write. Then it reads them back.
 6. On later rounds it reads `/proc/titan_qctrl` again and writes the config
    again if they differ, so a config change applies within 15 s.
@@ -95,7 +99,7 @@ A failed load is not retried until the config changes or the unit reboots.
 
 Status: `/var/run/witcher-qctrl.status`, with `state` (`off`, `waiting`,
 `applied`, `failed`), `detail`, `mode`, `trough_ms`, `target_ms`, `ack_adapt`,
-`ctrl_v3`.
+`ctrl_v3`, `upload`, `ul_target_ms`, `ul_pulse_kb`.
 `keeper.log` lines start with `download clamp`. A unit that never staged it
 logs none.
 

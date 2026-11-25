@@ -1,4 +1,4 @@
-# Passthrough bridge fast path (titan_k1fp 2.2)
+# Passthrough bridge fast path (titan_k1fp 2.3)
 
 Status: off by default and not in the firmware image. An operator stages
 `titan_k1fp.ko` per unit in `/mnt/titan-api/fastpath/` with a `config` file;
@@ -15,7 +15,7 @@ idle with 66 to 72 % softirq, backlog drops, and time squeezes in
 ebtables, `br_netfilter`, iptables, and conntrack before reaching
 `dev_queue_xmit`. Saturated softirq also adds queueing delay under load.
 
-`titan_k1fp` (v2.2) short-circuits steady-state unicast IPv4 and IPv6
+`titan_k1fp` (v2.3) short-circuits steady-state unicast IPv4 and IPv6
 TCP/UDP flows between `lte0pdn2` and `eth0` straight from the bridge port
 RX handler to `dev_queue_xmit`, after proving each flow through the full
 stock path first.
@@ -95,6 +95,11 @@ bridge and netfilter path:
   timestamps, OWD, RTT, ECN marking, and UDP drop. On uplink TCP (modes 1
   and 3), it yields to stock while `titan_qctrl` is loaded so RWND
   clamping and ACK thinning run untouched.
+  Since 2.3 a stock-path proof also accepts what `titan_qctrl` v0.4's
+  upload clamp writes on downlink: a lower TCP receive window with a checksum
+  whose one's complement sum with the window is unchanged, every other header
+  byte the same, and only while `titan_qctrl` was loaded when the proof began.
+  2.2 counted that rewrite as `modified` and tripped its watchdog.
 - **In-kernel watchdog and mismatch ring (no kernel-log dependence)**:
   While `mode >= 2`, a 100 ms timer and inline proof checks drop `mode` to
   `0` on `modified + wrongport` bursts (`wd_mod`, default 20 within a
@@ -160,9 +165,9 @@ Every 15 s the keeper:
 
 1. Reads `/mnt/titan-api/fastpath/config`.
 2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
-   `/proc/k1fp` reports a version string other than `titan_k1fp v2.2`. If
+   `/proc/k1fp` reports a version string other than `titan_k1fp v2.3`. If
    `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
-   exact pinned version line `titan_k1fp v2.2`, the keeper adopts it, logs
+   exact pinned version line `titan_k1fp v2.3`, the keeper adopts it, logs
    `fast path: adopted a loaded module`, and takes over its mode and grant
    lease without running `insmod`.
 3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and

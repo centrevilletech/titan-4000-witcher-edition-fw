@@ -29,7 +29,8 @@
 #   --hold-ack TOKEN     Write hold_ack=prb-tax to allow --hold up to 0x800
 #                        (adds padding uplink grants on the tower while active)
 #   --no-flags           Write no wm= lines (the image runs with every flag 0)
-#   --mode N             Clamp mode: 0, 2, 3 or 6 (default 2)
+#   --mode N             Clamp mode: 0, 2, 3 or 6 (default 2); add 16 for the upload
+#                        clamp (16, 18, 19 or 22)
 #   --trough-ms N        Clamp knob, 0..40 (default: module default 4)
 #   --clamp-target-ms N  Clamp knob, 4..80 (default: module default 40)
 #   --ack-adapt N        Clamp knob, 0 or 1 (default: module default 0)
@@ -37,6 +38,9 @@
 #   --ack-ms N           Clamp knob, 1..10 (default: module default 6)
 #   --ack-segs N         Clamp knob, 2..32 (default: module default 18)
 #   --ack-min-kbps N     Clamp knob, 0..100000 (default: module default 2000)
+#   --ul-target-ms N     Upload clamp knob, 0..40 (default: module default 8)
+#   --ul-pulse-kb N      Upload clamp knob, 0..64 (default: module default 0, no pulses)
+#   --ul-pulse-ms N      Upload clamp knob, 50..2000 (default: module default 200)
 #   --no-clamp           Skip the clamp; the .ko argument may be left out
 #   --fastpath PATH      Stage titan_k1fp.ko and fastpath/config
 #   --fastpath-mode N    Fast path mode: 0, 1, 2 or 3 (default 2)
@@ -65,6 +69,9 @@ CTRL_V3=
 ACK_MS=
 ACK_SEGS=
 ACK_MIN_KBPS=
+UL_TARGET=
+UL_PULSE_KB=
+UL_PULSE_MS=
 CLAMP=1
 FASTPATH=
 FASTPATH_MODE=2
@@ -92,6 +99,9 @@ while [ $# -gt 0 ]; do
     --ack-ms) ACK_MS=${2:?}; shift 2 ;;
     --ack-segs) ACK_SEGS=${2:?}; shift 2 ;;
     --ack-min-kbps) ACK_MIN_KBPS=${2:?}; shift 2 ;;
+    --ul-target-ms) UL_TARGET=${2:?}; shift 2 ;;
+    --ul-pulse-kb) UL_PULSE_KB=${2:?}; shift 2 ;;
+    --ul-pulse-ms) UL_PULSE_MS=${2:?}; shift 2 ;;
     --no-clamp) CLAMP=0; shift ;;
     --fastpath) FASTPATH=${2:?--fastpath needs a path}; shift 2 ;;
     --fastpath-mode) FASTPATH_MODE=${2:?}; shift 2 ;;
@@ -100,7 +110,7 @@ while [ $# -gt 0 ]; do
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,53p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -198,7 +208,7 @@ if [ "$hold" -gt "$hold_cap" ]; then
   fi
   die "--hold $HOLD is over $(printf '0x%x' "$hold_cap")"
 fi
-case "$MODE" in 0|2|3|6) ;; *) die "--mode must be 0, 2, 3 or 6" ;; esac
+case "$MODE" in 0|2|3|6|16|18|19|22) ;; *) die "--mode must be 0, 2, 3 or 6, or one of them plus 16 (upload clamp)" ;; esac
 case "$FASTPATH_MODE" in 0|1|2|3) ;; *) die "--fastpath-mode must be 0, 1, 2 or 3" ;; esac
 if [ -n "$TROUGH" ]; then [[ "$TROUGH" =~ ^[0-9]+$ ]] && [ "$TROUGH" -le 40 ] || die "--trough-ms must be 0..40"; fi
 if [ -n "$CLAMP_TARGET" ]; then [[ "$CLAMP_TARGET" =~ ^[0-9]+$ ]] && [ "$CLAMP_TARGET" -ge 4 ] && [ "$CLAMP_TARGET" -le 80 ] || die "--clamp-target-ms must be 4..80"; fi
@@ -207,6 +217,9 @@ if [ -n "$CTRL_V3" ]; then [[ "$CTRL_V3" =~ ^[0-9]+$ ]] && [ "$CTRL_V3" -le 1 ] 
 if [ -n "$ACK_MS" ]; then [[ "$ACK_MS" =~ ^[0-9]+$ ]] && [ "$ACK_MS" -ge 1 ] && [ "$ACK_MS" -le 10 ] || die "--ack-ms must be 1..10"; fi
 if [ -n "$ACK_SEGS" ]; then [[ "$ACK_SEGS" =~ ^[0-9]+$ ]] && [ "$ACK_SEGS" -ge 2 ] && [ "$ACK_SEGS" -le 32 ] || die "--ack-segs must be 2..32"; fi
 if [ -n "$ACK_MIN_KBPS" ]; then [[ "$ACK_MIN_KBPS" =~ ^[0-9]+$ ]] && [ "$ACK_MIN_KBPS" -le 100000 ] || die "--ack-min-kbps must be 0..100000"; fi
+if [ -n "$UL_TARGET" ]; then [[ "$UL_TARGET" =~ ^[0-9]+$ ]] && [ "$UL_TARGET" -le 40 ] || die "--ul-target-ms must be 0..40"; fi
+if [ -n "$UL_PULSE_KB" ]; then [[ "$UL_PULSE_KB" =~ ^[0-9]+$ ]] && [ "$UL_PULSE_KB" -le 64 ] || die "--ul-pulse-kb must be 0..64"; fi
+if [ -n "$UL_PULSE_MS" ]; then [[ "$UL_PULSE_MS" =~ ^[0-9]+$ ]] && [ "$UL_PULSE_MS" -ge 50 ] && [ "$UL_PULSE_MS" -le 2000 ] || die "--ul-pulse-ms must be 50..2000"; fi
 for t in "${TARGETS[@]}"; do
   [[ "$t" =~ ^[0-9A-Fa-f.:]+$ ]] || die "--target $t is not an IP address"
 done
@@ -363,6 +376,12 @@ ack_ms=$ACK_MS"
 ack_segs=$ACK_SEGS"
 [ -n "$ACK_MIN_KBPS" ] && QCTRL_CONFIG="$QCTRL_CONFIG
 ack_min_kbps=$ACK_MIN_KBPS"
+[ -n "$UL_TARGET" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ul_target_ms=$UL_TARGET"
+[ -n "$UL_PULSE_KB" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ul_pulse_kb=$UL_PULSE_KB"
+[ -n "$UL_PULSE_MS" ] && QCTRL_CONFIG="$QCTRL_CONFIG
+ul_pulse_ms=$UL_PULSE_MS"
 FASTPATH_CONFIG="# Written by scripts/stage-latency.sh at $stamp
 mode=$FASTPATH_MODE"
 
