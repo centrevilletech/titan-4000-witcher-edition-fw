@@ -232,8 +232,9 @@ A lost bridge device is not a drop in this sense. When `dev_gone` in
 `/proc/k1fp` has moved since the keeper's last look and `wd_trips` has
 not, the keeper logs it once and writes the configured mode again as soon
 as `ports_ok=1 lan_hooked=1 wan_hooked=1` read back. This is not a drop,
-so any number of re-attaches in one boot leave the fast path on. The keeper checks every 15 s, so the fast path is back at most
-about 16 s after the vendor scripts finish rebuilding the bridge.
+so any number of re-attaches in one boot leave the fast path on. The keeper
+checks every 15 s, so the fast path is back at most about 16 s after the
+vendor scripts finish rebuilding the bridge.
 
 ### Status and logs
 
