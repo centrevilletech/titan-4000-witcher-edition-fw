@@ -20,7 +20,6 @@
 //!
 //! The web service builds a copy of this module; both copies run these tests.
 
-use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -28,7 +27,7 @@ use std::time::{Duration, Instant};
 pub const MAX_SOURCES: usize = 256;
 
 /// One source's budget key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Key {
     V4([u8; 4]),
     /// The /64 prefix.
@@ -76,7 +75,8 @@ pub struct Throttle {
     per_source: usize,
     shared: usize,
     window: Duration,
-    sources: BTreeMap<Key, Vec<Instant>>,
+    /// At most `MAX_SOURCES`, searched in order: a small table, so no map.
+    sources: Vec<(Key, Vec<Instant>)>,
     public: Vec<Instant>,
 }
 
@@ -88,7 +88,7 @@ impl Throttle {
             per_source,
             shared,
             window,
-            sources: BTreeMap::new(),
+            sources: Vec::new(),
             public: Vec::new(),
         }
     }
@@ -105,23 +105,27 @@ impl Throttle {
             return false;
         }
         let key = key(source);
-        if !self.sources.contains_key(&key) && self.sources.len() >= MAX_SOURCES {
-            self.sources.retain(|_, times| {
-                fresh(times);
-                !times.is_empty()
-            });
-            if self.sources.len() >= MAX_SOURCES {
-                let oldest = self
-                    .sources
-                    .iter()
-                    .min_by_key(|(_, times)| times.last().copied())
-                    .map(|(key, _)| *key);
-                if let Some(oldest) = oldest {
-                    self.sources.remove(&oldest);
+        let index = match self.sources.iter().position(|(k, _)| *k == key) {
+            Some(index) => index,
+            None => {
+                if self.sources.len() >= MAX_SOURCES {
+                    self.sources.retain_mut(|(_, times)| {
+                        fresh(times);
+                        !times.is_empty()
+                    });
                 }
+                if self.sources.len() >= MAX_SOURCES {
+                    // Push out the source whose last attempt is oldest.
+                    let oldest = (0..self.sources.len())
+                        .min_by_key(|&i| self.sources[i].1.last().copied())
+                        .unwrap_or(0);
+                    self.sources.swap_remove(oldest);
+                }
+                self.sources.push((key, Vec::new()));
+                self.sources.len() - 1
             }
-        }
-        let times = self.sources.entry(key).or_default();
+        };
+        let times = &mut self.sources[index].1;
         fresh(times);
         if times.len() >= self.per_source {
             return false;
