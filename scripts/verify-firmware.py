@@ -118,7 +118,7 @@ def main():
     check('titan-api present', os.path.isfile(api) and is_exec('usr/lib/titan-api/titan-api'))
     if os.path.isfile(api):
         digest=hashlib.sha256(open(api,'rb').read()).hexdigest()
-        check('titan-api sha256', digest=='af3b032ed7d46ee9f802b499793f6e033ba8f68cfd261828b7cc75038a458683')
+        check('titan-api sha256', digest=='a5a8feecfce824bd577a751032806184ad9ebe2d73dba60461bd4218b319a91b')
     check('titan-api init present', os.path.isfile(os.path.join(d,'etc/init.d/titan-api')))
     check('native UI present', os.path.isfile(os.path.join(d,'usr/lib/titan-api/ui/index.html')))
     check('login MAC reads this unit Ethernet interface',

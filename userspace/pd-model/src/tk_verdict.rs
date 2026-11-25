@@ -193,9 +193,16 @@ impl Verdict {
     /// rollback, or `None` when there is nothing to judge: the strikes are
     /// below the limit, a rollback already waits, or the image is quarantined
     /// already (an earlier record stands, stuck or not).
-    pub fn stopped(&self, sha: &str, firmware: &str, at_limit: bool, quarantined: bool) -> Option<Self> {
+    pub fn stopped(
+        &self,
+        sha: &str,
+        firmware: &str,
+        at_limit: bool,
+        quarantined: bool,
+    ) -> Option<Self> {
         let stuck = self.applies(sha, firmware) && self.sticks();
-        (at_limit && !quarantined && !self.pending && !stuck).then(|| self.rolled_back(sha, firmware))
+        (at_limit && !quarantined && !self.pending && !stuck)
+            .then(|| self.rolled_back(sha, firmware))
     }
 }
 
@@ -293,9 +300,13 @@ mod tests {
 
     #[test]
     fn a_damaged_record_keeps_the_quarantine() {
-        let damaged = Verdict::parse(&format!("gzip={IMAGE}\nfirmware={BUILD}\ngenuine=x\npending=1\n"));
+        let damaged = Verdict::parse(&format!(
+            "gzip={IMAGE}\nfirmware={BUILD}\ngenuine=x\npending=1\n"
+        ));
         assert!(damaged.sticks() && damaged.holds(IMAGE, BUILD));
-        let unsure = Verdict::parse(&format!("gzip={IMAGE}\nfirmware={BUILD}\npending=yes\noutage=yes\n"));
+        let unsure = Verdict::parse(&format!(
+            "gzip={IMAGE}\nfirmware={BUILD}\npending=yes\noutage=yes\n"
+        ));
         assert!(!unsure.pending && !unsure.outage);
         assert_eq!(Verdict::parse(""), Verdict::default());
         // A v1.0.17 record from before `firmware=` names no build: it applies

@@ -98,6 +98,7 @@ says so and leaves the file alone:
 
 **Retry** under **Network → Latency** does both, and also clears the
 default image's rollback record (`verdict`) and build record (`default`).
+For the default image, a new firmware build clears them by itself at boot.
 
 `stage` makes `tk/config` an operator's config (it drops a default config's
 marker line), so later boots leave it alone. The keeper reads `tk/config` every 15 s, so on a

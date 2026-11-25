@@ -87,7 +87,9 @@ read-only mount and writes nothing:
 | A `config` whose first line is not `# witcher-default` | Nothing: the hook never asks. It is an operator's config. |
 | A `config` that starts with the marker but was edited since (its checksum fails) | `operator`: the hook's usual checks decide. |
 | `active.gz` with no `config` | `operator`. Either an operator's image, or one an operator turned off by deleting the config. Nothing is built over it. |
-| Anything in `quarantine`, or `strikes` at 2 or unreadable | `reason=quarantined`, `strikes` or `strikes-unreadable`: stock firmware, nothing built. |
+| A rollback of the release image waiting for its stock verdict, or a quarantine that stuck, under this firmware build (`verdict`) | `reason=quarantined`: stock firmware, nothing built. |
+| `strikes` at 2 counted by this firmware build, or unreadable | `reason=strikes` or `strikes-unreadable`: stock firmware, nothing built. The stock boot's keeper then judges those boots. |
+| The release image's quarantine line, strikes at 2 or a `verdict` left by another firmware build (or before v1.0.17), or a `verdict` for another image | `build`, and with `--write` they are cleared (`cleared`), then the image loads. Quarantine lines for an operator's other images stay and do not block the default. |
 | The default config and `active.gz` holding exactly the release image | `cached`: the usual checks load it. |
 | The same, but with a default config an earlier firmware wrote (other words or comments) | `build`, and with `--write` only the config is rewritten as this firmware writes it (`updated`), with no rebuild. |
 | Nothing, or a default config for another image | `build`, unless the build record stops it (below). |
@@ -199,7 +201,7 @@ not work, the command does not run and the check after it keeps stock.
 | `no-volume` | No Witcher volume yet (first boot after flashing). |
 | `strikes` | Two staged boots without a boot confirm. |
 | `strikes-unreadable` | `strikes` exists but holds no count. |
-| `quarantined` | The keeper rolled this image back before. With the default image: any quarantined hash. |
+| `quarantined` | The keeper rolled this image back before. With the default image: a rollback that waits for its stock verdict, or a quarantine that stuck under this firmware build. |
 | `not-allowed` | The image's SHA-256 is not on the allow-list. |
 | `header` | Not a gzip file the modem's reader accepts. |
 | `size`, `memory`, `no-image` | Image under 1 KiB or over 7.5 MiB, under 32 MiB free, or no `active.gz`. |
@@ -218,96 +220,103 @@ not work, the command does not run and the check after it keeps stock.
    `read from nand`, and whether `/lib/firmware` is clean again.
 
 With the default image, `pre` also records `build=` (`built`, `cached`,
-`updated`, `operator`, or the reason it kept stock firmware) and
+`updated`, `cleared`, `operator`, or the reason it kept stock firmware) and
 `build_secs=`. The
 keeper's stderr from the build goes to `/var/run/witcher-tk.build`.
 
 ## Boot confirm and rollback
 
 The keeper reads the hook's status once at start. It arms only when the hook
-staged an image this boot. On any other boot it never reboots for this.
+staged an image this boot, or when a stock boot has a rollback of the default
+image to judge (below). On any other boot it never reboots for this.
 
-- Every 15 s it pings the `target=` addresses (or the deaf watchdog's).
-- An address on `lte0pdn0` plus one answer confirms the boot: `strikes=0` and
-  `confirmed` get the hash.
-- No confirm within 300 s of the load, after at least two rounds by this
-  keeper process: the keeper adds the hash to `quarantine`, writes
-  `strikes=2`, reads both back, and reboots once onto stock firmware. If the
-  read-back does not show that the hook will refuse the image, it does not
-  reboot.
-- If the SAS CPAS window is open (06:45 to 10:15 UTC; no new grants are
-  issued then), the quarantine and strike record are still written at once,
-  so any boot from then on is stock, but the reboot waits for the window to
-  end. With the clock not yet set (a unit that never reached the network)
-  it does not wait. A keeper that restarts in the meantime owes the same
-  reboot once the record reads back.
+- Every 15 s it pings the `target=` addresses (or the deaf watchdog's) and
+  asks each one a DNS question. A carrier's DNS servers often ignore ping
+  but must answer DNS.
+- An address on `lte0pdn0` plus one answer, ping or DNS, confirms the boot:
+  `strikes=0` and `confirmed` get the hash.
+- **Only time with a cell in view counts against the image.** A cell is in
+  view while the vendor cache shows the modem `ATTACHED` or `CONNECTED`, or
+  any RSRP within -140 to -20 dBm. After 300 s of that with no answer, and at
+  least two rounds by this keeper process, the image is compared with stock
+  firmware.
+- **No cell in view is waiting for the network, not failure.** Only 30
+  minutes in a row of searching ask for one comparison. That catches an
+  image that breaks cell search.
+- **A comparison is a rollback.** The keeper adds the hash to `quarantine`,
+  writes `strikes=2`, reads both back, and reboots once onto stock firmware.
+  If the read-back does not show that the hook will refuse the image, it
+  does not reboot.
 - `/var/run/witcher-tk.result` records the outcome, so a keeper that restarts
   does not judge the boot again.
 
 This covers the case the deaf watchdog cannot: that watchdog arms only after a
 first answer, so a modem that never attaches never trips it.
 
-### The default image: a rollback is provisional
+### Every keeper reboot goes through one gate
 
-A tower outage, or a site power cut that boots the unit before its tower,
-also makes a good image miss its boot confirm. So for the default image (not
-an operator's) the keeper also records `pending=1` in `tk/verdict` with the
-quarantine, and the next stock boot judges the rollback. It runs the boot
-confirm's own watch on stock firmware: an address on `lte0pdn0` plus an
-answer from the same targets within 300 s of the modem load means stock
-firmware answered.
+The boot confirm's rollback, the way back onto the image (below) and the
+deaf watchdog's reboot all ask the same gate first.
+
+- **Never in the SAS CPAS window** (06:45 to 10:15 UTC). No new grants are
+  issued then, so a reboot can leave the unit without one for hours.
+- **Never with the clock unset on a boot that heard an answer through the
+  core**: that unit may hold a grant.
+
+  A boot that has heard nothing goes ahead. It has had no data path, so it
+  holds no grant. Its clock cannot be set either: the Titan has no battery
+  clock and boots at 2013 until NTP sets it. Waiting would strand an image
+  that breaks the data path.
+- **At most 4 keeper reboots in 24 hours** (`/mnt/titan-api/pd/keeper-reboots`).
+  - A reboot onto stock firmware, or the deaf watchdog's, needs two free
+    slots. A reboot back onto the image needs one. So the cap can stop the
+    keeper rebooting, but it never strands the unit on stock firmware.
+  - A reboot recorded while the clock was unset counts until a later boot
+    with a set clock dates it.
+
+A rollback that must wait records nothing. The image keeps running and the
+watch goes on, so an answer meanwhile still confirms it. `keeper.log` says
+why it waits, once per reason.
+
+### The default image: no network condition keeps it off
+
+A tower, core or backhaul outage, a missing SAS grant, the CPAS window or
+targets that never answer look the same from the image's side. For the
+default image (not an operator's) a rollback is only a comparison:
+
+1. The rollback also records `pending=1` in `tk/verdict`.
+2. The next boot is stock. Its keeper runs the same watch on stock firmware.
+   An address on `lte0pdn0` plus an answer within 300 s of the modem load
+   means stock firmware answered.
 
 | The stock boot | Verdict | What happens |
 | --- | --- | --- |
-| Gets no answer through the core within 300 s either | The network failed | The image comes out of quarantine and `strikes=0`, and `network=` counts it. Nothing reboots: the unit stays on stock modem firmware until a boot that happens anyway (a power cut, an upgrade, a restart), which loads the image again. |
-| Answers | Failure 1 of 2 | The image comes out of quarantine and `strikes=0`. The network is up now, so the keeper reboots at once to try the image again. |
-| Answers, at failure 2 | Failure 2 of 2 | The quarantine sticks until **Retry** under **Network → Latency**. Nothing reboots. |
+| Gets no answer either | The network failed (`network=` counts it) | The image comes out of quarantine with `strikes=0`, `outage=1` is recorded, and the keeper reboots straight back onto the image. There it waits for the network as stock would. It is not compared again until it answers, except once after 24 hours without an answer. |
+| Answers (failure 1 of 2) | The image failed where stock did not | The image comes out of quarantine and the keeper reboots straight back onto it to try again. The network is known to be up now. |
+| Answers again, right after that retry (failure 2) | The image failed twice in a row | The quarantine sticks until **Retry** under **Network → Latency**, or until a new firmware build. Nothing reboots. |
 
-A confirmed boot of the image sets the failure count back to 0: it works on
-this unit, so the earlier failure was not its own. That matters after a site
-power cut. The unit loads its modem soon after power returns, while a CBRS
-tower can take longer than the image's 300 s to boot and get its SAS grant.
-When the tower comes up after the image's 300 s but within the stock boot's,
-stock firmware answers, and that counts as failure 1 even though the image
-was fine. The retry right after it meets a working tower, confirms, and
-clears the count. Only an image that fails again with the tower known to be
-up gets quarantined for good.
-
-The retry reboot is careful in the same ways as the rollback reboot, and
-more:
-
-- It waits until the clock is set and the SAS CPAS window (06:45 to 10:15
-  UTC) is over. A unit that just reached the network may hold grants, and a
-  reboot inside the window would lose them until the window ends.
-- It happens only after the record reads back. A keeper that restarts
-  before the reboot leaves the retry to a later boot.
-- It comes at most once between confirmed boots of the image: the next
-  failure where stock answers is failure 2, which sticks.
-
-Two boots of the image can also end before their confirm decides anything (a
-power cut, a crash, a reboot by hand). That leaves `strikes=2` and no
-rollback. The stock boot that follows records them as one rollback (the
-quarantine line and `pending=1`) and judges it the same way. So a power
-supply that flaps while the unit boots cannot keep a good image off either.
-
+- **One outage costs at most one image → stock → image cycle**, whatever its
+  cause and length. The image then waits on the network like stock firmware
+  would, and confirms as soon as service returns.
+- **A confirmed boot of the image** sets the failure count back to 0 and ends
+  the wait. So a tower that came back between the image's watch and stock's
+  (a site power cut) costs one retry reboot, not a strike.
+- **The quarantine clears itself.** The keeper stamps strikes, rollback
+  records and the quarantine with the firmware build that wrote them
+  (`firmware=`, the first 16 hex digits of the SHA-256 of
+  `/etc/witcher-release`). At boot, records from another build or for
+  another image no longer apply: `tk-build boot` clears them and answers
+  `cleared` (status `build=cleared`), and the image loads. The same build's
+  own strikes still stop a crash loop.
+- **Boots cut short.** Two image boots can end before their confirm decides
+  anything (a power cut, a crash, a reboot by hand). That leaves `strikes=2`
+  and no rollback. The stock boot that follows records them as one rollback
+  and judges it the same way.
 - An unreadable record never clears a quarantine.
-- A new release image starts its own count.
-- A network failure never forces a reboot, so a long outage cannot make the
-  unit cycle between images. The strike before every load still stops a run
-  of boots that never reaches the keeper.
 
 `keeper.log` lines start with `tk boot verdict`. Retry clears `quarantine`,
 `verdict` and the build record and writes `strikes=0`, so the next boot
 loads (or builds) the image again.
-
-Neither layer can loop:
-
-- With the keeper working, a failing image loads once and the unit reboots
-  once. The next boot is stock (`quarantined`).
-- If the keeper cannot write, the strike count still stops the hook after two
-  staged boots, because the hook records each strike before the load.
-- If Linux dies or power fails before the confirm, the same strike count
-  applies.
 
 ## Modem feature flags
 
@@ -562,8 +571,8 @@ On the Witcher volume, `/mnt/titan-api/tk/` once mounted:
 | `config` | The keeper's default build, or an operator | `enabled=1`, `sha256=` lines, optional `target=` and `wm=` lines. The default config starts with `# witcher-default <image> <checksum>`. |
 | `active.gz` | The keeper's default build, or an operator | The staged image |
 | `default` | The keeper's default build | `gzip=` (the release image), `builds=`, `result=` (`started`, `built`, `failed`, `stock-mismatch`) |
-| `verdict` | Keeper (rollbacks of the default image, stock boot verdicts); Retry removes it | `gzip=` (the image), `genuine=` (failures where stock answered, since its last confirmed boot), `network=` (rollbacks blamed on the network), `pending=` (a rollback waits for a stock boot) |
-| `strikes` | Hook (+1 before each load), keeper (0 on confirm, 2 on rollback) | `strikes=N` |
+| `verdict` | Keeper (rollbacks of the default image, stock boot verdicts); Retry removes it; cleared at boot when another firmware build wrote it | `gzip=` (the image), `firmware=` (the build that wrote it), `genuine=` (failures in a row where stock answered, since its last confirmed boot), `network=` (rollbacks blamed on the network), `pending=` (a rollback waits for a stock boot), `outage=` (the image waits for the network) |
+| `strikes` | Hook (+1 before each load), keeper (0 on confirm, 2 on rollback) | `strikes=N` and `firmware=<id>`, the build that counted them |
 | `quarantine` | Keeper | One hash per line |
 | `confirmed` | Keeper | `sha256=<hash>` of the last confirmed image |
 
@@ -606,18 +615,19 @@ In RAM:
 - **One image built on the unit.** `tk-build` builds only the release image
   `n6h-r4-r1` (N6H + R4's Rust N4 + R1's PIE; [tk-patch.md](tk-patch.md)).
   Any other image is staged by hand.
-- **The verdict only sees the core.** A unit whose confirm targets never
-  answer ping (the bearer's DNS servers, without `target=` lines) blames
-  the network on every rollback. It tries the image again at each later boot
-  and returns to stock each time, one extra reboot per boot. Give the boot
-  confirm `target=` lines that answer ping if the bearer's DNS servers do
-  not.
+- **The modem words wait for an answer.** They are written only after the
+  boot confirm. On a network where no confirm target answers ping or DNS,
+  the default image loads and waits there, but its words stay off until
+  one answers. Give such units `target=` lines that answer.
 - **An image that fails only now and then** never sticks: each confirmed
-  boot clears its count. Each failure costs that boot its 300 s and one
-  reboot, plus the retry reboot.
-- **An operator's image** keeps the old rule: one rollback quarantines it
-  until the operator removes the line from `quarantine` and writes
-  `strikes=0` (or presses Retry).
+  boot clears its count. Each failure costs that boot 300 s and two reboots.
+- **An image broken in a way an outage hid.** If the comparison happens
+  during an outage, the image then waits for the network. A recheck after 24
+  hours without an answer compares it again, so a unit can be off the
+  network up to a day in that double fault.
+- **An operator's image** keeps the old rule, with the new clock: one
+  rollback quarantines it until the operator removes the line from
+  `quarantine` and writes `strikes=0` (or presses Retry).
 - **The build at boot is new in v1.0.17.** The early attach of `mtd20` before
   the vendor's `rcinit` has run on bench boots since v1.0.15. Building the
   image inside `pre` has run only in tests until the bench proves it.

@@ -18,7 +18,7 @@ can be turned off on its own, live.
    bank and writes it with a default `tk/config`. The image loads for that
    same `modprobe`. This makes that one boot about 20 s slower (17.5 s on the
    bench), and later boots reuse the file. After the boot confirm (an answer
-   through the core within 300 s) the keeper writes the modem words.
+   through the core) the keeper writes the modem words.
 2. **Clamp and fast path.** The keeper loads both from the image about 30 s
    after the customer port and LTE are up: the clamp first, then the fast
    path, which needs IP passthrough.
@@ -32,92 +32,101 @@ Nothing is built, and stock modem firmware loads, when any of these hold:
 - an operator's own `tk/config` exists, or `enabled=0`;
 - the active modem bank is not the exact stock image the release image is
   built from;
-- an image was rolled back (anything in `tk/quarantine`, or `tk/strikes` at 2).
+- the release image's rollback waits for its stock verdict, or its
+  quarantine stuck (two failures in a row where stock firmware answered),
+  or this firmware build counted two of its boots without a confirm.
 
 `/var/run/witcher-tk.status` says why (`reason=`), and `build=` says what the
 default image did this boot.
 
-A rollback of the default image is provisional: a tower outage or a power
-cut does not keep it off. The next section shows how.
+No network condition keeps a unit off the image: not a tower, core or
+backhaul outage, a missing SAS grant, the CPAS window or targets that ignore
+ping. A new firmware build clears a quarantine by itself (`build=cleared`).
+The next section shows what a unit does.
 
 ## A tower outage at the moment of upgrade
 
 This is what a unit does when its tower is down as it boots v1.0.17 for the
-first time. Any later boot with the default image goes the same way from
-step 2. Times are from the modem load; `3348aa36` is the release image.
+first time and stays down for hours. Any later boot with the default image
+goes the same way from step 2. `3348aa36` is the release image.
 
 1. **Boot 1, boot hook.** Before the boot's one `modprobe modem`, the keeper
    builds the release image from the active modem bank (about 20 s). It
-   writes `tk/active.gz`, the default `tk/config` and `tk/default`
-   (`result=built`). The hook records strike 1 of 2 in `tk/strikes` and
-   loads the image. Status: `state=staged`, `build=built`.
-2. **Boot 1, boot confirm.** The keeper pings its targets every 15 s. With
-   the tower down the modem never attaches and nothing answers. The modem
-   words stay off. The clamp and the fast path wait for LTE as always.
-3. **Boot 1, at 300 s: a provisional rollback.** The keeper adds the image's
-   hash to `tk/quarantine` and writes `strikes=2`. Because this is the
-   default image, it also writes `pending=1` in `tk/verdict`. It reads the
-   record back and reboots onto stock modem firmware. `keeper.log`:
-   `tk boot confirm: no management answer within 300 s of loading modem
-   firmware 3348aa36; quarantined it for now (the next stock boot tells
-   whether the image or the network failed), rebooting onto stock modem
-   firmware`.
-   - Between 06:45 and 10:15 UTC (the SAS CPAS window) with the clock set,
-     the reboot waits for the window to end; the record is written at once.
-   - A unit that never reached the network has no set clock, so it reboots
-     at once.
-4. **Boot 2, boot hook.** `strikes=2`, so there is no build and no load: stock
-   modem firmware. Status: `state=stock`, `reason=strikes`.
-5. **Boot 2, the verdict.** The keeper finds `pending=1` and watches the stock
-   boot the same way, for 300 s. `keeper.log`: `tk boot verdict armed: stock
-   modem firmware after a rollback of modem firmware 3348aa36; ...`.
-6. **Boot 2, at 300 s, tower still down: the network failed.** The keeper
-   removes the hash from `tk/quarantine`, writes `strikes=0` and records
-   `network=1`, `pending=0`. Nothing reboots. `keeper.log`: `tk boot
-   verdict: stock modem firmware got no answer through the core either, so
-   the rollback of modem firmware 3348aa36 was the network's (1 so far); it
-   is out of quarantine and a later boot loads it again`.
-   - When the tower comes back, stock modem firmware attaches as it always
-     has, and the clamp and the fast path load about 30 s later.
-   - The unit runs stock modem firmware, without the modem words, until its
-     next boot.
-   - **Network → Latency** shows **Modem image**: "Not held back; it loads
-     at boot." with the counts.
+   writes `tk/active.gz`, the default `tk/config` and `tk/default`. The hook
+   records strike 1 of 2 (`strikes=1` with `firmware=`, this build) and loads
+   the image. Status: `state=staged`, `build=built`.
+2. **Boot 1, waiting.** The keeper probes every 15 s, with ping and DNS. The
+   modem searches and sees no cell, so the boot confirm's 300 s clock does
+   not run: no cell is waiting, not failure. The modem words stay off until
+   the confirm. The clamp and the fast path wait for LTE as always.
+   `keeper.log`: `tk boot confirm armed: ... time with no cell is waiting,
+   not failure`.
+3. **Boot 1, after 30 minutes with no cell: one comparison.** The reboot gate
+   lets it go: nothing has answered since boot, so the unit holds no SAS
+   grant to lose. The keeper adds the image's hash to `tk/quarantine`, writes
+   `strikes=2` and `pending=1` in `tk/verdict`, reads them back and reboots
+   onto stock modem firmware. `keeper.log`: `tk boot confirm: no cell in view
+   for 1800 s in a row with modem firmware 3348aa36...; quarantined it for
+   now (the next stock boot tells whether the image or the network failed),
+   rebooting onto stock modem firmware`.
+4. **Boot 2, stock modem firmware.** The hook keeps stock firmware
+   (`reason=quarantined`). The keeper watches stock firmware the same way,
+   for 300 s from the modem load. `keeper.log`: `tk boot verdict armed: ...`.
+5. **Boot 2, at 300 s, the tower still down: the network failed.** The
+   keeper takes the hash out of `tk/quarantine`, writes `strikes=0`, records
+   `network=1` and `outage=1`, and reboots straight back onto the image.
+   `keeper.log`: `tk boot verdict: stock modem firmware got no answer through
+   the core either, so the rollback of modem firmware 3348aa36... was the
+   network's (1 so far); it is out of quarantine, and the unit goes back onto
+   it, where it waits for the network`, then `tk boot verdict: rebooting back
+   onto modem firmware 3348aa36...`.
+6. **Boot 3, the image again** (`build=cached`, nothing rebuilt). It waits
+   for the tower as stock firmware would.
+   - With `outage=1` it is not compared again until it answers. The one
+     exception is a recheck after 24 hours without an answer.
+   - No more reboots for the rest of the outage, however long it lasts.
+   - **Network → Latency** shows **Modem image**: "Waiting for the network:
+     ...".
+7. **Service returns.** The modem sees the cell and attaches. The first
+   answer through the core (ping or DNS) confirms the boot, usually within a
+   minute: `strikes=0`, `outage=0`, the failure count back at 0. The keeper
+   writes the modem words, and every feature is on. Nothing reboots when
+   service returns.
 
-   **If the tower is back before those 300 s are up**, stock firmware
-   answers where the image did not: failure 1 of 2. The keeper takes the
-   image out of quarantine and writes `strikes=0`. The tower is known to be
-   up now, so it reboots at once to try the image again (step 7). That
-   reboot waits until the clock is set and the CPAS window is over.
-7. **Boot 3**: after the reboot to try again, or whenever the unit next
-   boots (a power cut, an upgrade, **System → Restart**). The hook finds the
-   image and the default config intact (`build=cached`), records strike 1
-   and loads the image. Nothing is rebuilt.
-8. **Boot 3, tower up.** The modem attaches, and the first answer through the
-   core confirms the boot, usually within a minute. The keeper writes
-   `strikes=0`, sets the failure count back to 0 and writes the modem words.
-   Every feature is on.
-   - If the tower is down again at this boot, the unit goes back to step 3.
-     Each outage at boot costs one extra reboot. A network failure never
-     forces one, so a long outage cannot make the unit cycle.
+So the whole outage costs one image → stock → image cycle, and the unit is
+on the image when service returns.
 
-Power that comes and goes while the unit boots can end two image boots
-before their confirm decides anything. That leaves `strikes=2` and no
-rollback. The stock boot after them records the two as one rollback and
-judges it as in step 5.
+- **The tower comes back before the 30 minutes run out** (step 2): the image
+  attaches and confirms, with no comparison at all.
+- **The tower comes back while the unit is on stock firmware** (step 4):
+  stock answers, which counts as failure 1, and the unit reboots straight
+  back onto the image anyway. With the tower up the image confirms, and the
+  count goes back to 0.
+- **The core or backhaul is down but the cell is up:** the same, except that
+  the comparison comes after 300 s with the cell in view instead of 30
+  minutes of searching.
+- **Power comes and goes while the unit boots.** Two image boots can end
+  before their confirm decides anything (`strikes=2`, no rollback). The stock
+  boot after them records the two as one rollback and judges it as in steps
+  4 and 5.
+- **A reboot falls due inside the SAS CPAS window** (06:45 to 10:15 UTC) on a
+  unit with a set clock: it waits for the window to end, and a rollback
+  records nothing until then.
+- **Every keeper reboot counts toward a cap of 4 in 24 hours**, with the last
+  slot kept for the way back onto the image.
 
-The image stays off only after two failures in a row (with no confirmed boot
-between) where stock firmware answered each time. The second of those comes
-from the retry, with the tower known to be up. **Network → Latency** then
-shows **Modem image**: "Quarantined after 2 failures in a row where stock
-modem firmware answered. Retry tries it again at the next boot."
+The image stays off only after two failures in a row where stock firmware
+answered each time, the second straight after a retry with the tower known
+to be up. **Network → Latency** then shows **Modem image**: "Quarantined
+after 2 failures in a row where stock modem firmware answered. Retry, or a
+new firmware, tries it again at the next boot." A new firmware build clears
+that quarantine by itself.
 
 **Retry the modem image** clears the quarantine, the failure counts and the
 strikes. It does not reboot: restart the unit to load the image now. If the
-image fails its boot confirm again, the unit goes back to stock modem
-firmware by itself.
+image fails again, the same rules apply.
 
-[Boot-time loader](tk-boot-loader.md#the-default-image-a-rollback-is-provisional)
+[Boot-time loader](tk-boot-loader.md#the-default-image-no-network-condition-keeps-it-off)
 has the rules.
 
 ## Turning a feature off
@@ -167,7 +176,8 @@ have not been tested together. An operator's `qctrl/config` overrides that.
 | File | Shows |
 | --- | --- |
 | `/var/run/witcher-tk.status` | The modem image this boot: `state`, `reason`, `build`, `build_secs` |
-| `/mnt/titan-api/tk/verdict` | The default image's rollbacks: `genuine` (failures where stock answered, since its last confirmed boot), `network`, `pending` |
+| `/mnt/titan-api/tk/verdict` | The default image's rollbacks: `genuine` (failures in a row where stock answered, since its last confirmed boot), `network`, `pending`, `outage` (waiting for the network), `firmware` (the build that wrote it) |
+| `/mnt/titan-api/pd/keeper-reboots` | The keeper's own reboots, for its cap of 4 a day |
 | `/var/run/witcher-tk.flags` | The modem words |
 | `/var/run/witcher-qctrl.status` | The clamp; `detail` says where its mode came from |
 | `/var/run/witcher-fastpath.status` | The fast path; `detail` says where its mode came from |

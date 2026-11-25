@@ -71,7 +71,11 @@ pub fn settle(entries: &[Entry], wall: u64, boot_start: u64) -> Vec<Entry> {
     entries
         .iter()
         .map(|entry| Entry {
-            wall: if clock_set(entry.wall) { entry.wall } else { boot_start },
+            wall: if clock_set(entry.wall) {
+                entry.wall
+            } else {
+                boot_start
+            },
             why: entry.why.clone(),
         })
         .filter(|entry| wall.saturating_sub(entry.wall) < WINDOW)
@@ -127,7 +131,12 @@ mod tests {
         let mut entries = Vec::new();
         // An outage: away to stock, back to the image. A second outage the
         // same day: away again needs two free, so it goes; then back.
-        for (why, slots) in [("rollback", SLOTS_AWAY), ("return", SLOTS_BACK), ("rollback", SLOTS_AWAY), ("return", SLOTS_BACK)] {
+        for (why, slots) in [
+            ("rollback", SLOTS_AWAY),
+            ("return", SLOTS_BACK),
+            ("rollback", SLOTS_AWAY),
+            ("return", SLOTS_BACK),
+        ] {
             assert!(allows(&entries, NOON, slots), "{why}");
             entries = parse(&record(&entries, NOON, why));
         }
@@ -144,7 +153,11 @@ mod tests {
 
     #[test]
     fn reboots_leave_the_window_after_a_day() {
-        let entries = file(&[(NOON - WINDOW, "deaf"), (NOON - 3600, "rollback"), (NOON - 60, "return")]);
+        let entries = file(&[
+            (NOON - WINDOW, "deaf"),
+            (NOON - 3600, "rollback"),
+            (NOON - 60, "return"),
+        ]);
         assert_eq!(recent(&entries, NOON), 2);
         assert_eq!(settle(&entries, NOON, NOON - 600).len(), 2);
     }
@@ -155,7 +168,13 @@ mod tests {
         assert_eq!(recent(&entries, EARLY), 1);
         assert_eq!(settle(&entries, EARLY, 0), entries);
         let recorded = parse(&record(&entries, EARLY + 50, "rollback"));
-        assert_eq!(recorded[1], Entry { wall: 0, why: "rollback".into() });
+        assert_eq!(
+            recorded[1],
+            Entry {
+                wall: 0,
+                why: "rollback".into()
+            }
+        );
         // A later boot with a set clock dates it at its own start, which is
         // after the reboot: it stays in the window a little longer.
         let settled = settle(&recorded, NOON, NOON - 300);
@@ -166,10 +185,18 @@ mod tests {
 
     #[test]
     fn the_file_keeps_its_last_entries_and_drops_damage() {
-        let many: Vec<Entry> = (0..40).map(|i| Entry { wall: NOON + i, why: "deaf".into() }).collect();
+        let many: Vec<Entry> = (0..40)
+            .map(|i| Entry {
+                wall: NOON + i,
+                why: "deaf".into(),
+            })
+            .collect();
         let kept = parse(&render(&many));
         assert_eq!(kept.len(), 16);
         assert_eq!(kept[0].wall, NOON + 24);
-        assert_eq!(parse("x y\n\n123\n456 rollback extra\n"), file(&[(123, "reboot"), (456, "rollback")]));
+        assert_eq!(
+            parse("x y\n\n123\n456 rollback extra\n"),
+            file(&[(123, "reboot"), (456, "rollback")])
+        );
     }
 }

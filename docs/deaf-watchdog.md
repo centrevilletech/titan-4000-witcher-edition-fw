@@ -128,9 +128,20 @@ before the next one, up to six hours. An hour of answers clears the count
 
 Because it arms only after a first answer, the watchdog cannot catch a modem
 that never attaches. On a boot that loads a staged modem firmware image, the
-keeper's boot confirm covers that case: no answer within 300 s of the load
-quarantines the image and reboots once onto stock firmware. See the
+keeper's boot confirm covers that case. See the
 [boot-time modem firmware loader](tk-boot-loader.md).
+
+Since v1.0.17 the reboot passes the keeper's reboot gate, like every reboot
+the keeper starts:
+
+- It waits while the SAS CPAS window is open (06:45 to 10:15 UTC) and while
+  the clock is unset.
+- It counts against the keeper's cap of 4 reboots in 24 hours, and needs two
+  of those slots free.
+
+A reboot that must wait is noted once (`the reboot waits: ...`). The
+watchdog asks again after the next stretch of silence. Only a reboot that
+happens raises the strike count.
 
 An outage upstream of every target, with the radio still attached, looks the
 same from the unit. Each unit then reboots once, and does not arm again until
