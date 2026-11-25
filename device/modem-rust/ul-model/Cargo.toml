@@ -1,0 +1,13 @@
+[package]
+name = "witcher-modem-ul-model"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Pure-Rust no_std behavioural model of the Titan 4000 GDM7243A post-Ring-1 PDCP, LLCE0, RLC AM, HARQ, and BSR uplink pipeline"
+
+[dependencies]
+modem-atlas = { path = "../atlas" }
+
+[lib]
+name = "witcher_modem_ul_model"
+path = "src/lib.rs"

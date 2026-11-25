@@ -3,10 +3,16 @@
 //!
 //! Every offset was verified against disassembly of `l2_task` (`0x842d_a120`),
 //! `l2_proc_pdcp_ul` (`0x842d_cbf4`), `proc_pdcp_ul` (`0x842d_c968`),
+//! `ul_cipher_submit` (`0x842d_9a48`), `ScheduleUlData` LLCE0 completion (`0x842d_8b86`),
+//! `mac_bsr_pre_work` (`0x842d_a60c`), `pdcp_cnf_enqueue` (`0x842d_c8ec`),
 //! `pdcp_ul_proc_drb_cnf` (`0x842d_cf60`), `pdcp_proc_tmr_discard` (`0x842d_d074`),
-//! `get_rlc_cur_bo` (`0x842d_d134`), `rlc_upd_cur_bo` (`0x842d_d194`),
-//! `ProcessPduRetx` (`0x842d_d794`), `rlc_ul_am_gen_pdu` (`0x842d_f4f4`),
-//! `do_bo.isra.0` (`0x8452_c95c`), and `l2_tr_ul_latency` (`0x8454_5048`).
+//! `rlc_ul_proc_discard_req` (`0x842d_cd90`), `get_rlc_cur_bo` (`0x842d_d134`),
+//! `rlc_upd_cur_bo` (`0x842d_d194`), `ProcessPduRetx` (`0x842d_d794`),
+//! `upd_retx_bo` (`0x842d_dbc0`), `rlc_am_ul_bo_notify` (`0x842d_eaec`),
+//! `rlc_ul_am_proc_status_rpt` (`0x842d_eb44`), `rlc_ul_am_gen_pdu` (`0x842d_f4f4`),
+//! `rlc_am_poll_retx_expire` (`0x8452_b398`), `do_tc` (`0x842e_5adc`),
+//! `do_bo.isra.0` (`0x8452_c95c`), and `l2_tr_ul_latency` (`0x8454_5048`),
+//! and cross-checked in Unicorn against stock `tk.bin`.
 
 use crate::gipc::GipcIrb;
 use crate::Ptr32;
@@ -18,11 +24,29 @@ pub const RBC_RING_SLOTS: usize = 4096;
 pub const RBC_RING_MASK: u16 = 0x0fff;
 /// RLC AM TX / RETX window size (10-bit SN, half-window 512).
 pub const RLC_AM_WIN_SIZE: usize = 512;
+/// Maximum LLCE0 descriptors per UL hardware cipher batch (`proc_pdcp_ul` `0x842d_cae0`).
+pub const UL_CIPHER_BATCH_MAX_DESCS: u32 = 64;
+/// Stock `L2_PDCP_UL_DIVISOR_VA` (`0x84dd_9780`) initialized at `0x8410_456a`.
+pub const L2_PDCP_UL_DIVISOR_DEFAULT: u32 = 1500;
+/// Stock `do_tc` (`0x842e_5adc`) PDCP/RLC submission cap tiers (bytes).
+pub const DO_TC_CAP_LOW: u32 = 32_768;
+pub const DO_TC_CAP_MID: u32 = 65_536;
+pub const DO_TC_CAP_HIGH: u32 = 131_072;
 
 /// RLC mode constants in `Rbc::rlc_mode` (`+0x15`).
 pub const RLC_MODE_TM: u8 = 1;
 pub const RLC_MODE_UM: u8 = 2;
 pub const RLC_MODE_AM: u8 = 3;
+
+/// `Rbc::poll_cfg_flags` (`+0x16b`) bitmasks (`0x842e_2468..0x842e_2498`, `0x842e_033e..0x842e_0384`).
+pub const RLC_POLL_CFG_PDU: u8 = 0x01;
+pub const RLC_POLL_CFG_BYTE: u8 = 0x02;
+
+/// 3GPP TS 36.331 `pollByte` ROM table at `0x847f_8714` (`idx 0..13`; `14` = infinity).
+pub const RLC_POLL_BYTE_TABLE: [u32; 14] = [
+    25_000, 50_000, 75_000, 100_000, 125_000, 250_000, 375_000, 500_000, 750_000, 1_000_000,
+    1_250_000, 1_500_000, 2_000_000, 3_000_000,
+];
 
 /// Per-bearer uplink ingress ring (`rbc->ring0` high-priority or `rbc->ring1` bulk).
 #[repr(C)]
@@ -46,6 +70,34 @@ impl RbcRing {
     pub const fn is_empty(&self) -> bool {
         self.occupancy() == 0
     }
+}
+
+/// One PDCP UL confirmation range `[start_sn..=end_sn]` inside [`PdcpCnfRing`] (`4` bytes).
+///
+/// Enqueued by `pdcp_cnf_enqueue` (`0x842d_c8ec`) with contiguous-range coalescing,
+/// drained by `pdcp_cnf_drain` (`0x842d_cf00`) -> `rbc.pdcp_cnf_fn` (`pdcp_ul_proc_drb_cnf`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PdcpCnfEntry {
+    /// `+0x00`: First confirmed PDCP SN.
+    pub start_sn: u16,
+    /// `+0x02`: Last confirmed PDCP SN (inclusive).
+    pub end_sn: u16,
+}
+
+/// Per-bearer PDCP confirmation ring pointed to by `Rbc::pdcp_cnf_ring` (`+0x08`, `0x104` bytes).
+///
+/// Note the firmware's 1-based slot addressing in `0x842d_c930` / `0x842d_cf16`:
+/// `[wr, rd]` occupies word 0 (`+0x00..+0x03`), and entries are indexed at `(idx + 1) * 4`
+/// for `idx in 0..64` (`+0x04..+0x103`).
+#[repr(C)]
+pub struct PdcpCnfRing {
+    /// `+0x00`: Write index (`0..63`, 6-bit wrap).
+    pub wr: u16,
+    /// `+0x02`: Read index (`0..63`, 6-bit wrap).
+    pub rd: u16,
+    /// `+0x04..+0x103`: 64 confirmation range entries.
+    pub entries: [PdcpCnfEntry; 64],
 }
 
 /// One PDCP UL SDU entry inside [`PdcpUlSduWindow`] (`0x10` = 16 bytes).
@@ -88,6 +140,47 @@ pub struct PdcpUlSduWindow {
     pub entries: [PdcpUlSduEntry; 4096],
 }
 
+/// One ciphered PDCP PDU handed to RLC AM/UM inside `Rbc::pdcp_to_rlc_ring` (`+0xf8`, `8` bytes).
+///
+/// Written by `proc_pdcp_ul` (`0x842d_ca5e..0x842d_ca6a`), committed on LLCE0 completion
+/// (`0x842d_8d1e`), discarded if un-transmitted by `rlc_ul_proc_discard_req` (`0x842d_cdde`),
+/// and consumed by `rlc_ul_am_gen_pdu` (`0x842e_0256..0x842e_028e`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct PdcpToRlcEntry {
+    /// `+0x00`: 12-bit (or 7-bit) PDCP SN of this SDU.
+    pub pdcp_sn: u16,
+    /// `+0x02`: Ciphered PDCP PDU byte length (IP payload + 2 B PDCP header).
+    pub len: u16,
+    /// `+0x04`: Ciphered buffer pointer allocated by `ul_cipher_buf_alloc` (`0x842d_9914`).
+    pub cipher_buf: Ptr32<u8>,
+}
+
+/// Per-bearer packet/byte accumulator inside [`UlCipherBatch`] (`8` bytes).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct UlCipherBearerAccum {
+    /// `+0x00`: Number of packets queued for this bearer in this LLCE0 batch.
+    pub pkt_count: u32,
+    /// `+0x04`: Total PDCP PDU bytes queued for this bearer in this LLCE0 batch.
+    pub byte_count: u32,
+}
+
+/// One UL hardware cipher batch (`0x48` = 72 bytes); 2 static slots at `L2_UL_CIPHER_BATCH_VA` (`0x84d9_5050`).
+///
+/// Filled by `proc_pdcp_ul` (`0x842d_ca3c..0x842d_cae2`), kicked to `LLCE0` by `ul_cipher_submit`
+/// (`0x842d_9a48`), and harvested in `ScheduleUlData` (`0x842d_8b86..0x842d_8d5a`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct UlCipherBatch {
+    /// `+0x00..+0x3f`: Per-bearer accumulators indexed by `rbc.bearer_idx` (`0..7`).
+    pub bearers: [UlCipherBearerAccum; RBC_COUNT],
+    /// `+0x40`: Number of `LlceDesc` descriptors currently populated (`0..=64`).
+    pub desc_count: u32,
+    /// `+0x44`: Base pointer to the 64-entry `LlceDesc` DMA ring (`64 * 48 = 3072` B).
+    pub desc_ring: Ptr32<LlceDesc>,
+}
+
 /// 1-second banked RLC/PDCP statistics inside [`Rbc`] (`0x2c` = 44 bytes).
 ///
 /// Active bank index (`0` or `1`) is stored at `RBC_STATS_BANK_VA` (`0x84dd_9784`).
@@ -127,52 +220,103 @@ pub struct RbcStatsBank {
     pub _pad1: [u32; 2],
 }
 
+/// One scatter-gather segment descriptor inside `Rbc::ul_am_sdu_desc_pool` (`8` bytes).
+///
+/// For an [`RlcAmTxEntry`], `pdu_desc[0]` holds `(rlc_hdr_ptr, rlc_hdr_len)` and
+/// `pdu_desc[1..seg_count]` hold the payload slices from ciphered PDCP SDUs.
+/// Verified against `rlc_am_append_sdu` (`0x842d_dd0a`) and `rlc_ul_am_gen_pdu` (`0x842d_f828`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RlcScatterSeg {
+    /// `+0x00`: Byte pointer to header or payload slice.
+    pub ptr: Ptr32<u8>,
+    /// `+0x04`: Byte length of this slice.
+    pub len: u32,
+}
+
+/// Linked-list node connecting an [`RlcAmTxEntry`] to its pending [`RlcAmRetxEntry`] slots (`0x10` = 16 bytes).
+///
+/// Pool of 512 nodes at `Rbc::retx_node_pool` (`+0x1c8`, `8192` B), free-list at `+0x1bc..+0x1c4`.
+/// Verified against `ProcessPduRetx` (`0x842d_d7e2..0x842d_d824`) and AM setup (`0x842e_2556..0x842e_257c`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RlcAmRetxNode {
+    /// `+0x00`: Index (`0..511`) of the associated entry in `Rbc::ul_am_retx_ring`.
+    pub ring_idx: u32,
+    /// `+0x04`: Previous node in owning `RlcAmTxEntry`'s retx list.
+    pub prev: Ptr32<RlcAmRetxNode>,
+    /// `+0x08`: Next node in owning `RlcAmTxEntry`'s retx list.
+    pub next: Ptr32<RlcAmRetxNode>,
+    /// `+0x0c`: Next pointer when sitting on `Rbc::retx_node_freelist`.
+    pub free_next: Ptr32<RlcAmRetxNode>,
+}
+
 /// RLC AM UL transmit buffer entry (`0x40` = 64 bytes), 512 entries at `rbc.ul_am_tx_buf`.
 ///
-/// Indexed by `sn & 0x1ff`. Verified against `ProcessPduRetx` (`0x842d_d794`).
+/// Indexed by `sn & 0x1ff`. Verified against `ProcessPduRetx` (`0x842d_d794`),
+/// `rlc_ul_am_gen_pdu` (`0x842d_fe3c..0x842d_fe4c`), and `rlc_am_poll_retx_expire` (`0x8452_b428`).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RlcAmTxEntry {
-    pub _pad0: [u32; 2],
-    /// `+0x08`: Pointer to RLC PDU buffer descriptor (`[pdu_desc]` points to RLC header byte 0).
-    pub pdu_desc: Ptr32<Ptr32<u8>>,
+    /// `+0x00`: Starting index in `Rbc::ul_am_sdu_desc_pool` (`+0x19c`).
+    pub seg_pool_start_idx: u16,
+    /// `+0x02`: Total scatter segment count (`1` header + N SDU payload segments).
+    pub seg_count: u16,
+    /// `+0x04`: Total AMD PDU byte length (RLC header + payload).
+    pub total_len: u32,
+    /// `+0x08`: Pointer to scatter segment array (`pdu_desc[0]` = RLC header `(ptr, len)`).
+    pub pdu_desc: Ptr32<RlcScatterSeg>,
     /// `+0x0c`: 10-bit RLC AM Sequence Number (`0..1023`).
     pub sn: u16,
-    /// `+0x0e`: Length of linked retx-info list attached to this TX entry.
+    /// `+0x0e`: Length of linked `RlcAmRetxNode` list attached to this TX entry.
     pub retx_list_len: u16,
     /// `+0x10`: `RETX_COUNT` (compared against `rbc.max_retx_threshold` at `+0x169`).
     pub retx_count: u8,
-    /// `+0x11`: Flags / segment metadata byte.
+    /// `+0x11`: Framing Info (`FI`) / header metadata byte copied into `RlcAmRetxEntry::fi_flags`.
     pub meta_flags: u8,
-    pub _pad1: u8,
-    /// `+0x13`: `1` if previously NACKed (controls whether `ProcessPduRetx` bumps `retx_count`).
+    /// `+0x12`: TX entry state flag (checked non-zero in `rlc_am_poll_retx_expire` & `status_rpt`).
+    pub tx_state_flags: u8,
+    /// `+0x13`: `1` if previously NACKed/retransmitted (controls `ProcessPduRetx` `RETX_COUNT` bump).
     pub was_nacked: u8,
     /// `+0x14`: Duplicate guard (`1` = already queued in `ul_am_retx_ring`).
     pub in_retx_queue: u8,
-    pub _pad2: [u8; 0x27],
-    /// `+0x3c`: Tail pointer of retx-info list.
-    pub retx_tail: u32,
+    pub _pad1: [u8; 0x23],
+    /// `+0x38`: Head pointer of linked `RlcAmRetxNode` list.
+    pub retx_head: Ptr32<RlcAmRetxNode>,
+    /// `+0x3c`: Tail pointer of linked `RlcAmRetxNode` list.
+    pub retx_tail: Ptr32<RlcAmRetxNode>,
 }
 
 /// RLC AM UL retransmission ring entry (`0x18` = 24 bytes), 512 entries at `rbc.ul_am_retx_ring`.
 ///
-/// Verified against `ProcessPduRetx` (`0x842d_d7d0..0x842d_d83e`) and `rlc_ul_am_gen_pdu` (`0x842d_f52e`).
+/// Verified against `ProcessPduRetx` (`0x842d_d7d0..0x842d_d856`) and `rlc_ul_am_gen_pdu`
+/// (`0x842d_f52e..0x842d_f950`).
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RlcAmRetxEntry {
     /// `+0x00`: 10-bit RLC SN to retransmit.
     pub sn: u16,
-    pub _pad0: u8,
-    /// `+0x03`: Segment / retx type flags.
+    /// `+0x02`: Framing Info (`FI`) bits copied from `tx_entry.meta_flags` (`+0x11`).
+    pub fi_flags: u8,
+    /// `+0x03`: Retx cause/type flags (`flags` argument to `ProcessPduRetx`).
     pub flags: u8,
-    /// `+0x04`: Segment state byte (`0` on full PDU retx).
+    /// `+0x04`: Segment state (`0` = full AMD PDU pending, `1` = re-segmentation in progress).
     pub seg_state: u8,
-    pub _pad1: [u8; 3],
+    /// `+0x05`: Non-zero when created from a byte-range `SOstart`/`SOend` STATUS NACK.
+    pub is_so_nack: u8,
+    pub _pad0: [u8; 2],
     /// `+0x08`: Back-pointer to the owning [`RlcAmTxEntry`].
     pub tx_entry: Ptr32<RlcAmTxEntry>,
-    /// `+0x0c`: Pointer to retx-info node popped from `rbc.retx_node_freelist`.
-    pub retx_node: u32,
-    pub _pad2: [u32; 2],
+    /// `+0x0c`: Pointer to [`RlcAmRetxNode`] popped from `rbc.retx_node_freelist`.
+    pub retx_node: Ptr32<RlcAmRetxNode>,
+    /// `+0x10`: Next scatter segment index in `tx_entry.pdu_desc` (starts at `1`).
+    pub seg_sdu_idx: u16,
+    /// `+0x12`: Byte offset within `tx_entry.pdu_desc[seg_sdu_idx]` (starts at `0`).
+    pub seg_sdu_off: u16,
+    /// `+0x14`: Remaining un-retransmitted payload bytes (`total_len - hdr_len` initially).
+    pub seg_rem_bytes: u16,
+    /// `+0x16`: Current 3GPP RLC AM Segment Offset (`SO`, starts at `0`).
+    pub seg_so: u16,
 }
 
 /// Radio Bearer Context (`Rbc`, `0x248` = 584 bytes).
@@ -185,7 +329,9 @@ pub struct Rbc {
     pub ring0: Ptr32<RbcRing>,
     /// `+0x04`: Ring 1 (normal bulk queue).
     pub ring1: Ptr32<RbcRing>,
-    pub _pad0: [u8; 0x08],
+    /// `+0x08`: PDCP UL confirmation range ring (`pdcp_cnf_enqueue` / `pdcp_cnf_drain`).
+    pub pdcp_cnf_ring: Ptr32<PdcpCnfRing>,
+    pub _pad0: u32,
     /// `+0x10`: Bearer configured flag (`do_bo.isra.0`).
     pub configured: u8,
     /// `+0x11`: Bearer active flag (`1` = active).
@@ -216,7 +362,12 @@ pub struct Rbc {
     pub _pad4: [u8; 6],
     /// `+0x28`: PDCP DL RX Hyper Frame Number (`RX_HFN`).
     pub rx_hfn: u32,
-    pub _pad5: [u8; 0x14],
+    pub _pad5a: [u8; 4],
+    /// `+0x30`: Radio bearer type (`0` = DRB, `1` = MRB/MBMS, `2` = SRB).
+    /// Checked by `mac_bsr_pre_work` (`0x842d_a66e`): only DRBs (`rb_type == 0`) add
+    /// `ring_pending_bytes` into `L2_BSR_PRE_BO_VA`.
+    pub rb_type: u8,
+    pub _pad5b: [u8; 0x0f],
     /// `+0x40..+0x97`: Double-buffered 1-second RLC/PDCP statistics (`2 * 0x2c`).
     pub stats: [RbcStatsBank; 2],
     pub _pad6: [u8; 0x10],
@@ -234,7 +385,9 @@ pub struct Rbc {
     pub _pad8: [u8; 0x08],
     /// `+0xd0`: Optional DL delivery hook (`dp tcp shp_tgt`).
     pub dl_hold_hook: u32,
-    /// `+0xd4`: Counter incremented on Ring 0 drain (stock `do_bo` activity tracker).
+    /// `+0xd4`: Monotonic TTI (`TTI_CLK_VA`) stored on Ring 0 drain in `l2_proc_pdcp_ul` (`0x842d_ccfc`).
+    /// Stock `do_bo.isra.0` (`0x8452_c976`) compares this against `bo_hold_last_cnt` (`+0x240`),
+    /// making stock `bo_margin` Ring 0 ONLY.
     pub ring0_last_tx_cnt: u32,
     /// `+0xd8`: 32-bit PDCP UL TX COUNT (incremented on every UL SDU; A4 `do_bo` source).
     pub pdcp_tx_count: u32,
@@ -248,34 +401,60 @@ pub struct Rbc {
     pub t_discard_tmr_id: u16,
     /// `+0xe4`: PDCP UL SDU tracking window (`PdcpUlSduWindow`).
     pub pdcp_ul_win: Ptr32<PdcpUlSduWindow>,
-    /// `+0xe8`: Callback invoked when LLCE0 UL cipher batch completes to update RLC BO.
+    /// `+0xe8`: Callback invoked when LLCE0 UL cipher batch completes (`rlc_am_ul_bo_notify` `0x842d_eaed`).
     pub rlc_ul_bo_notify_fn: u32,
-    pub _pad9: [u8; 0x0c],
-    /// `+0xf8`: Ciphered PDCP-to-RLC UL ring pointer (8 bytes/entry).
-    pub pdcp_to_rlc_ring: u32,
-    /// `+0xfc`: `pdcp_to_rlc_ring` write index (advanced at LLCE0 submit).
+    /// `+0xec`: RLC AM UL secondary handler (`0x842d_e4f9`).
+    pub rlc_ul_reest_fn: u32,
+    /// `+0xf0`: RLC UL PDU generator (`rlc_ul_am_gen_pdu` `0x842d_f4f5`).
+    pub rlc_ul_gen_pdu_fn: u32,
+    /// `+0xf4`: PDCP UL confirmation callback (`pdcp_ul_proc_drb_cnf` `0x842d_cf61`).
+    pub pdcp_cnf_fn: u32,
+    /// `+0xf8`: Ciphered PDCP-to-RLC UL ring pointer (8 bytes/entry: [`PdcpToRlcEntry`]).
+    pub pdcp_to_rlc_ring: Ptr32<PdcpToRlcEntry>,
+    /// `+0xfc`: `pdcp_to_rlc_ring` write index (advanced by `proc_pdcp_ul` at LLCE0 submit).
     pub pdcp_to_rlc_wr: u16,
-    /// `+0xfe`: `pdcp_to_rlc_ring` committed index (advanced at LLCE0 completion).
-    pub pdcp_to_rlc_rd_pend: u16,
-    pub _pad10: u16,
+    /// `+0xfe`: `pdcp_to_rlc_ring` committed index (advanced at LLCE0 completion `0x842d_8d22`).
+    pub pdcp_to_rlc_committed: u16,
+    /// `+0x100`: `pdcp_to_rlc_ring` read index (advanced by `rlc_ul_am_gen_pdu` / discard).
+    pub pdcp_to_rlc_rd: u16,
     /// `+0x102`: `pdcp_to_rlc_ring` size (power of 2).
     pub pdcp_to_rlc_size: u16,
-    pub _pad11: u16,
-    /// `+0x106`: Number of ciphered PDCP PDUs waiting for RLC segmentation.
+    /// `+0x104`: PDCP SN of the partially segmented SDU currently at head of RLC AM.
+    pub cur_sdu_sn: u16,
+    /// `+0x106`: Number of committed ciphered PDCP PDUs waiting in `pdcp_to_rlc_ring`.
     pub pdcp_to_rlc_cnt: u16,
-    pub _pad12: u16,
-    /// `+0x10a`: Estimated PDCP/RLC header overhead bytes (2 B per ciphered SDU).
+    /// `+0x108`: Remaining unsegmented bytes of the current head PDCP SDU (`0` if none).
+    pub cur_sdu_rem: u16,
+    /// `+0x10a`: Estimated PDCP/RLC header overhead bytes (`2 B` per queued ciphered SDU).
     pub pdcp_rlc_hdr_bo: u16,
     /// `+0x10c`: Ciphered PDCP bytes ready in RLC TX queue (checked against PDCP staging cap).
     pub pdcp_rlc_tx_bo: u32,
-    pub _pad13: [u8; 0x16],
-    /// `+0x126`: RLC UM/AM additional header BO bytes.
-    pub rlc_um_hdr_bo: u16,
-    /// `+0x128`: RLC UM extra payload BO bytes.
-    pub rlc_um_extra_bo: u32,
-    pub _pad14: u32,
+    /// `+0x110`: Byte pointer into remaining bytes of the partially segmented head SDU.
+    pub cur_sdu_ptr: Ptr32<u8>,
+    /// `+0x114`: Secondary/re-establishment PDCP-to-RLC SDU ring pointer (`8` B/entry).
+    pub reest_ring: Ptr32<PdcpToRlcEntry>,
+    /// `+0x118`: Re-establishment ring write index.
+    pub reest_wr: u16,
+    /// `+0x11a`: Re-establishment ring committed index.
+    pub reest_committed: u16,
+    /// `+0x11c`: Re-establishment ring ACK release read index.
+    pub reest_ack_rd: u16,
+    /// `+0x11e`: Re-establishment ring size (power of 2, `32` in AM setup).
+    pub reest_size: u16,
+    /// `+0x120`: Re-establishment ring RLC read index (`0xffff` when uninitialized).
+    pub reest_rd: u16,
+    /// `+0x122`: Re-establishment ring queued SDU count.
+    pub reest_cnt: u16,
+    /// `+0x124`: Remaining unsegmented bytes of head re-establishment SDU.
+    pub reest_cur_rem: u16,
+    /// `+0x126`: Re-establishment/UM additional RLC header BO bytes.
+    pub rlc_reest_hdr_bo: u16,
+    /// `+0x128`: Re-establishment/UM extra payload BO bytes (summed with `+0x10c` into `+0x154`).
+    pub rlc_reest_tx_bo: u32,
+    /// `+0x12c`: Byte pointer into remaining bytes of head re-establishment SDU.
+    pub reest_cur_ptr: Ptr32<u8>,
     /// `+0x130`: Bytes pending in Ring 0 + Ring 1 + in-flight LLCE0 cipher batch.
-    /// Added to BSR by N4 `TRUE_BO` (`bit 0`).
+    /// Subtracted on LLCE0 completion (`0x842d_8d2e`); added to BSR by N4 `TRUE_BO` (`bit 0`).
     pub ring_pending_bytes: u32,
     pub _pad15: u32,
     /// `+0x138`: RLC AM DL `VR(R)` (next in-sequence SN).
@@ -288,61 +467,88 @@ pub struct Rbc {
     pub vr_x: u16,
     /// `+0x140`: RLC TM BO bytes (mode 1 only).
     pub rlc_tm_bo: u32,
-    /// `+0x144`: Pending UL RLC STATUS PDU bytes.
+    /// `+0x144`: Pending UL RLC STATUS PDU bytes (feeds `get_rlc_cur_bo`).
     pub rlc_status_bo: u16,
     pub _pad16: [u8; 6],
     /// `+0x14c`: RLC AM DL receive reorder buffer (`512 * 16 B`).
     pub dl_rx_buf: u32,
     /// `+0x150`: RLC AM DL segment pool (`2048 * 20 B`).
     pub dl_seg_pool: u32,
-    /// `+0x154`: RLC AM UL retransmission queue bytes (feeds `get_rlc_cur_bo`).
-    pub rlc_retx_bo: u32,
-    /// `+0x158`: RLC AM UL new-transmission bytes (feeds `get_rlc_cur_bo`).
-    pub rlc_newtx_bo: u32,
+    /// `+0x154`: RLC AM UL **new-transmission** BO bytes (`pdcp_rlc_tx_bo + rlc_reest_tx_bo`).
+    /// Updated by `rlc_am_ul_bo_notify` (`0x842d_eb34`) and `rlc_ul_am_gen_pdu` (`0x842e_044c`).
+    pub rlc_am_newtx_bo: u32,
+    /// `+0x158`: RLC AM UL **retransmission** BO bytes (`retx_bytes`; UM TX BO in mode 2).
+    /// Updated by `upd_retx_bo` (`0x842d_dbee`) and `rlc_ul_am_gen_pdu` (`0x842d_f650`).
+    pub rlc_am_retx_bo: u32,
     pub _pad17: [u8; 0x0c],
-    /// `+0x168`: RLC AM UL poll trigger byte.
-    pub rlc_ul_poll_pending: u8,
+    /// `+0x168`: Per-call UL RLC control (STATUS) PDU count (`0` or `1`, reset at `0x842d_f510`).
+    pub ul_ctrl_pdu_cnt: u8,
     /// `+0x169`: Configured `maxRetxThreshold` (16 on Nokia QCI 9).
     pub max_retx_threshold: u8,
     /// `+0x16a`: RLC AM DL `STATUS_TRIGGER` flag.
     pub status_trigger: u8,
-    pub _pad18: [u8; 3],
-    /// `+0x16e`: RLC AM UL `POLL_SN`.
+    /// `+0x16b`: RLC AM poll configuration mask (`RLC_POLL_CFG_PDU = 1`, `RLC_POLL_CFG_BYTE = 2`).
+    pub poll_cfg_flags: u8,
+    /// `+0x16c`: RLC AM UL poll trigger byte (`1` = set `P` bit on next AMD PDU; `rlc_poll_check`).
+    pub poll_trigger: u8,
+    /// `+0x16d`: Set to `1` during `rlc_ul_am_gen_pdu` when `t-PollRetransmit` must be restarted on exit.
+    pub start_poll_retx_tmr: u8,
+    /// `+0x16e`: RLC AM UL `POLL_SN` (set to `vt_s - 1` when `P` bit is transmitted).
     pub poll_sn: u16,
     /// `+0x170`: Configured `pollPDU` (64 on Nokia QCI 9).
     pub poll_pdu: u16,
-    /// `+0x172`: L2 timer table ID for `t-PollRetransmit`.
+    /// `+0x172`: L2 timer table ID for `t-PollRetransmit` (`40 ms` -> `38 ms` with `-2 ms` offset).
     pub t_poll_retx_tmr_id: u16,
-    /// `+0x174`: RLC AM UL `VT(A)` (lowest un-ACKed SN).
+    /// `+0x174`: RLC AM UL `VT(A)` (lowest un-ACKed SN, 10-bit mod 1024).
     pub vt_a: u16,
-    /// `+0x176`: RLC AM UL `VT(S)` (next new SN to transmit).
+    /// `+0x176`: RLC AM UL `VT(S)` (next new SN to transmit, 10-bit mod 1024).
     pub vt_s: u16,
     /// `+0x178`: L2 timer table ID for `t-StatusProhibit`.
     pub t_status_prohibit_tmr_id: u16,
     /// `+0x17a`: Incoming peer STATUS PDU length in bytes.
     pub status_pdu_len: u16,
-    pub _pad19: u32,
-    /// `+0x180`: Configured `pollByte`.
+    /// `+0x17c`: `PDU_WITHOUT_POLL` counter (incremented per AMD PDU, compared against `poll_pdu`).
+    pub pdu_without_poll: u32,
+    /// `+0x180`: Configured `pollByte` (bytes, decoded from `RLC_POLL_BYTE_TABLE`).
     pub poll_byte: u32,
-    pub _pad20: u32,
+    /// `+0x184`: `BYTE_WITHOUT_POLL` counter (incremented by AMD PDU payload bytes, compared against `poll_byte`).
+    pub byte_without_poll: u32,
     /// `+0x188`: Incoming peer STATUS PDU payload pointer.
     pub status_pdu_ptr: Ptr32<u8>,
-    pub _pad21: [u8; 0x0e],
-    /// `+0x19a`: Remaining free UL RLC AM window slots (initializes to `512`).
+    /// `+0x18c`: Temporary pointer to stack-local TX PDU builder scratch inside `rlc_ul_am_gen_pdu`.
+    pub active_tx_build_ctx: u32,
+    /// `+0x190`: `64 KiB` arena buffer for constructing UL RLC AM headers (`0x842e_250a`).
+    pub ul_am_hdr_buf: Ptr32<u8>,
+    /// `+0x194`: Current write offset inside `ul_am_hdr_buf` (wraps at `0x10000`).
+    pub ul_am_hdr_buf_off: u16,
+    /// `+0x196`: Current write index inside `ul_am_sdu_desc_pool`.
+    pub ul_am_sdu_desc_idx: u16,
+    /// `+0x198`: Capacity of `ul_am_sdu_desc_pool` (`512..=16384`).
+    pub ul_am_sdu_desc_cap: u16,
+    /// `+0x19a`: Remaining free UL RLC AM window slots (initializes to `512`; `0` = window stall).
     pub ul_am_free_win_slots: u16,
-    pub _pad22: [u8; 0x14],
-    /// `+0x1b0`: RLC AM UL transmit buffer (`512 * 64 B`).
+    /// `+0x19c`: Scatter-gather descriptor pool (`ul_am_sdu_desc_cap * 8 B`).
+    pub ul_am_sdu_desc_pool: Ptr32<RlcScatterSeg>,
+    /// `+0x1a0`: RLC AM SDU-to-PDU completion tracking ring (`1024 * 8 B`, indexed by `ul_am_sdu_cnf_wr`).
+    pub ul_am_sdu_cnf_pool: u32,
+    /// `+0x1a4`: Write index inside `ul_am_sdu_cnf_pool`.
+    pub ul_am_sdu_cnf_wr: u32,
+    pub _pad22: [u8; 0x08],
+    /// `+0x1b0`: RLC AM UL transmit buffer (`512 * 64 B` = `32 KiB`).
     pub ul_am_tx_buf: Ptr32<RlcAmTxEntry>,
-    /// `+0x1b4`: RLC AM UL SDU-to-PDU mapping info table.
-    pub ul_am_sdu_info: u32,
-    pub _pad23: u32,
-    /// `+0x1bc`: Retx info node free-list head.
-    pub retx_node_freelist: u32,
-    pub _pad24: u32,
-    /// `+0x1c4`: Retx info node free-list count.
+    /// `+0x1b4`: Pointer to `VT(A)` entry inside `ul_am_tx_buf` (advanced on STATUS ACK).
+    pub ul_am_tx_head: Ptr32<RlcAmTxEntry>,
+    /// `+0x1b8`: Pointer to `VT(S)` entry inside `ul_am_tx_buf` (advanced on new AMD PDU TX).
+    pub ul_am_tx_tail: Ptr32<RlcAmTxEntry>,
+    /// `+0x1bc`: Retx node free-list head.
+    pub retx_node_freelist: Ptr32<RlcAmRetxNode>,
+    /// `+0x1c0`: Retx node free-list tail.
+    pub retx_node_freelist_tail: Ptr32<RlcAmRetxNode>,
+    /// `+0x1c4`: Retx node free-list count.
     pub retx_node_free_cnt: u32,
-    pub _pad25: u32,
-    /// `+0x1cc`: RLC AM UL retransmission ring (`512 * 24 B`).
+    /// `+0x1c8`: Base pointer of 512-entry `RlcAmRetxNode` pool (`8 KiB`).
+    pub retx_node_pool: Ptr32<RlcAmRetxNode>,
+    /// `+0x1cc`: RLC AM UL retransmission ring (`512 * 24 B` = `12 KiB`).
     pub ul_am_retx_ring: Ptr32<RlcAmRetxEntry>,
     /// `+0x1d0`: Retx ring write index (9-bit wrap `0..511`).
     pub retx_wr: u16,
@@ -352,12 +558,35 @@ pub struct Rbc {
     pub retx_cnt: u16,
     /// `+0x1d6`: Retx RLC header overhead BO bytes.
     pub retx_hdr_bo: u16,
-    /// `+0x1d8`: Retx ring total payload bytes.
+    /// `+0x1d8`: Retx ring total payload bytes (mirrored to `rlc_am_retx_bo` at `+0x158`).
     pub retx_bytes: u32,
-    pub _pad26: [u8; 0x16],
-    /// `+0x1f2`: Additional RLC AM header BO bytes.
+    pub _pad26: [u8; 0x10],
+    /// `+0x1ec`: Built UL RLC STATUS PDU buffer pointer (`0x842d_f44c`).
+    pub tx_status_buf: Ptr32<u8>,
+    /// `+0x1f0`: Built UL RLC STATUS PDU length in bytes (`0x842d_f454`).
+    pub tx_status_len: u16,
+    /// `+0x1f2`: Additional RLC AM STATUS header BO bytes (`1` when STATUS pending).
     pub am_extra_hdr_bo: u16,
-    pub _pad27: [u8; 0x1c],
+    /// `+0x1f4`: `ACK_SN` packed into pending UL STATUS PDU.
+    pub tx_status_ack_sn: u16,
+    /// `+0x1f6`: Number of NACK entries in pending UL STATUS PDU.
+    pub tx_status_nack_cnt: u16,
+    /// `+0x1f8`: Pointer to NACK descriptor table for STATUS truncation.
+    pub tx_status_nack_list: u32,
+    pub _pad27a: u32,
+    /// `+0x200`: Per-call UL RLC data PDU count (retx + new TX) inside `rlc_ul_am_gen_pdu`.
+    pub ul_data_pdu_cnt: u16,
+    /// `+0x202`: Non-zero if UL STATUS PDU was truncated to fit `grant_bytes`.
+    pub tx_status_truncated: u16,
+    /// `+0x204`: Actual STATUS PDU bytes emitted in this `rlc_ul_am_gen_pdu` call.
+    pub tx_status_sent_len: u16,
+    /// `+0x206`: Bit length of truncated NACK fields in UL STATUS PDU.
+    pub tx_status_nack_bits: u16,
+    /// `+0x208`: Scatter descriptor scratch index for AMD PDU re-segmentation.
+    pub retx_seg_desc_idx: u16,
+    /// `+0x20a`: Header buffer scratch offset for AMD PDU re-segmentation.
+    pub retx_seg_hdr_off: u16,
+    pub _pad27b: u32,
     /// `+0x210`: ROHC compression enabled flag (`0` on bench).
     pub rohc_enabled: u8,
     pub _pad28: [u8; 0x0b],
@@ -367,7 +596,7 @@ pub struct Rbc {
     /// `+0x236`: PDCP `discardTimer` duration in ms (`750` on Nokia `pdcpProf2`).
     pub pdcp_discard_timer_ms: u16,
     pub _pad30: [u8; 8],
-    /// `+0x240`: Last activity counter snapshot stored by 250 ms `do_bo.isra.0`.
+    /// `+0x240`: Last `ring0_last_tx_cnt` snapshot stored by 250 ms `do_bo.isra.0`.
     pub bo_hold_last_cnt: u32,
     /// `+0x244`: Active `bo_margin` hold bytes added to BSR in `rlc_upd_cur_bo`.
     pub bo_margin_bytes: u32,
@@ -393,7 +622,7 @@ pub struct L2TimerEntry {
     pub active_idx: u8,
 }
 
-/// Hardware LTE Cipher/Decipher Engine (`LLCE0`/`LLCE1`, `0x1213_0000`) DMA descriptor (`0x30` = 48 B).
+/// Hardware LTE Cipher/Decipher Engine (`LLCE0` `0x1212_0000` / `LLCE1` `0x1213_0000`) DMA descriptor (`0x30` = 48 B).
 ///
 /// All multi-byte fields are stored **big-endian** (`rev` instruction in `proc_pdcp_ul`).
 #[repr(C)]
@@ -404,7 +633,8 @@ pub struct LlceDesc {
     /// `+0x04`: Big-endian 32-bit PDCP COUNT.
     pub count_be: u32,
     pub _rsvd0: u32,
-    /// `+0x0c`: Big-endian physical address of next 48-byte descriptor (`self + 0x30`).
+    /// `+0x0c`: Big-endian physical address of next 48-byte descriptor (`self + 0x30`),
+    /// or `rev(LLCE_SENTINEL_VA)` on the last descriptor in a batch.
     pub next_desc_be: u32,
     pub _rsvd1: [u32; 4],
     /// `+0x20`: Big-endian payload byte length.

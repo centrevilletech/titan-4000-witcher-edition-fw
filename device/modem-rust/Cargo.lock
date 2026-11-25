@@ -14,7 +14,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "witcher-modem-mac-opt"
+version = "0.1.0"
+dependencies = [
+ "modem-atlas",
+]
+
+[[package]]
 name = "witcher-modem-n4"
+version = "0.1.0"
+dependencies = [
+ "modem-atlas",
+]
+
+[[package]]
+name = "witcher-modem-ul-model"
 version = "0.1.0"
 dependencies = [
  "modem-atlas",
