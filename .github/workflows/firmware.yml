@@ -142,6 +142,8 @@ jobs:
           components: clippy
       - name: Unsafe audit (every unsafe block in titan-sys has a SAFETY comment)
         run: cargo clippy --locked --manifest-path userspace/Cargo.toml -p titan-sys --all-targets -- -D warnings
+      - name: Type-check every crate and its tests (a fast signal; the tests job runs them)
+        run: cargo check --locked --manifest-path userspace/Cargo.toml --workspace --all-targets
       - name: Build the release binaries and report their sizes
         run: |
           set -euo pipefail
