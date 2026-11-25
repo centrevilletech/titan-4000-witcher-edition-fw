@@ -857,12 +857,16 @@ fn check_min_max(
     }
 }
 
-/// `enabled=1` in `tk/config` (the last `enabled=` line, comments removed).
+/// The loader is on in `tk/config`: the last `enabled=` line, comments
+/// removed, says `1`, or `default` (the release default config, which
+/// v1.0.17 and later read as on; v1.0.16 wanted exactly `1`, so a unit
+/// flashed back keeps stock modem firmware). `witcher-tk-stage` uses the
+/// same rule.
 pub fn enabled(config: &str) -> bool {
     let mut on = false;
     for line in config.lines() {
         if let Some(rest) = line.strip_prefix("enabled=") {
-            on = strip_comment_and_ws(rest) == "1";
+            on = matches!(strip_comment_and_ws(rest).as_str(), "1" | "default");
         }
     }
     on
@@ -2822,6 +2826,11 @@ wm=0x8418ff08:0x1
         assert!(enabled("enabled=1 # on\n"));
         assert!(!enabled("enabled=1\nenabled=0\n"));
         assert!(!enabled("enabled=yes\n"));
+        // The release default config says `enabled=default`. Reading it as off
+        // left every default unit's words unwritten (bench, 2026-11-25).
+        assert!(enabled("enabled=default\n"));
+        assert!(enabled("enabled=default # the release default\n"));
+        assert!(!enabled("enabled=default\nenabled=0\n"));
 
         // N4 PDCP words roll back to 0x4000 / 0x6000; N5 tunables roll back to 0.
         let mixed = parse_writes(

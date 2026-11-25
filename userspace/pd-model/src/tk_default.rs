@@ -387,7 +387,17 @@ mod tests {
         // reads `enabled=default` as on; v1.0.16's wants exactly 1, so a unit
         // flashed back keeps stock modem firmware.
         assert_eq!(text.lines().filter(|l| l.starts_with("enabled=")).collect::<Vec<_>>(), ["enabled=default"]);
-        assert!(!tk_flags::enabled(&text), "the v1.0.16 reading of enabled= is off");
+        let v1016 = text
+            .lines()
+            .rev()
+            .find_map(|l| l.strip_prefix("enabled="))
+            .map(|v| v.split('#').next().unwrap_or("").trim() == "1");
+        assert_eq!(v1016, Some(false), "the v1.0.16 reading of enabled= is off");
+        // This keeper reads it as on, so the flag writer wants every wm= word.
+        assert!(tk_flags::enabled(&text));
+        let parsed = tk_flags::parse_writes(&text).writes;
+        assert_eq!(parsed.len(), text.lines().filter(|l| l.starts_with("wm=")).count());
+        assert_eq!(tk_flags::wanted(&text, &[]), parsed);
         let wm: Vec<&str> = text.lines().filter(|l| l.starts_with("wm=")).collect();
         assert_eq!(
             wm,
