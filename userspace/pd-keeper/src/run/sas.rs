@@ -87,13 +87,9 @@ impl Keeper {
     pub(super) fn maintain_sas_nat(&mut self, routes: &str) {
         self.follow_rcinit_log();
         let interval = self.sas_watch.interval(self.now);
-        if self
-            .last_sas_check
-            .is_some_and(|last| self.now.saturating_sub(last) < interval)
-        {
+        if !self.last_sas_check.ready(self.now, interval) {
             return;
         }
-        self.last_sas_check = Some(self.now);
         let local_ip = self.nvram_get_cached("lan_management_ipaddr");
         let data_ip = self.nvram_get_cached("pdn_data_ipaddr");
         let snat = sas_nat::needed(&local_ip, &data_ip, routes);

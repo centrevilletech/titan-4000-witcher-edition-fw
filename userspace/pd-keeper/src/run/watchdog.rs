@@ -86,13 +86,9 @@ impl Keeper {
             }
             return;
         }
-        if self
-            .last_deaf_round
-            .is_some_and(|last| self.now.saturating_sub(last) < deaf::PROBE_EVERY)
-        {
+        if !self.last_deaf_round.ready(self.now, deaf::PROBE_EVERY) {
             return;
         }
-        self.last_deaf_round = Some(self.now);
         let settings = deaf::parse_settings(&read_file(state_dir().join("watchdog.conf")));
         self.deaf_secs = settings.deaf_secs;
         self.maintain_vendor_watchdog(&settings);
@@ -129,13 +125,9 @@ impl Keeper {
         let was = value.as_deref().unwrap_or("").trim().to_owned();
         let done = crate::nvram::set("detection_enable", "0").is_ok();
         // Something that keeps turning it back on must not fill the flash log.
-        let quiet = self
-            .vendor_watchdog_logged
-            .is_some_and(|at| self.now.saturating_sub(at) < 3600);
-        if quiet {
+        if !self.vendor_watchdog_logged.ready(self.now, 3600) {
             return;
         }
-        self.vendor_watchdog_logged = Some(self.now);
         if done {
             self.note(&format!(
                 "vendor ping watchdog: turned off in RAM for this boot (detection_enable was {was}); the keeper's deaf watchdog covers this unit"

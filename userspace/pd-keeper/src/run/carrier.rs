@@ -4,6 +4,7 @@
 use std::fs;
 
 use titan_pd_model::carrier_watch::{self, Action as CarrierAction};
+use titan_pd_model::pace::Pace;
 
 use crate::{carrier_watch_io, nvram};
 use crate::clock::unix_now;
@@ -16,7 +17,7 @@ pub(super) struct CarrierWatch {
     watch: carrier_watch::Watch,
     log_tail: carrier_watch_io::CbrsLogTail,
     config: carrier_watch::Config,
-    config_at: Option<u64>,
+    config_at: Pace,
     refused_logged: Vec<String>,
     status: StatusFile,
 }
@@ -27,7 +28,7 @@ impl CarrierWatch {
             watch: carrier_watch::Watch::default(),
             log_tail: carrier_watch_io::CbrsLogTail::new(carrier_watch_io::cbrslog_path()),
             config: carrier_watch::Config::default(),
-            config_at: None,
+            config_at: Pace::default(),
             refused_logged: Vec::new(),
             status: StatusFile::default(),
         }
@@ -42,12 +43,7 @@ impl Keeper {
         if !self.carrier_watch.watch.due(self.now) {
             return;
         }
-        if self
-            .carrier_watch
-            .config_at
-            .is_none_or(|at| self.now.saturating_sub(at) >= carrier_watch::CONFIG_EVERY)
-        {
-            self.carrier_watch.config_at = Some(self.now);
+        if self.carrier_watch.config_at.ready(self.now, carrier_watch::CONFIG_EVERY) {
             let cfg = carrier_watch_io::load_config();
             if cfg.refused != self.carrier_watch.refused_logged {
                 for line in &cfg.refused {

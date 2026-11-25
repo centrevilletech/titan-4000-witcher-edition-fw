@@ -1,5 +1,6 @@
 //! The staged download clamp module. See `titan_pd_model::qctrl`.
 
+use titan_pd_model::pace::Pace;
 use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 
 use crate::{qctrl_io, staged};
@@ -13,7 +14,7 @@ use super::mgmt_v6::mgmt_address_up;
 /// The download clamp's progress this boot.
 #[derive(Default)]
 pub(super) struct QctrlWatch {
-    checked_at: Option<u64>,
+    checked_at: Pace,
     /// The customer port and the management bearer were both up since then.
     up_since: Option<u64>,
     /// The last status, so the file and the log change only on news.
@@ -29,14 +30,9 @@ impl Keeper {
     /// Load the staged download clamp once the customer port and LTE are up,
     /// and keep its mode as `qctrl/config` says. Runs in every mode.
     pub(super) fn maintain_qctrl(&mut self) {
-        if self
-            .qctrl
-            .checked_at
-            .is_some_and(|at| self.now.saturating_sub(at) < qctrl::CHECK_EVERY)
-        {
+        if !self.qctrl.checked_at.ready(self.now, qctrl::CHECK_EVERY) {
             return;
         }
-        self.qctrl.checked_at = Some(self.now);
         let Some(dir) = qctrl_io::MODULE.staged_dir() else {
             self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
             return;

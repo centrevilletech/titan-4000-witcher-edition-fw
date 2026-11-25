@@ -60,6 +60,7 @@ use titan_pd_model::host_mac;
 use titan_pd_model::ipv4;
 use titan_pd_model::ipv4_health::{self, Peer};
 use titan_pd_model::mgmt;
+use titan_pd_model::pace::Pace;
 use titan_pd_model::prefix::Block;
 use titan_pd_model::sas_nat;
 use titan_pd_model::tk_boot;
@@ -130,7 +131,7 @@ struct Keeper {
     // Read the dynamic PDN snapshot at most once per second per bearer.
     assigned_at: Option<(u64, String, Option<std::net::Ipv4Addr>)>,
     sas_watch: sas_nat::Watch,
-    last_sas_check: Option<u64>,
+    last_sas_check: Pace,
     dhcp_child: Option<std::process::Child>,
     last_flood: u64,
     flood_bearer: String,
@@ -149,7 +150,7 @@ struct Keeper {
     /// The customer port's receive counter, sampled every `LINK_SAMPLE` s for
     /// the IPv6 health check. Bulk IPv6 is no longer read from the port.
     link_rx: ipv4_health::Activity,
-    link_rx_at: Option<u64>,
+    link_rx_at: Pace,
     /// The MAC of the last IPv6 control packet from the router (solicitation,
     /// neighbour probe or DHCPv6). Forgotten when eth0 stays down long enough
     /// for a router swap.
@@ -174,7 +175,7 @@ struct Keeper {
     status_flash: Option<Report>,
     status_gate: wear::FlashGate,
     /// When the vendor ping watchdog line was last written.
-    vendor_watchdog_logged: Option<u64>,
+    vendor_watchdog_logged: Pace,
     last_mgmt: u64,
     last_mgmt_log: u64,
     mgmt_up_logged: bool,
@@ -185,12 +186,12 @@ struct Keeper {
     deaf_watch: deaf::Watch,
     deaf_probe: Option<PingRound>,
     deaf_secs: u64,
-    last_deaf_round: Option<u64>,
+    last_deaf_round: Pace,
     reboot_asked_at: Option<u64>,
     reboot_forced: bool,
     /// The bearer bridged to the customer port, or the vendor's data bearer.
     bearer: String,
-    mode_checked: Option<u64>,
+    mode_checked: Pace,
     /// The customer bearer is a port of the LAN bridge right now.
     bridged: bool,
     /// Since when, without a break.
@@ -204,11 +205,11 @@ struct Keeper {
     driver_watch: driver_mac::Watch,
     /// Corrections since the last log line, and when that line was written.
     driver_fixes: u32,
-    driver_logged_at: Option<u64>,
+    driver_logged_at: Pace,
     /// The vendor kernel's IPv4 host MAC, read from its log and kept on the
     /// router that holds the customer lease. See `titan_pd_model::host_mac`.
     host_mac_watch: host_mac::Watch,
-    host_mac_logged_at: Option<u64>,
+    host_mac_logged_at: Pace,
     flow_watch: ethernet::Watch,
     flow_checked: Option<u64>,
     /// The kernel log was read to its end once, so a flow control report
@@ -228,14 +229,14 @@ struct Keeper {
     /// Pending confirm for a boot that loaded a staged modem firmware image.
     tk_confirm: Option<tk_boot::Confirm>,
     tk_probe: Option<PingRound>,
-    tk_last_round: Option<u64>,
+    tk_last_round: Pace,
     /// The boot hook's status, read once at start.
     tk_status: tk_boot::BootStatus,
     /// Modem feature flags after a confirmed staged boot (see
     /// `titan_pd_model::tk_flags`), and the DM session running for them.
     tk_flags: Option<tk_flags::Control>,
     tk_flags_job: Option<(std::thread::JoinHandle<(tk_flags::Outcome, bool)>, tk_flags::Plan)>,
-    tk_flags_config_at: Option<u64>,
+    tk_flags_config_at: Pace,
     tk_flags_refused: Vec<String>,
     tk_flags_config_hands_off: bool,
     /// The kernel log showed a modem firmware load after the keeper started.
@@ -299,7 +300,7 @@ impl Keeper {
             last_ipv4_check: 0,
             assigned_at: None,
             sas_watch: sas_nat::Watch::default(),
-            last_sas_check: None,
+            last_sas_check: Pace::default(),
             dhcp_child: None,
             last_flood: 0,
             flood_bearer: String::new(),
@@ -311,7 +312,7 @@ impl Keeper {
             delegated_mac: None,
             delegated_at: 0,
             link_rx: ipv4_health::Activity::default(),
-            link_rx_at: None,
+            link_rx_at: Pace::default(),
             ipv6_router: None,
             eth0_down_since: None,
             ipv4_conf_good: None,
@@ -328,7 +329,7 @@ impl Keeper {
             status_ram: None,
             status_flash: None,
             status_gate: wear::FlashGate::default(),
-            vendor_watchdog_logged: None,
+            vendor_watchdog_logged: Pace::default(),
             last_mgmt: 0,
             last_mgmt_log: 0,
             mgmt_up_logged: false,
@@ -339,11 +340,11 @@ impl Keeper {
             deaf_watch: deaf::Watch::default(),
             deaf_probe: None,
             deaf_secs: deaf::DEAF_SECS,
-            last_deaf_round: None,
+            last_deaf_round: Pace::default(),
             reboot_asked_at: None,
             reboot_forced: false,
             bearer: DEFAULT_BEARER.to_owned(),
-            mode_checked: None,
+            mode_checked: Pace::default(),
             bridged: false,
             bridged_since: None,
             ipv4_peer: None,
@@ -352,9 +353,9 @@ impl Keeper {
             ipv4_gateway: None,
             driver_watch: driver_mac::Watch::default(),
             driver_fixes: 0,
-            driver_logged_at: None,
+            driver_logged_at: Pace::default(),
             host_mac_watch: host_mac::Watch::default(),
-            host_mac_logged_at: None,
+            host_mac_logged_at: Pace::default(),
             flow_watch: ethernet::Watch::default(),
             flow_checked: None,
             kmsg_drained: false,
@@ -367,11 +368,11 @@ impl Keeper {
             tk_checked: false,
             tk_confirm: None,
             tk_probe: None,
-            tk_last_round: None,
+            tk_last_round: Pace::default(),
             tk_status: tk_boot::BootStatus::default(),
             tk_flags: None,
             tk_flags_job: None,
-            tk_flags_config_at: None,
+            tk_flags_config_at: Pace::default(),
             tk_flags_refused: Vec::new(),
             tk_flags_config_hands_off: false,
             modem_restart_seen: false,

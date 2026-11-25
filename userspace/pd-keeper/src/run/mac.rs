@@ -44,10 +44,7 @@ impl Keeper {
                     Ok(()) => {
                         self.driver_fixes += 1;
                         // keeper.log is on flash: one line a minute at most.
-                        if self
-                            .driver_logged_at
-                            .is_none_or(|at| self.now.saturating_sub(at) >= 60)
-                        {
+                        if self.driver_logged_at.ready(self.now, 60) {
                             self.note(&format!(
                                 "the unit was forwarding the router's IPv6, so the LTE driver had the wrong downlink MAC; sent the router's ARP ({} {}) out {bearer} to put it back ({} time(s) since the last note)",
                                 ipv4::mac_text(peer.mac),
@@ -55,7 +52,6 @@ impl Keeper {
                                 self.driver_fixes
                             ));
                             self.driver_fixes = 0;
-                            self.driver_logged_at = Some(self.now);
                         }
                     }
                     Err(err) => self.note(&format!("LTE driver MAC correction could not be sent: {err}")),
@@ -98,13 +94,9 @@ impl Keeper {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 let result = run_status(program, &args);
                 // keeper.log is on flash: one line a minute at most.
-                if self
-                    .host_mac_logged_at
-                    .is_some_and(|at| self.now.saturating_sub(at) < 60)
-                {
+                if !self.host_mac_logged_at.ready(self.now, 60) {
                     return;
                 }
-                self.host_mac_logged_at = Some(self.now);
                 let to = ipv4::mac_text(to);
                 match result {
                     Ok(()) => {

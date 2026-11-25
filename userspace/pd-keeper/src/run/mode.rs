@@ -27,18 +27,14 @@ impl Keeper {
                 self.sas_watch.burst(self.now);
                 self.last_flood = 0;
             }
-            self.mode_checked = None;
+            self.mode_checked.reset();
             return;
         }
         self.bridged = false;
         self.bridged_since = None;
-        if self
-            .mode_checked
-            .is_some_and(|last| self.now.saturating_sub(last) < MODE_EVERY)
-        {
+        if !self.mode_checked.ready(self.now, MODE_EVERY) {
             return;
         }
-        self.mode_checked = Some(self.now);
         // A failed or empty read keeps the last mode. Taking it for NAT stopped
         // the responder and removed the port filter, and the SQM under it.
         if let Some(mode) = vendor_passthrough(&self.nvram_get_cached("router_disable")) {

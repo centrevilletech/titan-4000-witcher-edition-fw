@@ -168,12 +168,8 @@ impl Keeper {
         // Frames from the router stand in for the bulk IPv6 the port filter
         // no longer copies out, and a busy link is never dropped.
         let rx = rx_packets(CUSTOMER);
-        if self
-            .link_rx_at
-            .is_none_or(|at| self.now.saturating_sub(at) >= LINK_SAMPLE)
-        {
+        if self.link_rx_at.ready(self.now, LINK_SAMPLE) {
             self.link_rx.sample(self.now, rx);
-            self.link_rx_at = Some(self.now);
         }
         let traffic = self.link_rx.traffic(self.now, rx);
         let busy = matches!(traffic, Traffic::Busy { .. });

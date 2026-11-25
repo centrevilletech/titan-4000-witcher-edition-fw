@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use titan_pd_model::pace::Pace;
 use titan_pd_model::cpu_trims::{self, Config, LedPacer, LedState, LedStep, StatusView};
 use titan_sys::process::{self, Signal};
 
@@ -89,7 +90,7 @@ fn set_nice(pid: i32, nice: i32) -> bool {
 #[derive(Default)]
 pub struct Watch {
     config: Config,
-    config_at: Option<u64>,
+    config_at: Pace,
     refused_logged: Vec<String>,
     /// The last second `maintain` ran in.
     ran_at: Option<u64>,
@@ -97,14 +98,14 @@ pub struct Watch {
     started: bool,
     pacer: LedPacer,
     led_pid: Option<i32>,
-    led_scan_at: Option<u64>,
+    led_scan_at: Pace,
     led_state: Option<LedState>,
     led_logged: Option<LedState>,
-    led_logged_at: Option<u64>,
+    led_logged_at: Pace,
     /// `/proc/locks` could not be read, so the loop is never paused.
     led_unverifiable: bool,
     softirq_pid: Option<i32>,
-    softirq_scan_at: Option<u64>,
+    softirq_scan_at: Pace,
     softirq_shown: String,
     pauses: u64,
     lock_backoffs: u64,
@@ -122,11 +123,8 @@ impl Watch {
         self.ran_at = Some(now);
         let root = proc_root();
 
-        let check = self
-            .config_at
-            .is_none_or(|at| now.saturating_sub(at) >= cpu_trims::CHECK_EVERY);
+        let check = self.config_at.ready(now, cpu_trims::CHECK_EVERY);
         if check {
-            self.config_at = Some(now);
             let config = load_config();
             if config.refused != self.refused_logged {
                 for line in &config.refused {
@@ -153,7 +151,7 @@ impl Watch {
                 self.led_pid = Some(pid);
                 signal(pid, Signal::Continue);
             }
-            self.led_scan_at = Some(now);
+            self.led_scan_at.mark(now);
             self.pacer.resumed_at(now);
         }
 
@@ -172,13 +170,9 @@ impl Watch {
             }
             self.led_pid = None;
         }
-        if self
-            .led_scan_at
-            .is_some_and(|at| now.saturating_sub(at) < cpu_trims::RESCAN_EVERY)
-        {
+        if !self.led_scan_at.ready(now, cpu_trims::RESCAN_EVERY) {
             return None;
         }
-        self.led_scan_at = Some(now);
         self.led_pid = find_led_loop(root);
         self.led_pid
     }
@@ -257,14 +251,10 @@ impl Watch {
             self.led_logged = Some(state);
             return;
         }
-        if self
-            .led_logged_at
-            .is_some_and(|at| now.saturating_sub(at) < LED_LOG_EVERY)
-        {
+        if !self.led_logged_at.ready(now, LED_LOG_EVERY) {
             return;
         }
         self.led_logged = Some(state);
-        self.led_logged_at = Some(now);
         note(&format!(
             "cpu trims: LED loop {} (period {} s)",
             state.name(),
@@ -278,13 +268,9 @@ impl Watch {
             .and_then(|pid| ksoftirqd_nice(root, pid).map(|nice| (pid, nice)));
         let found = known.or_else(|| {
             self.softirq_pid = None;
-            if self
-                .softirq_scan_at
-                .is_some_and(|at| now.saturating_sub(at) < cpu_trims::RESCAN_EVERY)
-            {
+            if !self.softirq_scan_at.ready(now, cpu_trims::RESCAN_EVERY) {
                 return None;
             }
-            self.softirq_scan_at = Some(now);
             let pid = find_ksoftirqd(root)?;
             self.softirq_pid = Some(pid);
             ksoftirqd_nice(root, pid).map(|nice| (pid, nice))

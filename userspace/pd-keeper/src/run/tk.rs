@@ -66,13 +66,9 @@ impl Keeper {
             }
             return;
         }
-        if self
-            .tk_last_round
-            .is_some_and(|last| self.now.saturating_sub(last) < tk_boot::PROBE_EVERY)
-        {
+        if !self.tk_last_round.ready(self.now, tk_boot::PROBE_EVERY) {
             return;
         }
-        self.tk_last_round = Some(self.now);
         let targets = self.tk_targets();
         match PingRound::start(&targets, self.now) {
             Some(round) => self.tk_probe = Some(round),
@@ -199,7 +195,7 @@ impl Keeper {
             let _ = fs::write(tk_flags_status_path(), control.status(self.now));
         }
         self.tk_flags = Some(control);
-        self.tk_flags_config_at = Some(self.now);
+        self.tk_flags_config_at.mark(self.now);
     }
 
     fn tk_flags_hands_off_reason(&self) -> Option<String> {
@@ -250,11 +246,7 @@ impl Keeper {
         // The operator may change tk/config: read it again now and then. A
         // missing file means off; a read error changes nothing.
         let mut config_text = None;
-        if self
-            .tk_flags_config_at
-            .is_none_or(|at| self.now.saturating_sub(at) >= TK_FLAGS_CONFIG_EVERY)
-        {
-            self.tk_flags_config_at = Some(self.now);
+        if self.tk_flags_config_at.ready(self.now, TK_FLAGS_CONFIG_EVERY) {
             if let Some(dir) = tk_dir() {
                 config_text = match fs::read_to_string(dir.join("config")) {
                     Ok(text) => Some(text),

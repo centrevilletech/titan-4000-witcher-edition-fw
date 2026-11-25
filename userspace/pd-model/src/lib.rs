@@ -32,6 +32,7 @@ pub mod ipv4;
 pub mod ipv4_health;
 pub mod mgmt;
 pub mod nvram;
+pub mod pace;
 pub mod prefix;
 pub mod qctrl;
 pub mod ra;

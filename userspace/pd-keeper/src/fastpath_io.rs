@@ -13,6 +13,7 @@ use std::thread;
 use std::time::Duration;
 
 use titan_pd_model::cbrs_gate::{self, Gate, Step as GateStep};
+use titan_pd_model::pace::Pace;
 use titan_pd_model::fastpath::{
     self, Config, LeaseAction, LeaseState, Loaded, Proc, StatusView, TripAction, TripWatch,
 };
@@ -74,7 +75,7 @@ fn read_proc_until(done: &dyn Fn(&Proc) -> bool) -> Proc {
 /// Fast path lifecycle and grant-lease state for one keeper process.
 #[derive(Default)]
 pub struct Watch {
-    checked_at: Option<u64>,
+    checked_at: Pace,
     /// Both `eth0` and `lte0pdn2` were up and in `br0` in passthrough since then.
     up_since: Option<u64>,
     /// Last logged `state: detail`, so log lines emit only on state/detail change.
@@ -136,7 +137,7 @@ impl Watch {
         if self.lease_state != prev_lease {
             // Re-read /proc/k1fp on this same tick so witcher-fastpath.status
             // reflects the new gate state immediately.
-            self.checked_at = None;
+            self.checked_at.reset();
         }
     }
 
@@ -150,13 +151,9 @@ impl Watch {
         nvram_cache_path: &Path,
         mut note: impl FnMut(&str),
     ) {
-        if self
-            .checked_at
-            .is_some_and(|at| now.saturating_sub(at) < fastpath::CHECK_EVERY)
-        {
+        if !self.checked_at.ready(now, fastpath::CHECK_EVERY) {
             return;
         }
-        self.checked_at = Some(now);
 
         let Some(dir) = MODULE.staged_dir() else {
             self.module_loaded = false;
