@@ -77,6 +77,10 @@ pub const L2_DO_IC_DROPS_VA: u32 = 0x84dd_9cda;
 pub const L2_CNT_UL_IRBS_VA: u32 = 0x84dd_9cec;
 /// Pure UL TCP ACKs routed to Ring 0 (`u16` / `u32` at `+0x52e`).
 pub const L2_CNT_R0_TCP_ACK_VA: u32 = 0x84dd_9cee;
+/// Per-LCG pre-RLC Ring-1 pending bytes populated by `mac_bsr_pre_work` (`[u32; 4]`).
+pub const L2_BSR_PRE_BO_VA: u32 = 0x84dd_9d18;
+/// Current LTE air subframe index `sfn * 10 + sf` (`0..10239`, mod `0x2800`) at `0x84b4_d07c + 0xc`.
+pub const AIR_STI_VA: u32 = 0x84b4_d088;
 
 // ---------------------------------------------------------------------------
 // MAC UL / BSR / SR / HARQ / L1U globals & ROM tables
@@ -190,6 +194,7 @@ pub const FN_ASSIGN_SCHEDULE_SIZE_2LC: u32 = 0x842c_fd40;
 pub const FN_GENERATE_MAC_UL_PDU: u32 = 0x842d_0248;
 pub const FN_UPDATE_MAC_UL_PH: u32 = 0x842d_1c40;
 pub const FN_ACCESS_RA: u32 = 0x842d_3abc;
+pub const FN_SCHED_RA: u32 = 0x842d_3d10;
 pub const FN_HANDLE_RA_ULGRANT: u32 = 0x842d_4a78;
 pub const FN_GET_MAC_UL_SR: u32 = 0x842d_4ca4;
 pub const FN_RECONSTRUCT_SCHED_INFO: u32 = 0x842d_5258;
