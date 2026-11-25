@@ -46,11 +46,13 @@ It handles IPv4 and IPv6 alike. It clamps only flows whose handshake it saw, so
 it knows the server's window scale. A connection the customer accepts (its SYN
 comes from the internet) is left alone.
 
-`ul_pulse_kb` (off by default) grows every window by that much for one round
-trip every `ul_pulse_ms`. The Nokia eNB schedules a second uplink carrier only
-while the UE's buffer report is high enough. A pulse raises the report, and it
-lets `bw` see the link's full rate when the target sits below what the tower
-needs.
+Once a second, every window doubles for one round trip (a capacity probe, as
+BBR's). The tower grants against a buffer report about 10 ms old, so a target
+shorter than that wait makes every round trip longer than `rtt_f + ul_target_ms`.
+Without the probe each rate sample then reads low and a single upload's window
+spirals down (a third of the link in lane R1's model). The probe keeps a
+saturated sample in the 2 s maximum, at the cost of one round of extra queue
+per second.
 
 The modem's PIE stays on as the backstop. With the clamp holding the queue
 under PIE's target, PIE drops nothing.
@@ -96,20 +98,20 @@ ssh -p 2222 root@<unit> 'printf "mode=18\nul_target_ms=8\n" > /mnt/titan-api/qct
 | --- | --- | --- |
 | `mode=` | `16`, `18`, `19`, `22` | 16 upload clamp alone; 18, 19 and 22 add it to download modes 2, 3 and 6. |
 | `ul_target_ms=` | 0 to 40 | Queue each upload keeps above its round trip. Module default 8. |
-| `ul_pulse_kb=` | 0 to 64 | Extra window per pulse, for one round trip. Module default 0 (no pulses). |
-| `ul_pulse_ms=` | 50 to 2000 | Time between pulses. Module default 200. |
 
-The keeper writes the knobs, then the mode, to `/proc/titan_qctrl` within 15 s
+The keeper writes the knob, then the mode, to `/proc/titan_qctrl` within 15 s
 and reads them back. An unknown line is ignored and logged. The status file
-`/var/run/witcher-qctrl.status` shows `upload=1` and the knobs.
+`/var/run/witcher-qctrl.status` shows `upload=1` and `ul_target_ms`.
 
 `cat /proc/titan_qctrl` shows the live clamp on its `upload:` lines:
 
+- `ul_full`: 1 once startup ended (the shared window applies).
+- `ul_dlq_ms`: the download queue added to the target.
 - `ul_bw_kbps`: the rate estimate.
 - `ul_rtt_ms`: the shortest round trip.
 - `ul_flows`: bulk uploads sharing the window.
 - `ul_w_kb`: the total window.
-- `ul_acks`, `ul_clamped`, `ul_samples`, `ul_pulses`: counters.
+- `ul_acks`, `ul_clamped`, `ul_samples`, `ul_probes`, `ul_startups`: counters.
 
 The estimates run in every mode, so they are filled in before you turn the
 clamp on.

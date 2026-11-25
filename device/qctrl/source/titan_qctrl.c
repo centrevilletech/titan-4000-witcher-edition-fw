@@ -21,8 +21,6 @@
  *   echo "mode <0..31>"      (1=ACK-thin, 2=RWND-clamp, 4=DL-ECN, 8=UDP-drop, 16=UL-clamp)
  *   echo "target_ms <ms>"    (target eNB queue delay, default 12 ms)
  *   echo "ul_target_ms <ms>" (Q2: modem queue the upload clamp allows, 0..40, default 8)
- *   echo "ul_pulse_kb <kb>"  (Q2: extra window per pulse, 0..64, default 0 = off)
- *   echo "ul_pulse_ms <ms>"  (Q2: time between pulses, 50..2000, default 200)
  *   echo "hold_us <us>"      (max ACK coalesce hold, default 2500 us)
  *   echo "ack_span <bytes>"  (max bytes per coalesced ACK, default 8192 B)
  *   echo "phy <kbps>"        (optional PHY DL ceiling; 0 = off, else 4000..1000000)
@@ -2120,12 +2118,12 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
         g.stat_rwnd_clamped, g.stat_ecn_marked, g.stat_udp_dropped);
     /* Q2: upload clamp. bw is bytes per 1024 units (1.048576 ms): x 7.63 = kbps. */
     seq_printf(m,
-        "upload: ul_target_ms=%u ul_pulse_kb=%u ul_pulse_ms=%u\n"
+        "upload: ul_target_ms=%u ul_full=%u ul_dlq_ms=%u\n"
         "        ul_bw_kbps=%u ul_rtt_ms=%u ul_flows=%u ul_w_kb=%u\n"
-        "        ul_acks=%u ul_clamped=%u ul_samples=%u ul_pulses=%u\n",
-        g.ul.target_ms, g.ul.pulse_bytes >> 10, g.ul.pulse_ms,
+        "        ul_acks=%u ul_clamped=%u ul_samples=%u ul_probes=%u ul_startups=%u\n",
+        g.ul.target_ms, g.ul.full, g.ul.dl_queue_ms,
         (g.ul.bw * 1000u) / 131u, units_to_ms(g.ul.rtt_base), g.ul.n_active, g.ul.w_total >> 10,
-        g.ul.st_acks, g.ul.st_clamped, g.ul.st_samples, g.ul.st_pulses);
+        g.ul.st_acks, g.ul.st_clamped, g.ul.st_samples, g.ul.st_probes, g.ul.st_startups);
     return 0;
 }
 
@@ -2179,10 +2177,6 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
     local_bh_disable();
     if (starts_with(kbuf, "ul_target_ms") && parse_u32(kbuf + 12, &val)) {
         if (val <= ULC_TARGET_MAX_MS) g.ul.target_ms = val;           /* Q2 */
-    } else if (starts_with(kbuf, "ul_pulse_kb") && parse_u32(kbuf + 11, &val)) {
-        if (val <= ULC_PULSE_MAX_KB) g.ul.pulse_bytes = val << 10;    /* Q2: 0 = no pulses */
-    } else if (starts_with(kbuf, "ul_pulse_ms") && parse_u32(kbuf + 11, &val)) {
-        if (val >= ULC_PULSE_MS_MIN && val <= ULC_PULSE_MS_MAX) g.ul.pulse_ms = val;  /* Q2 */
     } else if (starts_with(kbuf, "mode") && parse_u32(kbuf + 4, &val)) {
         if (val <= MODE_ALL) {              /* Y6: reject, do not mask, >15 */
             g.mode = val;
@@ -2291,7 +2285,7 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
         g.thin_backoff_ticks = g.thin_armed = g.thin_drop_ticks = 0;
         g.thin_strikes = g.thin_ref_kbps = g.pre_thin_kbps = 0;
         g.thinned_last = 0;
-        g.ul.st_acks = g.ul.st_clamped = g.ul.st_samples = g.ul.st_pulses = 0;  /* Q2 */
+        g.ul.st_acks = g.ul.st_clamped = g.ul.st_samples = g.ul.st_probes = g.ul.st_startups = 0;  /* Q2 */
         g.ctl_active = 0;
         g.release_left = 0;
         g.starve_ticks = 0;

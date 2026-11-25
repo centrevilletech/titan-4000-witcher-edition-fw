@@ -8,16 +8,20 @@
  * bounds each upload's window by lowering the receive window in those ACKs. A flow that has
  * finished its slow start gets
  *
- *     W_f = bw / n x (rtt_f + target_ms)       (+ pulse_bytes / n for one round per pulse)
+ *     W_f = bw / n x (rtt_f + target_ms)       (twice that for one round each second)
  *
  * so the n bulk uploads share the measured rate equally and each keeps about target_ms of
  * data queued in the modem, whatever its congestion control, without a single drop.
  *
  * - bw: the maximum delivery-rate sample of the last 2 s (8 slots of 250 ms). A sample is
  *   what all uploads had acknowledged over one probe's round trip, as BBR's rate samples, so
- *   it is smooth on a TDD link. A maximum keeps a clamp-limited stretch from dragging the
- *   estimate down before its window ends. With target_ms above 0 the clamp lets the rate
- *   grow by about target_ms / rtt per round, so it finds new capacity without probing.
+ *   it is smooth on a TDD link.
+ * - Capacity probe: once a second, every window doubles for one round, so the 2 s maximum
+ *   always holds a sample taken with the link saturated. Without it, a target shorter than
+ *   the tower's own grant wait (about 10 ms of report-to-grant lag on the bench sector)
+ *   makes every round trip longer than rtt_f + target_ms: each sample reads under the
+ *   estimate, and the window spirals down to its floor (a single CUBIC flow fell to a third
+ *   of the link in the model). The probe costs one round of extra queue per second.
  * - rtt_f: the flow's minimum round trip from the Titan over the last 5-10 s. The handshake
  *   (SYN to SYN-ACK, before any data queues) is the first sample.
  * - Startup: until the link is full, a flow (and every flow that has not yet delivered
@@ -31,9 +35,6 @@
  *   servers' own clocks (one way, so the uploads' queue cannot feed into it) and passes it
  *   in as dl_queue_ms, which adds to every upload's target, so an upload keeps its rate
  *   while a download runs.
- * - Pulses (off by default): the Nokia eNB schedules a second uplink carrier only while the
- *   UE's buffer report is high enough. Every pulse_ms the window grows by pulse_bytes for
- *   one round, which raises the report and lets bw see the link's full rate.
  * - The right edge (ack + window) never moves back (RFC 7323 section 2.4), the window never
  *   rises above what the server advertised, and a zero window passes untouched.
  *
@@ -55,16 +56,16 @@
 #define ULC_ROUND_MIN     39063u    /* 40 ms: shortest startup round */
 #define ULC_FULL_ROUNDS   3u        /* rounds without 25 % growth that end startup */
 #define ULC_EXIT_SLACK    9766u     /* 10 ms: a round trip this far over min + target ends startup */
+#ifndef ULC_PROBE_EVERY           /* the host tests turn it off to show what it prevents */
+#define ULC_PROBE_EVERY   976563u   /* 1 s between capacity probes (one round at twice the window) */
+#endif
 #define ULC_STARTUP_BYTES 65536u    /* a flow joins the shared window after delivering this */
 #define ULC_CEIL_BYTES    (32u << 20)
 #define ULC_MIN_SEGS      4u        /* per-flow floor: 4 segments keep fast retransmit */
 #define ULC_DEFAULT_MSS   1328u
 
-/* Knob limits (the /proc writer and the keeper refuse anything else). */
+/* Knob limit (the /proc writer and the keeper refuse anything else). */
 #define ULC_TARGET_MAX_MS 40u
-#define ULC_PULSE_MAX_KB  64u
-#define ULC_PULSE_MS_MIN  50u
-#define ULC_PULSE_MS_MAX  2000u
 #define ULC_DLQ_MAX_MS    200u      /* largest downlink queue added to the target */
 
 /* struct ulc_flow.state */
@@ -95,10 +96,8 @@ struct ulc_flow {
 
 /* The clamp: knobs, shared estimates and counters. */
 struct ulc {
-	/* knobs */
+	/* knob */
 	u32 target_ms;   /* queue the clamp leaves above the round trip (0..40, default 8) */
-	u32 pulse_bytes; /* extra window for one round per pulse (0 = no pulses) */
-	u32 pulse_ms;    /* time between pulses (50..2000) */
 	/* input */
 	u32 dl_queue_ms; /* the unit's downlink queue (one way, ms; 0 = none measured) */
 	/* estimates */
@@ -114,8 +113,8 @@ struct ulc {
 	u32 full_cnt;    /* rounds since then */
 	u32 round_t;     /* start of the current startup round */
 	u32 busy_t;      /* last tick with a sending flow */
-	u32 pulse_next;  /* next pulse may start */
-	u32 pulse_until; /* the current pulse ends */
+	u32 probe_next;  /* next capacity probe may start */
+	u32 probe_until; /* the current capacity probe round ends */
 	u32 w_total;     /* sum of the shared windows at the last tick (telemetry) */
 	/* tick accumulators */
 	u32 n_next;
@@ -126,7 +125,7 @@ struct ulc {
 	u32 st_acks;     /* downlink ACKs of sending flows seen */
 	u32 st_clamped;  /* windows lowered */
 	u32 st_samples;  /* rate samples */
-	u32 st_pulses;
+	u32 st_probes;   /* capacity probes */
 	u32 st_startups; /* startups begun */
 };
 
@@ -141,12 +140,11 @@ static inline void ulc_init(struct ulc *g, u32 now)
 {
 	__builtin_memset(g, 0, sizeof(*g));
 	g->target_ms = 8u;
-	g->pulse_ms = 200u;
 	g->slot_t = now;
 	g->round_t = now;
 	g->busy_t = now;
-	g->pulse_next = now;
-	g->pulse_until = now;
+	g->probe_next = now;
+	g->probe_until = now;
 }
 
 /* A new connection on this 4-tuple (the customer's SYN). */
@@ -274,8 +272,8 @@ static inline u32 ulc_share(const struct ulc *g, const struct ulc_flow *f, u32 n
 	if (!g->bw || !rtt)
 		return 0;
 	w = ((u64)g->bw * (u64)(rtt + ulc_ms(g->target_ms + ulc_dlq(g)))) >> 10;
-	if (g->pulse_bytes && ulc_before(now, g->pulse_until))
-		w += g->pulse_bytes;
+	if (ulc_before(now, g->probe_until))
+		w <<= 1;
 	if (w > ULC_CEIL_BYTES)
 		w = ULC_CEIL_BYTES;
 	w = (u32)w / n;
@@ -432,10 +430,10 @@ static inline void ulc_tick_end(struct ulc *g, u32 now)
 			g->full = 1;
 		}
 	}
-	if (g->full && g->pulse_bytes && g->n_active && g->rtt_base && !ulc_before(now, g->pulse_next)) {
-		g->pulse_next = now + ulc_ms(g->pulse_ms);
-		g->pulse_until = now + g->rtt_base;
-		g->st_pulses++;
+	if (g->full && g->n_active && g->rtt_base && !ulc_before(now, g->probe_next)) {
+		g->probe_next = now + ULC_PROBE_EVERY;
+		g->probe_until = now + g->rtt_base;
+		g->st_probes++;
 	}
 	g->w_total = (g->full && g->n_active && g->bw && g->rtt_base) ?
 		     (u32)((((u64)g->bw * (u64)(g->rtt_base + ulc_ms(g->target_ms + ulc_dlq(g)))) >> 10) &

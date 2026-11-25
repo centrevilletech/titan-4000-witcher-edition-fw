@@ -69,7 +69,7 @@ port and LTE are up.
 | `ack_ms=` | 1 to 10 | Per-flow ACK time budget in ms when `ack_adapt=1`. Module default 6. |
 | `ack_segs=` | 2 to 32 | Per-flow ACK segment budget when `ack_adapt=1`. Module default 18. |
 | `ack_min_kbps=` | 0 to 100000 | Per-flow DL rate floor in kbps below which `ack_adapt=1` never thins. Module default 2000. |
-| `ul_target_ms=`, `ul_pulse_kb=`, `ul_pulse_ms=` | see [upload clamp](upload-clamp.md) | Upload clamp knobs. |
+| `ul_target_ms=` | 0 to 40 | The [upload clamp](upload-clamp.md)'s target. Module default 8. |
 
 A `#` starts a comment. The last line for a key wins. A bad `mode=` line
 leaves the clamp off, and a bad knob line leaves the module default. Either
@@ -89,8 +89,8 @@ Every 15 s, in every mode:
    SHA-256 against the digest built into the keeper, then runs `insmod` on
    that copy. The module starts in mode 0 (observe only).
 5. Writes any configured knobs (`trough_ms`, `target_ms`, `ack_adapt`,
-   `ctrl_v3`, `ack_ms`, `ack_segs`, `ack_min_kbps`, `ul_target_ms`,
-   `ul_pulse_kb`, `ul_pulse_ms`), then `mode`, to
+   `ctrl_v3`, `ack_ms`, `ack_segs`, `ack_min_kbps`, `ul_target_ms`), then
+   `mode`, to
    `/proc/titan_qctrl`, one line per write. Then it reads them back.
 6. On later rounds it reads `/proc/titan_qctrl` again and writes the config
    again if they differ, so a config change applies within 15 s.
@@ -99,7 +99,7 @@ A failed load is not retried until the config changes or the unit reboots.
 
 Status: `/var/run/witcher-qctrl.status`, with `state` (`off`, `waiting`,
 `applied`, `failed`), `detail`, `mode`, `trough_ms`, `target_ms`, `ack_adapt`,
-`ctrl_v3`, `upload`, `ul_target_ms`, `ul_pulse_kb`.
+`ctrl_v3`, `upload`, `ul_target_ms`.
 `keeper.log` lines start with `download clamp`. A unit that never staged it
 logs none.
 

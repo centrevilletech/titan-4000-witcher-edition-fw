@@ -52,11 +52,8 @@ pub const ACK_MS_MAX: u32 = 10;
 pub const ACK_SEGS_MIN: u32 = 2;
 pub const ACK_SEGS_MAX: u32 = 32;
 pub const ACK_MIN_KBPS_MAX: u32 = 100_000;
-/// Upload clamp limits (`ulclamp_core.h`).
+/// Upload clamp limit (`ulclamp_core.h`).
 pub const UL_TARGET_MAX: u32 = 40;
-pub const UL_PULSE_KB_MAX: u32 = 64;
-pub const UL_PULSE_MS_MIN: u32 = 50;
-pub const UL_PULSE_MS_MAX: u32 = 2000;
 
 /// `/mnt/titan-api/qctrl/config`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -70,8 +67,6 @@ pub struct Config {
     pub ack_segs: Option<u32>,
     pub ack_min_kbps: Option<u32>,
     pub ul_target_ms: Option<u32>,
-    pub ul_pulse_kb: Option<u32>,
-    pub ul_pulse_ms: Option<u32>,
     /// Lines that were not used, as written.
     pub refused: Vec<String>,
 }
@@ -84,8 +79,8 @@ fn plain(text: &str) -> Option<u32> {
 }
 
 /// `mode=N`, `trough_ms=N`, `target_ms=N`, `ack_adapt=0|1`, `ctrl_v3=0|1`,
-/// `ack_ms=N`, `ack_segs=N`, `ack_min_kbps=N`, `ul_target_ms=N`, `ul_pulse_kb=N`,
-/// `ul_pulse_ms=N`, plain decimal, `#` comments.
+/// `ack_ms=N`, `ack_segs=N`, `ack_min_kbps=N`, `ul_target_ms=N`, plain decimal, `#`
+/// comments.
 /// The last line for a key wins. A bad `mode` line leaves the clamp off; a bad
 /// knob line leaves the module default.
 pub fn parse_config(text: &str) -> Config {
@@ -147,14 +142,6 @@ pub fn parse_config(text: &str) -> Config {
                 config.ul_target_ms = Some(ms);
                 true
             }
-            ("ul_pulse_kb", Some(kb)) if kb <= UL_PULSE_KB_MAX => {
-                config.ul_pulse_kb = Some(kb);
-                true
-            }
-            ("ul_pulse_ms", Some(ms)) if (UL_PULSE_MS_MIN..=UL_PULSE_MS_MAX).contains(&ms) => {
-                config.ul_pulse_ms = Some(ms);
-                true
-            }
             _ => false,
         };
         if !ok {
@@ -178,8 +165,6 @@ pub struct Proc {
     pub ack_segs: Option<u32>,
     pub ack_min_kbps: Option<u32>,
     pub ul_target_ms: Option<u32>,
-    pub ul_pulse_kb: Option<u32>,
-    pub ul_pulse_ms: Option<u32>,
 }
 
 pub fn parse_proc(text: &str) -> Proc {
@@ -212,10 +197,6 @@ pub fn parse_proc(text: &str) -> Proc {
             proc.ack_min_kbps = proc.ack_min_kbps.or_else(|| kbps.parse().ok());
         } else if let Some(ms) = word.strip_prefix("ul_target_ms=") {
             proc.ul_target_ms = proc.ul_target_ms.or_else(|| ms.parse().ok());
-        } else if let Some(kb) = word.strip_prefix("ul_pulse_kb=") {
-            proc.ul_pulse_kb = proc.ul_pulse_kb.or_else(|| kb.parse().ok());
-        } else if let Some(ms) = word.strip_prefix("ul_pulse_ms=") {
-            proc.ul_pulse_ms = proc.ul_pulse_ms.or_else(|| ms.parse().ok());
         }
     }
     proc
@@ -249,12 +230,6 @@ pub fn proc_writes(config: &Config) -> Vec<String> {
     if let Some(ms) = config.ul_target_ms {
         lines.push(format!("ul_target_ms {ms}\n"));
     }
-    if let Some(kb) = config.ul_pulse_kb {
-        lines.push(format!("ul_pulse_kb {kb}\n"));
-    }
-    if let Some(ms) = config.ul_pulse_ms {
-        lines.push(format!("ul_pulse_ms {ms}\n"));
-    }
     lines.push(format!("mode {}\n", config.mode));
     lines
 }
@@ -274,8 +249,6 @@ pub fn matches(config: &Config, proc: &Proc) -> bool {
             .ack_min_kbps
             .is_none_or(|kbps| proc.ack_min_kbps == Some(kbps))
         && config.ul_target_ms.is_none_or(|ms| proc.ul_target_ms == Some(ms))
-        && config.ul_pulse_kb.is_none_or(|kb| proc.ul_pulse_kb == Some(kb))
-        && config.ul_pulse_ms.is_none_or(|ms| proc.ul_pulse_ms == Some(ms))
 }
 
 /// Which clamp module is loaded.
@@ -326,15 +299,14 @@ pub fn settled(up_since: Option<u64>, now: u64) -> bool {
 pub fn status(state: &str, detail: &str, config: &Config, now: u64) -> String {
     let knob = |v: Option<u32>| v.map_or_else(|| "default".to_owned(), |v| v.to_string());
     format!(
-        "state={state}\ndetail={detail}\nmode={}\ntrough_ms={}\ntarget_ms={}\nack_adapt={}\nctrl_v3={}\nupload={}\nul_target_ms={}\nul_pulse_kb={}\nupdated={now}\n",
+        "state={state}\ndetail={detail}\nmode={}\ntrough_ms={}\ntarget_ms={}\nack_adapt={}\nctrl_v3={}\nupload={}\nul_target_ms={}\nupdated={now}\n",
         config.mode,
         knob(config.trough_ms),
         knob(config.target_ms),
         knob(config.ack_adapt),
         knob(config.ctrl_v3),
         u32::from(config.mode & UPLOAD != 0),
-        knob(config.ul_target_ms),
-        knob(config.ul_pulse_kb)
+        knob(config.ul_target_ms)
     )
 }
 
@@ -343,7 +315,7 @@ mod tests {
     use super::*;
 
     // As printed by v0.4 in mode 2 (qctrl_proc_show, from device/qctrl/test's host build).
-    const PROC: &str = "titan_qctrl v0.4 (NF_BR_FORWARD prio=+100)\nmode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0 ul_clamp=0)\nparams: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n        ack_adapt=0 ctrl_v3=0 ack_ms=6 ack_segs=18 ack_min_kbps=2000\nstate:  c_hat_kbps=65000 rate100_kbps=0 free_kbps=0 dl_kbps=0 ul_kbps=0 udp_dl_kbps=0\n        ctl_active=0 w_kb=0 n_ctl=0 active_bulk=0 inflight_kb=0 release_ticks=0\n        dq_est_ms=0 q_src=0 q_owd_ms=-1 q_rtt_ms=-1 q_bias_ms=0 owd_flows=0 sat_ticks=0 trough100_ms=-1 busy_ticks=0\n        rtt_base_ms=0 rtt_cycle_ms=0 p_ecn_pct=0 held_acks=0 timer_pending=0 thin_bo_ticks=0\nstats:  dl_pkts=0 ul_pkts=0 rtt_samples=0 owd_ok=0 owd_bad=0\n        rwnd_clamped=0 ecn_marked=0 udp_dropped=0\nupload: ul_target_ms=8 ul_pulse_kb=0 ul_pulse_ms=200\n        ul_bw_kbps=0 ul_rtt_ms=0 ul_flows=0 ul_w_kb=0\n        ul_acks=0 ul_clamped=0 ul_samples=0 ul_pulses=0\n";
+    const PROC: &str = "titan_qctrl v0.4 (NF_BR_FORWARD prio=+100)\nmode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0 ul_clamp=0)\nparams: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n        ack_adapt=0 ctrl_v3=0 ack_ms=6 ack_segs=18 ack_min_kbps=2000\nstate:  c_hat_kbps=65000 rate100_kbps=0 free_kbps=0 dl_kbps=0 ul_kbps=0 udp_dl_kbps=0\n        ctl_active=0 w_kb=0 n_ctl=0 active_bulk=0 inflight_kb=0 release_ticks=0\n        dq_est_ms=0 q_src=0 q_owd_ms=-1 q_rtt_ms=-1 q_bias_ms=0 owd_flows=0 sat_ticks=0 trough100_ms=-1 busy_ticks=0\n        rtt_base_ms=0 rtt_cycle_ms=0 p_ecn_pct=0 held_acks=0 timer_pending=0 thin_bo_ticks=0\nstats:  dl_pkts=0 ul_pkts=0 rtt_samples=0 owd_ok=0 owd_bad=0\n        rwnd_clamped=0 ecn_marked=0 udp_dropped=0\nupload: ul_target_ms=8 ul_full=0 ul_dlq_ms=0\n        ul_bw_kbps=0 ul_rtt_ms=0 ul_flows=0 ul_w_kb=0\n        ul_acks=0 ul_clamped=0 ul_samples=0 ul_probes=0 ul_startups=0\n";
     const MODULES: &str =
         "titan_qctrl 47104 0 - Live 0x7f0b4000\nsch_cake 31676 0 - Live 0x7f0a0000\n";
 
@@ -380,23 +352,14 @@ mod tests {
     }
 
     #[test]
-    fn upload_knobs_stay_inside_the_module_limits() {
-        let config = parse_config(
-            "mode=16\nul_target_ms=41\nul_pulse_kb=65\nul_pulse_ms=49\nul_pulse_ms=2001\nul_target_ms=x\n",
-        );
+    fn the_upload_target_stays_inside_the_module_limits() {
+        let config = parse_config("mode=16\nul_target_ms=41\nul_target_ms=x\nul_pulse_kb=16\n");
         assert_eq!(config.mode, 16);
-        assert_eq!((config.ul_target_ms, config.ul_pulse_kb, config.ul_pulse_ms), (None, None, None));
-        assert_eq!(
-            config.refused,
-            vec!["ul_target_ms=41", "ul_pulse_kb=65", "ul_pulse_ms=49", "ul_pulse_ms=2001", "ul_target_ms=x"]
-        );
-        let config = parse_config("mode=18\nul_target_ms=0\nul_pulse_kb=0\nul_pulse_ms=50\n");
-        assert_eq!((config.ul_target_ms, config.ul_pulse_kb, config.ul_pulse_ms), (Some(0), Some(0), Some(50)));
-        let config = parse_config("mode=22\nul_target_ms=40\nul_pulse_kb=64\nul_pulse_ms=2000\n");
-        assert_eq!(
-            (config.mode, config.ul_target_ms, config.ul_pulse_kb, config.ul_pulse_ms),
-            (22, Some(40), Some(64), Some(2000))
-        );
+        assert_eq!(config.ul_target_ms, None);
+        assert_eq!(config.refused, vec!["ul_target_ms=41", "ul_target_ms=x", "ul_pulse_kb=16"]);
+        assert_eq!(parse_config("mode=18\nul_target_ms=0\n").ul_target_ms, Some(0));
+        let config = parse_config("mode=22\nul_target_ms=40\n");
+        assert_eq!((config.mode, config.ul_target_ms), (22, Some(40)));
         assert!(config.refused.is_empty());
     }
 
@@ -458,7 +421,7 @@ mod tests {
     #[test]
     fn proc_writes_put_the_mode_last() {
         let config = parse_config(
-            "mode=19\ntrough_ms=8\ntarget_ms=40\nack_adapt=1\nctrl_v3=1\nack_ms=5\nack_segs=14\nack_min_kbps=4000\nul_target_ms=6\nul_pulse_kb=24\nul_pulse_ms=150\n",
+            "mode=19\ntrough_ms=8\ntarget_ms=40\nack_adapt=1\nctrl_v3=1\nack_ms=5\nack_segs=14\nack_min_kbps=4000\nul_target_ms=6\n",
         );
         assert_eq!(
             proc_writes(&config),
@@ -471,8 +434,6 @@ mod tests {
                 "ack_segs 14\n",
                 "ack_min_kbps 4000\n",
                 "ul_target_ms 6\n",
-                "ul_pulse_kb 24\n",
-                "ul_pulse_ms 150\n",
                 "mode 19\n"
             ]
         );
@@ -495,8 +456,6 @@ mod tests {
                 ack_segs: Some(18),
                 ack_min_kbps: Some(2000),
                 ul_target_ms: Some(8),
-                ul_pulse_kb: Some(0),
-                ul_pulse_ms: Some(200),
             }
         );
         // `rtt_target_ms=15` and `trough100_ms=-1` are other values.
@@ -511,9 +470,8 @@ mod tests {
         assert!(!matches(&parse_config("mode=2\nack_adapt=1\n"), &proc));
         assert!(!matches(&parse_config("mode=2\nctrl_v3=1\n"), &proc));
         // `ul_target_ms=8` is not `target_q_ms`, and the upload knobs read back on their own.
-        assert!(matches(&parse_config("mode=2\nul_target_ms=8\nul_pulse_kb=0\nul_pulse_ms=200\n"), &proc));
+        assert!(matches(&parse_config("mode=2\nul_target_ms=8\n"), &proc));
         assert!(!matches(&parse_config("mode=2\nul_target_ms=4\n"), &proc));
-        assert!(!matches(&parse_config("mode=2\nul_pulse_kb=16\n"), &proc));
         assert!(!matches(&parse_config("mode=18\n"), &proc));
         let upload = parse_proc(&PROC.replace("mode=0x2 ", "mode=0x12 "));
         assert_eq!(upload.mode, Some(18));
@@ -572,9 +530,9 @@ mod tests {
         );
         assert_eq!(
             text,
-            "state=applied\ndetail=mode 3 read back\nmode=3\ntrough_ms=8\ntarget_ms=default\nack_adapt=1\nctrl_v3=1\nupload=0\nul_target_ms=default\nul_pulse_kb=default\nupdated=77\n"
+            "state=applied\ndetail=mode 3 read back\nmode=3\ntrough_ms=8\ntarget_ms=default\nack_adapt=1\nctrl_v3=1\nupload=0\nul_target_ms=default\nupdated=77\n"
         );
         let text = status("applied", "mode 16 read back", &parse_config("mode=16\nul_target_ms=6\n"), 9);
-        assert!(text.contains("\nupload=1\nul_target_ms=6\nul_pulse_kb=default\n"), "{text}");
+        assert!(text.contains("\nupload=1\nul_target_ms=6\nupdated=9\n"), "{text}");
     }
 }

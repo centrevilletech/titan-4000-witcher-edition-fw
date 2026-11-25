@@ -232,10 +232,17 @@ static u16 dl_ack(struct conn *c, u32 ack, u16 win, u32 *csum_ok)
 struct loop_res { double queue_ms, mbps; int edge_back, csum_bad, raised; };
 
 #define RING 8192u
+/*
+ * lag_ms 0: an ideal link that drains rate_bpms every ms. lag_ms > 0: a TDD tower that
+ * grants once per 5 ms TTI half the backlog it saw lag_ms earlier, at most rate_bpms x 5
+ * (lane Q3's fit of the bench sector: about half the report, about 10 ms old). A report
+ * that read empty while data waits costs a scheduling request: 600 B, at most every 10 ms.
+ */
 static struct loop_res upload_loop(int n, int v6, u32 rate_bpms, u32 rtt_ms, u32 secs, u16 srv_win, int srv_ws,
-				   int slow_start)
+				   int slow_start, u32 lag_ms)
 {
-	u32 cwnd[8];
+	u32 cwnd[8], last_sr = 0;
+	static u32 backlog_hist[64];
 	struct conn c[8];
 	u32 sent_hi[8], drained[8], acked[8], edge[8];
 	static u32 due_t[8][RING], due_b[8][RING];
@@ -253,13 +260,24 @@ static struct loop_res upload_loop(int n, int v6, u32 rate_bpms, u32 rtt_ms, u32
 		edge[k] = c[k].c_seq + 65160u;   /* the SYN-ACK's window: SYN windows are never scaled */
 		cwnd[k] = slow_start ? 10u * 1328u : 0xfffffffu;
 	}
+	memset(backlog_hist, 0, sizeof(backlog_hist));
 	for (t = 0; t < secs * 1000; t++) {
 		u32 queue = 0, budget = rate_bpms;
 		set_ms(start_ms + t);
-		/* the link drains rate_bpms per ms, shared in proportion to each flow's queue;
-		 * a byte's ACK comes back rtt_ms after it drained */
+		/* the link drains its grant, shared in proportion to each flow's queue; a byte's
+		 * ACK comes back rtt_ms after it drained */
 		for (k = 0; k < (u32)n; k++)
 			queue += sent_hi[k] - drained[k];
+		if (lag_ms) {
+			u32 seen = t >= lag_ms ? backlog_hist[(t - lag_ms) % 64] : 0;
+			backlog_hist[t % 64] = queue;
+			seen /= 2;
+			budget = (t % 5 == 0) ? (seen < rate_bpms * 5 ? seen : rate_bpms * 5) : 0;
+			if (t % 5 == 0 && !seen && queue && t - last_sr >= 10) {
+				budget = 600;
+				last_sr = t;
+			}
+		}
 		for (k = 0; k < (u32)n && queue; k++) {
 			u32 qk = sent_hi[k] - drained[k];
 			u32 d = (u32)(((u64)budget * qk) / queue);
@@ -322,7 +340,7 @@ static void test_core_units(void)
 	struct ulc_flow f;
 	u32 now = 5u;
 	ulc_init(&u, now);
-	CHECK(u.target_ms == 8 && u.pulse_bytes == 0 && u.pulse_ms == 200, "defaults");
+	CHECK(u.target_ms == 8 && !u.full && !u.bw, "defaults");
 	CHECK(ulc_ms(1000) == 976562u, "ms to units");
 	CHECK(ulc_rate(1000000u, 1024u) == 1000000u, "rate exact");
 	CHECK(ulc_rate(0xffffffffu, 2048u) > 2000000000u, "rate large stays 32-bit");
@@ -374,16 +392,6 @@ static void test_modes_and_knobs(void)
 	CHECK(g.ul.target_ms == 0, "target 0");
 	proc("ul_target_ms 12");
 	CHECK(strstr(show(), "ul_target_ms=12 ") != NULL, "target 12 shown");
-	proc("ul_pulse_kb 65");
-	CHECK(g.ul.pulse_bytes == 0, "pulse 65 refused");
-	proc("ul_pulse_kb 32");
-	CHECK(g.ul.pulse_bytes == 32768 && strstr(show(), "ul_pulse_kb=32 "), "pulse 32");
-	proc("ul_pulse_ms 49");
-	CHECK(g.ul.pulse_ms == 200, "pulse_ms 49 refused");
-	proc("ul_pulse_ms 2001");
-	CHECK(g.ul.pulse_ms == 200, "pulse_ms 2001 refused");
-	proc("ul_pulse_ms 150");
-	CHECK(g.ul.pulse_ms == 150, "pulse_ms 150");
 	proc("ul_target_ms 0x8");
 	CHECK(g.ul.target_ms == 12, "hex refused");
 }
@@ -394,11 +402,11 @@ static void test_upload_clamp_converges(int v6)
 	/* 2 KB/ms (16 Mbps), 20 ms base RTT, 4 flows, server window 4096 << 9 = 2 MB */
 	fresh();
 	proc("mode 2");                         /* the download clamp alone leaves uploads alone */
-	off = upload_loop(4, v6, 2000, 20, 6, 4096, 9, 1);
+	off = upload_loop(4, v6, 2000, 20, 6, 4096, 9, 1, 0);
 	fresh();
 	proc("ul_target_ms 8");
 	proc("mode 18");
-	on = upload_loop(4, v6, 2000, 20, 6, 4096, 9, 1);
+	on = upload_loop(4, v6, 2000, 20, 6, 4096, 9, 1, 0);
 	printf("  upload x4 %s: unclamped queue %.0f ms %.2f Mbps | clamp (8 ms) queue %.1f ms %.2f Mbps | %s\n",
 	       v6 ? "IPv6" : "IPv4", off.queue_ms, off.mbps, on.queue_ms, on.mbps, strstr(show(), "ul_bw_kbps"));
 	CHECK(off.queue_ms > 100, "without the clamp the queue is the server's window");
@@ -415,10 +423,32 @@ static void test_upload_window_dump(void)
 	struct loop_res r;
 	fresh();
 	proc("mode 16");
-	r = upload_loop(4, 0, 2000, 20, 6, 2048, 7, 0);   /* 256 KB each, sent at once */
+	r = upload_loop(4, 0, 2000, 20, 6, 2048, 7, 0, 0);   /* 256 KB each, sent at once */
 	printf("  upload x4, windows dumped at once: queue %.1f ms in the last 3 s, %.2f Mbps\n", r.queue_ms, r.mbps);
 	CHECK(r.queue_ms < 16 && r.mbps > 15.5, "the clamp takes over after the first edge drains");
 	CHECK(r.edge_back == 0 && r.csum_bad == 0 && r.raised == 0, "edge/csum/raise");
+}
+
+/* A tower whose grants are half a buffer report 10 ms old (the bench sector, lane Q3):
+ * every round trip is longer than rtt_min + a short target. A single flow must still get
+ * most of the link, and the queue must follow the target. (The single-flow stall itself
+ * showed in R1's model with a Linux-like CUBIC; lane Q2's report has those runs.) */
+static void test_upload_lagged_grants(void)
+{
+	u32 tg;
+	for (tg = 0; tg <= 8; tg += 4) {
+		struct loop_res r;
+		char line[32];
+		fresh();
+		snprintf(line, sizeof(line), "ul_target_ms %u", tg);
+		proc(line);
+		proc("mode 16");
+		r = upload_loop(1, 0, 2000, 20, 10, 8192, 7, 1, 10);
+		printf("  upload x1, 16 Mbps tower with a 10 ms grant lag: target %u ms -> %.2f Mbps, queue %.1f ms, probes %u\n",
+		       tg, r.mbps, r.queue_ms, g.ul.st_probes);
+		CHECK(r.mbps > (tg ? 13.0 : 10.0), "no spiral at target %u (%.2f Mbps)", tg, r.mbps);
+		CHECK(r.edge_back == 0 && r.csum_bad == 0 && r.raised == 0, "edge/csum/raise");
+	}
 }
 
 static void test_upload_single_and_targets(void)
@@ -432,7 +462,7 @@ static void test_upload_single_and_targets(void)
 		snprintf(line, sizeof(line), "ul_target_ms %u", tg);
 		proc(line);
 		proc("mode 16");
-		r = upload_loop(1, 0, 1000, 25, 6, 8192, 7, 1);
+		r = upload_loop(1, 0, 1000, 25, 6, 8192, 7, 1, 0);
 		printf("  upload x1, 8 Mbps link, 25 ms: target %2u ms -> queue %.1f ms, %.2f Mbps\n", tg, r.queue_ms, r.mbps);
 		CHECK(r.mbps > 7.7, "full link at target %u (%.2f)", tg, r.mbps);
 		CHECK(r.queue_ms >= prev - 0.5, "queue grows with the target");
@@ -579,6 +609,7 @@ int main(int argc, char **argv)
 	test_upload_clamp_converges(1);
 	test_upload_single_and_targets();
 	test_upload_window_dump();
+	test_upload_lagged_grants();
 	test_upload_untouched_cases();
 	if (failures) {
 		printf("FAIL: %d titan_qctrl host checks failed\n", failures);
