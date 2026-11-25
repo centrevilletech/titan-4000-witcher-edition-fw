@@ -13,10 +13,13 @@ pub const R4: &str = include_str!("../manifests/r4.manifest");
 /// R4's Rust N4 uplink engine plus R1's hardened Rust PIE (M1 block version
 /// 0x20261126).
 pub const N6H_R4_R1: &str = include_str!("../manifests/n6h-r4-r1.manifest");
+/// Lane N1: `n6h-r4-r1` with N5's per-flow sparse lane, PDCP staging limit, and
+/// exact Ring-0 feeder accounting rewritten in Rust (`device/modem-rust/n5`).
+pub const N6H_R4_N5_R1: &str = include_str!("../manifests/n6h-r4-n5-r1.manifest");
 
 /// Every manifest in the tree. Tests walk this list; tests/stock.rs and
 /// scripts/test-tk-patch.py pin each one's bench hashes.
-pub const ALL: [&str; 5] = [N6H, M1, R1, R4, N6H_R4_R1];
+pub const ALL: [&str; 6] = [N6H, M1, R1, R4, N6H_R4_R1, N6H_R4_N5_R1];
 
 /// What `titan-pd-keeper tk-build` builds, and the only manifest the keeper
 /// carries: each one costs about 20 KiB of flash. A keeper test checks its

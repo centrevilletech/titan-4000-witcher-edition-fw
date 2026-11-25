@@ -1,0 +1,13 @@
+[package]
+name = "witcher-modem-n5"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "no_std Rust Thumb-2 port of the Titan 4000 N5 per-flow sparse uplink lane"
+
+[dependencies]
+modem-atlas = { path = "../atlas" }
+
+[lib]
+name = "witcher_modem_n5"
+crate-type = ["rlib", "staticlib"]

@@ -19,3 +19,10 @@ version = "0.1.0"
 dependencies = [
  "modem-atlas",
 ]
+
+[[package]]
+name = "witcher-modem-n5"
+version = "0.1.0"
+dependencies = [
+ "modem-atlas",
+]
