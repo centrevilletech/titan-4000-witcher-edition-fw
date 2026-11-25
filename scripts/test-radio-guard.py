@@ -24,7 +24,9 @@ It checks, against the landmines lane L1/L2/L3 found:
    next boot confirms it;
 6. a failed stock restore keeps the operator's saved profile, never reboots
    on its own, and is retried until stock settings are back;
-7. a lock clears itself on a new firmware.
+7. a lock clears itself on a new firmware;
+8. a radio cycle (the carrier picker's survey) waits out the CPAS window,
+   moved onto the current time with `TITAN_TK_QUIET_UTC`, and sends nothing.
 
 The old guard cannot run here (it needs the ubifs Witcher volume). Lane L3's
 `models/radio_guard_model.py` reproduces its locks; the Rust model tests in
@@ -158,6 +160,20 @@ def record():
 def log():
     p = Path('/tmp/pd/keeper.log')
     return p.read_text() if p.exists() else ''
+
+
+def pick():
+    try:
+        return json.loads((RAM/'radio-pick').read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def window_around_now():
+    """A quiet window from 5 minutes ago to 30 minutes on, in UTC."""
+    now = int(time.time()) // 60 % 1440
+    fmt = lambda m: '%02d:%02d' % (m % 1440 // 60, m % 60)
+    return fmt(now - 5) + '-' + fmt(now + 30)
 
 
 class Guard:
@@ -342,6 +358,32 @@ def main():
         guard.start()
         wait_for('the profile on a new firmware', lambda: status().get('phase') == 'active', 150, guard)
         print('PASS: a locked profile stayed locked under the same firmware and applied on a new one.', flush=True)
+
+        # 8. A radio cycle inside the CPAS window. Before v1.0.17 the
+        # enforcement re-attach had no time-of-day check at all; every cycle
+        # now waits out the window every keeper reboot waits out.
+        guard.reboot()
+        picker = dict(PROFILE, actions=[{'kind': 'carrier_pick', 'arms': [
+            {'earfcn': 55440, 'pci': 199, 'carriers': 2}, {'earfcn': 56440, 'pci': 208, 'carriers': 3}]}])
+        (DISK/'profile.json').write_text(json.dumps(picker))
+        nvram('ATTACHED')
+        cpas = Guard(dict(env, TITAN_TK_QUIET_UTC=window_around_now()))
+        cpas.start()
+        wait_for('the picker profile', lambda: status().get('phase') == 'active', 150, cpas)
+        (RAM/'pick-survey-now').write_text('1')
+        wait_for('the survey held', lambda: 'the SAS CPAS window is open' in pick().get('detail', ''), 60, cpas)
+        time.sleep(15)
+        assert pick()['phase'] == 'waiting', pick()
+        assert not any(c.startswith(('AT+CFUN', 'AT%GLOCKPCELL=')) for c in console_log()), console_log()
+        assert not (DISK/'cycles').exists(), (DISK/'cycles').read_text()
+        cpas.kill()
+        # Outside the window the same request passes that gate and stops at a
+        # later one (no idle customer here), still with no radio cycle.
+        guard.start()
+        wait_for('the survey past the window', lambda: pick().get('detail', '').startswith('survey requested: ')
+                 and 'CPAS' not in pick()['detail'], 120, guard)
+        assert not any(c.startswith('AT+CFUN') for c in console_log()), console_log()
+        print('PASS: a requested survey waited out the CPAS window with no radio cycle, and passed that gate outside it.', flush=True)
         assert not Path('/tmp/console-overlap').exists(), 'two console sessions overlapped'
     finally:
         guard.kill()
