@@ -6,7 +6,7 @@ import {DiagnosticsView,DIAGNOSTIC_TOOLS} from './diagnostics-view.js';
 import {jsonRequest,session,logout,parseJsonTelemetry,SampleClock} from './json-client.js';
 const routes={
  radio:{apn:'APN profiles',selection:'Band & selection',lock:'PCI lock',scan:'Cell scan'},
- network:{mode:'Operating mode',lan:'LAN & DHCP',firewall:'Firewall',forwards:'Port forwards',routes:'Routes'},
+ network:{mode:'Operating mode',lan:'LAN & DHCP',firewall:'Firewall',forwards:'Port forwards',routes:'Routes',latency:'Latency'},
  system:{device:'Device',access:'Access',ssh:'SSH keys',services:'ACS',sas:'SAS',cpi:'CPI',sasStatus:'CBSD status',backup:'Backup',firmware:'Firmware',restart:'Restart'},
  diagnostics:{ping:'Ping',traceroute:'Traceroute',status:'Network status'}
 };

@@ -16,15 +16,18 @@
 //! means off, because a line is only ever written to change a default, and
 //! the keeper logs it. The last line for a key wins; `#` starts a comment.
 //!
-//! The web service (titan-4000-ops `backend/pd-model/src/switches.rs`) carries
-//! a copy of this module; both run the same tests.
+//! The web service builds a copy of this module, so both read the file the
+//! same way; both copies run these tests.
 
 /// Where the file lives on the Witcher volume, under `/mnt/titan-api`.
 pub const DIR: &str = "latency";
 
 /// The three features, in the file's order: key and what it controls.
 pub const KEYS: [(&str, &str); 3] = [
-    ("modem", "upload latency and AQM (the modem words, the Rust PIE included)"),
+    (
+        "modem",
+        "upload latency and AQM (the modem words, the Rust PIE included)",
+    ),
     ("clamp", "the download clamp"),
     ("fastpath", "the passthrough fast path"),
 ];
@@ -67,7 +70,12 @@ pub struct Switches {
 
 impl Default for Switches {
     fn default() -> Self {
-        Self { modem: true, clamp: true, fastpath: true, refused: Vec::new() }
+        Self {
+            modem: true,
+            clamp: true,
+            fastpath: true,
+            refused: Vec::new(),
+        }
     }
 }
 
@@ -84,7 +92,12 @@ impl Switches {
     /// The switches as `on`/`off` words, in `KEYS` order, for a log line.
     pub fn describe(&self) -> String {
         let word = |on: bool| if on { "on" } else { "off" };
-        format!("modem {}, clamp {}, fastpath {}", word(self.modem), word(self.clamp), word(self.fastpath))
+        format!(
+            "modem {}, clamp {}, fastpath {}",
+            word(self.modem),
+            word(self.clamp),
+            word(self.fastpath)
+        )
     }
 
     /// The same three switches, ignoring `refused`.
@@ -165,10 +178,23 @@ mod tests {
 
     #[test]
     fn each_line_turns_its_feature_off_and_the_last_line_wins() {
-        assert_eq!(of(&parse("modem=off\nclamp=0\nfastpath=no\n")), set(false, false, false));
-        assert_eq!(of(&parse("Modem = OFF # gone\nmodem=on\n")), set(true, true, true));
-        assert_eq!(of(&parse("fastpath=false\nclamp=yes\n")), set(true, true, false));
-        assert!(parse("modem=off\nclamp=0\nfastpath=no\n").refused.is_empty());
+        assert_eq!(
+            of(&parse("modem=off\nclamp=0\nfastpath=no\n")),
+            set(false, false, false)
+        );
+        assert_eq!(
+            of(&parse("Modem = OFF # gone\nmodem=on\n")),
+            set(true, true, true)
+        );
+        assert_eq!(
+            of(&parse("fastpath=false\nclamp=yes\n")),
+            set(true, true, false)
+        );
+        assert!(
+            parse("modem=off\nclamp=0\nfastpath=no\n")
+                .refused
+                .is_empty()
+        );
     }
 
     #[test]
@@ -181,14 +207,22 @@ mod tests {
     #[test]
     fn the_rendered_file_reads_back_as_written() {
         for bits in 0..8u8 {
-            let s = Switches { modem: bits & 1 != 0, clamp: bits & 2 != 0, fastpath: bits & 4 != 0, refused: Vec::new() };
+            let s = Switches {
+                modem: bits & 1 != 0,
+                clamp: bits & 2 != 0,
+                fastpath: bits & 4 != 0,
+                refused: Vec::new(),
+            };
             assert_eq!(parse(&render(&s)), s);
         }
         assert_eq!(
             render(&Switches::default()),
             "# Witcher latency features (docs/latency-switches.md). on is the default.\nmodem=on\nclamp=on\nfastpath=on\n"
         );
-        assert_eq!(parse("clamp=off").describe(), "modem on, clamp off, fastpath on");
+        assert_eq!(
+            parse("clamp=off").describe(),
+            "modem on, clamp off, fastpath on"
+        );
         assert!(parse("clamp=off\n").same_as(&parse("clamp = off # again\nturbo=1\n")));
     }
 }

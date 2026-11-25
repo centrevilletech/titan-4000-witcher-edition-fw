@@ -69,7 +69,7 @@ try{
   }
   throw new Error('Unexpected API request '+method+' '+path);
  });
- const cases=[['Radio','APN profiles','apn'],['Radio','Band & selection','selection'],['Radio','PCI lock','lock'],['Radio','Cell scan','scan'],['Network','Operating mode','mode'],['Network','LAN & DHCP','lan'],['Network','Firewall','firewall'],['Network','Port forwards','forwards'],['Network','Routes','routes'],['System','Device','device'],['System','Access','access'],['System','SSH keys','ssh'],['System','ACS','services'],['System','SAS','sas'],['System','CPI','cpi'],['System','CBSD status','sasStatus'],['System','Backup','backup'],['System','Firmware','firmware'],['System','Restart','restart'],['Diagnostics','Network status','status']];
+ const cases=[['Radio','APN profiles','apn'],['Radio','Band & selection','selection'],['Radio','PCI lock','lock'],['Radio','Cell scan','scan'],['Network','Operating mode','mode'],['Network','LAN & DHCP','lan'],['Network','Firewall','firewall'],['Network','Port forwards','forwards'],['Network','Routes','routes'],['Network','Latency','latency'],['System','Device','device'],['System','Access','access'],['System','SSH keys','ssh'],['System','ACS','services'],['System','SAS','sas'],['System','CPI','cpi'],['System','CBSD status','sasStatus'],['System','Backup','backup'],['System','Firmware','firmware'],['System','Restart','restart'],['Diagnostics','Network status','status']];
  async function open(id){
   const [section,tab]=cases.find(c=>c[2]===id);await page.setViewportSize({width:1440,height:1000});
   await page.locator('.side-nav').getByText(section,{exact:true}).click();
@@ -142,7 +142,13 @@ try{
  await page.getByRole('button',{name:'Remove key',exact:true}).click();await page.getByRole('button',{name:'Continue',exact:true}).click();await expect(page.locator('#toast')).toHaveText('Key removed.');
  assert.equal(mutations.length,beforeRemove+1);assert.deepEqual(mutations.at(-1).body.values,{remove:'SHA256:fixtureAdded'});await expect(page.getByRole('cell',{name:'Field laptop',exact:true})).toHaveCount(0);
  await expect(page.getByRole('cell',{name:'NOC laptop',exact:true})).toBeVisible();
+ await open('latency');for(const label of ['Upload latency and AQM','Download clamp','Fast path'])await expect(page.getByLabel(label,{exact:true})).toBeChecked();
+ await expect(page.getByText('applied, mode 3: mode 3 (the firmware default) read back from /proc/titan_qctrl',{exact:true})).toBeVisible();
+ await page.getByLabel('Download clamp',{exact:true}).uncheck();await page.getByRole('button',{name:'Save changes',exact:true}).click();
+ await expect(page.locator('#toast')).toHaveText('Settings saved and read back from the Titan.');
+ assert.equal(mutations.at(-1).path,'/api/v1/settings/latency');assert.equal(mutations.at(-1).method,'PUT');assert.deepEqual(mutations.at(-1).body.values,{modem:true,clamp:false,fastpath:true});
+ await expect(page.getByLabel('Download clamp',{exact:true})).not.toBeChecked();await expect(page.locator('[data-settings-ready]')).toHaveAttribute('data-dirty','false');
  authenticated=false;await open('access').catch(()=>{});await expect(page.locator('#login-password')).toBeVisible();
  assert.deepEqual(errors,[]);assert.deepEqual(forbidden,[]);await expect(page.locator('iframe')).toHaveCount(0);
- console.log('PASS: all 21 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove and auth expiry.');
+ console.log('PASS: all 22 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove, latency switches and auth expiry.');
 }finally{await browser.close();await server.close();}

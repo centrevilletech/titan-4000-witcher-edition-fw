@@ -1,4 +1,4 @@
-export const SECTIONS=['apn','selection','lock','scan','mode','lan','firewall','forwards','routes','device','access','ssh','services','sas','cpi','sasStatus','backup','firmware','restart','ping','status'];
+export const SECTIONS=['apn','selection','lock','scan','mode','lan','firewall','forwards','routes','latency','device','access','ssh','services','sas','cpi','sasStatus','backup','firmware','restart','ping','status'];
 const types=new Set(['text','password','number','select','checkbox','textarea','readonly','file','list']);
 const safeId=id=>typeof id==='string'&&/^[A-Za-z_][A-Za-z0-9_.-]*$/.test(id)&&!['__proto__','prototype','constructor'].includes(id);
 export const clone=value=>structuredClone(value);
