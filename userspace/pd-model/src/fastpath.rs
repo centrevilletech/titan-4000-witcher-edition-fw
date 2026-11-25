@@ -700,8 +700,8 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v1.2"));
         assert!(!v1.ours);
         assert!(!matches(&parse_config("mode=2\n"), &v1));
-        let v21 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.2-dev"));
-        assert!(!v21.ours);
+        let dev = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.2-dev"));
+        assert!(!dev.ours);
         assert!(!parse_proc("").ours);
     }
 
@@ -712,7 +712,7 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert_eq!(loaded(MODULES, BENCH_PROC), Loaded::Ours);
         assert_eq!(
             loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.1")),
-            Loaded::Other("titan_k1fp (titan_k1fp v2.2)".into())
+            Loaded::Other("titan_k1fp (titan_k1fp v2.1)".into())
         );
         assert_eq!(
             loaded(MODULES, ""),

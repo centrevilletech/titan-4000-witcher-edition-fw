@@ -1136,13 +1136,13 @@ else:
         Path('/tmp/fastpath.status').unlink(missing_ok=True)
         before_refuse_log = len(log())
         Path('/tmp/k1fp-proc').write_text(
-            'titan_k1fp v2.2\n'
+            'titan_k1fp v2.1\n'
             'mode=0 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n'
         )
         with fp_lock:
             k1fp_cmds.clear()
         restart()
-        wait_for(lambda: 'state=failed\n' in fp_status() and 'titan_k1fp v2.2' in fp_status(), 30)
+        wait_for(lambda: 'state=failed\n' in fp_status() and 'titan_k1fp v2.1' in fp_status(), 30)
         assert 'fast path: adopted a loaded module' not in log()[before_refuse_log:], log()[before_refuse_log:]
         assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
         with fp_lock:
