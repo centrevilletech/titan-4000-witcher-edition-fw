@@ -12,6 +12,7 @@
 //! SAS grants, the boot confirm for a staged modem firmware image, its modem
 //! feature flags, the staged download clamp module, the staged passthrough
 //! bridge fast path, the carrier picker, and the opt-in CPU trims.
+#![forbid(unsafe_code)]
 
 pub mod carrier_pick;
 pub mod carrier_watch;
@@ -30,6 +31,8 @@ pub mod host_mac;
 pub mod ipv4;
 pub mod ipv4_health;
 pub mod mgmt;
+pub mod nvram;
+pub mod pace;
 pub mod prefix;
 pub mod qctrl;
 pub mod ra;

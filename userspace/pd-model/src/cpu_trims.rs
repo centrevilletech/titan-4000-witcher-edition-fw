@@ -37,7 +37,7 @@
 //! keeper sets it to nice `KSOFTIRQD_NICE`. Userspace keeps a share of the
 //! core (CFS weights), so the watchdog feeders and the SAS client still run.
 
-use crate::deaf::nvram_field;
+use crate::nvram::field as nvram_field;
 
 /// Seconds between reads of `cpu-trims/config`.
 pub const CHECK_EVERY: u64 = 5;

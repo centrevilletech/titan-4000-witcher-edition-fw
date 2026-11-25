@@ -1,6 +1,7 @@
 //! Password-authenticated first setup and recovery on LAN and remote IPv4.
 //! Autonomous jitter seed bootstrap normally starts the native HTTPS login.
 //! HTTP browser seeding remains a trusted-network recovery path on failure.
+#![forbid(unsafe_code)]
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -12,6 +13,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use titan_sys::process::effective_uid;
 
 const BUNDLE: &str = "/usr/lib/titan-api";
 const STATE: &str = "/mnt/titan-api";
@@ -153,7 +155,7 @@ fn decode_seed(value: &str) -> io::Result<[u8; 64]> {
 }
 fn save_seed(directory: &Path, seed: &[u8; 64]) -> io::Result<()> {
     let meta = fs::symlink_metadata(directory)?;
-    if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+    if !meta.is_dir() || meta.uid() != effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(invalid());
     }
     let temporary = directory.join(format!(".seed-bootstrap-{}", std::process::id()));
@@ -225,13 +227,13 @@ fn main() -> io::Result<()> {
         println!("Witcher v{}", VERSION.trim());
         return Ok(());
     }
-    if mode == "bootstrap" && unsafe { libc::geteuid() } == 0 {
+    if mode == "bootstrap" && effective_uid() == 0 {
         return bootstrap(
             Path::new(STATE),
             Path::new(&format!("{BUNDLE}/witcher-entropy")),
         );
     }
-    if !matches!(mode.as_str(), "setup" | "recovery") || unsafe { libc::geteuid() } != 0 {
+    if !matches!(mode.as_str(), "setup" | "recovery") || effective_uid() != 0 {
         return Err(invalid());
     }
     let setup = mode == "setup";

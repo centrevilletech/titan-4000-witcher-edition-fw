@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::deaf::nvram_field;
+use crate::nvram::field as nvram_field;
 
 /// Seconds between carrier-watch checks.
 pub const INTERVAL: u64 = 1;

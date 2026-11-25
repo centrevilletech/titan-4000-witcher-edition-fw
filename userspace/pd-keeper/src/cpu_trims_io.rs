@@ -7,46 +7,34 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use titan_pd_model::config;
+use titan_pd_model::pace::Pace;
 use titan_pd_model::cpu_trims::{self, Config, LedPacer, LedState, LedStep, StatusView};
+use titan_sys::process::{self, Signal};
+
+use crate::paths::{env_path_or, volume_config};
+use crate::status_file::StatusFile;
 
 /// Seconds between log lines about the LED loop changing state.
 const LED_LOG_EVERY: u64 = 60;
 /// Seconds between status file rewrites while only the counters move.
 const STATUS_EVERY: u64 = 60;
 
-/// `cpu-trims/config` lives here, only while the volume is mounted.
-pub fn config_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("TITAN_CPU_TRIMS_DIR") {
-        return Some(PathBuf::from(path));
-    }
-    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/cpu-trims"))
-}
-
 pub fn status_path() -> PathBuf {
-    std::env::var_os("TITAN_CPU_TRIMS_STATUS").map_or_else(
-        || PathBuf::from("/var/run/witcher-cpu-trims.status"),
-        PathBuf::from,
-    )
+    env_path_or("TITAN_CPU_TRIMS_STATUS", "/var/run/witcher-cpu-trims.status")
 }
 
 fn proc_root() -> PathBuf {
-    std::env::var_os("TITAN_PROC_ROOT").map_or_else(|| PathBuf::from("/proc"), PathBuf::from)
+    env_path_or("TITAN_PROC_ROOT", "/proc")
 }
 
 fn button_mask() -> PathBuf {
-    std::env::var_os("TITAN_BUTTON_MASK")
-        .map_or_else(|| PathBuf::from(cpu_trims::BUTTON_MASK), PathBuf::from)
+    env_path_or("TITAN_BUTTON_MASK", cpu_trims::BUTTON_MASK)
 }
 
+/// `cpu-trims/config` on the volume, or the defaults.
 fn load_config() -> Config {
-    let Some(dir) = config_dir() else {
-        return Config::default();
-    };
-    let Ok(text) = fs::read_to_string(dir.join("config")) else {
-        return Config::default();
-    };
-    cpu_trims::parse_config(&text)
+    volume_config("TITAN_CPU_TRIMS_DIR", "cpu-trims")
+        .map_or_else(Config::default, |text| cpu_trims::parse_config(&text))
 }
 
 fn pids(root: &Path) -> Vec<i32> {
@@ -90,20 +78,19 @@ fn find_ksoftirqd(root: &Path) -> Option<i32> {
         .find(|pid| ksoftirqd_nice(root, *pid).is_some())
 }
 
-fn signal(pid: i32, sig: libc::c_int) -> bool {
-    pid > 1 && unsafe { libc::kill(pid as libc::pid_t, sig) } == 0
+/// Never init, nor a pid `kill(2)` reads as a group.
+fn signal(pid: i32, signal: Signal) -> bool {
+    pid > 1 && process::kill(pid, signal).is_ok()
 }
 
 fn set_nice(pid: i32, nice: i32) -> bool {
-    pid > 1
-        && unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as libc::id_t, nice as libc::c_int) }
-            == 0
+    pid > 1 && process::set_nice(pid, nice).is_ok()
 }
 
 #[derive(Default)]
 pub struct Watch {
     config: Config,
-    config_at: Option<u64>,
+    config_at: Pace,
     refused_logged: Vec<String>,
     /// The last second `maintain` ran in.
     ran_at: Option<u64>,
@@ -111,18 +98,18 @@ pub struct Watch {
     started: bool,
     pacer: LedPacer,
     led_pid: Option<i32>,
-    led_scan_at: Option<u64>,
+    led_scan_at: Pace,
     led_state: Option<LedState>,
     led_logged: Option<LedState>,
-    led_logged_at: Option<u64>,
+    led_logged_at: Pace,
     /// `/proc/locks` could not be read, so the loop is never paused.
     led_unverifiable: bool,
     softirq_pid: Option<i32>,
-    softirq_scan_at: Option<u64>,
+    softirq_scan_at: Pace,
     softirq_shown: String,
     pauses: u64,
     lock_backoffs: u64,
-    status_body: String,
+    status: StatusFile,
     status_at: Option<u64>,
 }
 
@@ -136,11 +123,8 @@ impl Watch {
         self.ran_at = Some(now);
         let root = proc_root();
 
-        let check = self
-            .config_at
-            .is_none_or(|at| now.saturating_sub(at) >= cpu_trims::CHECK_EVERY);
+        let check = self.config_at.ready(now, cpu_trims::CHECK_EVERY);
         if check {
-            self.config_at = Some(now);
             let config = load_config();
             if config.refused != self.refused_logged {
                 for line in &config.refused {
@@ -165,9 +149,9 @@ impl Watch {
             // A keeper that died may have left the loop paused.
             if let Some(pid) = find_led_loop(&root) {
                 self.led_pid = Some(pid);
-                signal(pid, libc::SIGCONT);
+                signal(pid, Signal::Continue);
             }
-            self.led_scan_at = Some(now);
+            self.led_scan_at.mark(now);
             self.pacer.resumed_at(now);
         }
 
@@ -186,13 +170,9 @@ impl Watch {
             }
             self.led_pid = None;
         }
-        if self
-            .led_scan_at
-            .is_some_and(|at| now.saturating_sub(at) < cpu_trims::RESCAN_EVERY)
-        {
+        if !self.led_scan_at.ready(now, cpu_trims::RESCAN_EVERY) {
             return None;
         }
-        self.led_scan_at = Some(now);
         self.led_pid = find_led_loop(root);
         self.led_pid
     }
@@ -222,7 +202,7 @@ impl Watch {
             LedStep::Leave => {}
             LedStep::Resume => {
                 if let Some(pid) = self.led_target(now, root) {
-                    signal(pid, libc::SIGCONT);
+                    signal(pid, Signal::Continue);
                 }
                 self.pacer.resumed_at(now);
             }
@@ -244,7 +224,7 @@ impl Watch {
             note("cpu trims: cannot read /proc/locks, so the LED loop is never paused");
             return;
         }
-        if !signal(pid, libc::SIGSTOP) {
+        if !signal(pid, Signal::Stop) {
             self.led_pid = None;
             self.pacer.resumed_at(now);
             return;
@@ -256,7 +236,7 @@ impl Watch {
             self.pauses += 1;
             self.pacer.paused_at(now);
         } else {
-            signal(pid, libc::SIGCONT);
+            signal(pid, Signal::Continue);
             self.lock_backoffs += 1;
             self.pacer.resumed_at(now);
         }
@@ -271,14 +251,10 @@ impl Watch {
             self.led_logged = Some(state);
             return;
         }
-        if self
-            .led_logged_at
-            .is_some_and(|at| now.saturating_sub(at) < LED_LOG_EVERY)
-        {
+        if !self.led_logged_at.ready(now, LED_LOG_EVERY) {
             return;
         }
         self.led_logged = Some(state);
-        self.led_logged_at = Some(now);
         note(&format!(
             "cpu trims: LED loop {} (period {} s)",
             state.name(),
@@ -292,13 +268,9 @@ impl Watch {
             .and_then(|pid| ksoftirqd_nice(root, pid).map(|nice| (pid, nice)));
         let found = known.or_else(|| {
             self.softirq_pid = None;
-            if self
-                .softirq_scan_at
-                .is_some_and(|at| now.saturating_sub(at) < cpu_trims::RESCAN_EVERY)
-            {
+            if !self.softirq_scan_at.ready(now, cpu_trims::RESCAN_EVERY) {
                 return None;
             }
-            self.softirq_scan_at = Some(now);
             let pid = find_ksoftirqd(root)?;
             self.softirq_pid = Some(pid);
             ksoftirqd_nice(root, pid).map(|nice| (pid, nice))
@@ -344,13 +316,9 @@ impl Watch {
             && self
                 .status_at
                 .is_none_or(|at| now.saturating_sub(at) >= STATUS_EVERY);
-        if body == self.status_body && !stale {
-            return;
+        if self.status.update(status_path(), body, stale, |_| cpu_trims::status(&view, now)) {
+            self.status_at = Some(now);
         }
-        let text = cpu_trims::status(&view, now);
-        self.status_body = body;
-        self.status_at = Some(now);
-        let _ = fs::write(status_path(), text);
     }
 }
 
@@ -420,9 +388,9 @@ mod tests {
 
     #[test]
     fn signals_never_reach_init_or_a_bad_pid() {
-        assert!(!signal(1, libc::SIGCONT));
-        assert!(!signal(0, libc::SIGCONT));
-        assert!(!signal(-1, libc::SIGCONT));
+        assert!(!signal(1, Signal::Continue));
+        assert!(!signal(0, Signal::Continue));
+        assert!(!signal(-1, Signal::Continue));
         assert!(!set_nice(1, 0));
         assert!(!set_nice(0, 0));
     }

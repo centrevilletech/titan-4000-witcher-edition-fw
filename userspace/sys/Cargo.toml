@@ -1,0 +1,9 @@
+[package]
+name = "titan-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The workspace's audited unsafe: typed, safe wrappers over the Linux calls the keeper and the first-boot service make"
+
+[dependencies]
+libc = "0.2"

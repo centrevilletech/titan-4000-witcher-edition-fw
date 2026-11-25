@@ -8,31 +8,32 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write as _};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
 use titan_pd_model::cbrs_gate::{self, Gate, Step as GateStep};
-use titan_pd_model::config;
+use titan_pd_model::pace::Pace;
 use titan_pd_model::fastpath::{
     self, Config, LeaseAction, LeaseState, Loaded, Proc, StatusView, TripAction, TripWatch,
 };
-use titan_pd_model::sha256;
 
-const MANIFEST: &str = include_str!("../../../device/fastpath/SHA256SUMS");
+use crate::files::read_file;
+use crate::netdev::{bridge_ports, carrier_up};
+use crate::paths::env_or;
+use crate::staged::{self, Staged};
+use crate::status_file::StatusFile;
 
-/// The staged module and its config, only while the volume is mounted.
-pub fn staged_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("TITAN_FASTPATH_DIR") {
-        return Some(PathBuf::from(path));
-    }
-    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/fastpath"))
-}
+/// The staged fast path module.
+pub const MODULE: Staged = Staged {
+    file: fastpath::FILE,
+    manifest: include_str!("../../../device/fastpath/SHA256SUMS"),
+    dir: "fastpath",
+    dir_env: "TITAN_FASTPATH_DIR",
+};
 
 pub fn proc_path() -> String {
-    std::env::var("TITAN_FASTPATH_PROC").unwrap_or_else(|_| "/proc/k1fp".into())
+    env_or("TITAN_FASTPATH_PROC", "/proc/k1fp")
 }
 
 /// Separate write target only when tests point it at a control pipe. On a real
@@ -41,92 +42,8 @@ pub fn proc_write_path() -> String {
     std::env::var("TITAN_FASTPATH_PROC_WRITE").unwrap_or_else(|_| proc_path())
 }
 
-pub fn modules_path() -> String {
-    std::env::var("TITAN_PROC_MODULES").unwrap_or_else(|_| "/proc/modules".into())
-}
-
 pub fn status_path() -> String {
-    std::env::var("TITAN_FASTPATH_STATUS")
-        .unwrap_or_else(|_| "/var/run/witcher-fastpath.status".into())
-}
-
-fn insmod_program() -> String {
-    std::env::var("TITAN_INSMOD").unwrap_or_else(|_| "insmod".into())
-}
-
-/// The digest built into this keeper.
-pub fn pinned() -> Option<&'static str> {
-    sha256::pinned(MANIFEST, fastpath::FILE)
-}
-
-fn short(sha: &str) -> &str {
-    sha.get(..12).unwrap_or(sha)
-}
-
-/// Copy the staged module into RAM once its bytes match the pinned digest,
-/// check the copy again, and return its path.
-pub fn stage(dir: &Path) -> Result<PathBuf, String> {
-    let want = pinned().ok_or("the keeper's fastpath manifest has no titan_k1fp.ko line")?;
-    let source = dir.join(fastpath::FILE);
-    let bytes =
-        fs::read(&source).map_err(|e| format!("{} is not staged: {e}", source.display()))?;
-    let got = sha256::hex(&sha256::digest(&bytes));
-    if got != want {
-        return Err(format!(
-            "{} has SHA-256 {}, not the pinned {}",
-            source.display(),
-            short(&got),
-            short(want)
-        ));
-    }
-    let run = crate::runtime().join("fastpath");
-    if !run.is_dir() {
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&run)
-            .map_err(|e| format!("cannot create {}: {e}", run.display()))?;
-    }
-    let dest = run.join(fastpath::FILE);
-    let tmp = run.join(format!(".{}.{}", fastpath::FILE, std::process::id()));
-    let _ = fs::remove_file(&tmp);
-    let written = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)
-        .and_then(|mut file| {
-            file.write_all(&bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&tmp, &dest));
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
-        return Err(format!("cannot copy the module into RAM: {e}"));
-    }
-    let copy = fs::read(&dest).map_err(|e| format!("cannot read the RAM copy: {e}"))?;
-    if sha256::hex(&sha256::digest(&copy)) != want {
-        let _ = fs::remove_file(&dest);
-        return Err("the RAM copy does not match the pinned digest".into());
-    }
-    Ok(dest)
-}
-
-pub fn insmod(path: &Path) -> Result<(), String> {
-    let out = Command::new(insmod_program())
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("insmod did not run: {e}"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let why = String::from_utf8_lossy(&out.stderr).trim().to_owned();
-    Err(if why.is_empty() {
-        format!("insmod failed ({})", out.status)
-    } else {
-        format!("insmod failed: {why}")
-    })
+    env_or("TITAN_FASTPATH_STATUS", "/var/run/witcher-fastpath.status")
 }
 
 /// One small `write()` to `/proc/k1fp` (no process spawns, fd closed at once
@@ -139,58 +56,26 @@ fn write_proc_cmd(cmd: &str) -> std::io::Result<()> {
         .and_then(|mut file| file.write_all(cmd.as_bytes()))
 }
 
-fn read_text(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
+fn read_proc() -> Proc {
+    fastpath::parse_proc(&read_file(proc_path()))
 }
 
-fn carrier_up(dev: &str) -> bool {
-    read_text(Path::new(&format!("/sys/class/net/{dev}/carrier"))).trim() == "1"
-}
-
-fn bridge_ports() -> Vec<String> {
-    fs::read_dir("/sys/class/net/br0/brif")
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn read_proc_after_mode_write(want: u32) -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
-    if proc.ours && proc.mode == Some(want) {
-        return proc;
-    }
-    // On a real kernel `/proc/k1fp` updates synchronously on the first read.
-    // A brief retry covers a test control pipe updating a stand-in file.
-    thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
-}
-
-fn read_proc_after_grant_open() -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
-    if proc.ours && proc.gate_open == Some(true) {
+/// `/proc/k1fp` once it shows what a write asked for. A real kernel updates
+/// it synchronously, so the first read shows it; one brief retry covers a
+/// test control pipe updating a stand-in file.
+fn read_proc_until(done: &dyn Fn(&Proc) -> bool) -> Proc {
+    let proc = read_proc();
+    if proc.ours && done(&proc) {
         return proc;
     }
     thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
-}
-
-fn read_proc_after_grant_close() -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
-    if proc.ours && proc.gate_open == Some(false) {
-        return proc;
-    }
-    thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
+    read_proc()
 }
 
 /// Fast path lifecycle and grant-lease state for one keeper process.
 #[derive(Default)]
 pub struct Watch {
-    checked_at: Option<u64>,
+    checked_at: Pace,
     /// Both `eth0` and `lte0pdn2` were up and in `br0` in passthrough since then.
     up_since: Option<u64>,
     /// Last logged `state: detail`, so log lines emit only on state/detail change.
@@ -198,7 +83,7 @@ pub struct Watch {
     /// Last rendered status body (without `updated=`), so the status file is
     /// rewritten whenever state, detail, mode, active_mode, gate, qctrl_present,
     /// wd_trips, or wd_reason changes.
-    status_body: String,
+    status: StatusFile,
     /// A load failed for this config; not retried until config changes or reboot.
     failed_for: Option<Config>,
     refused_logged: Vec<String>,
@@ -223,8 +108,7 @@ impl Watch {
         if !loaded && self.lease_state == LeaseState::Unknown && step == GateStep::Close {
             // Handle a keeper restart or hand-loaded module before the first
             // `maintain()` tick runs without suppressing the adoption log.
-            let text = read_text(Path::new(&proc_path()));
-            if fastpath::parse_proc(&text).ours {
+            if read_proc().ours {
                 loaded = true;
             }
         }
@@ -253,7 +137,7 @@ impl Watch {
         if self.lease_state != prev_lease {
             // Re-read /proc/k1fp on this same tick so witcher-fastpath.status
             // reflects the new gate state immediately.
-            self.checked_at = None;
+            self.checked_at.reset();
         }
     }
 
@@ -267,15 +151,11 @@ impl Watch {
         nvram_cache_path: &Path,
         mut note: impl FnMut(&str),
     ) {
-        if self
-            .checked_at
-            .is_some_and(|at| now.saturating_sub(at) < fastpath::CHECK_EVERY)
-        {
+        if !self.checked_at.ready(now, fastpath::CHECK_EVERY) {
             return;
         }
-        self.checked_at = Some(now);
 
-        let Some(dir) = staged_dir() else {
+        let Some(dir) = MODULE.staged_dir() else {
             self.module_loaded = false;
             self.managed = false;
             self.active_for_lease = false;
@@ -291,7 +171,7 @@ impl Watch {
             return;
         };
 
-        let config = fastpath::parse_config(&read_text(&dir.join("config")));
+        let config = fastpath::parse_config(&read_file(&dir.join("config")));
         if config.refused != self.refused_logged {
             for line in &config.refused {
                 note(&format!(
@@ -311,8 +191,8 @@ impl Watch {
             self.up_since = Some(now);
         }
 
-        let proc_text = read_text(Path::new(&proc_path()));
-        let modules_text = read_text(Path::new(&modules_path()));
+        let proc_text = read_file(proc_path());
+        let modules_text = read_file(staged::modules_path());
         let adopted = match fastpath::loaded(&modules_text, &proc_text) {
             Loaded::Other(name) => {
                 self.module_loaded = false;
@@ -409,7 +289,7 @@ impl Watch {
                 if self.failed_for.as_ref() == Some(&config) {
                     return;
                 }
-                if let Err(err) = stage(&dir).and_then(|path| insmod(&path)) {
+                if let Err(err) = MODULE.load(&dir) {
                     self.failed_for = Some(config.clone());
                     self.publish(
                         "failed",
@@ -443,7 +323,7 @@ impl Watch {
             }
         };
 
-        let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+        let proc = read_proc();
         if !proc.ours {
             self.module_loaded = false;
             self.managed = false;
@@ -489,9 +369,9 @@ impl Watch {
             let revoked = self.revoke_if_open();
             let proc = if proc.mode != Some(0) {
                 let _ = write_proc_cmd("mode 0\n");
-                read_proc_after_mode_write(0)
+                read_proc_until(&|proc| proc.mode == Some(0))
             } else if revoked {
-                read_proc_after_grant_close()
+                read_proc_until(&|proc| proc.gate_open == Some(false))
             } else {
                 proc
             };
@@ -522,12 +402,12 @@ impl Watch {
                 let mut proc = proc;
                 if config.mode == 0 {
                     if self.revoke_if_open() {
-                        proc = read_proc_after_grant_close();
+                        proc = read_proc_until(&|proc| proc.gate_open == Some(false));
                     }
                 } else if (adopted || self.lease_state != LeaseState::Open)
                     && self.renew_if_grant_held(nvram_cache_path)
                 {
-                    proc = read_proc_after_grant_open();
+                    proc = read_proc_until(&|proc| proc.gate_open == Some(true));
                 }
                 let (state, detail) = if config.mode == 0 {
                     ("off", "mode 0 read back from /proc/k1fp".to_owned())
@@ -561,7 +441,7 @@ impl Watch {
                     );
                     return;
                 }
-                let mut proc = read_proc_after_mode_write(config.mode);
+                let mut proc = read_proc_until(&|proc| proc.mode == Some(config.mode));
                 if !fastpath::matches(&config, &proc) {
                     let shown = proc
                         .mode
@@ -582,10 +462,10 @@ impl Watch {
                 self.active_for_lease = config.mode > 0;
                 if config.mode == 0 {
                     if self.revoke_if_open() {
-                        proc = read_proc_after_grant_close();
+                        proc = read_proc_until(&|proc| proc.gate_open == Some(false));
                     }
                 } else if self.renew_if_grant_held(nvram_cache_path) {
-                    proc = read_proc_after_grant_open();
+                    proc = read_proc_until(&|proc| proc.gate_open == Some(true));
                 }
                 let (state, detail) = if config.mode == 0 {
                     ("off", "mode 0 read back from /proc/k1fp".to_owned())
@@ -625,7 +505,7 @@ impl Watch {
                     );
                     return;
                 }
-                let mut proc = read_proc_after_mode_write(config.mode);
+                let mut proc = read_proc_until(&|proc| proc.mode == Some(config.mode));
                 if !fastpath::matches(&config, &proc) {
                     let shown = proc
                         .mode
@@ -645,7 +525,7 @@ impl Watch {
                 self.trip.note_applied(config.mode, &proc);
                 self.active_for_lease = true;
                 if self.renew_if_grant_held(nvram_cache_path) {
-                    proc = read_proc_after_grant_open();
+                    proc = read_proc_until(&|proc| proc.gate_open == Some(true));
                 }
                 self.publish(
                     "applied",
@@ -665,9 +545,9 @@ impl Watch {
                 let revoked = self.revoke_if_open();
                 let proc = if proc.mode != Some(0) {
                     let _ = write_proc_cmd("mode 0\n");
-                    read_proc_after_mode_write(0)
+                    read_proc_until(&|proc| proc.mode == Some(0))
                 } else if revoked {
-                    read_proc_after_grant_close()
+                    read_proc_until(&|proc| proc.gate_open == Some(false))
                 } else {
                     proc
                 };
@@ -730,14 +610,12 @@ impl Watch {
         let key = format!("{state}: {detail}");
         let body = fastpath::status_body(&view);
         let log_changed = key != self.shown;
-        let status_changed = body != self.status_body;
-        if !log_changed && !status_changed && !force_status {
+        let quiet = state == "off" && self.shown.is_empty();
+        let render = |body: &str| format!("{body}updated={now}\n");
+        if !self.status.update(status_path(), body, log_changed || force_status, render) {
             return;
         }
-        let quiet = state == "off" && self.shown.is_empty();
         self.shown = key;
-        self.status_body = body;
-        let _ = fs::write(status_path(), format!("{}updated={now}\n", self.status_body));
         if log_changed && !quiet {
             note(&format!("fast path {state}: {detail}"));
         }
@@ -750,7 +628,9 @@ mod tests {
 
     #[test]
     fn manifest_pins_titan_k1fp() {
-        let digest = pinned().expect("device/fastpath/SHA256SUMS must pin titan_k1fp.ko");
+        let digest = MODULE
+            .pinned()
+            .expect("device/fastpath/SHA256SUMS must pin titan_k1fp.ko");
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
     }

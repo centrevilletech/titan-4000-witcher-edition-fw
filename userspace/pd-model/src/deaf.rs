@@ -116,15 +116,6 @@ pub fn targets(settings: &Settings, wan_get_dns: &str) -> Vec<IpAddr> {
     }
 }
 
-/// One `key=value` record from the vendor's RAM cache (`/tmp/nvram.cfg`).
-/// Records end in a NUL byte (a newline is accepted too).
-pub fn nvram_field<'a>(cache: &'a [u8], key: &str) -> Option<&'a str> {
-    cache
-        .split(|byte| *byte == 0 || *byte == b'\n')
-        .find_map(|record| record.strip_prefix(key.as_bytes())?.strip_prefix(b"="))
-        .and_then(|value| std::str::from_utf8(value).ok())
-}
-
 /// The value as `ucid` reads it: C `atoi`, so leading digits count and
 /// anything unreadable is 0.
 fn atoi(text: &str) -> i64 {
@@ -270,6 +261,7 @@ impl Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nvram::field as nvram_field;
 
     fn rounds(watch: &mut Watch, from: u64, to: u64, attached: bool, heard: bool) -> Vec<Action> {
         let mut seen = Vec::new();

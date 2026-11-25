@@ -2,17 +2,11 @@
 use std::{
     fs,
     net::Ipv4Addr,
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use titan_pd_model::{extdev, sas_nat};
 
-fn output(program: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new(program).args(args).output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
+use crate::command::stdout_if_success;
 
 fn authorized(text: &str, now_ms: u128) -> bool {
     let Ok(state) = serde_json::from_str::<serde_json::Value>(text) else {
@@ -46,10 +40,10 @@ pub fn endpoints(sas: Ipv4Addr) -> Option<String> {
         return None;
     }
     let bearer = extdev::bridged_bearer(ports.iter().map(String::as_str))?;
-    let routes = output("ip", &["route"])?;
+    let routes = stdout_if_success("ip", &["route"])?;
     let snat = sas_nat::needed(
-        &output("nvram_get", &["0", "lan_management_ipaddr"])?,
-        &output("nvram_get", &["0", "pdn_data_ipaddr"])?,
+        &stdout_if_success("nvram_get", &["0", "lan_management_ipaddr"])?,
+        &stdout_if_success("nvram_get", &["0", "pdn_data_ipaddr"])?,
         &routes,
     )?;
     if sas == snat.bearer || sas == snat.local || sas.is_unspecified() || sas.is_multicast() {
@@ -75,10 +69,10 @@ pub fn endpoints(sas: Ipv4Addr) -> Option<String> {
     }
     if !found
         || sas_nat::present(
-            &output("iptables", &["-t", "nat", "-S", "POSTROUTING"])?,
+            &stdout_if_success("iptables", &["-t", "nat", "-S", "POSTROUTING"])?,
             snat,
         ) != Some(true)
-        || output("iptables", &["-S", "FORWARD"])?.trim() != "-P FORWARD ACCEPT"
+        || stdout_if_success("iptables", &["-S", "FORWARD"])?.trim() != "-P FORWARD ACCEPT"
     {
         return None;
     }

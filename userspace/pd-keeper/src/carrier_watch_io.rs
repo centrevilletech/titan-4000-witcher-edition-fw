@@ -12,7 +12,8 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use titan_pd_model::carrier_watch::{self, Config, LogParser};
-use titan_pd_model::config;
+
+use crate::paths::{env_path_or, volume_config};
 
 /// Maximum bytes read on the very first open of `/mnt/cbrslog0.txt`.
 /// The vendor rotates at about 128 KB, so this reads a full live file once at
@@ -23,42 +24,26 @@ const CHUNK_READ: u64 = 64 * 1024;
 /// Cap on an unterminated trailing line buffer.
 const MAX_PENDING_LINE: usize = 16 * 1024;
 
-/// Persistent config directory, only while the volume is mounted (unless
-/// overridden in tests).
-pub fn config_dir() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("TITAN_CARRIER_DIR") {
-        return Some(PathBuf::from(path));
-    }
-    config::persistent_volume_mounted().then(|| PathBuf::from("/mnt/titan-api/carrier-watch"))
-}
-
 pub fn cbrslog_path() -> PathBuf {
-    std::env::var_os("TITAN_CBRS_LOG")
-        .map_or_else(|| PathBuf::from("/mnt/cbrslog0.txt"), PathBuf::from)
+    env_path_or("TITAN_CBRS_LOG", "/mnt/cbrslog0.txt")
 }
 
 pub fn status_path() -> PathBuf {
-    std::env::var_os("TITAN_CARRIER_STATUS")
-        .map_or_else(|| PathBuf::from("/var/run/witcher-carrier.status"), PathBuf::from)
+    env_path_or("TITAN_CARRIER_STATUS", "/var/run/witcher-carrier.status")
 }
 
 /// Read `carrier-watch/config` when present; default (`mode=log`) otherwise.
 pub fn load_config() -> Config {
-    let Some(dir) = config_dir() else {
-        return Config::default();
-    };
-    let Ok(text) = fs::read_to_string(dir.join("config")) else {
-        return Config::default();
-    };
-    carrier_watch::parse_config(&text)
+    volume_config("TITAN_CARRIER_DIR", "carrier-watch")
+        .map_or_else(Config::default, |text| carrier_watch::parse_config(&text))
 }
 
 /// Trigger the proven vendor re-grant sequence: `nvram_set 0 sqns_network_cbrs 1`
 /// followed by `SIGUSR1` to `rcinit`.
 pub fn trigger_regrant() -> Result<(), String> {
-    crate::nvram_set("sqns_network_cbrs", "1")
+    crate::nvram::set("sqns_network_cbrs", "1")
         .map_err(|()| "nvram_set sqns_network_cbrs=1 failed".to_owned())?;
-    crate::signal_rcinit().map_err(|()| "SIGUSR1 to rcinit failed".to_owned())
+    crate::nvram::signal_rcinit().map_err(|()| "SIGUSR1 to rcinit failed".to_owned())
 }
 
 /// Incremental reader for `/mnt/cbrslog0.txt`.

@@ -6,7 +6,8 @@
 //! That keeps `ptype_all` empty so the kernel never runs `dev_queue_xmit_nit`
 //! on transmit, and bridge-forwarded customer traffic never enters `ptype_base`.
 use libc::sock_filter;
-use std::{io, mem};
+use std::os::fd::BorrowedFd;
+use titan_sys::socket::SocketExt;
 
 const LOAD_HALF: u16 = 0x28;
 const LOAD_BYTE: u16 = 0x30;
@@ -93,56 +94,39 @@ fn ipv6_program(sniff: bool) -> Vec<sock_filter> {
     }
 }
 
-pub fn install_arp(fd: libc::c_int) -> Result<(), String> {
-    attach(fd, &mut arp_program())
+pub fn install_arp(fd: BorrowedFd<'_>) -> Result<(), String> {
+    attach(fd, &arp_program())
 }
 
-pub fn install_ipv4_dhcp(fd: libc::c_int) -> Result<(), String> {
-    attach(fd, &mut ipv4_dhcp_program())
+pub fn install_ipv4_dhcp(fd: BorrowedFd<'_>) -> Result<(), String> {
+    attach(fd, &ipv4_dhcp_program())
 }
 
-pub fn install_ipv6(fd: libc::c_int, sniff: bool) -> Result<(), String> {
-    attach(fd, &mut ipv6_program(sniff))
+pub fn install_ipv6(fd: BorrowedFd<'_>, sniff: bool) -> Result<(), String> {
+    attach(fd, &ipv6_program(sniff))
 }
 
-fn attach(fd: libc::c_int, code: &mut [sock_filter]) -> Result<(), String> {
-    let filter = libc::sock_fprog {
-        len: code.len() as u16,
-        filter: code.as_mut_ptr(),
-    };
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ATTACH_FILTER,
-            (&filter as *const libc::sock_fprog).cast(),
-            mem::size_of_val(&filter) as _,
-        )
-    };
-    if rc < 0 {
-        return Err(format!(
-            "attach packet filter: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    Ok(())
+fn attach(fd: BorrowedFd<'_>, code: &[sock_filter]) -> Result<(), String> {
+    fd.attach_filter(code)
+        .map_err(|err| format!("attach packet filter: {err}"))
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::os::{fd::AsRawFd, unix::net::UnixDatagram};
+    use std::io;
+    use std::os::{fd::AsFd, unix::net::UnixDatagram};
 
     // Execute the real Linux socket filter for the given protocol socket.
     pub(crate) fn captured(packet: &[u8], protocol: i32, sniff: bool) -> Vec<u8> {
         let (tx, rx) = UnixDatagram::pair().unwrap();
-        let mut code = match protocol {
+        let code = match protocol {
             libc::ETH_P_ARP => arp_program(),
             libc::ETH_P_IP => ipv4_dhcp_program(),
             libc::ETH_P_IPV6 => ipv6_program(sniff),
             other => panic!("unexpected protocol {other:#x}"),
         };
-        attach(rx.as_raw_fd(), &mut code).unwrap();
+        attach(rx.as_fd(), &code).unwrap();
         rx.set_nonblocking(true).unwrap();
         tx.send(packet).unwrap();
         let mut buf = [0; 2048];

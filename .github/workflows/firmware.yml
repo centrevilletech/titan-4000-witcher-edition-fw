@@ -122,6 +122,38 @@ jobs:
             test "$REF_NAME" = "v$(cat VERSION)"
           fi
 
+  sizes:
+    name: Stripped armv7 binary sizes
+    # The rootfs has little room left. Every PR prints what its Rust binaries
+    # cost on the unit, built exactly as the image build does.
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential git ca-certificates curl
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          targets: armv7-unknown-linux-musleabi
+          components: clippy
+      - name: Unsafe audit (every unsafe block in titan-sys has a SAFETY comment)
+        run: cargo clippy --locked --manifest-path userspace/Cargo.toml -p titan-sys --all-targets -- -D warnings
+      - name: Type-check every crate and its tests (a fast signal; the tests job runs them)
+        run: cargo check --locked --manifest-path userspace/Cargo.toml --workspace --all-targets
+      - name: Build the release binaries and report their sizes
+        run: |
+          set -euo pipefail
+          out=$(mktemp -d)
+          scripts/build-keeper.sh "$out/titan-pd-keeper"
+          scripts/build-firstboot.sh "$out/witcher-firstboot"
+          for binary in titan-pd-keeper witcher-firstboot; do
+            echo "$binary $(stat -c %s "$out/$binary") bytes (armv7-unknown-linux-musleabi, release, stripped)"
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+
   prg:
     name: Build and verify firmware
     # PRs run public tests only. Packaging and its private denylist are trusted.

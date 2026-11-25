@@ -6,8 +6,8 @@
 //! written while attached waits for the next attach. The only radio cycle is
 //! the opt-in enforcement re-attach, gated by `titan_pd_model::radio::cycle_gate`.
 use crate::{
-    carrier_pick_io,
-    radio_modem::{cfun, console},
+    carrier_pick_io, nvram,
+    radio_modem::{cfun, console, media},
     radio_sqm,
 };
 use serde_json::{Value, json};
@@ -16,12 +16,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     mem::discriminant,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        },
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+        process::CommandExt,
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -34,6 +31,7 @@ use titan_pd_model::{
     config::persistent_volume_mounted,
     radio::{self as model, Action, Cell, PCELL_CLEAR, PCELL_QUERY, Picker, Profile, failures},
 };
+use titan_sys::process::{Signal, SpawnExt, effective_uid, kill_group};
 
 /// Seconds between health and carrier checks while a profile is active.
 const CHECK_EVERY: u64 = 30;
@@ -158,7 +156,7 @@ pub fn supervise() {
 }
 
 fn root() -> io::Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if effective_uid() != 0 {
         return Err(fail("operator access required"));
     }
     if !persistent_volume_mounted() {
@@ -276,18 +274,9 @@ fn run_worker(op: &str, seconds: u64) -> io::Result<()> {
     let mut cmd = Command::new("/tmp/titan-pd-keeper/titan-pd-keeper");
     cmd.args(["radio-worker", op])
         .stdin(Stdio::null())
-        .process_group(0);
-    let ppid = std::process::id();
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-                || libc::getppid() != ppid as i32
-            {
-                return Err(fail("guard gone"));
-            }
-            Ok(())
-        });
-    }
+        .process_group(0)
+        // The worker dies with the guard, and does not start once it is gone.
+        .die_with_parent(std::process::id());
     let reason = ram("radio-worker-error");
     cmd.stderr(Stdio::from(File::create(&reason)?));
     let mut child = cmd.spawn()?;
@@ -314,9 +303,7 @@ fn run_worker(op: &str, seconds: u64) -> io::Result<()> {
         }
         pause(1);
     }
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
+    let _ = kill_group(child.id() as i32, Signal::Kill);
     child.wait()?;
     Err(fail("worker deadline expired"))
 }
@@ -333,7 +320,7 @@ pub fn transition_in_progress(now: u64) -> bool {
         .is_some_and(|until| until > now && until - now <= 185)
 }
 fn transition(seconds: u64) -> io::Result<()> {
-    let until = crate::run::monotonic() + seconds;
+    let until = crate::clock::monotonic() + seconds;
     atomic(&ram("radio-transition"), until.to_string().as_bytes())
 }
 
@@ -372,7 +359,8 @@ fn lock_guard() -> io::Result<File> {
         .truncate(false)
         .mode(0o600)
         .open(ram("radio.lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // flock(LOCK_EX | LOCK_NB), held until the file is closed.
+    if file.try_lock().is_err() {
         return Err(fail("guard already running"));
     }
     Ok(file)
@@ -460,9 +448,9 @@ pub fn guard() -> io::Result<()> {
             }
         } else {
             let mut checked = Ok(());
-            if watch.due(crate::run::monotonic(), media() == "ATTACHED") {
+            if watch.due(crate::clock::monotonic(), media() == "ATTACHED") {
                 checked = run_worker("check", 35)
-                    .and_then(|()| watch.carriers(&desired, crate::run::monotonic()));
+                    .and_then(|()| watch.carriers(&desired, crate::clock::monotonic()));
             }
             // A failed picker re-attach is handled like a failed enforcement.
             if let (Ok(()), Some(p)) = (&checked, desired.picker()) {
@@ -515,7 +503,7 @@ impl CarrierWatch {
             return rm(ram("radio-carriers"));
         };
         let attached = media() == "ATTACHED";
-        let carriers = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
+        let carriers = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
         let over = attached && carriers.is_some_and(|n| n > cap);
         if !over {
             self.over_since = None;
@@ -536,8 +524,8 @@ impl CarrierWatch {
             }
         }
         let last_cycle = last_cycle();
-        let mode_grant = nvram_field(b"cbrs_mode_grant=");
-        let grant_state = nvram_field(b"cbrs_grant_state=");
+        let mode_grant = nvram::read_value("cbrs_mode_grant");
+        let grant_state = nvram::read_value("cbrs_grant_state");
         let verdict = model::cycle_gate(model::Gate {
             cap,
             cycle_hours,
@@ -578,21 +566,8 @@ fn last_cycle() -> u64 {
         .unwrap_or(0)
 }
 
-fn nvram_field(key: &[u8]) -> String {
-    let raw = fs::read("/tmp/nvram.cfg").unwrap_or_default();
-    let value = |name: &[u8]| {
-        raw.split(|b| *b == 0 || *b == b'\n')
-            .find_map(|s| s.strip_prefix(name))
-            .map(|s| String::from_utf8_lossy(s).trim().to_string())
-            .unwrap_or_default()
-    };
-    value(key)
-}
-fn media() -> String {
-    nvram_field(b"sqns_connection_mediaState=")
-}
 fn ready() -> bool {
-    nvram_field(b"sqns_identity_boardName=") == "GDM7243AP-ODU-E-B48"
+    nvram::read_value("sqns_identity_boardName") == "GDM7243AP-ODU-E-B48"
         && fs::metadata("/var/tmp/lted-daemon").is_ok_and(|m| m.file_type().is_socket())
         && ["lted", "lteatcm", "ucid"].iter().all(|name| {
             Command::new("pidof")
@@ -608,7 +583,7 @@ fn ready() -> bool {
 // enforcement cycle has its own grant gate.
 fn reachable(p: &Profile) -> bool {
     media() == "ATTACHED"
-        && crate::mgmt_up()
+        && crate::revert::mgmt_up()
         && p.management_probe.is_some_and(|ip| {
             Command::new("ping")
                 .args(["-I", "lte0pdn0", "-c", "1", "-W", "2", &ip.to_string()])
@@ -676,7 +651,7 @@ fn sample(p: &Profile, base: u32) -> io::Result<()> {
     let delta = n
         .checked_sub(base)
         .ok_or_else(|| fail("modem counters reset"))?;
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     let prev = json_file("radio-counters")["last_failure_uptime"].as_u64();
     let storm = titan_pd_model::radio::storm(delta, prev, now);
     let last = if delta > 0 { Some(now) } else { prev };
@@ -698,7 +673,7 @@ fn sample(p: &Profile, base: u32) -> io::Result<()> {
     Ok(())
 }
 fn apply(p: &Profile, old: &Profile) -> io::Result<()> {
-    let pd = crate::state();
+    let pd = crate::paths::state_dir();
     let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
     if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
         return Err(fail("keeper recovery already pending"));
@@ -752,7 +727,7 @@ fn apply(p: &Profile, old: &Profile) -> io::Result<()> {
     if rates(&journal).is_some() {
         if rates(p).is_some() {
             let wait = Instant::now();
-            while (!Path::new("/sys/class/net/lte0pdn2").exists() || !crate::mgmt_up())
+            while (!Path::new("/sys/class/net/lte0pdn2").exists() || !crate::revert::mgmt_up())
                 && wait.elapsed() < Duration::from_secs(45)
             {
                 pause(1);
@@ -815,10 +790,10 @@ fn enforce(p: &Profile) -> io::Result<()> {
     let hours = cycle_hours.ok_or_else(|| fail("radio cycles are off"))?;
     // Read every condition again right before acting. The guard's
     // over-cap timer is the only value carried in.
-    let now = crate::run::monotonic();
-    let before = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
-    let mode_grant = nvram_field(b"cbrs_mode_grant=");
-    let grant_state = nvram_field(b"cbrs_grant_state=");
+    let now = crate::clock::monotonic();
+    let before = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
+    let mode_grant = nvram::read_value("cbrs_mode_grant");
+    let grant_state = nvram::read_value("cbrs_grant_state");
     let fresh = model::cycle_gate(model::Gate {
         cap,
         cycle_hours,
@@ -870,7 +845,7 @@ fn enforce(p: &Profile) -> io::Result<()> {
     } else {
         Ok(())
     };
-    let after = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
+    let after = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
     crate::log(&format!(
         "radio profile: enforcement re-attach {}; carriers now {}{}",
         if attached { "attached" } else { "did not attach within 90 s" },
@@ -987,7 +962,7 @@ fn arm_index(op: &str) -> io::Result<usize> {
 }
 
 fn minute_utc() -> Option<u16> {
-    let unix = carrier_pick_io::unix_now();
+    let unix = crate::clock::unix_now();
     // A unit without network time reads 1970 or 2013: no radio cycle then.
     (unix > 1_704_067_200).then_some(((unix % 86_400) / 60) as u16)
 }
@@ -1007,13 +982,13 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
         Some(_) => {}
     }
     if media() != "ATTACHED"
-        || nvram_field(b"cbrs_mode_grant=") != "1"
-        || nvram_field(b"cbrs_grant_state=") != "2"
+        || nvram::read_value("cbrs_mode_grant") != "1"
+        || nvram::read_value("cbrs_grant_state") != "2"
     {
         eprintln!("radio-worker: picker cycle skipped: not attached with a held SAS grant");
         return Ok(());
     }
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     atomic(&ram("radio-last-cycle"), now.to_string().as_bytes())?;
     crate::log(&format!(
         "carrier picker: re-attaching on arm {i} (EARFCN {} PCI {}, {}-carrier cap)",
@@ -1126,7 +1101,7 @@ struct PickWatch {
 
 /// Whether the picker may cycle the radio now. Read fresh every time.
 fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(), &'static str> {
-    let pd = crate::state();
+    let pd = crate::paths::state_dir();
     let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
     if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
         return Err("keeper recovery pending");
@@ -1137,15 +1112,15 @@ fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(),
         window: p.window,
         forced,
         attached,
-        mode_grant: nvram_field(b"cbrs_mode_grant=") == "1",
-        grant_state: nvram_field(b"cbrs_grant_state=").parse().unwrap_or(0),
+        mode_grant: nvram::read_value("cbrs_mode_grant") == "1",
+        grant_state: nvram::read_value("cbrs_grant_state").parse().unwrap_or(0),
         idle,
     })
 }
 
 impl PickWatch {
     fn tick(&mut self, p: &Picker) -> io::Result<()> {
-        let now = crate::run::monotonic();
+        let now = crate::clock::monotonic();
         if let Some((rx, tx)) = carrier_pick_io::counters(&carrier_pick_io::customer_dev()) {
             self.traffic.push((now, rx, tx));
         }
@@ -1238,7 +1213,7 @@ impl PickWatch {
                     run_worker(&format!("pick-cycle-{i}"), 175)?;
                     self.visit = Some(Visit {
                         arm: i,
-                        since: crate::run::monotonic(),
+                        since: crate::clock::monotonic(),
                         granted_at: None,
                         purpose: Purpose::Survey,
                     });
@@ -1252,7 +1227,7 @@ impl PickWatch {
                     *record = Record {
                         arms: p.arms.clone(),
                         chosen,
-                        surveyed_at: Some(carrier_pick_io::unix_now()),
+                        surveyed_at: Some(crate::clock::unix_now()),
                         results: survey.results,
                     };
                     atomic(&disk("pick.json"), &serde_json::to_vec(&*record)?)?;
@@ -1271,7 +1246,7 @@ impl PickWatch {
         let forced = ram("pick-survey-now").exists();
         let due = forced
             || record.surveyed_at.is_none_or(|t| {
-                carrier_pick_io::unix_now().saturating_sub(t) >= u64::from(p.survey_hours) * 3600
+                crate::clock::unix_now().saturating_sub(t) >= u64::from(p.survey_hours) * 3600
             });
         if due {
             match pick_gate(p, forced, here.is_some(), idle) {
@@ -1311,7 +1286,7 @@ impl PickWatch {
         run_worker(&format!("pick-cycle-{c}"), 175)?;
         self.visit = Some(Visit {
             arm: c,
-            since: crate::run::monotonic(),
+            since: crate::clock::monotonic(),
             granted_at: None,
             purpose: Purpose::Hold,
         });

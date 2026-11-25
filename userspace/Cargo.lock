@@ -99,6 +99,7 @@ dependencies = [
  "libc",
  "serde_json",
  "titan-pd-model",
+ "titan-sys",
 ]
 
 [[package]]
@@ -107,6 +108,13 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "titan-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -121,6 +129,7 @@ version = "1.0.15"
 dependencies = [
  "libc",
  "serde_json",
+ "titan-sys",
 ]
 
 [[package]]
