@@ -30,7 +30,7 @@ pub fn console(cmd: &str) -> io::Result<String> {
     let dm = !cmd.starts_with("AT") && cmd != "arm1log 1";
     // A hint for bench tools, and how a later restore knows a DM query was
     // cut short with the console still logging.
-    let marker = crate::paths::runtime_dir().join("radio-console-open");
+    let marker = std::path::Path::new(crate::radio::RAM).join("radio-console-open");
     if dm {
         std::fs::write(&marker, b"1")?;
     }

@@ -75,7 +75,12 @@ const MISSING_COUNTER: &str = "missing RRC counter";
 const NOT_NOW: &str = "not now: ";
 /// Left in the keeper's RAM directory when a stock restore keeps failing: the
 /// keeper restarts the unit through its reboot gate (`run/radio_reboot.rs`).
-pub const REBOOT_REQUEST: &str = "radio-reboot";
+const REBOOT_REQUEST: &str = "radio-reboot";
+
+/// The guard asks for a restart because stock settings will not go back.
+pub fn restart_requested() -> bool {
+    ram(REBOOT_REQUEST).exists()
+}
 
 fn profile_signal() -> &'static (Mutex<u64>, Condvar) {
     static SIGNAL: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
@@ -98,9 +103,11 @@ fn disk_dir() -> PathBuf {
 fn disk(name: &str) -> PathBuf {
     disk_dir().join(name)
 }
-/// The keeper's private RAM directory (`TITAN_PD_RUNTIME` in tests).
+/// The radio files in the keeper's private RAM directory. A fixed path:
+/// other code and the harnesses look for the guard's marker files here.
+pub(crate) const RAM: &str = "/tmp/titan-pd-keeper";
 fn ram(name: &str) -> PathBuf {
-    crate::paths::runtime_dir().join(name)
+    Path::new(RAM).join(name)
 }
 /// The persistent volume holds the radio files (tests name a directory).
 fn volume_ready() -> bool {
@@ -255,7 +262,7 @@ fn root() -> io::Result<()> {
 }
 
 fn private_runtime() -> io::Result<()> {
-    let md = fs::symlink_metadata(crate::paths::runtime_dir())?;
+    let md = fs::symlink_metadata(RAM)?;
     if !md.is_dir() || md.uid() != 0 || md.mode() & 0o077 != 0 {
         return Err(fail("untrusted keeper runtime directory"));
     }
