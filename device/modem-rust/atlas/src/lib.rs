@@ -19,6 +19,7 @@ pub mod ffi;
 pub mod gipc;
 pub mod l2;
 pub mod mac;
+pub mod mac_model;
 pub mod patches;
 
 /// A 32-bit modem virtual address typed as a pointer to `T`.
@@ -199,6 +200,7 @@ mod tests {
         assert_eq!(offset_of!(Rbc, pdcp_sn_max), 0x1e);
         assert_eq!(offset_of!(Rbc, next_pdcp_rx_sn), 0x20);
         assert_eq!(offset_of!(Rbc, rx_hfn), 0x28);
+        assert_eq!(offset_of!(Rbc, rb_type), 0x30);
         assert_eq!(offset_of!(Rbc, stats), 0x40);
         assert_eq!(offset_of!(Rbc, ul_enqueued_bytes_total), 0xa8);
         assert_eq!(offset_of!(Rbc, ul_enqueued_pkts_total), 0xb0);
@@ -304,26 +306,36 @@ mod tests {
         assert_eq!(size_of::<MacUlLcCfg>(), 0x14);
         assert_eq!(offset_of!(MacUlLcCfg, priority), 0x04);
         assert_eq!(offset_of!(MacUlLcCfg, lcg_id), 0x05);
+        assert_eq!(offset_of!(MacUlLcCfg, pbr_bytes_per_tti), 0x08);
 
         assert_eq!(size_of::<MacUlLcgState>(), 0x08);
         assert_eq!(offset_of!(MacUlLcgState, has_data), 0x00);
         assert_eq!(offset_of!(MacUlLcgState, bo_bytes), 0x04);
         assert_eq!(size_of::<MacUlBsrCtx>(), 0x5c);
+        assert_eq!(offset_of!(MacUlBsrCtx, bsr_sent_in_tb), 0x00);
         assert_eq!(offset_of!(MacUlBsrCtx, bsr_pending), 0x01);
         assert_eq!(offset_of!(MacUlBsrCtx, sr_triggered_flag), 0x02);
         assert_eq!(offset_of!(MacUlBsrCtx, bsr_trigger_mask), 0x04);
+        assert_eq!(offset_of!(MacUlBsrCtx, highest_prio_with_data), 0x08);
         assert_eq!(offset_of!(MacUlBsrCtx, lc_bo), 0x0c);
         assert_eq!(offset_of!(MacUlBsrCtx, default_lcg), 0x38);
         assert_eq!(offset_of!(MacUlBsrCtx, trigger_lcg), 0x39);
         assert_eq!(offset_of!(MacUlBsrCtx, retx_bsr_has_data), 0x3b);
         assert_eq!(offset_of!(MacUlBsrCtx, lcg), 0x3c);
 
+        assert_eq!(size_of::<MacUlCfg>(), 0x160);
         assert_eq!(offset_of!(MacUlCfg, feature_flags), 0x00);
+        assert_eq!(offset_of!(MacUlCfg, duplex_mode), 0x04);
+        assert_eq!(offset_of!(MacUlCfg, tdd_ul_dl_cfg), 0x05);
         assert_eq!(offset_of!(MacUlCfg, bsr_timer_flags), 0x1c);
         assert_eq!(offset_of!(MacUlCfg, periodic_bsr_tmr_id), 0x20);
         assert_eq!(offset_of!(MacUlCfg, periodic_bsr_pending_ms), 0x28);
         assert_eq!(offset_of!(MacUlCfg, periodic_bsr_dirty), 0x2a);
+        assert_eq!(offset_of!(MacUlCfg, retx_bsr_tmr_id), 0x44);
+        assert_eq!(offset_of!(MacUlCfg, retx_bsr_pending_ms), 0x4c);
+        assert_eq!(offset_of!(MacUlCfg, retx_bsr_dirty), 0x4e);
         assert_eq!(offset_of!(MacUlCfg, max_harq_tx), 0x5d);
+        assert_eq!(offset_of!(MacUlCfg, phr_mode), 0x68);
         assert_eq!(offset_of!(MacUlCfg, active_lc_mask), 0x70);
         assert_eq!(offset_of!(MacUlCfg, lc_cfg), 0x74);
         assert_eq!(
@@ -334,11 +346,58 @@ mod tests {
             offset_of!(MacUlCfg, lc_cfg) + offset_of!(MacUlLcCfg, lcg_id),
             0x79
         );
+        assert_eq!(
+            offset_of!(MacUlCfg, lc_cfg) + offset_of!(MacUlLcCfg, pbr_bytes_per_tti),
+            0x7c
+        );
+        assert_eq!(offset_of!(MacUlCfg, tti_bundling_en), 0x150);
         assert_eq!(offset_of!(MacUlCfg, ext_bsr_mode), 0x152);
+        assert_eq!(offset_of!(MacUlCfg, meas_gap_en), 0x15c);
 
+        assert_eq!(size_of::<MacUlLcBoPair>(), 0x08);
+        assert_eq!(size_of::<MacUlLcPbr>(), 0x08);
+        assert_eq!(size_of::<MacUlLcpTbl>(), 0x110);
+        assert_eq!(offset_of!(MacUlLcpTbl, total_bo), 0x00);
+        assert_eq!(offset_of!(MacUlLcpTbl, active_prio_mask), 0x04);
+        assert_eq!(offset_of!(MacUlLcpTbl, prio_lc_mask), 0x08);
+        assert_eq!(offset_of!(MacUlLcpTbl, prio_rr_cursor), 0x4c);
+        assert_eq!(offset_of!(MacUlLcpTbl, lc_bo), 0x60);
+        assert_eq!(offset_of!(MacUlLcpTbl, lc_pbr), 0xb8);
+
+        assert_eq!(size_of::<MacUlGlobal>(), 0x30);
+        assert_eq!(offset_of!(MacUlGlobal, pending_newtx_cnt), 0x14);
+        assert_eq!(offset_of!(MacUlGlobal, sfn_wrap_cnt), 0x1c);
+        assert_eq!(offset_of!(MacUlGlobal, sps_interval), 0x20);
+        assert_eq!(offset_of!(MacUlGlobal, sps_last_tti), 0x24);
+        assert_eq!(offset_of!(MacUlGlobal, sps_implicit_rel_after), 0x28);
+        assert_eq!(offset_of!(MacUlGlobal, sps_active), 0x2b);
+        assert_eq!(offset_of!(MacUlGlobal, sps_zero_sdu_cnt), 0x2c);
+
+        assert_eq!(size_of::<MacUlSchedInfo>(), 0x64);
+        assert_eq!(offset_of!(MacUlSchedInfo, tti), 0x00);
+        assert_eq!(offset_of!(MacUlSchedInfo, valid), 0x04);
+        assert_eq!(offset_of!(MacUlSchedInfo, cc), 0x10);
+        assert_eq!(offset_of!(MacUlSchedInfo, tb_size), 0x14);
+        assert_eq!(offset_of!(MacUlSchedInfo, mcs), 0x20);
+        assert_eq!(offset_of!(MacUlSchedInfo, ndi), 0x21);
+        assert_eq!(offset_of!(MacUlSchedInfo, eff_mcs), 0x30);
+        assert_eq!(offset_of!(MacUlSchedInfo, eff_ndi), 0x32);
+        assert_eq!(offset_of!(MacUlSchedInfo, eff_tb_size), 0x34);
+        assert_eq!(offset_of!(MacUlSchedInfo, harq_action), 0x44);
+        assert_eq!(offset_of!(MacUlSchedInfo, has_grant), 0x4c);
+        assert_eq!(offset_of!(MacUlSchedInfo, phich_ack_raw), 0x50);
+        assert_eq!(offset_of!(MacUlSchedInfo, phich_ack), 0x5c);
+
+        assert_eq!(offset_of!(MacTbBuildFrame, packed_lc_mask), 0x2c);
         assert_eq!(offset_of!(MacTbBuildFrame, tb_size), 48);
+        assert_eq!(offset_of!(MacTbBuildFrame, tb_idx), 0x38);
+        assert_eq!(offset_of!(MacTbBuildFrame, ce_enable_mask), 0x3c);
         assert_eq!(offset_of!(MacTbBuildFrame, used_bytes), 92);
+        assert_eq!(offset_of!(MacTbBuildFrame, last_subhdr_ptr), 0x60);
+        assert_eq!(offset_of!(MacTbBuildFrame, mac_hdr_len), 0x64);
+        assert_eq!(offset_of!(MacTbBuildFrame, bsr_type), 0x68);
         assert_eq!(offset_of!(MacTbBuildFrame, bsr_lcid), 108);
+        assert_eq!(offset_of!(MacTbBuildFrame, deferred_bsr_flag), 112);
         assert_eq!(offset_of!(MacTbBuildFrame, has_trailing_pad), 113);
 
         assert_eq!(offset_of!(MacRaSrCtx, ra_state), 0x00);

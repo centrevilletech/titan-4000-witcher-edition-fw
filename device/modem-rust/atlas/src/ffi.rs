@@ -9,7 +9,7 @@
 
 use crate::gipc::GipcIrb;
 use crate::l2::{Rbc, RbcRing, RlcAmTxEntry};
-use crate::mac::MacHarqProc;
+use crate::mac::{MacHarqProc, MacUlLcpTbl, MacUlSchedInfo};
 
 // Linker-resolved external symbols (`PROVIDE(sym = 0x84xxxxxx | 1);` for Thumb).
 //
@@ -76,8 +76,15 @@ extern "C" {
     pub fn pdcp_proc_tmr_discard(rbc: *mut Rbc);
     /// `0x842d_d134` (Thumb): Compute per-bearer `(actual_bo, hdr_bo)` for RLC AM/UM/TM.
     pub fn get_rlc_cur_bo(rbc: *const Rbc, out_actual_bo: *mut u32, out_hdr_bo: *mut u32);
-    /// `0x842d_d194` (Thumb): Aggregate per-LCG BO into `lcg_bo[4]` (includes `bo_margin` + N4 `TRUE_BO`).
+    /// `0x842d_d194` (Thumb): Aggregate per-LCG BO into `lcg_bo[4]` (seeds from `L2_BSR_PRE_BO_VA`,
+    /// then adds `actual_bo`, `hdr_bo`, `bo_margin` + N4 Hook 2).
     pub fn rlc_upd_cur_bo(lcg_bo: *mut [u32; 4]);
+    /// `0x842d_d238` (Thumb): Refresh RLC BO for `lcid` and call `update_mac_ul_bo`.
+    pub fn upd_lcid_bo_to_mac(lcid: u32);
+    /// `0x842d_d360` (Thumb): Query RLC AM/UM/TM whether `alloc_bytes` fits into `out_info` (`[u32; 3]`).
+    pub fn rlc_check_size(lcid: u32, alloc_bytes: u32, out_info: *mut [u32; 3]) -> u32;
+    /// `0x842d_a60c` (Thumb): Populate `L2_BSR_PRE_BO_VA[0..3]` from active DRBs' `ring_pending_bytes`.
+    pub fn mac_bsr_pre_work(active_lc_mask: u32);
     /// `0x842d_d794` (Thumb): Enqueue an RLC AM TX entry into the UL retransmission ring (returns 1 on maxRetx).
     pub fn process_pdu_retx(rbc: *mut Rbc, tx_entry: *mut RlcAmTxEntry, flags: u32) -> u32;
     /// `0x842d_dbc0` (Thumb): Refresh RLC retx BO and notify MAC UL BO.
@@ -86,8 +93,12 @@ extern "C" {
     pub fn rlc_ul_am_proc_status_rpt(rbc: *mut Rbc);
     /// `0x842d_f4f4` (Thumb): Build UL RLC AM PDU(s) for a MAC grant allocation.
     pub fn rlc_ul_am_gen_pdu(rbc: *mut Rbc, alloc_packed: u32, allow_retx: u32, out_buf: *mut u8) -> u32;
-    /// `0x8452_c9e8` (Thumb): Set `DP_BO_MARGIN_VA = margin_kb << 10`.
-    pub fn tc_set_hp_bo_margin(margin_kb: u32);
+    /// `0x842e_5b40` (Thumb): Return current global `DP_BO_MARGIN_VA` (`0x84f9_3008`) in bytes.
+    pub fn get_hp_bo_margin() -> u32;
+    /// `0x8452_c95c` (Thumb): 250 ms Ring-0 `bo_margin` hold/expiry timer tick (`do_bo.isra.0`).
+    pub fn do_bo();
+    /// `0x8452_c9e8` (Thumb): Store `margin_bytes` directly into `DP_BO_MARGIN_VA` (`0x84f9_3008`).
+    pub fn tc_set_hp_bo_margin(margin_bytes: u32);
 
     // -----------------------------------------------------------------------
     // MAC UL: BSR, SR, LCP, TB build, HARQ (Thumb-2)
@@ -95,28 +106,65 @@ extern "C" {
 
     /// `0x842c_cf64` (Thumb): Map `bo_bytes` to 3GPP 6-bit BSR index (`0..=63`).
     pub fn search_mac_ul_bo_idx(bo_bytes: u32) -> u8;
+    /// `0x842c_cff8` (Thumb): Reset `MacUlBsrCtx` (`0x84d6_2940`) to idle defaults.
+    pub fn init_mac_ul_bsr_info();
     /// `0x842c_d080` (Thumb): Restart `periodicBSR-Timer`.
     pub fn restart_bsr_timer();
-    /// `0x842c_d298` (Thumb): Update MAC UL BO for `lcid`, triggering Regular BSR / SR if needed.
-    pub fn update_mac_ul_bo(lcid: u32, new_bo: u32, extra: u32);
+    /// `0x842c_d0e8` (Thumb): Stop `periodicBSR-Timer`.
+    pub fn stop_bsr_timer();
+    /// `0x842c_d104` (Thumb): `periodicBSR-Timer` expiry callback (sets `bsr_pending=1, mask=0x01`).
+    pub fn expire_bsr_timer();
+    /// `0x842c_d168` (Thumb): Restart `retxBSR-Timer`.
+    pub fn restart_retx_bsr_timer();
+    /// `0x842c_d1d0` (Thumb): Stop `retxBSR-Timer`.
+    pub fn stop_retx_bsr_timer();
+    /// `0x842c_d1ec` (Thumb): `retxBSR-Timer` expiry callback (sets `bsr_pending=1, mask=0x14` if data).
+    pub fn expire_retx_bsr_timer();
+    /// `0x842c_d254` (Thumb): Clear `bsr_pending`, `sr_triggered_flag`, and `bsr_trigger_mask`.
+    pub fn reset_mac_ul_bsr_event();
+    /// `0x842c_d298` (Thumb): Update MAC UL BO for `lcid`, triggering Regular BSR (`0x12`) if higher prio.
+    pub fn update_mac_ul_bo(lcid: u32, new_bo: u32, hdr_bo: u32);
     /// `0x842c_d46c` (Thumb): Select BSR format LCID (`28` Truncated, `29` Short, `30` Long, `255` None).
-    pub fn get_mac_ul_bsr_format(bsr_kind: u32, rem_bytes: u32) -> u8;
-    /// `0x842c_d54c` (Thumb): Populate BSR MAC CE payload into `out_bsr_ce` for `lcid` (28/29/30).
-    pub fn get_mac_ul_bsr_value(bsr_lcid: u32, out_bsr_ce: *mut u32, active_lc_mask: u32);
-    /// `0x842c_fb34` (Thumb): MAC LCP Step 2 (remaining TB bytes distributed by priority).
-    pub fn second_step_pbr(ctx: *mut core::ffi::c_void, rem_bytes: u32);
-    /// `0x842c_fd40` (Thumb): MAC LCP Step 1 (allocate up to each LC's PBR token bucket `Bj`).
-    pub fn assign_schedule_size_2lc(ctx: *mut core::ffi::c_void, rem_bytes: u32);
+    pub fn get_mac_ul_bsr_format(
+        bsr_kind: u32,
+        tb_size: u32,
+        used_bytes: u32,
+        deferred_bsr_flag: u32,
+    ) -> u8;
+    /// `0x842c_d54c` (Thumb): Populate BSR MAC CE payload into `out_bsr_ce` for `bsr_lcid` (28/29/30).
+    pub fn get_mac_ul_bsr_value(bsr_lcid: u32, out_bsr_ce: *mut u32, packed_lc_mask: u32);
+    /// `0x842c_fad8` (Thumb): Increment every active LC's PBR token bucket `Bj` once per TTI.
+    pub fn update_bj(tti_delta: u32);
+    /// `0x842c_fb34` (Thumb): MAC LCP Step 2 (remaining TB bytes distributed by priority/equal share).
+    pub fn second_step_pbr(rem_bytes: *mut u32, lc_alloc: *mut [u32; 11], lcp_tbl: *mut MacUlLcpTbl);
+    /// `0x842c_fd40` (Thumb): MAC LCP Step 1 (allocate up to each LC's PBR token bucket `Bj`, then Step 2).
+    pub fn assign_schedule_size_2lc(
+        rem_bytes: *mut u32,
+        lc_alloc: *mut [u32; 11],
+        lcp_tbl: *mut MacUlLcpTbl,
+    );
+    /// `0x842c_fe34` (Thumb): Simulate TB packing to check if Long BSR (`30`) can downgrade to Short (`29`).
+    pub fn check_long_bsr_downgrade_to_short(tb_rem_plus_2: u32) -> u32;
     /// `0x842d_3abc` (Thumb): Trigger PUCCH Scheduling Request or fallback to contention RACH.
     pub fn access_ra();
     /// `0x842d_4a78` (Thumb): Cancel pending SR when `cancel_flag != 0` (NewTx grant).
     pub fn handle_ra_ulgrant(cc: u32, hq_id: u32, cancel_flag: u32);
     /// `0x842d_4ca4` (Thumb): Poll MAC SR state machine on a PUCCH SR occasion (returns 1 to TX SR).
     pub fn get_mac_ul_sr() -> u32;
+    /// `0x842d_5258` (Thumb): Reconstruct L1D UL grant & PHICH scheduling fields for one CC.
+    pub fn reconstruct_sched_info(sched: *mut MacUlSchedInfo, body_idx: u32);
     /// `0x842d_54fc` (Thumb): Free HARQ TB buffer and reset `MacHarqProc` fields.
     pub fn clear_mac_ul_buffer(proc_ptr: *mut MacHarqProc);
     /// `0x842d_556c` (Thumb): Handle PHICH ACK without DCI-0 (suspends HARQ process).
     pub fn harq_proc_ack(cc: u32, hq_id: u32, proc_ptr: *mut MacHarqProc);
+    /// `0x842d_576c` (Thumb): Return TTI-bundling UL index for TDD cfg 0/1/6 (`0xff` for cfg 2).
+    pub fn get_tdd_bundle_ul_idx(tdd_cfg: u32, pusch_tti: u32) -> u32;
+    /// `0x842d_6d04` (Thumb): Resolve TTI-bundling PHICH HARQ ID for TDD cfg 0/1/6 (`0xff` for cfg 2).
+    pub fn get_tdd_bundle_phich_hq(tdd_cfg: u32, phich_tti: u32) -> u32;
+    /// `0x842d_89ac` (Thumb): Per-TTI MAC UL top-level scheduler (PCell then SCell, then LLCE0 harvest).
+    pub fn schedule_ul_data(sched_msg: *mut MacUlSchedInfo);
+    /// `0x842d_95c4` (Thumb): Tick SCell deactivation timers once per TTI.
+    pub fn check_scell_deact_timer();
 
     // -----------------------------------------------------------------------
     // Downlink key functions (Thumb-2)

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "atlas", "n4"]
+members = [".", "atlas", "n3", "n4"]
 resolver = "2"
 
 [package]

@@ -216,7 +216,12 @@ pub struct Rbc {
     pub _pad4: [u8; 6],
     /// `+0x28`: PDCP DL RX Hyper Frame Number (`RX_HFN`).
     pub rx_hfn: u32,
-    pub _pad5: [u8; 0x14],
+    pub _pad5a: [u8; 4],
+    /// `+0x30`: Radio bearer type (`0` = DRB, `1` = MRB/MBMS, `2` = SRB).
+    /// Checked by `mac_bsr_pre_work` (`0x842d_a66e`): only DRBs (`rb_type == 0`) add
+    /// `ring_pending_bytes` into `L2_BSR_PRE_BO_VA`.
+    pub rb_type: u8,
+    pub _pad5b: [u8; 0x0f],
     /// `+0x40..+0x97`: Double-buffered 1-second RLC/PDCP statistics (`2 * 0x2c`).
     pub stats: [RbcStatsBank; 2],
     pub _pad6: [u8; 0x10],
@@ -234,7 +239,9 @@ pub struct Rbc {
     pub _pad8: [u8; 0x08],
     /// `+0xd0`: Optional DL delivery hook (`dp tcp shp_tgt`).
     pub dl_hold_hook: u32,
-    /// `+0xd4`: Counter incremented on Ring 0 drain (stock `do_bo` activity tracker).
+    /// `+0xd4`: Monotonic TTI (`TTI_CLK_VA`) stored on Ring 0 drain in `l2_proc_pdcp_ul` (`0x842d_ccfc`).
+    /// Stock `do_bo.isra.0` (`0x8452_c976`) compares this against `bo_hold_last_cnt` (`+0x240`),
+    /// making stock `bo_margin` Ring 0 ONLY.
     pub ring0_last_tx_cnt: u32,
     /// `+0xd8`: 32-bit PDCP UL TX COUNT (incremented on every UL SDU; A4 `do_bo` source).
     pub pdcp_tx_count: u32,
