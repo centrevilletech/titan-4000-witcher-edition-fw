@@ -829,25 +829,28 @@ class RealDefaultImage(unittest.TestCase):
         self.assertEqual(unit.boot()['firmware'], self.release)
         unit.assert_stock_after(self)
 
-    def test_a_build_killed_by_the_time_limit_is_finished_next_boot(self):
-        real = shutil.which('timeout')
-        if real is None:
-            self.skipTest('no timeout program')
+    def test_a_build_that_died_is_cleaned_up_and_done_again_next_boot(self):
+        # What a build killed by the time limit or a power cut leaves: its
+        # record says started, half an image, no config. (A real build here
+        # takes about a second, too quick to kill on cue; DefaultImage proves
+        # the hook's time limit with a stand-in keeper.)
         unit = self.unit
-        (unit.root / 'bin/timeout').write_text(f'#!/bin/sh\n[ "$1" = -t ] && exit 1\nexec {real} "$@"\n')
-        limited = re.sub(r'^build_limit=.*$', 'build_limit=1', unit.hook.read_text(), flags=re.M)
-        normal = unit.hook.read_text()
-        unit.hook.write_text(limited)
-        self.assertEqual(unit.boot()['firmware'], 'nand')
-        self.assertEqual(unit.status()['reason'], 'build')
-        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '1', 'result': 'started'})
-        self.assertNotIn('config', self.files())
-        unit.hook.write_text(normal)
+        unit.tk.mkdir()
+        (unit.tk / 'default').write_text(f'gzip={self.release}\nbuilds=1\nresult=started\n')
+        (unit.tk / '.active.gz.tk-build').write_bytes(b'\x1f\x8b\x08\x00' + b'half' * 1000)
+        (unit.tk / '.default.tk-build').write_text('builds=')
         self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.status()['build'], 'built')
         self.assertEqual(self.record(), {'gzip': self.release, 'builds': '2', 'result': 'built'})
-        self.assertFalse([name for name in self.files() if name.startswith('.')], self.files())
+        self.assertEqual(self.files(), ['active.gz', 'config', 'default', 'strikes'])
         unit.assert_stock_after(self)
-
+        # The same, stopped after the image and before its config: still ours.
+        (unit.tk / 'config').unlink()
+        (unit.tk / 'default').write_text(f'gzip={self.release}\nbuilds=2\nresult=started\n')
+        (unit.tk / 'strikes').write_text('strikes=0\n')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '3', 'result': 'built'})
+        unit.assert_stock_after(self)
 
 class Build(unittest.TestCase):
     def test_hook_and_build_pin_the_same_gated_module(self):
