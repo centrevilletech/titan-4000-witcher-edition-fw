@@ -50,7 +50,8 @@ An extracted host directory or a successful CRC check is insufficient.
 Use the desktop firmware page. In Witcher, use **System → Firmware** to
 upload a compatible `.prg`. For an intentional downgrade, select the
 older-image option. Witcher's updater checks NAND readback and bank selection
-before rebooting. Keep power connected throughout the operation.
+before rebooting; if the readback fails, the running firmware stays selected
+for the next boot. Keep power connected throughout the operation.
 
 There are two firmware banks, but an intact alternate image is not proof of
 automatic rollback. Browser bank switching and recovery require working Linux
