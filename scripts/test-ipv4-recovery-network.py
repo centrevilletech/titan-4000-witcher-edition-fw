@@ -23,7 +23,9 @@ DHCP server's write over the shared lease file.
 The CBRS gate reads the SAS grant keys from that same cache file and edits two
 files standing in for the ebtables and ip6tables FORWARD chains, through stubs
 that print them the way the unit's tools do: this proves the keeper's
-decisions and commands, not the kernel tables.
+decisions and commands, not the kernel tables. One ip6tables call is made to
+hang for an hour: the keeper stops it after 10 s, keeps its loop and its
+heartbeat file going, and the gate still closes.
 The boot confirm for a staged modem firmware image reads a status file standing
 in for the boot hook's and runs against the ping and reboot stubs, the
 vendor cache (attached with an RSRP, or searching) and a DNS stand-in for the
@@ -246,7 +248,10 @@ for line in sys.stdin:
     for name in ('ebt', 'ip6'):
         Path('/tmp/'+name+'-forward').write_text('')
     exe('/tmp/bin/ebtables', 'exec /tmp/bin/chain-stub /tmp/ebt-forward "$@"')
-    exe('/tmp/bin/ip6tables', 'exec /tmp/bin/chain-stub /tmp/ip6-forward "$@"')
+    # While /tmp/hang-ip6tables exists, the next ip6tables call hangs (a tool
+    # stuck on a kernel lock) for an hour; the marker is used up by that call.
+    exe('/tmp/bin/ip6tables', 'if [ -e /tmp/hang-ip6tables ]; then rm -f /tmp/hang-ip6tables; exec sleep 3600; fi\n'
+        'exec /tmp/bin/chain-stub /tmp/ip6-forward "$@"')
     exe('/tmp/bin/mii-tool', 'echo "$*" >> /tmp/phy-actions; /tmp/bin/real-ip netns exec witcher-peer /bin/sh -c "echo 0 > /proc/sys/net/ipv4/conf/router0/arp_ignore"')
     exe('/usr/sbin/udhcpd', 'echo start >> /tmp/dhcp-starts; while :; do sleep 30; done')
     peer = json.loads(subprocess.check_output([ip, '-n', 'witcher-peer', '-j', '-4', 'addr', 'show', 'router0']))[0]
@@ -485,6 +490,28 @@ for line in sys.stdin:
         set_grant(['cbrs_mode_grant=1','cbrs_grant_state=2'])
         wait_for(lambda:gate_rules()==[],10)
         print('PASS: CBRS gate failed closed %.1f s after the grant keys went missing, and opened again.'%took,flush=True)
+        # A child that hangs (v1.0.17): one ip6tables call stuck for an hour.
+        # Up to v1.0.16 the keeper's loop waited on it, so the gate stayed open
+        # with no grant, and the DHCP, ARP and deaf-watchdog work stopped with
+        # it, until a reboot. Now the call is stopped after 10 s, the loop goes
+        # on, and the gate closes.
+        alive=lambda:Path('/tmp/runtime/alive').read_text() if Path('/tmp/runtime/alive').exists() else ''
+        wait_for(lambda:alive()!='',15)
+        beat=alive()
+        Path('/tmp/hang-ip6tables').write_text('')
+        set_grant(['cbrs_mode_grant=1','cbrs_grant_state=1'])
+        lost=time.monotonic()
+        wait_for(lambda:len(gate_rules())==4,30)
+        took=time.monotonic()-lost
+        assert not Path('/tmp/hang-ip6tables').exists(), 'the gate never ran ip6tables'
+        assert 8<=took<25, took
+        assert 'did not finish within 10 s; stopping it' in ram(), ram()
+        assert alive()!=beat, 'the heartbeat stopped: '+alive()
+        hung=[line for line in subprocess.check_output(['/tmp/bin/real-ps','-eo','pid,stat,args']).decode().splitlines() if 'sleep 3600' in line]
+        assert not hung, ('the hung child was not stopped and reaped', hung)
+        set_grant(['cbrs_mode_grant=1','cbrs_grant_state=2'])
+        wait_for(lambda:gate_rules()==[],10)
+        print('PASS: an ip6tables call that hung was stopped after 10 s; the loop and its heartbeat went on and the gate closed in %.1f s.'%took,flush=True)
         wait_for(lambda:'automatic recovery is armed' in log(),35)
         print('PASS: real ARP reply established the IPv4 baseline with IPv6 unset.',flush=True)
         # Steady-state packet socket audit: the keeper must never hold an
