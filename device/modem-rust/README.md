@@ -79,8 +79,9 @@ controlled and leaves selector 1 untouched:
   under the target.
 - The ceiling, the burst allowance, ECN and the small-packet rule are selector 1's.
 
-Per packet, selector 3 does no division and no grant bookkeeping: the flow count, capacity,
-carrier mode, target and delay readings move to the update every `t_update_ms` (15 ms).
+Per packet, selector 3 does no grant bookkeeping and no PDCP walk, and divides only when the
+backstop scales a small packet's probability: the flow count, capacity, carrier mode, target and
+delay readings move to the update every `t_update_ms` (15 ms).
 
 | Word | Offset | Boot | What |
 | --- | --- | --- | --- |

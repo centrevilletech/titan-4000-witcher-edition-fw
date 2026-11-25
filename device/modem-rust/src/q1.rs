@@ -29,8 +29,9 @@
 //!   target. It stays at zero while CoDel holds the queue, and holds BBR and floods.
 //! - The ceiling, the burst allowance, ECN and the small-packet rule are selector 1's.
 //!
-//! Per packet there is no division and no grant bookkeeping: the capacity, carrier mode,
-//! delay estimate, target and PDCP telemetry move to the update every `t_update_ms`.
+//! Per packet there is no grant bookkeeping and no PDCP walk, and the only division is the
+//! backstop's packet-size scaling: the capacity, carrier mode, delay estimate, target and
+//! PDCP telemetry move to the update every `t_update_ms`.
 
 #![forbid(unsafe_code)]
 
