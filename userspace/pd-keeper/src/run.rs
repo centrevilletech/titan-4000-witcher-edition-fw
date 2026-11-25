@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -71,6 +71,7 @@ use self::carrier::CarrierWatch;
 use self::if_inet6::{link_local, live_prefix, proc_if_inet6_addrs};
 use self::kmsg::{KernelLog, kernel_messages};
 use self::packet::{Class, all_nodes_mac, client_mac_of, ethernet_frame, fe80_1, prefixes_advert, ra_packet, udp_packet};
+use self::routes::main_routes;
 use self::wire::{ControlSockets, send_ipv6, send_marked_frame};
 
 mod carrier;
@@ -80,6 +81,7 @@ mod if_inet6;
 mod kmsg;
 mod mode;
 mod packet;
+mod routes;
 mod wire;
 
 const CUSTOMER: &str = "eth0";
@@ -2608,51 +2610,6 @@ fn bridge_probe_address(bearer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr
         })
 }
 
-// The main table, without spawning ip on every tick.
-fn main_routes() -> String {
-    fs::read_to_string("/proc/net/route")
-        .map(|text| ipv4_routes(&text))
-        .unwrap_or_else(|_| command_stdout("ip", &["route"]))
-}
-
-// The model consumes the two forms printed by ip route. The proc file
-// prints network-order addresses as native-endian hex integers.
-fn ipv4_routes(text: &str) -> String {
-    use std::{fmt::Write, net::Ipv4Addr};
-    let mut routes = String::new();
-    for row in text.lines().skip(1) {
-        let mut fields = row.split_whitespace();
-        let (Some(dev), Some(dest), Some(gw), Some(flags), Some(mask)) = (
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.next(),
-            fields.nth(3),
-        ) else {
-            continue;
-        };
-        let (Ok(dest), Ok(gw), Ok(flags), Ok(mask)) = (
-            u32::from_str_radix(dest, 16),
-            u32::from_str_radix(gw, 16),
-            u32::from_str_radix(flags, 16),
-            u32::from_str_radix(mask, 16),
-        ) else {
-            continue;
-        };
-        if flags & 0x201 != 1 || dev == "*" {
-            continue;
-        }
-        if mask == u32::MAX && gw == 0 {
-            let addr = Ipv4Addr::from(dest.to_ne_bytes());
-            let _ = writeln!(routes, "{addr} dev {dev}");
-        } else if mask == 0 && dest == 0 && flags & 2 != 0 {
-            let addr = Ipv4Addr::from(gw.to_ne_bytes());
-            let _ = writeln!(routes, "default via {addr} dev {dev}");
-        }
-    }
-    routes
-}
-
 #[derive(Default)]
 struct Sniff {
     prefixes: Vec<Block>,
@@ -3230,26 +3187,6 @@ mod tests {
         let (program, args) = link_recovery();
         assert_eq!(program, "mii-tool");
         assert_eq!(args, ["-r", "eth0"]);
-    }
-
-    #[test]
-    fn proc_routes_preserve_direct_hosts_and_gateway_defaults() {
-        let encode = |octets| format!("{:08X}", u32::from_ne_bytes(octets));
-        let host_ip = std::net::Ipv4Addr::from([192, 0, 2, 9]);
-        let gw_ip = std::net::Ipv4Addr::from([192, 0, 2, 1]);
-        let host = encode(host_ip.octets());
-        let gw = encode(gw_ip.octets());
-        let text = format!(
-            "Iface Destination Gateway Flags RefCnt Use Metric Mask\n\
-            br0 {host} 00000000 0005 0 0 0 FFFFFFFF\n\
-            wan 00000000 {gw} 0003 0 0 2 00000000\n\
-            wan {host} {gw} 0007 0 0 0 FFFFFFFF\n\
-            br0 {host} 00000000 0205 0 0 0 FFFFFFFF\n"
-        );
-        assert_eq!(
-            ipv4_routes(&text),
-            format!("{host_ip} dev br0\ndefault via {gw_ip} dev wan\n")
-        );
     }
 
     #[test]
