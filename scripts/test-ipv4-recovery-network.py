@@ -1284,6 +1284,8 @@ for line in sys.stdin:
         before_restart=len(log())
         with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
         wait_for(lambda:'modem restart seen' in log()[before_restart:],10)
+        # The keeper logs the restart just before it rewrites the status file.
+        wait_for(lambda:'state=pending' in flags(),10)
         assert 'state=pending' in flags(), flags()
         print('PASS: a modem restart in the kernel log starts the flag writes over.',flush=True)
         # The clamp and fast path waited for the links, refused bogus bytes and never ran insmod.
