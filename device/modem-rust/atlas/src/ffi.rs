@@ -1,6 +1,6 @@
 //! `extern "C"` signatures for stock `tk.bin` functions that a Rust modem patch
-//! may call (via linker symbol table / `PROVIDE` or typed function pointers) or
-//! replace via hook trampolines.
+//! may call (resolved at link time with `PROVIDE(sym = va | 1);`) or replace via
+//! hook trampolines.
 //!
 //! Calling convention: ARMv7 AAPCS (`r0..r3` args, `r0` return, `r4..r11` callee-saved).
 //! All L2/MAC/GIPC functions below are **Thumb-2** (`va | 1` for indirect `blx`),
@@ -49,7 +49,7 @@ extern "C" {
     /// `0x842d_a5d8` (Thumb): Lookup [`Rbc`] by MAC logical channel ID (`lcid`), NULL if unmapped.
     pub fn rbc_by_lcid(lcid: u32) -> *mut Rbc;
     /// `0x842d_a530` (Thumb): Schedule a deferred L2 callback (`prio`: 1=HP, 2=normal).
-    pub fn l2_sched_event(callback: unsafe extern "C" fn(*mut core::ffi::c_void), arg: *mut core::ffi::c_void, prio: u32);
+    pub fn l2_sched_event(callback: extern "C" fn(*mut core::ffi::c_void), arg: *mut core::ffi::c_void, prio: u32);
     /// `0x842d_9e5c` (Thumb): Start L2 software timer slot `tmr_id` (`0..63`).
     pub fn l2_timer_start(tmr_id: u32);
     /// `0x842d_9ef4` (Thumb): Stop L2 software timer slot `tmr_id` (`0..63`).
@@ -138,44 +138,4 @@ extern "C" {
     pub fn l2_tr_ul_latency(rbc: *mut Rbc, pdcp_sn: u32);
     /// `0x8454_52e8` (Thumb): Track Ring-1 IRB sojourn (`stage`: 0=enqueue, 1=PDCP submit).
     pub fn l2_tr_irb_latency(irb: *mut GipcIrb, stage: u32);
-}
-
-/// Typed 32-bit function-pointer constructors for calling stock `tk.bin` routines
-/// without a custom linker script. Automatically sets the Thumb interworking bit
-/// (`va | 1`) for Thumb functions and preserves bit 0 = `0` for ARM-mode helpers.
-#[cfg(target_pointer_width = "32")]
-pub mod fn_ptr {
-    use super::*;
-    use crate::addr::*;
-
-    #[inline]
-    pub fn rbc_by_lcid() -> unsafe extern "C" fn(u32) -> *mut Rbc {
-        unsafe { core::mem::transmute((FN_RBC_BY_LCID | 1) as usize) }
-    }
-
-    #[inline]
-    pub fn gipc_rel_rx_irb() -> unsafe extern "C" fn(*mut GipcIrb) {
-        unsafe { core::mem::transmute((FN_GIPC_REL_RX_IRB | 1) as usize) }
-    }
-
-    #[inline]
-    pub fn rlc_upd_cur_bo() -> unsafe extern "C" fn(*mut [u32; 4]) {
-        unsafe { core::mem::transmute((FN_RLC_UPD_CUR_BO | 1) as usize) }
-    }
-
-    #[inline]
-    pub fn search_mac_ul_bo_idx() -> unsafe extern "C" fn(u32) -> u8 {
-        unsafe { core::mem::transmute((FN_SEARCH_MAC_UL_BO_IDX | 1) as usize) }
-    }
-
-    #[inline]
-    pub fn clear_mac_ul_buffer() -> unsafe extern "C" fn(*mut MacHarqProc) {
-        unsafe { core::mem::transmute((FN_CLEAR_MAC_UL_BUFFER | 1) as usize) }
-    }
-
-    #[inline]
-    pub fn dma_clean_range_arm() -> unsafe extern "C" fn(*const u8, *const u8) {
-        // ARM mode: bit 0 MUST remain 0.
-        unsafe { core::mem::transmute(FN_DMA_CLEAN_RANGE_ARM as usize) }
-    }
 }

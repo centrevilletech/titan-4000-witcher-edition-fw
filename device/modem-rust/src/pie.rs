@@ -1,355 +1,317 @@
-//! Burst-tolerant Proportional Integral controller Enhanced (PIE, RFC 8033 / RFC 8034)
-//! tailored to an enqueue-time LTE UE uplink hook (GCT GDM7243A TDD Config 2).
+//! PIE (RFC 8033, with DOCSIS-PIE's gain scaling from RFC 8034) for the LTE uplink,
+//! run at Ring-1 enqueue in integer arithmetic on the control block's words.
 //!
-//! Pure 32-bit integer / fixed-point `no_std` implementation: zero floating-point,
-//! zero 64-bit arithmetic, zero heap allocation, and zero panics.
+//! Three limits shape the queue:
+//!
+//! - **Target.** The control law moves the drop probability `p` toward the queue delay
+//!   that holds `target_ms`.
+//! - **Budget.** For responsive senders (CUBIC), `p` is capped at `drop_budget_q24`
+//!   (2%). Four CUBIC flows on one carrier would need about 4% to sit at the target;
+//!   capped, their queue floats higher instead. The Nokia eNB keeps the second uplink
+//!   carrier busy only while the reported backlog stays high, so that float is worth
+//!   about half the upload rate.
+//! - **Ceiling.** Big packets are tail-dropped above `max(ceiling_floor_bytes, drain
+//!   rate x ceiling_ms)`. Responsive senders back off and rarely come back; a sender
+//!   that does not respond to loss (BBR, a UDP flood) keeps hitting it.
+//!
+//! A token bucket polices the ceiling at the budget rate, `ceiling_burst_pkts` deep.
+//! When it runs dry, the traffic is not responding to the budget, so the cap is
+//! lifted: `p` may rise to whatever holds the target (RFC 8033). This *overload* ends
+//! at the first update where `p` is back under the budget. Slow-start overshoot and
+//! isolated tail-drop bursts fit in the bucket.
+//!
+//! The bench result this answers (2026-11-25, `runs-20261125-m1/`): with the budget
+//! alone, 4 BBR flows sat on the ceiling, 1,438 ceiling drops against 54 PIE drops in
+//! 20 s.
+//!
+//! No floating point, no 64-bit arithmetic, no allocation, no panic paths.
 
-use crate::ecn::try_mark_ce;
+#![forbid(unsafe_code)]
 
-/// Fixed-point probability unity (`1.0 == 1 << 24 = 16_777_216`).
+use crate::block::M1Block;
+use crate::ecn;
+
+/// Probability 1.0 in Q24.
 pub const P_SCALE: u32 = 1 << 24;
 
-/// De-randomization thresholds (`0.5` and `4.0`, tuned from RFC 8033 Section 5.1
-/// for low-BDP 1CC LTE uplinks so first drops aren't delayed by ~500 ms).
-pub const ACCU_LOW: u32 = P_SCALE >> 1;
-pub const ACCU_HIGH: u32 = P_SCALE << 2;
+/// Derandomisation bounds on the drop accumulator (RFC 8033 section 5.1 uses 0.85 and
+/// 8.5; lower bounds let the first drop come sooner at LTE's small windows).
+const ACCU_LOW: u32 = P_SCALE / 2;
+const ACCU_HIGH: u32 = P_SCALE * 4;
 
-/// Identity magic `"M1PI"` (decodes cleanly as Thumb-2 under Capstone).
-pub const M1_MAGIC: u32 = 0x4d31_5049;
-/// Build version `2026-11-25` (BCD, decodes cleanly as Thumb-2 under Capstone).
-pub const M1_VERSION: u32 = 0x2026_1125;
+/// Largest rise of `p` per update (+2%).
+const MAX_STEP: i32 = (P_SCALE / 50) as i32;
 
-/// Runtime selector values at `M1Block::selector` (`0x841b5908`).
-pub const SELECTOR_N4_V2: u32 = 0;
-pub const SELECTOR_RUST_PIE: u32 = 1;
-pub const SELECTOR_NO_AQM: u32 = 2;
+/// A gap this long between updates resets the controller.
+pub const IDLE_RESET_MS: u32 = 200;
 
-/// Feature flags in `M1Block::flags` (`0x841b5930`).
+/// The xorshift32 state after boot (and whenever it would be zero).
+pub const RNG_SEED: u32 = 0x1357_2468;
+
+/// `flags`: packet-size scaling of `p` (RFC 8033 section 5.2).
 pub const FLAG_SIZE_SCALE: u32 = 1 << 0;
-pub const FLAG_DERAND: u32 = 1 << 1;
+/// `flags`: derandomised drops (RFC 8033 section 5.1).
+pub const FLAG_DERANDOMISE: u32 = 1 << 1;
 
-/// Outcome of evaluating one Ring-1 uplink packet.
+/// One packet arriving at Ring 1, with the queue and grant state hook 4 sees.
+#[derive(Copy, Clone, Debug)]
+pub struct Arrival {
+    /// IP length.
+    pub len: u32,
+    /// 1 ms TTI clock.
+    pub now: u32,
+    /// Bytes waiting in Ring 0 + Ring 1 + the cipher batch + RLC staging.
+    pub queue_bytes: u32,
+    /// N4's EWMA of granted bytes per uplink TTI.
+    pub g_ema: u32,
+    /// N4's minimum length for drops and marks (600 B).
+    pub min_len: u32,
+}
+
+/// What happens to a packet. The discriminant indexes `M1Block::decisions`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(u32)]
+#[repr(u8)]
 pub enum Decision {
-    /// Enqueue normally to Ring 1 (Exit B).
     Enqueue = 0,
-    /// Enqueue normally to Ring 1 after marking CE in place (Exit B).
-    EcnMark = 1,
-    /// Probabilistic PIE drop (Exit D).
-    Drop = 2,
-    /// Hard overload ceiling drop (Exit D).
-    HardDrop = 3,
-    /// Spared because `pkt_len < min_len` while congested (Exit B).
+    Drop = 1,
+    /// Enqueued with CE set.
+    Mark = 2,
+    /// Tail-dropped at the ceiling.
+    Ceiling = 3,
+    /// Enqueued above target: shorter than the AQM's minimum length.
     SparedSmall = 4,
+    /// Enqueued above target: inside the burst allowance.
+    SparedBurst = 5,
 }
 
 impl Decision {
-    #[inline]
     pub const fn is_drop(self) -> bool {
-        matches!(self, Decision::Drop | Decision::HardDrop)
+        matches!(self, Self::Drop | Self::Ceiling)
     }
 }
-
-/// 256-byte (4 x 64 B cache lines) RAM control, parameter, state, and counter block.
-///
-/// Placed at `0x841b5900..0x841b5a00` inside dead `UMM_DecodeATR` (M2 cave catalog).
-/// Every field is a 32-bit little-endian word readable/writable via DM `vm`/`wm`.
-#[repr(C)]
-#[derive(Clone, Debug)]
-pub struct M1Block {
-    // --- Header & tunable parameters (+0x00..+0x3f) ---
-    pub magic: u32,             // +0x00: 0x4d315049 ("M1PI")
-    pub version: u32,           // +0x04: 0x20261125
-    pub selector: u32,          // +0x08: 0=old N4 v2 (default/rollback), 1=Rust PIE, 2=no AQM
-    pub target_delay_ms: u32,   // +0x0c: target queue delay in ms (default 14)
-    pub t_update_ms: u32,       // +0x10: PI control-law update period in ms (default 15)
-    pub max_burst_ms: u32,      // +0x14: burst allowance window in ms (default 55)
-    pub alpha_q10: u32,         // +0x18: alpha * 1024 in Hz (default 256 = 0.25, DOCSIS-PIE)
-    pub beta_q10: u32,          // +0x1c: beta * 1024 in Hz (default 2560 = 2.50, DOCSIS-PIE)
-    pub min_rate_bpms: u32,     // +0x20: floor on drain-rate estimate in B/ms (default 500 = 4 Mbps)
-    pub hard_cap_bytes: u32,    // +0x24: min overload ceiling in bytes (default 50000 = 50 KB; scales with 10*G_ema)
-    pub ecn_max_prob_q24: u32,  // +0x28: max prob_q24 for ECN marking (default 1677722 ~= 10%)
-    pub mtu_bytes: u32,         // +0x2c: reference MTU for packet-size scaling (default 1380)
-    pub flags: u32,             // +0x30: bit0=size_scale, bit1=accu_prob derand (default 3)
-    pub max_drop_prob_q24: u32, // +0x34: cap on probabilistic drop/mark rate in Q24 (default 335544 = 2%; 0=uncapped)
-    pub reserved_cfg: [u32; 2], // +0x38..+0x3f
-
-    // --- Live PIE controller state (+0x40..+0x5f) ---
-    pub prob_q24: u32,        // +0x40: current drop/mark probability in Q24 (1.0 = 1<<24)
-    pub accu_prob_q24: u32,   // +0x44: RFC 8033 Section 5.1 de-randomization accumulator
-    pub qdelay_us: u32,       // +0x48: latest estimated total queue sojourn delay (us)
-    pub qdelay_old_us: u32,   // +0x4c: previous T_update queue delay (us)
-    pub burst_allow_ms: u32,  // +0x50: remaining burst allowance (ms)
-    pub last_update_tti: u32, // +0x54: 1 ms TTI clock of last PI update
-    pub last_rate_bpms: u32,  // +0x58: latest estimated drain rate (B/ms)
-    pub rng_state: u32,       // +0x5c: xorshift32 PRNG state (non-zero)
-
-    // --- Diagnostic counters (+0x60..+0x97) ---
-    pub c_pie_seen: u32,          // +0x60: packets evaluated by Rust PIE
-    pub c_pie_enq: u32,           // +0x64: packets enqueued (incl. ECN marked & spared)
-    pub c_pie_drop: u32,          // +0x68: probabilistic PIE drops
-    pub c_pie_mark: u32,          // +0x6c: ECN CE marks applied
-    pub c_pie_hard_drop: u32,     // +0x70: hard-cap overload drops
-    pub c_pie_spared_small: u32,  // +0x74: packets < min_len spared while congested
-    pub c_pie_spared_burst: u32,  // +0x78: packets spared by burst_allow_ms > 0
-    pub c_pie_updates: u32,       // +0x7c: PI control-law updates executed
-    pub c_pie_max_qdelay_us: u32, // +0x80: peak estimated queue delay (us)
-    pub c_pie_max_prob_q24: u32,  // +0x84: peak prob_q24 observed
-    pub c_bypass_pkts: u32,       // +0x88: packets bypassed under selector == 2
-    pub c_pie_idle_resets: u32,   // +0x8c: idle/quiet burst-allowance resets
-    pub pdcp_hol_age_ms: u32,     // +0x90: live PDCP-to-ACK HoL age from rbc->pdcp_ul_win[oldest_sn] (telemetry)
-    pub pdcp_max_hol_age_ms: u32, // +0x94: peak PDCP-to-ACK HoL age observed (ms)
-
-    // --- Zero tail to exact 256 B (+0x98..+0xff) ---
-    pub reserved_tail: [u32; 26],
-}
-
-const _: () = assert!(core::mem::size_of::<M1Block>() == 256);
 
 impl M1Block {
-    /// Boot-default `M1Block` with `selector = 0` (old N4 v2 behaviour, off by default).
-    pub const fn new_boot_default() -> Self {
-        Self {
-            magic: M1_MAGIC,
-            version: M1_VERSION,
-            selector: SELECTOR_N4_V2,
-            target_delay_ms: 14,
-            t_update_ms: 15,
-            max_burst_ms: 55,
-            alpha_q10: 256,              // 0.25 Hz (DOCSIS-PIE)
-            beta_q10: 2560,              // 2.50 Hz (DOCSIS-PIE)
-            min_rate_bpms: 500,          // 4 Mbps drain floor
-            hard_cap_bytes: 50_000,      // 50 KB floor (adapts to max(hard_cap_bytes, 10*G_ema); Capstone-clean word 0x0000c350)
-            ecn_max_prob_q24: 1_677_722, // ~10% of 2^24
-            mtu_bytes: 1380,
-            flags: FLAG_SIZE_SCALE | FLAG_DERAND,
-            max_drop_prob_q24: 335_544, // 2% probabilistic cap (0 = uncapped)
-            reserved_cfg: [0; 2],
-            prob_q24: 0,
-            accu_prob_q24: 0,
-            qdelay_us: 0,
-            qdelay_old_us: 0,
-            burst_allow_ms: 55,
-            last_update_tti: 0,
-            last_rate_bpms: 0,
-            rng_state: 0x1357_2468,
-            c_pie_seen: 0,
-            c_pie_enq: 0,
-            c_pie_drop: 0,
-            c_pie_mark: 0,
-            c_pie_hard_drop: 0,
-            c_pie_spared_small: 0,
-            c_pie_spared_burst: 0,
-            c_pie_updates: 0,
-            c_pie_max_qdelay_us: 0,
-            c_pie_max_prob_q24: 0,
-            c_bypass_pkts: 0,
-            c_pie_idle_resets: 0,
-            pdcp_hol_age_ms: 0,
-            pdcp_max_hol_age_ms: 0,
-            reserved_tail: [0; 26],
+    /// Decide one packet and count it. `ip` is the start of its IP header (CE is set in
+    /// place).
+    pub fn decide(&self, arrival: Arrival, ip: &mut [u8]) -> Decision {
+        let rate_bpms = self.drain_rate_bpms(arrival.g_ema);
+        let qdelay_us = arrival.queue_bytes.min(4_000_000) * 1000 / rate_bpms;
+        self.rate_bpms.set(rate_bpms);
+        self.qdelay_us.set(qdelay_us);
+        self.max_qdelay_us.raise(qdelay_us);
+        self.seen.bump();
+
+        let dt = arrival.now.wrapping_sub(self.last_update_tti.get());
+        if dt >= self.t_update_ms.get() {
+            self.update(qdelay_us, arrival.now, dt);
+        }
+        let decision = self.classify(&arrival, qdelay_us, rate_bpms, ip);
+        self.count_decision(decision);
+        decision
+    }
+
+    fn classify(&self, arrival: &Arrival, qdelay_us: u32, rate_bpms: u32, ip: &mut [u8]) -> Decision {
+        let above_target = qdelay_us > self.target_us();
+
+        // Small packets (ACKs, DNS, VoIP, handshakes) are never dropped or marked.
+        if arrival.len < arrival.min_len {
+            return if above_target { Decision::SparedSmall } else { Decision::Enqueue };
+        }
+
+        let ceiling = self.ceiling_bytes(rate_bpms);
+        if ceiling > 0 && arrival.queue_bytes > ceiling {
+            self.accu_q24.set(0);
+            self.spend_token();
+            return Decision::Ceiling;
+        }
+        self.earn_token();
+
+        // The burst allowance absorbs TDD framing, HARQ pauses and TCP bursts.
+        if self.burst_ms.get() > 0 {
+            return if above_target { Decision::SparedBurst } else { Decision::Enqueue };
+        }
+
+        // No drops while the queue is short (RFC 8033 section 4.3).
+        let p = self.prob_q24.get();
+        let mtu = self.mtu_bytes.get().max(1);
+        let half_target = self.target_us() / 2;
+        let quiet = qdelay_us < half_target && self.qdelay_old_us.get() < half_target && p < P_SCALE / 5;
+        if p == 0 || arrival.queue_bytes < mtu.saturating_mul(2) || quiet {
+            return Decision::Enqueue;
+        }
+
+        let flags = self.flags.get();
+        let p_packet = if flags & FLAG_SIZE_SCALE != 0 && arrival.len < mtu {
+            ((p >> 8).saturating_mul(arrival.len) / mtu) << 8
+        } else {
+            p
+        };
+        if !self.trigger(p_packet, flags & FLAG_DERANDOMISE != 0) {
+            return Decision::Enqueue;
+        }
+
+        let ecn_max = self.ecn_max_prob_q24.get();
+        if (ecn_max == 0 || p <= ecn_max) && ecn::mark_ce(ip) {
+            Decision::Mark
+        } else {
+            Decision::Drop
         }
     }
 
-    #[inline(always)]
-    fn next_rand_q24(&mut self) -> u32 {
-        let mut x = self.rng_state;
-        if x == 0 {
-            x = 0x1357_2468;
-        }
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.rng_state = x;
-        x & (P_SCALE - 1)
-    }
-
-    /// Run the periodic RFC 8033 / 8034 PI control-law update when `t_update_ms` has elapsed.
+    /// The control law, every `t_update_ms`.
     #[inline(never)]
-    fn update_pi(&mut self, cur_delay_us: u32, target_us: u32, now_tti: u32, dt: u32) {
-        // First packet ever or long idle gap (> 200 ms): reset controller cleanly.
-        if self.c_pie_updates == 0 || dt > 200 {
-            self.prob_q24 = 0;
-            self.accu_prob_q24 = 0;
-            self.qdelay_old_us = cur_delay_us;
-            self.burst_allow_ms = self.max_burst_ms;
-            self.last_update_tti = now_tti;
-            self.c_pie_updates = self.c_pie_updates.wrapping_add(1);
-            self.c_pie_idle_resets = self.c_pie_idle_resets.wrapping_add(1);
+    fn update(&self, qdelay_us: u32, now: u32, dt: u32) {
+        self.updates.bump();
+        if dt > IDLE_RESET_MS {
+            self.reset(qdelay_us, now);
             return;
         }
 
-        let old_delay_us = self.qdelay_old_us;
-        // 64 us ticks (1/15625 s), clamped to +-500 ms -> pure 32-bit i32 math.
-        let cur_t = (cur_delay_us.min(500_000) >> 6) as i32;
-        let ref_t = (target_us.min(500_000) >> 6) as i32;
-        let old_t = (old_delay_us.min(500_000) >> 6) as i32;
-        let err = cur_t - ref_t;
-        let diff = cur_t - old_t;
+        let overload = self.overload.get() != 0;
+        let cap = if overload { P_SCALE } else { self.budget() };
+        let p_old = self.prob_q24.get().min(P_SCALE) as i32;
+        let mut p = p_old.saturating_add(self.control_delta(qdelay_us)).clamp(0, cap as i32) as u32;
 
-        // (q10 / 1024) * (ticks / 15625) * 2^24 = q10 * ticks * 1.048576
-        // ~= sum + (sum >> 4) - (sum >> 6)  (1.046875, 0.16% accuracy, zero division).
-        let a = (self.alpha_q10 & 0x3fff) as i32;
-        let b = (self.beta_q10 & 0x3fff) as i32;
-        let raw_sum = a * err + b * diff;
-        let raw_delta = raw_sum + (raw_sum >> 4) - (raw_sum >> 6);
+        // Below half the target for two updates: decay p, and re-arm the burst
+        // allowance once p reaches zero.
+        let half_target = self.target_us() / 2;
+        if qdelay_us < half_target && self.qdelay_old_us.get() < half_target {
+            p -= p >> 3;
+            if p < 16 {
+                p = 0;
+                self.burst_ms.set(self.max_burst_ms.get());
+                self.accu_q24.set(0);
+                self.rearms.bump();
+            }
+        } else {
+            self.burst_ms.set(self.burst_ms.get().saturating_sub(dt));
+        }
 
-        let prob = self.prob_q24;
-        // DOCSIS-PIE (RFC 8034) gain auto-scaling.
-        let shift: u32 = if prob < (P_SCALE / 200) {
-            2 // p < 0.5%: 1/4 step
-        } else if prob < (P_SCALE / 20) {
-            1 // p < 5%: 1/2 step
+        // The overload ends once the budget is enough again.
+        if overload {
+            if p >= self.budget() {
+                self.overload_updates.bump();
+            } else {
+                self.overload.set(0);
+            }
+        }
+        self.prob_q24.set(p);
+        self.max_prob_q24.raise(p);
+        self.qdelay_old_us.set(qdelay_us);
+        self.last_update_tti.set(now);
+    }
+
+    /// Start over after an idle gap: no drop probability, a full burst allowance and a
+    /// full token bucket.
+    fn reset(&self, qdelay_us: u32, now: u32) {
+        self.prob_q24.set(0);
+        self.accu_q24.set(0);
+        self.qdelay_old_us.set(qdelay_us);
+        self.burst_ms.set(self.max_burst_ms.get());
+        self.last_update_tti.set(now);
+        self.overload.set(0);
+        self.tokens_q24.set(self.token_depth());
+        self.rearms.bump();
+    }
+
+    /// The PI step `alpha * (qdelay - target) + beta * (qdelay - qdelay_old)` in Q24.
+    fn control_delta(&self, qdelay_us: u32) -> i32 {
+        // 64 us ticks clamped to 500 ms keep every product inside i32.
+        let ticks = |us: u32| (us.min(500_000) >> 6) as i32;
+        let error = ticks(qdelay_us) - ticks(self.target_us());
+        let trend = ticks(qdelay_us) - ticks(self.qdelay_old_us.get());
+        let alpha = (self.alpha_q10.get() & 0x3fff) as i32;
+        let beta = (self.beta_q10.get() & 0x3fff) as i32;
+        let raw = alpha * error + beta * trend;
+        // Gain (1/1024) x tick (1/15625 s) x Q24 = 1.048576 ~ 1 + 1/16 - 1/64.
+        let delta = raw + (raw >> 4) - (raw >> 6);
+        // DOCSIS-PIE: smaller steps while p is small.
+        let p = self.prob_q24.get();
+        let shift = if p < P_SCALE / 200 {
+            2
+        } else if p < P_SCALE / 20 {
+            1
         } else {
             0
         };
-        let mut delta = raw_delta >> shift;
-        let max_step = (P_SCALE / 50) as i32; // cap positive jump at +2% per tick
-        if delta > max_step {
-            delta = max_step;
-        }
-
-        let cap = if self.max_drop_prob_q24 > 0 && self.max_drop_prob_q24 < P_SCALE {
-            self.max_drop_prob_q24 as i32
-        } else {
-            P_SCALE as i32
-        };
-        let mut new_prob = (prob as i32 + delta).clamp(0, cap) as u32;
-
-        // Exponential decay and burst-allowance reset when queue stays below target/2.
-        let half_target = target_us >> 1;
-        if cur_delay_us < half_target && old_delay_us < half_target {
-            new_prob -= new_prob >> 3;
-            if new_prob < 16 {
-                new_prob = 0;
-            }
-            if new_prob == 0 {
-                self.burst_allow_ms = self.max_burst_ms;
-                self.accu_prob_q24 = 0;
-                self.c_pie_idle_resets = self.c_pie_idle_resets.wrapping_add(1);
-            }
-        } else if self.burst_allow_ms > 0 {
-            self.burst_allow_ms = self.burst_allow_ms.saturating_sub(dt);
-        }
-
-        self.prob_q24 = new_prob;
-        if new_prob > self.c_pie_max_prob_q24 {
-            self.c_pie_max_prob_q24 = new_prob;
-        }
-        self.qdelay_old_us = cur_delay_us;
-        self.last_update_tti = now_tti;
-        self.c_pie_updates = self.c_pie_updates.wrapping_add(1);
+        (delta >> shift).min(MAX_STEP)
     }
 
-    /// Evaluate one Ring-1 uplink packet arriving at `now_tti` (1 ms TTI clock).
-    #[inline]
-    pub fn evaluate_packet(
-        &mut self,
-        q_total: u32,
-        g_ema: u32,
-        min_len: u32,
-        pkt_len: u32,
-        now_tti: u32,
-        ip_hdr: &mut [u8],
-    ) -> Decision {
-        self.c_pie_seen = self.c_pie_seen.wrapping_add(1);
-
-        // Drain rate in B/ms: TDD Config 2 has 1 UL subframe per 5 ms -> G_ema / 5.
-        let rate_bpms = (g_ema / 5).max(self.min_rate_bpms.max(1));
-        self.last_rate_bpms = rate_bpms;
-        let cur_delay_us = (q_total.min(4_000_000) * 1000) / rate_bpms;
-        self.qdelay_us = cur_delay_us;
-        if cur_delay_us > self.c_pie_max_qdelay_us {
-            self.c_pie_max_qdelay_us = cur_delay_us;
+    /// Whether to act on this packet at probability `p_q24`.
+    fn trigger(&self, p_q24: u32, derandomise: bool) -> bool {
+        if !derandomise {
+            return self.random_q24() < p_q24;
         }
-
-        let target_us = self.target_delay_ms * 1000;
-        let dt = now_tti.wrapping_sub(self.last_update_tti);
-        if self.c_pie_updates == 0 || dt >= self.t_update_ms {
-            self.update_pi(cur_delay_us, target_us, now_tti, dt);
+        let accu = self.accu_q24.get().saturating_add(p_q24);
+        if accu < ACCU_LOW || (accu < ACCU_HIGH && self.random_q24() >= p_q24) {
+            self.accu_q24.set(accu);
+            return false;
         }
+        self.accu_q24.set(0);
+        true
+    }
 
-        // Rule 1: Never drop or mark packets shorter than min_len (600 B, N5 fast lane).
-        if pkt_len < min_len {
-            self.c_pie_enq = self.c_pie_enq.wrapping_add(1);
-            if cur_delay_us > target_us {
-                self.c_pie_spared_small = self.c_pie_spared_small.wrapping_add(1);
-                return Decision::SparedSmall;
-            }
-            return Decision::Enqueue;
-        }
-
-        // Rule 2: Adaptive hard overload ceiling (max(hard_cap_bytes, 10 * G_ema) = ~50 ms on 1CC & 2CC).
-        let hard_cap = self.hard_cap_bytes;
-        if hard_cap > 0 {
-            let scaled_cap = g_ema.saturating_mul(10);
-            let eff_cap = if scaled_cap > hard_cap { scaled_cap } else { hard_cap };
-            if q_total > eff_cap {
-                self.accu_prob_q24 = 0;
-                self.c_pie_hard_drop = self.c_pie_hard_drop.wrapping_add(1);
-                return Decision::HardDrop;
-            }
-        }
-
-        // Rule 3: Burst tolerance window absorbs TDD 5 ms framing, HARQ pauses, and TCP GSO bursts.
-        if self.burst_allow_ms > 0 {
-            if cur_delay_us > target_us {
-                self.c_pie_spared_burst = self.c_pie_spared_burst.wrapping_add(1);
-            }
-            self.c_pie_enq = self.c_pie_enq.wrapping_add(1);
-            return Decision::Enqueue;
-        }
-
-        // Rule 4: Low-queue drop suppression (RFC 8033 Section 4.3).
-        let mtu = self.mtu_bytes.max(1);
-        let prob = self.prob_q24;
-        let half_target = target_us >> 1;
-        if prob == 0
-            || q_total < (mtu << 1)
-            || (cur_delay_us < half_target && self.qdelay_old_us < half_target && prob < (P_SCALE / 5))
-        {
-            self.c_pie_enq = self.c_pie_enq.wrapping_add(1);
-            return Decision::Enqueue;
-        }
-
-        // Rule 5: Packet-size scaling (RFC 8033 Section 5.2, 32-bit udiv only).
-        let p_pkt = if (self.flags & FLAG_SIZE_SCALE) != 0 && pkt_len < mtu {
-            (((prob >> 8) * pkt_len) / mtu) << 8
-        } else {
-            prob
+    /// Uniform Q24 sample from xorshift32.
+    fn random_q24(&self) -> u32 {
+        let mut x = match self.rng.get() {
+            0 => RNG_SEED,
+            x => x,
         };
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng.set(x);
+        x & (P_SCALE - 1)
+    }
 
-        // Rule 6: De-randomized drop/mark decision (RFC 8033 Section 5.1).
-        let trigger = if (self.flags & FLAG_DERAND) != 0 {
-            let acc = self.accu_prob_q24.saturating_add(p_pkt);
-            if acc < ACCU_LOW {
-                self.accu_prob_q24 = acc;
-                false
-            } else if acc >= ACCU_HIGH || self.next_rand_q24() < p_pkt {
-                self.accu_prob_q24 = 0;
-                true
-            } else {
-                self.accu_prob_q24 = acc;
-                false
-            }
-        } else {
-            self.next_rand_q24() < p_pkt
-        };
-
-        if !trigger {
-            self.c_pie_enq = self.c_pie_enq.wrapping_add(1);
-            return Decision::Enqueue;
+    /// A ceiling drop spends one packet of budget; an empty bucket starts an overload.
+    fn spend_token(&self) {
+        if self.token_depth() == 0 {
+            return;
         }
-
-        // Rule 7: ECN CE mark for ECT(0)/ECT(1) packets when prob <= ecn_max_prob_q24 (RFC 8033 Section 5.3).
-        if (self.ecn_max_prob_q24 == 0 || prob <= self.ecn_max_prob_q24) && try_mark_ce(ip_hdr) {
-            self.c_pie_mark = self.c_pie_mark.wrapping_add(1);
-            self.c_pie_enq = self.c_pie_enq.wrapping_add(1);
-            return Decision::EcnMark;
+        let tokens = self.tokens_q24.get().saturating_sub(P_SCALE);
+        self.tokens_q24.set(tokens);
+        if tokens == 0 && self.overload.get() == 0 {
+            self.overload.set(1);
+            self.overloads.bump();
         }
+    }
 
-        self.c_pie_drop = self.c_pie_drop.wrapping_add(1);
-        Decision::Drop
+    /// A packet under the ceiling earns one packet's share of the budget.
+    fn earn_token(&self) {
+        let depth = self.token_depth();
+        if depth == 0 {
+            return;
+        }
+        let tokens = self.tokens_q24.get().saturating_add(self.budget());
+        self.tokens_q24.set(tokens.min(depth));
+    }
+
+    fn target_us(&self) -> u32 {
+        self.target_ms.get().saturating_mul(1000)
+    }
+
+    /// The cap on `p` outside overload: 0 or above 1.0 means no cap (plain RFC 8033).
+    pub fn budget(&self) -> u32 {
+        match self.drop_budget_q24.get() {
+            0 => P_SCALE,
+            b => b.min(P_SCALE),
+        }
+    }
+
+    /// Bytes per ms the uplink drains: N4's grant EWMA is bytes per uplink TTI.
+    pub fn drain_rate_bpms(&self, g_ema: u32) -> u32 {
+        let per_frame = self.ul_subframes_per_frame.get().clamp(1, 10);
+        (g_ema.saturating_mul(per_frame) / 10).max(self.min_rate_bpms.get()).max(1)
+    }
+
+    /// The ceiling at drain rate `rate_bpms`; 0 means none.
+    pub fn ceiling_bytes(&self, rate_bpms: u32) -> u32 {
+        self.ceiling_floor_bytes.get().max(rate_bpms.saturating_mul(self.ceiling_ms.get()))
+    }
+
+    /// The token bucket's depth (Q24 packets, at most 255); 0 turns overloads off.
+    pub fn token_depth(&self) -> u32 {
+        self.ceiling_burst_pkts.get().min(255) << 24
     }
 }

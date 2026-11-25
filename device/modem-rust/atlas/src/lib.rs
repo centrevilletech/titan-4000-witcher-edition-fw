@@ -86,26 +86,6 @@ impl<T> Ptr32<T> {
     }
 }
 
-/// Helper to read a volatile `u32` at a fixed modem VA on 32-bit targets.
-///
-/// # Safety
-/// Caller must ensure `va` is a valid, 4-byte-aligned modem address.
-#[cfg(target_pointer_width = "32")]
-#[inline]
-pub unsafe fn read_u32(va: u32) -> u32 {
-    core::ptr::read_volatile(va as *const u32)
-}
-
-/// Helper to write a volatile `u32` at a fixed modem VA on 32-bit targets.
-///
-/// # Safety
-/// Caller must ensure `va` is a valid, writable, 4-byte-aligned modem address.
-#[cfg(target_pointer_width = "32")]
-#[inline]
-pub unsafe fn write_u32(va: u32, val: u32) {
-    core::ptr::write_volatile(va as *mut u32, val);
-}
-
 #[cfg(test)]
 mod tests {
     use core::mem::{offset_of, size_of};
