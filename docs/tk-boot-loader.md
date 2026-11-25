@@ -8,7 +8,14 @@ on a confirmed boot of a staged image and only the words `tk/config` lists
 
 Since v1.0.16 a unit can build the release image itself from its own stock
 firmware: `titan-pd-keeper tk-build stage` writes `tk/active.gz` and
-`tk/config` (see [Building the modem image on the unit](tk-patch.md)).
+`tk/config` (see [Building the modem image on the unit](tk-patch.md)). The
+release image is `n6h-r4-r1`:
+
+- N6H;
+- lane R4's Rust N4 uplink engine;
+- lane R1's hardened Rust PIE uplink AQM (M1 block version `0x20261126`).
+
+Its gzip SHA-256 is `3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb`.
 
 ## Why
 
@@ -464,8 +471,9 @@ In RAM:
   change and its own bench test.
 - **No crash quarantine.** A modem crash after a confirmed boot reloads stock
   NAND firmware without a reboot, but the next boot loads the image again.
-- **One image built on the unit.** `tk-build` builds the release image the
-  keeper carries ([tk-patch.md](tk-patch.md)). Any other image is staged by hand.
+- **One image built on the unit.** `tk-build` builds only the release image
+  `n6h-r4-r1` (N6H + R4's Rust N4 + R1's PIE; [tk-patch.md](tk-patch.md)).
+  Any other image is staged by hand.
 - **Not yet run on hardware.** The early attach of `mtd20` before the vendor's
   `rcinit` is new. It runs on every boot of every unit with this firmware, opt
   in or not, and the bench must prove it first.

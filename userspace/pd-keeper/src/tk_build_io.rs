@@ -226,16 +226,19 @@ mod tests {
     use witcher_tk_patch::manifest::Manifest;
     use witcher_tk_patch::manifests;
 
-    /// `stage` writes the release image. Unless the keeper manages that
-    /// image's M1 block version, its PIE selector is never written and the
+    /// `stage` writes the release image, N6H + R4's Rust N4 + R1's PIE. It
+    /// carries R1's M1 block, version 0x20261126, and the keeper must manage
+    /// that version: otherwise its PIE selector is never written and the
     /// image runs N4's AQM.
     #[test]
-    fn the_release_image_carries_an_m1_block_the_keeper_manages() {
+    fn the_release_image_carries_r1s_m1_block_which_the_keeper_manages() {
         let m = Manifest::parse(manifests::RELEASE).unwrap();
+        assert_eq!(m.name, "n6h-r4-r1");
         let block = m.replacement_at(M1_MAGIC_ADDR, 8).expect("the release image carries the M1 block");
         let word = |at: usize| u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
         // The console prints the word most significant byte first: "M1PI".
         assert_eq!(word(0).to_be_bytes(), *b"M1PI");
+        assert_eq!(word(4), 0x2026_1126, "R1's M1 block version");
         assert!(M1_VERSIONS.contains(&word(4)), "the keeper does not manage M1 block version {:#x}", word(4));
     }
 }

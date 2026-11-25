@@ -36,8 +36,10 @@ def check(name, ok, detail=''):
 def release_gzip_sha():
     """The gzip SHA-256 the keeper's built-in manifest (manifests::RELEASE) pins."""
     src = (REPO / 'userspace/tk-patch/src/manifests.rs').read_text()
-    name = re.search(r'pub const RELEASE: &str = (\w+);', src)[1].lower()
-    text = (REPO / f'userspace/tk-patch/manifests/{name}.manifest').read_text()
+    const = re.search(r'pub const RELEASE: &str = (\w+);', src)[1]
+    # The file the constant includes, not a name guessed from the constant.
+    path = re.search(rf'pub const {const}: &str = include_str!\("\.\./manifests/([^"]+)"\);', src)[1]
+    text = (REPO / 'userspace/tk-patch/manifests' / path).read_text()
     return re.search(r'^gzip \d+ ([0-9a-f]{64})$', text, re.M)[1]
 
 
