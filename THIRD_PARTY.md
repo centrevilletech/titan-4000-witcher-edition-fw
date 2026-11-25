@@ -103,12 +103,14 @@ ABI patches, exact upstream source locations and ARM build recipe accompany
 the payload in [device/sqm/source](device/sqm/source/). Release distributors
 should include these inputs and the corresponding upstream sources.
 
-## Download clamp module
+## Download clamp and fast path modules
 
-`device/qctrl/payload/titan_qctrl.ko` (staged on a unit's persistent volume,
-not packed in the image) is an original Centreville Tech, LLC kernel module.
-Its source in [device/qctrl/source](device/qctrl/source/) is licensed
-GPL-2.0-only, because the module runs inside the GPL-2.0 Linux kernel; the
-license text is [device/sqm/source/COPYING](device/sqm/source/COPYING).
-`device/qctrl/source/build.sh` rebuilds the binary byte for byte with
-Ubuntu 24.04's `gcc-arm-linux-gnueabihf` (GCC 13.3.0-6ubuntu2~24.04.1).
+`device/qctrl/payload/titan_qctrl.ko` and `device/fastpath/payload/titan_k1fp.ko`
+are original Centreville Tech, LLC kernel modules. Since v1.0.17 both are packed
+in the image at `/usr/lib/titan-api/modules/`. Their sources in
+[device/qctrl/source](device/qctrl/source/) and
+[device/fastpath/source](device/fastpath/source/) are licensed GPL-2.0-only,
+because the modules run inside the GPL-2.0 Linux kernel; the license text is
+[device/sqm/source/COPYING](device/sqm/source/COPYING). Each `build.sh` rebuilds
+its binary byte for byte with Ubuntu 24.04's `gcc-arm-linux-gnueabihf`
+(GCC 13.3.0-6ubuntu2~24.04.1).
