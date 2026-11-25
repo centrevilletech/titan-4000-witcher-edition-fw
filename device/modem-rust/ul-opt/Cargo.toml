@@ -1,0 +1,13 @@
+[package]
+name = "witcher-modem-ul-opt"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "no_std Rust Thumb-2 boot-off optimizations for the Titan 4000 PDCP/RLC/BSR uplink hot path"
+
+[dependencies]
+modem-atlas = { path = "../atlas" }
+
+[lib]
+name = "witcher_modem_ul_opt"
+crate-type = ["rlib", "staticlib"]

@@ -162,6 +162,14 @@ mod tests {
         assert_eq!(offset_of!(RbcRing, rd), 0x02);
         assert_eq!(offset_of!(RbcRing, slots), 0x04);
 
+        assert_eq!(size_of::<PdcpCnfEntry>(), 0x04);
+        assert_eq!(offset_of!(PdcpCnfEntry, start_sn), 0x00);
+        assert_eq!(offset_of!(PdcpCnfEntry, end_sn), 0x02);
+        assert_eq!(size_of::<PdcpCnfRing>(), 0x104);
+        assert_eq!(offset_of!(PdcpCnfRing, wr), 0x00);
+        assert_eq!(offset_of!(PdcpCnfRing, rd), 0x02);
+        assert_eq!(offset_of!(PdcpCnfRing, entries), 0x04);
+
         assert_eq!(size_of::<PdcpUlSduEntry>(), 0x10);
         assert_eq!(offset_of!(PdcpUlSduEntry, pdcp_count), 0x00);
         assert_eq!(offset_of!(PdcpUlSduEntry, irb), 0x04);
@@ -170,6 +178,19 @@ mod tests {
 
         assert_eq!(offset_of!(PdcpUlSduWindow, active_count), 0x00);
         assert_eq!(offset_of!(PdcpUlSduWindow, entries), 0x04);
+
+        assert_eq!(size_of::<PdcpToRlcEntry>(), 0x08);
+        assert_eq!(offset_of!(PdcpToRlcEntry, pdcp_sn), 0x00);
+        assert_eq!(offset_of!(PdcpToRlcEntry, len), 0x02);
+        assert_eq!(offset_of!(PdcpToRlcEntry, cipher_buf), 0x04);
+
+        assert_eq!(size_of::<UlCipherBearerAccum>(), 0x08);
+        assert_eq!(offset_of!(UlCipherBearerAccum, pkt_count), 0x00);
+        assert_eq!(offset_of!(UlCipherBearerAccum, byte_count), 0x04);
+        assert_eq!(size_of::<UlCipherBatch>(), 0x48);
+        assert_eq!(offset_of!(UlCipherBatch, bearers), 0x00);
+        assert_eq!(offset_of!(UlCipherBatch, desc_count), 0x40);
+        assert_eq!(offset_of!(UlCipherBatch, desc_ring), 0x44);
 
         assert_eq!(size_of::<RbcStatsBank>(), 0x2c);
         assert_eq!(offset_of!(RbcStatsBank, dl_ctrl_pdus), 0x00);
@@ -183,9 +204,20 @@ mod tests {
         assert_eq!(offset_of!(RbcStatsBank, dl_bytes), 0x1c);
         assert_eq!(offset_of!(RbcStatsBank, ul_bytes), 0x20);
 
+        assert_eq!(size_of::<RlcScatterSeg>(), 0x08);
+        assert_eq!(offset_of!(RlcScatterSeg, ptr), 0x00);
+        assert_eq!(offset_of!(RlcScatterSeg, len), 0x04);
+
+        assert_eq!(size_of::<RlcAmRetxNode>(), 0x10);
+        assert_eq!(offset_of!(RlcAmRetxNode, ring_idx), 0x00);
+        assert_eq!(offset_of!(RlcAmRetxNode, prev), 0x04);
+        assert_eq!(offset_of!(RlcAmRetxNode, next), 0x08);
+        assert_eq!(offset_of!(RlcAmRetxNode, free_next), 0x0c);
+
         assert_eq!(size_of::<Rbc>(), 0x248);
         assert_eq!(offset_of!(Rbc, ring0), 0x00);
         assert_eq!(offset_of!(Rbc, ring1), 0x04);
+        assert_eq!(offset_of!(Rbc, pdcp_cnf_ring), 0x08);
         assert_eq!(offset_of!(Rbc, configured), 0x10);
         assert_eq!(offset_of!(Rbc, active), 0x11);
         assert_eq!(offset_of!(Rbc, lcid), 0x12);
@@ -211,15 +243,31 @@ mod tests {
         assert_eq!(offset_of!(Rbc, t_discard_tmr_id), 0xe2);
         assert_eq!(offset_of!(Rbc, pdcp_ul_win), 0xe4);
         assert_eq!(offset_of!(Rbc, rlc_ul_bo_notify_fn), 0xe8);
+        assert_eq!(offset_of!(Rbc, rlc_ul_reest_fn), 0xec);
+        assert_eq!(offset_of!(Rbc, rlc_ul_gen_pdu_fn), 0xf0);
+        assert_eq!(offset_of!(Rbc, pdcp_cnf_fn), 0xf4);
         assert_eq!(offset_of!(Rbc, pdcp_to_rlc_ring), 0xf8);
         assert_eq!(offset_of!(Rbc, pdcp_to_rlc_wr), 0xfc);
-        assert_eq!(offset_of!(Rbc, pdcp_to_rlc_rd_pend), 0xfe);
+        assert_eq!(offset_of!(Rbc, pdcp_to_rlc_committed), 0xfe);
+        assert_eq!(offset_of!(Rbc, pdcp_to_rlc_rd), 0x100);
         assert_eq!(offset_of!(Rbc, pdcp_to_rlc_size), 0x102);
+        assert_eq!(offset_of!(Rbc, cur_sdu_sn), 0x104);
         assert_eq!(offset_of!(Rbc, pdcp_to_rlc_cnt), 0x106);
+        assert_eq!(offset_of!(Rbc, cur_sdu_rem), 0x108);
         assert_eq!(offset_of!(Rbc, pdcp_rlc_hdr_bo), 0x10a);
         assert_eq!(offset_of!(Rbc, pdcp_rlc_tx_bo), 0x10c);
-        assert_eq!(offset_of!(Rbc, rlc_um_hdr_bo), 0x126);
-        assert_eq!(offset_of!(Rbc, rlc_um_extra_bo), 0x128);
+        assert_eq!(offset_of!(Rbc, cur_sdu_ptr), 0x110);
+        assert_eq!(offset_of!(Rbc, reest_ring), 0x114);
+        assert_eq!(offset_of!(Rbc, reest_wr), 0x118);
+        assert_eq!(offset_of!(Rbc, reest_committed), 0x11a);
+        assert_eq!(offset_of!(Rbc, reest_ack_rd), 0x11c);
+        assert_eq!(offset_of!(Rbc, reest_size), 0x11e);
+        assert_eq!(offset_of!(Rbc, reest_rd), 0x120);
+        assert_eq!(offset_of!(Rbc, reest_cnt), 0x122);
+        assert_eq!(offset_of!(Rbc, reest_cur_rem), 0x124);
+        assert_eq!(offset_of!(Rbc, rlc_reest_hdr_bo), 0x126);
+        assert_eq!(offset_of!(Rbc, rlc_reest_tx_bo), 0x128);
+        assert_eq!(offset_of!(Rbc, reest_cur_ptr), 0x12c);
         assert_eq!(offset_of!(Rbc, ring_pending_bytes), 0x130);
         assert_eq!(offset_of!(Rbc, vr_r), 0x138);
         assert_eq!(offset_of!(Rbc, vr_h), 0x13a);
@@ -229,11 +277,14 @@ mod tests {
         assert_eq!(offset_of!(Rbc, rlc_status_bo), 0x144);
         assert_eq!(offset_of!(Rbc, dl_rx_buf), 0x14c);
         assert_eq!(offset_of!(Rbc, dl_seg_pool), 0x150);
-        assert_eq!(offset_of!(Rbc, rlc_retx_bo), 0x154);
-        assert_eq!(offset_of!(Rbc, rlc_newtx_bo), 0x158);
-        assert_eq!(offset_of!(Rbc, rlc_ul_poll_pending), 0x168);
+        assert_eq!(offset_of!(Rbc, rlc_am_newtx_bo), 0x154);
+        assert_eq!(offset_of!(Rbc, rlc_am_retx_bo), 0x158);
+        assert_eq!(offset_of!(Rbc, ul_ctrl_pdu_cnt), 0x168);
         assert_eq!(offset_of!(Rbc, max_retx_threshold), 0x169);
         assert_eq!(offset_of!(Rbc, status_trigger), 0x16a);
+        assert_eq!(offset_of!(Rbc, poll_cfg_flags), 0x16b);
+        assert_eq!(offset_of!(Rbc, poll_trigger), 0x16c);
+        assert_eq!(offset_of!(Rbc, start_poll_retx_tmr), 0x16d);
         assert_eq!(offset_of!(Rbc, poll_sn), 0x16e);
         assert_eq!(offset_of!(Rbc, poll_pdu), 0x170);
         assert_eq!(offset_of!(Rbc, t_poll_retx_tmr_id), 0x172);
@@ -241,20 +292,42 @@ mod tests {
         assert_eq!(offset_of!(Rbc, vt_s), 0x176);
         assert_eq!(offset_of!(Rbc, t_status_prohibit_tmr_id), 0x178);
         assert_eq!(offset_of!(Rbc, status_pdu_len), 0x17a);
+        assert_eq!(offset_of!(Rbc, pdu_without_poll), 0x17c);
         assert_eq!(offset_of!(Rbc, poll_byte), 0x180);
+        assert_eq!(offset_of!(Rbc, byte_without_poll), 0x184);
         assert_eq!(offset_of!(Rbc, status_pdu_ptr), 0x188);
+        assert_eq!(offset_of!(Rbc, active_tx_build_ctx), 0x18c);
+        assert_eq!(offset_of!(Rbc, ul_am_hdr_buf), 0x190);
+        assert_eq!(offset_of!(Rbc, ul_am_hdr_buf_off), 0x194);
+        assert_eq!(offset_of!(Rbc, ul_am_sdu_desc_idx), 0x196);
+        assert_eq!(offset_of!(Rbc, ul_am_sdu_desc_cap), 0x198);
         assert_eq!(offset_of!(Rbc, ul_am_free_win_slots), 0x19a);
+        assert_eq!(offset_of!(Rbc, ul_am_sdu_desc_pool), 0x19c);
         assert_eq!(offset_of!(Rbc, ul_am_tx_buf), 0x1b0);
-        assert_eq!(offset_of!(Rbc, ul_am_sdu_info), 0x1b4);
+        assert_eq!(offset_of!(Rbc, ul_am_tx_head), 0x1b4);
+        assert_eq!(offset_of!(Rbc, ul_am_tx_tail), 0x1b8);
         assert_eq!(offset_of!(Rbc, retx_node_freelist), 0x1bc);
+        assert_eq!(offset_of!(Rbc, retx_node_freelist_tail), 0x1c0);
         assert_eq!(offset_of!(Rbc, retx_node_free_cnt), 0x1c4);
+        assert_eq!(offset_of!(Rbc, retx_node_pool), 0x1c8);
         assert_eq!(offset_of!(Rbc, ul_am_retx_ring), 0x1cc);
         assert_eq!(offset_of!(Rbc, retx_wr), 0x1d0);
         assert_eq!(offset_of!(Rbc, retx_rd), 0x1d2);
         assert_eq!(offset_of!(Rbc, retx_cnt), 0x1d4);
         assert_eq!(offset_of!(Rbc, retx_hdr_bo), 0x1d6);
         assert_eq!(offset_of!(Rbc, retx_bytes), 0x1d8);
+        assert_eq!(offset_of!(Rbc, tx_status_buf), 0x1ec);
+        assert_eq!(offset_of!(Rbc, tx_status_len), 0x1f0);
         assert_eq!(offset_of!(Rbc, am_extra_hdr_bo), 0x1f2);
+        assert_eq!(offset_of!(Rbc, tx_status_ack_sn), 0x1f4);
+        assert_eq!(offset_of!(Rbc, tx_status_nack_cnt), 0x1f6);
+        assert_eq!(offset_of!(Rbc, tx_status_nack_list), 0x1f8);
+        assert_eq!(offset_of!(Rbc, ul_data_pdu_cnt), 0x200);
+        assert_eq!(offset_of!(Rbc, tx_status_truncated), 0x202);
+        assert_eq!(offset_of!(Rbc, tx_status_sent_len), 0x204);
+        assert_eq!(offset_of!(Rbc, tx_status_nack_bits), 0x206);
+        assert_eq!(offset_of!(Rbc, retx_seg_desc_idx), 0x208);
+        assert_eq!(offset_of!(Rbc, retx_seg_hdr_off), 0x20a);
         assert_eq!(offset_of!(Rbc, rohc_enabled), 0x210);
         assert_eq!(offset_of!(Rbc, rohc_ctx_tbl), 0x21c);
         assert_eq!(offset_of!(Rbc, pdcp_discard_timer_ms), 0x236);
@@ -262,18 +335,32 @@ mod tests {
         assert_eq!(offset_of!(Rbc, bo_margin_bytes), 0x244);
 
         assert_eq!(size_of::<RlcAmTxEntry>(), 0x40);
+        assert_eq!(offset_of!(RlcAmTxEntry, seg_pool_start_idx), 0x00);
+        assert_eq!(offset_of!(RlcAmTxEntry, seg_count), 0x02);
+        assert_eq!(offset_of!(RlcAmTxEntry, total_len), 0x04);
         assert_eq!(offset_of!(RlcAmTxEntry, pdu_desc), 0x08);
         assert_eq!(offset_of!(RlcAmTxEntry, sn), 0x0c);
         assert_eq!(offset_of!(RlcAmTxEntry, retx_list_len), 0x0e);
         assert_eq!(offset_of!(RlcAmTxEntry, retx_count), 0x10);
+        assert_eq!(offset_of!(RlcAmTxEntry, meta_flags), 0x11);
+        assert_eq!(offset_of!(RlcAmTxEntry, tx_state_flags), 0x12);
         assert_eq!(offset_of!(RlcAmTxEntry, was_nacked), 0x13);
         assert_eq!(offset_of!(RlcAmTxEntry, in_retx_queue), 0x14);
+        assert_eq!(offset_of!(RlcAmTxEntry, retx_head), 0x38);
         assert_eq!(offset_of!(RlcAmTxEntry, retx_tail), 0x3c);
 
         assert_eq!(size_of::<RlcAmRetxEntry>(), 0x18);
         assert_eq!(offset_of!(RlcAmRetxEntry, sn), 0x00);
+        assert_eq!(offset_of!(RlcAmRetxEntry, fi_flags), 0x02);
+        assert_eq!(offset_of!(RlcAmRetxEntry, flags), 0x03);
+        assert_eq!(offset_of!(RlcAmRetxEntry, seg_state), 0x04);
+        assert_eq!(offset_of!(RlcAmRetxEntry, is_so_nack), 0x05);
         assert_eq!(offset_of!(RlcAmRetxEntry, tx_entry), 0x08);
         assert_eq!(offset_of!(RlcAmRetxEntry, retx_node), 0x0c);
+        assert_eq!(offset_of!(RlcAmRetxEntry, seg_sdu_idx), 0x10);
+        assert_eq!(offset_of!(RlcAmRetxEntry, seg_sdu_off), 0x12);
+        assert_eq!(offset_of!(RlcAmRetxEntry, seg_rem_bytes), 0x14);
+        assert_eq!(offset_of!(RlcAmRetxEntry, seg_so), 0x16);
 
         assert_eq!(size_of::<L2TimerEntry>(), 0x10);
         assert_eq!(offset_of!(L2TimerEntry, callback), 0x00);
