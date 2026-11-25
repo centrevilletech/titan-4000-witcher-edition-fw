@@ -182,7 +182,9 @@ In `/mnt/titan-api/pd/keeper.log`:
   wedged unit with `kern reboot`. It also reboots a unit after about 110
   seconds without its ping target, with no backoff. Run one or the other:
   since v1.0.12 the keeper turns the vendor one off in RAM while this one is on.
-- The passthrough driver serves one LAN device. It learns one host MAC.
+- The passthrough driver serves one LAN device. The vendor kernel stores one
+  host MAC for its IPv4. After a router swap the keeper moves it to the router
+  that holds the DHCP lease. See [router swaps](ipv4-recovery.md#router-swaps).
 - The unit tests cover the decisions. The packet integration test covers the
   freeze on a dummy bearer, the guard against a file standing in for the
   kernel log, and a watchdog reboot through recording stubs.

@@ -71,8 +71,41 @@ The local reachability monitor is enabled automatically in passthrough:
 
 This targets loss of local IPv4 reachability. It cannot detect every case in
 which a router still answers ARP but its internet forwarding is broken. It
-neither resets LTE nor reboots the Titan, and does not establish a fix for the
-modem's historical MAC latch.
+neither resets LTE nor reboots the Titan. A router swap is handled separately,
+below.
+
+## Router swaps
+
+In IP passthrough the vendor kernel writes one stored MAC as the destination
+of every IPv4 frame it hands to the LAN from the customer bearer, including
+the LTE driver's answers to ARP requests for the gateway. It stores the MAC of
+the first Ethernet frame after boot and logs `usb0 set host mac: <mac>`. A
+learned flag then keeps it: only an Ethernet driver probe or remove clears it.
+IPv6 does not use this MAC. The LTE driver addresses IPv6 to the sender of the
+last ARP request it answered.
+
+Up to v1.0.15, a router swapped in without a Titan reboot got its DHCP lease
+and IPv6 but no IPv4. Each of its ARP requests for the gateway was answered,
+and the kernel addressed every answer to the old router. On the bench on
+2026-11-24 a laptop in place of the bench router stayed without IPv4 until it
+took the old router's MAC.
+
+The vendor kernel has a command that sets the stored MAC:
+`kern netif hmac <hostif> <mac>`. It logs the same line. The keeper reads the
+stored MAC from the kernel log. In passthrough, with the customer bearer in
+the bridge, it runs that command when the router that holds the customer DHCP
+lease has a different MAC. It never points it at one of the unit's own MACs or
+at a group MAC.
+
+When the old lease ends or a new router's discover clears it, the new router
+gets its lease, and IPv4 follows within about a second. The keeper sends the
+command again at most every 5 s, until the kernel log shows the new MAC. After
+4 commands that changed nothing in the log it waits 2 minutes and tries again.
+It writes one `router swap:` line a minute at most to `keeper.log`. See
+`userspace/pd-model/src/host_mac.rs`.
+
+The keeper needs the DHCP lease to know the router. A router with a static WAN
+address gets no help from this; reboot the Titan after swapping one in.
 
 ## Public data PDN offers
 
