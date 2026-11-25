@@ -1,4 +1,4 @@
-//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.2).
+//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.2.1).
 //!
 //! At 130+ Mbps in IP passthrough, softirq saturates the CPU and adds queueing
 //! delay. `titan_k1fp` short-circuits steady-state unicast IPv4 and IPv6
@@ -25,20 +25,24 @@
 //! - drives the module's SAS grant lease from the keeper's own CBRS gate state
 //!   (renewing once a second while held, writing `grant 0` first on close, and
 //!   never writing a lease while `cbrs_mode_grant` is not 1);
-//! - tracks watchdog trips (`wd_trips`, `wd_reason`) and unexpected mode drops,
-//!   re-arming automatically at most once per boot before holding at mode 0 in
-//!   `state=tripped` until the config changes or the unit reboots;
+//! - tracks watchdog trips (`wd_trips`, `wd_reason`) and unexpected mode drops.
+//!   After each drop it holds mode 0 in `state=tripped` for a wait that
+//!   doubles with each drop in a row (`retry::MODULES`: 1 min up to 1 h),
+//!   then writes the mode again, for as long as it takes. An hour at the mode
+//!   without a drop (`CLEAN_SECS`) forgets the earlier ones, and a config
+//!   change or the switch turned off and on re-arms at once;
 //! - treats a lost bridge device as a pause, not a trip. A modem re-attach
 //!   makes the vendor scripts recreate `br0` and `lte0pdn2`; the module drops
 //!   to mode 0, counts `dev_gone`, and takes the new devices by itself. The
 //!   keeper writes the configured mode again once the bridge is ready, and
-//!   that does not use the re-arm budget.
+//!   that is not a drop.
 
 use crate::cbrs_gate::{Gate, Step as GateStep};
+use crate::retry::{Backoff, Policy};
 use crate::switches::Source;
 
 /// The first line of `/proc/k1fp` for the allowed build.
-pub const VERSION_LINE: &str = "titan_k1fp v2.2";
+pub const VERSION_LINE: &str = "titan_k1fp v2.2.1";
 /// The module's name in `/proc/modules`.
 pub const MODULE: &str = "titan_k1fp";
 /// The file in the staging directory and in the manifest.
@@ -59,8 +63,9 @@ pub const CHECK_EVERY: u64 = 15;
 /// Validity in seconds written to `/proc/k1fp` once per second while a SAS
 /// grant is held. A crashed keeper leaves the lease to expire on its own.
 pub const GRANT_LEASE_SECS: u32 = 5;
-/// Maximum automatic re-arms per boot after a watchdog trip or mode drop.
-pub const MAX_AUTO_REARMS: u32 = 1;
+/// Seconds at the configured mode without a drop after which earlier drops
+/// are forgotten, so the next one waits the shortest time again.
+pub const CLEAN_SECS: u64 = 3600;
 
 /// `/mnt/titan-api/fastpath/config`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -388,25 +393,37 @@ pub fn lease_command(action: LeaseAction) -> Option<String> {
     }
 }
 
-/// Tracks applied mode and watchdog trips / unexpected drops for one boot.
+/// Tracks the applied mode and watchdog trips or unexpected drops for one
+/// keeper process. Nothing here is kept across a restart or a reboot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TripWatch {
     /// True after the first `/proc/k1fp` observation in this keeper process.
     observed: bool,
     /// Mode last confirmed in `/proc/k1fp` (only when > 0).
     applied_mode: Option<u32>,
-    /// Automatic re-arms used this boot (capped at `MAX_AUTO_REARMS`).
-    rearms: u32,
+    /// When the mode first ran after the last drop (monotonic seconds).
+    /// Writing it again after a lost bridge device does not move it.
+    clean_since: Option<u64>,
     /// Last observed `wd_trips` count from `/proc/k1fp`.
     last_wd_trips: u32,
-    /// Config held in `state=tripped` until config changes or reboot.
-    tripped_for: Option<Config>,
-    /// Reason recorded when entering `state=tripped`.
-    tripped_reason: Option<String>,
+    /// Held at mode 0 after a drop, until `rearm` is ready.
+    held: Option<Held>,
+    /// Drops in a row and when the next re-arm is due.
+    rearm: Backoff,
     /// Last observed `dev_gone` count from `/proc/k1fp`.
     last_dev_gone: Option<u32>,
     /// A device loss was seen and not yet reported with `take_device_event`.
     device_event: bool,
+}
+
+/// A drop the fast path is waiting out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Held {
+    /// The config it happened under. Another config is applied at once.
+    config: Config,
+    reason: String,
+    /// The wait chosen at the drop, in seconds.
+    wait: u64,
 }
 
 /// Mode action decided from config and `/proc/k1fp`.
@@ -416,12 +433,12 @@ pub enum TripAction {
     Normal,
     /// Initial apply or config change: write `config.mode`.
     Apply,
-    /// Unexpected drop / watchdog trip, first time this boot: log reason and
-    /// re-arm `config.mode` once.
-    Rearm { reason: String },
-    /// Re-arm budget spent: hold at mode 0 with `state=tripped` until config
-    /// changes or reboot.
-    Tripped { reason: String, first_notice: bool },
+    /// The wait after a drop is over: write `config.mode` again. `drops` is
+    /// the number of drops in a row, this one included.
+    Rearm { reason: String, drops: u32 },
+    /// After a drop: hold at mode 0 with `state=tripped` for `wait` seconds.
+    /// `first_notice` is true on the look that saw the drop.
+    Tripped { reason: String, first_notice: bool, wait: u64 },
 }
 
 fn describe_trip(proc: &Proc, prev_wd_trips: u32, want_mode: u32) -> String {
@@ -438,15 +455,17 @@ fn describe_trip(proc: &Proc, prev_wd_trips: u32, want_mode: u32) -> String {
 }
 
 impl TripWatch {
-    pub fn evaluate(&mut self, config: &Config, proc: &Proc) -> TripAction {
+    /// One look at `/proc/k1fp` at `now` (monotonic seconds). `policy` sets
+    /// the waits after drops (`retry::MODULES`, shortened in tests).
+    pub fn evaluate(&mut self, config: &Config, proc: &Proc, policy: Policy, now: u64) -> TripAction {
         let first_observation = !self.observed;
         self.observed = true;
 
         // The module lost a bridge device since the last look (a modem
         // re-attach recreates `br0` and `lte0pdn2`) and set mode 0 itself.
-        // That is a pause, not a trip: forget the applied mode so the
-        // configured mode is written again without using the re-arm budget.
-        // A unit already held in `state=tripped` stays there.
+        // That is a pause, not a drop: forget the applied mode so the
+        // configured mode is written again at once. A fast path waiting out
+        // a drop keeps waiting.
         if let Some(count) = proc.dev_gone {
             if self.last_dev_gone.is_some_and(|prev| prev != count) {
                 self.device_event = true;
@@ -459,12 +478,12 @@ impl TripWatch {
         }
 
         if config.mode == 0 {
+            // Off, by config or by the switch: turning it on again starts afresh.
             self.applied_mode = None;
-            self.tripped_for = None;
-            self.tripped_reason = None;
-            if let Some(t) = proc.wd_trips {
-                self.last_wd_trips = t;
-            }
+            self.clean_since = None;
+            self.held = None;
+            self.rearm.reset();
+            self.seen_trips(proc);
             return if proc.mode == Some(0) {
                 TripAction::Normal
             } else {
@@ -472,88 +491,98 @@ impl TripWatch {
             };
         }
 
-        if let Some(ref tripped_cfg) = self.tripped_for {
-            if tripped_cfg == config {
-                if let Some(t) = proc.wd_trips {
-                    self.last_wd_trips = t;
+        if let Some(held) = self.held.take() {
+            if &held.config == config {
+                self.seen_trips(proc);
+                if !self.rearm.ready(now) {
+                    let action = TripAction::Tripped {
+                        reason: held.reason.clone(),
+                        first_notice: false,
+                        wait: held.wait,
+                    };
+                    self.held = Some(held);
+                    return action;
                 }
-                let reason = self
-                    .tripped_reason
-                    .clone()
-                    .unwrap_or_else(|| describe_trip(proc, self.last_wd_trips, config.mode));
-                return TripAction::Tripped {
-                    reason,
-                    first_notice: false,
+                return TripAction::Rearm {
+                    reason: held.reason,
+                    drops: self.rearm.failures(),
                 };
             }
-            // Config changed: clear tripped hold, keep boot re-arm count.
-            self.tripped_for = None;
-            self.tripped_reason = None;
+            // Config changed: apply it at once, with no drops counted.
+            self.rearm.reset();
             self.applied_mode = None;
+            self.clean_since = None;
         }
 
         if self.applied_mode == Some(config.mode) {
             if proc.mode == Some(config.mode) {
-                if let Some(t) = proc.wd_trips {
-                    self.last_wd_trips = t;
+                self.seen_trips(proc);
+                if self
+                    .clean_since
+                    .is_some_and(|at| now.saturating_sub(at) >= CLEAN_SECS)
+                {
+                    self.rearm.reset();
                 }
                 return TripAction::Normal;
             }
             let reason = describe_trip(proc, self.last_wd_trips, config.mode);
-            if let Some(t) = proc.wd_trips {
-                self.last_wd_trips = t;
-            }
-            if self.rearms < MAX_AUTO_REARMS {
-                self.rearms += 1;
-                return TripAction::Rearm { reason };
-            }
-            self.applied_mode = None;
-            self.tripped_for = Some(config.clone());
-            self.tripped_reason = Some(reason.clone());
-            return TripAction::Tripped {
-                reason,
-                first_notice: true,
-            };
+            self.seen_trips(proc);
+            return self.hold(config, reason, policy, now);
         }
 
-        // First observation (e.g. keeper restarted after a watchdog trip).
+        // First observation (e.g. keeper restarted after a watchdog trip):
+        // wait as after a drop, then write the mode again.
         if first_observation
             && self.applied_mode.is_none()
             && proc.mode == Some(0)
             && proc.wd_trips.unwrap_or(0) > 0
         {
-            let trips = proc.wd_trips.unwrap_or(0);
             let reason = describe_trip(proc, self.last_wd_trips, config.mode);
-            self.last_wd_trips = trips;
-            if trips > MAX_AUTO_REARMS || self.rearms >= MAX_AUTO_REARMS {
-                self.tripped_for = Some(config.clone());
-                self.tripped_reason = Some(reason.clone());
-                return TripAction::Tripped {
-                    reason,
-                    first_notice: true,
-                };
-            }
-            self.rearms += 1;
-            return TripAction::Rearm { reason };
+            self.seen_trips(proc);
+            return self.hold(config, reason, policy, now);
         }
 
-        if let Some(t) = proc.wd_trips {
-            self.last_wd_trips = t;
-        }
+        self.seen_trips(proc);
         if proc.mode == Some(config.mode) {
+            // Adopted at the configured mode.
             self.applied_mode = Some(config.mode);
+            self.clean_since.get_or_insert(now);
             TripAction::Normal
         } else {
             TripAction::Apply
         }
     }
 
-    /// Record that `mode` was written and read back from `/proc/k1fp`.
-    pub fn note_applied(&mut self, mode: u32, proc: &Proc) {
-        self.applied_mode = (mode > 0).then_some(mode);
+    fn seen_trips(&mut self, proc: &Proc) {
         if let Some(t) = proc.wd_trips {
             self.last_wd_trips = t;
         }
+    }
+
+    /// A drop at `now`: hold mode 0 for the next wait in `policy`.
+    fn hold(&mut self, config: &Config, reason: String, policy: Policy, now: u64) -> TripAction {
+        self.applied_mode = None;
+        self.clean_since = None;
+        let wait = self.rearm.failed(now, policy);
+        self.held = Some(Held {
+            config: config.clone(),
+            reason: reason.clone(),
+            wait,
+        });
+        TripAction::Tripped {
+            reason,
+            first_notice: true,
+            wait,
+        }
+    }
+
+    /// Record that `mode` was written and read back from `/proc/k1fp` at `now`.
+    pub fn note_applied(&mut self, mode: u32, proc: &Proc, now: u64) {
+        self.applied_mode = (mode > 0).then_some(mode);
+        if mode > 0 {
+            self.clean_since.get_or_insert(now);
+        }
+        self.seen_trips(proc);
     }
 
     /// Clear `applied_mode` when paused (unloaded, left passthrough, or bridge
@@ -567,12 +596,14 @@ impl TripWatch {
         std::mem::take(&mut self.device_event)
     }
 
-    pub fn rearms(&self) -> u32 {
-        self.rearms
+    /// Drops in a row (forgotten after `CLEAN_SECS` at the mode).
+    pub fn drops(&self) -> u32 {
+        self.rearm.failures()
     }
 
+    /// Holding mode 0 after a drop.
     pub fn is_tripped(&self) -> bool {
-        self.tripped_for.is_some()
+        self.held.is_some()
     }
 }
 
@@ -628,7 +659,7 @@ mod tests {
 
     // Real `/proc/k1fp` output captured on the bench unit (mode 2, download running).
     const BENCH_PROC: &str = "\
-titan_k1fp v2.2
+titan_k1fp v2.2.1
 mode=2 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1
 devices: dev_gone=0 reacq=0
 require_grant=1 grant_left_ms=4290 gate=open v4=1 v6=1 lease_ms=60 sample_ms=20
@@ -725,10 +756,10 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert!(unhooked_wan.bridge_issue().contains("wan_hooked=0"));
 
         // Different version string is rejected.
-        let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v1.2"));
+        let v1 = parse_proc(&BENCH_PROC.replace(VERSION_LINE, "titan_k1fp v1.2"));
         assert!(!v1.ours);
         assert!(!matches(&parse_config("mode=2\n"), &v1));
-        let dev = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.2-dev"));
+        let dev = parse_proc(&BENCH_PROC.replace(VERSION_LINE, "titan_k1fp v2.2.1-dev"));
         assert!(!dev.ours);
         assert!(!parse_proc("").ours);
     }
@@ -739,8 +770,8 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert_eq!(loaded("", ""), Loaded::None);
         assert_eq!(loaded(MODULES, BENCH_PROC), Loaded::Ours);
         assert_eq!(
-            loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.1")),
-            Loaded::Other("titan_k1fp (titan_k1fp v2.1)".into())
+            loaded(MODULES, &BENCH_PROC.replace(VERSION_LINE, "titan_k1fp v2.2")),
+            Loaded::Other("titan_k1fp (titan_k1fp v2.2)".into())
         );
         assert_eq!(
             loaded(MODULES, ""),
@@ -885,188 +916,224 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert_eq!(lease_decision(&g, s, LeaseState::Open, true), LeaseAction::Renew(GRANT_LEASE_SECS));
     }
 
-    #[test]
-    fn trip_policy_rearms_at_most_once_per_boot_then_stays_tripped_until_config_change() {
-        let cfg2 = parse_config("mode=2\n");
-        let cfg3 = parse_config("mode=3\n");
-        let cfg0 = parse_config("mode=0\n");
-        let proc0 = parse_proc(&BENCH_PROC.replace("mode=2 ", "mode=0 "));
-        let proc2 = parse_proc(BENCH_PROC);
+    /// `/proc/k1fp` after a watchdog trip: mode 0, `wd_trips` = `trips`.
+    fn tripped(trips: u32, reason: &str) -> Proc {
+        parse_proc(&BENCH_PROC.replace("mode=2 ", "mode=0 ").replace(
+            "wd_trips=0 wd_reason=none",
+            &format!("wd_trips={trips} wd_reason={reason}"),
+        ))
+    }
 
+    /// `/proc/k1fp` running `mode` after `trips` earlier trips.
+    fn running(mode: u32, trips: u32, reason: &str) -> Proc {
+        let mut proc = tripped(trips, reason);
+        proc.mode = Some(mode);
+        proc
+    }
+
+    const P: Policy = crate::retry::MODULES;
+
+    #[test]
+    fn every_drop_waits_its_turn_then_rearms_for_as_long_as_it_takes() {
+        let cfg2 = parse_config("mode=2\n");
         let mut tw = TripWatch::default();
         // Initial load starts at mode 0 -> Apply.
-        assert_eq!(tw.evaluate(&cfg2, &proc0), TripAction::Apply);
-        tw.note_applied(2, &proc2);
-        assert_eq!(tw.evaluate(&cfg2, &proc2), TripAction::Normal);
-        assert_eq!(tw.rearms(), 0);
+        assert_eq!(tw.evaluate(&cfg2, &tripped(0, "none"), P, 0), TripAction::Apply);
+        tw.note_applied(2, &running(2, 0, "none"), 0);
+        assert_eq!(tw.evaluate(&cfg2, &running(2, 0, "none"), P, 15), TripAction::Normal);
+        assert_eq!(tw.drops(), 0);
 
-        // Watchdog trip #1 -> Rearm once with reason.
-        let trip1 = parse_proc(
-            &BENCH_PROC
-                .replace("mode=2 ", "mode=0 ")
-                .replace("wd_trips=0 wd_reason=none", "wd_trips=1 wd_reason=tx_stall"),
-        );
-        match tw.evaluate(&cfg2, &trip1) {
-            TripAction::Rearm { reason } => {
-                assert!(reason.contains("tx_stall"), "{reason}");
-                assert!(reason.contains("wd_trips=1"), "{reason}");
-            }
-            other => panic!("expected Rearm, got {other:?}"),
-        }
-        assert_eq!(tw.rearms(), 1);
-        let rearmed = parse_proc(
-            &BENCH_PROC.replace("wd_trips=0 wd_reason=none", "wd_trips=1 wd_reason=tx_stall"),
-        );
-        tw.note_applied(2, &rearmed);
-        assert_eq!(tw.evaluate(&cfg2, &rearmed), TripAction::Normal);
-
-        // Watchdog trip #2 -> Tripped, no second automatic re-arm.
-        let trip2 = parse_proc(
-            &BENCH_PROC
-                .replace("mode=2 ", "mode=0 ")
-                .replace("wd_trips=0 wd_reason=none", "wd_trips=2 wd_reason=ring_full"),
-        );
-        let first_reason = match tw.evaluate(&cfg2, &trip2) {
-            TripAction::Tripped { reason, first_notice } => {
-                assert!(first_notice);
-                assert!(reason.contains("ring_full"), "{reason}");
-                assert!(reason.contains("wd_trips=2"), "{reason}");
-                reason
-            }
-            other => panic!("expected Tripped, got {other:?}"),
+        // Trip 1: hold mode 0 for a minute, then re-arm.
+        let reason = match tw.evaluate(&cfg2, &tripped(1, "tx_stall"), P, 100) {
+            TripAction::Tripped { reason, first_notice: true, wait: 60 } => reason,
+            other => panic!("expected a 60 s hold, got {other:?}"),
         };
+        assert!(reason.contains("tx_stall") && reason.contains("wd_trips=1"), "{reason}");
         assert!(tw.is_tripped());
-
-        // Subsequent poll stays Tripped with identical reason and first_notice=false.
+        for now in [115, 130, 159] {
+            assert_eq!(
+                tw.evaluate(&cfg2, &tripped(1, "tx_stall"), P, now),
+                TripAction::Tripped { reason: reason.clone(), first_notice: false, wait: 60 },
+                "still waiting at {now}"
+            );
+        }
         assert_eq!(
-            tw.evaluate(&cfg2, &trip2),
-            TripAction::Tripped {
-                reason: first_reason,
-                first_notice: false,
+            tw.evaluate(&cfg2, &tripped(1, "tx_stall"), P, 160),
+            TripAction::Rearm { reason: reason.clone(), drops: 1 }
+        );
+        assert!(!tw.is_tripped());
+        tw.note_applied(2, &running(2, 1, "tx_stall"), 160);
+        assert_eq!(tw.evaluate(&cfg2, &running(2, 1, "tx_stall"), P, 175), TripAction::Normal);
+
+        // Every further drop in a row waits twice as long, up to an hour, and
+        // is always re-armed: there is no budget to spend. (v1.0.17 held the
+        // second one at mode 0 until the config changed or the unit rebooted.)
+        let mut now = 200;
+        for drop in 2..=12u32 {
+            let want = P.wait(drop);
+            match tw.evaluate(&cfg2, &tripped(drop, "ring_full"), P, now) {
+                TripAction::Tripped { first_notice: true, wait, .. } => assert_eq!(wait, want, "drop {drop}"),
+                other => panic!("drop {drop}: expected a hold, got {other:?}"),
             }
-        );
+            assert!(matches!(
+                tw.evaluate(&cfg2, &tripped(drop, "ring_full"), P, now + want - 1),
+                TripAction::Tripped { first_notice: false, .. }
+            ));
+            assert_eq!(
+                tw.evaluate(&cfg2, &tripped(drop, "ring_full"), P, now + want),
+                TripAction::Rearm {
+                    reason: "watchdog tripped (reason=ring_full, wd_trips=".to_owned()
+                        + &drop.to_string()
+                        + ", mode 2 -> 0)",
+                    drops: drop
+                }
+            );
+            now += want;
+            tw.note_applied(2, &running(2, drop, "ring_full"), now);
+            now += 30;
+        }
+        assert_eq!(P.wait(12), 3600, "the wait stops growing at an hour");
 
-        // Changing config clears tripped hold, applies new mode, but keeps boot re-arm count.
-        assert_eq!(tw.evaluate(&cfg3, &trip2), TripAction::Apply);
-        assert!(!tw.is_tripped());
-        let proc3 = parse_proc(
-            &BENCH_PROC
-                .replace("mode=2 ", "mode=3 ")
-                .replace("wd_trips=0 wd_reason=none", "wd_trips=2 wd_reason=ring_full"),
-        );
-        tw.note_applied(3, &proc3);
-
-        // Another drop on the new config goes straight to Tripped (already re-armed once this boot).
-        let trip3 = parse_proc(
-            &BENCH_PROC
-                .replace("mode=2 ", "mode=0 ")
-                .replace("wd_trips=0 wd_reason=none", "wd_trips=3 wd_reason=modified"),
-        );
+        // An hour at the mode with no drop forgets them: the next waits a minute.
+        assert_eq!(tw.evaluate(&cfg2, &running(2, 12, "ring_full"), P, now + CLEAN_SECS), TripAction::Normal);
+        assert_eq!(tw.drops(), 0);
         assert!(matches!(
-            tw.evaluate(&cfg3, &trip3),
-            TripAction::Tripped { first_notice: true, .. }
+            tw.evaluate(&cfg2, &tripped(13, "modified"), P, now + CLEAN_SECS + 15),
+            TripAction::Tripped { first_notice: true, wait: 60, .. }
         ));
+    }
 
-        // Config rollback to mode=0 clears tripped state.
-        assert_eq!(tw.evaluate(&cfg0, &trip3), TripAction::Normal);
+    #[test]
+    fn a_new_config_or_the_switch_turned_off_and_on_rearms_at_once() {
+        let cfg2 = parse_config("mode=2\n");
+        let cfg3 = parse_config("mode=3\n");
+        let off = Config::default();
+        let mut tw = TripWatch::default();
+        tw.note_applied(2, &running(2, 0, "none"), 0);
+        assert!(matches!(tw.evaluate(&cfg2, &tripped(1, "tx_stall"), P, 10), TripAction::Tripped { wait: 60, .. }));
+        tw.evaluate(&cfg2, &tripped(1, "tx_stall"), P, 70);
+        tw.note_applied(2, &running(2, 1, "tx_stall"), 70);
+        assert!(matches!(tw.evaluate(&cfg2, &tripped(2, "tx_stall"), P, 80), TripAction::Tripped { wait: 120, .. }));
+
+        // A new config while waiting: applied at once, with no drops counted.
+        assert_eq!(tw.evaluate(&cfg3, &tripped(2, "tx_stall"), P, 90), TripAction::Apply);
         assert!(!tw.is_tripped());
+        assert_eq!(tw.drops(), 0);
+        tw.note_applied(3, &running(3, 2, "tx_stall"), 90);
+        assert!(matches!(tw.evaluate(&cfg3, &tripped(3, "modified"), P, 100), TripAction::Tripped { wait: 60, .. }));
+
+        // The web switch: fastpath=off (mode 0) and on again. Off ends the
+        // hold; on applies at once and the next drop waits a minute.
+        assert_eq!(tw.evaluate(&off, &tripped(3, "modified"), P, 105), TripAction::Normal);
+        assert!(!tw.is_tripped());
+        assert_eq!(tw.evaluate(&cfg3, &tripped(3, "modified"), P, 110), TripAction::Apply);
+        tw.note_applied(3, &running(3, 3, "modified"), 110);
+        assert!(matches!(tw.evaluate(&cfg3, &tripped(4, "modified"), P, 120), TripAction::Tripped { wait: 60, .. }));
     }
 
     #[test]
     fn trip_policy_handles_manual_mode_drop_and_pause_and_restart() {
         let cfg2 = parse_config("mode=2\n");
-        let proc0 = parse_proc(&BENCH_PROC.replace("mode=2 ", "mode=0 "));
-        let proc2 = parse_proc(BENCH_PROC);
+        let proc0 = tripped(0, "none");
+        let proc2 = running(2, 0, "none");
 
-        // Manual mode 0 write (wd_trips stays 0): re-arms once, then trips on second drop.
+        // A hand-written mode 0 (wd_trips stays 0) is a drop too: wait, then re-arm.
         let mut tw = TripWatch::default();
-        assert_eq!(tw.evaluate(&cfg2, &proc0), TripAction::Apply);
-        tw.note_applied(2, &proc2);
-        assert!(matches!(tw.evaluate(&cfg2, &proc0), TripAction::Rearm { .. }));
-        tw.note_applied(2, &proc2);
-        assert!(matches!(
-            tw.evaluate(&cfg2, &proc0),
-            TripAction::Tripped { first_notice: true, .. }
-        ));
+        assert_eq!(tw.evaluate(&cfg2, &proc0, P, 0), TripAction::Apply);
+        tw.note_applied(2, &proc2, 0);
+        match tw.evaluate(&cfg2, &proc0, P, 15) {
+            TripAction::Tripped { reason, first_notice: true, wait: 60 } => {
+                assert!(reason.contains("mode changed unexpectedly"), "{reason}")
+            }
+            other => panic!("expected a hold, got {other:?}"),
+        }
+        assert!(matches!(tw.evaluate(&cfg2, &proc0, P, 75), TripAction::Rearm { drops: 1, .. }));
 
-        // Pause (e.g., bridge unready) and resume is NOT a trip.
+        // Pause (e.g., bridge unready) and resume is NOT a drop.
         let mut tw2 = TripWatch::default();
-        assert_eq!(tw2.evaluate(&cfg2, &proc0), TripAction::Apply);
-        tw2.note_applied(2, &proc2);
+        assert_eq!(tw2.evaluate(&cfg2, &proc0, P, 0), TripAction::Apply);
+        tw2.note_applied(2, &proc2, 0);
         tw2.note_paused();
-        assert_eq!(tw2.evaluate(&cfg2, &proc0), TripAction::Apply);
-        assert_eq!(tw2.rearms(), 0);
+        assert_eq!(tw2.evaluate(&cfg2, &proc0, P, 15), TripAction::Apply);
+        assert_eq!(tw2.drops(), 0);
 
-        // Keeper restart seeing wd_trips >= 2 and mode=0 stays tripped without re-arming.
+        // A keeper that restarts and finds the module at mode 0 after trips
+        // waits a minute, then writes the mode again. (v1.0.17 held it at mode
+        // 0 for the rest of the boot once wd_trips was 2 or more.)
         let mut tw3 = TripWatch::default();
-        let already_tripped = parse_proc(
-            &BENCH_PROC
-                .replace("mode=2 ", "mode=0 ")
-                .replace("wd_trips=0 wd_reason=none", "wd_trips=2 wd_reason=bad_ring"),
-        );
         assert!(matches!(
-            tw3.evaluate(&cfg2, &already_tripped),
-            TripAction::Tripped { first_notice: true, .. }
+            tw3.evaluate(&cfg2, &tripped(2, "bad_ring"), P, 500),
+            TripAction::Tripped { first_notice: true, wait: 60, .. }
         ));
-        // Operator clears tripped state by setting mode=0 then re-enabling mode=2.
-        let cfg0 = parse_config("mode=0\n");
-        assert_eq!(tw3.evaluate(&cfg0, &already_tripped), TripAction::Normal);
-        assert_eq!(tw3.evaluate(&cfg2, &already_tripped), TripAction::Apply);
+        assert!(matches!(tw3.evaluate(&cfg2, &tripped(2, "bad_ring"), P, 559), TripAction::Tripped { .. }));
+        assert!(matches!(tw3.evaluate(&cfg2, &tripped(2, "bad_ring"), P, 560), TripAction::Rearm { .. }));
 
         // Adopting an already-loaded module running at mode=2 records applied_mode so
         // any later drop is detected.
         let mut tw4 = TripWatch::default();
-        assert_eq!(tw4.evaluate(&cfg2, &proc2), TripAction::Normal);
-        assert!(matches!(tw4.evaluate(&cfg2, &proc0), TripAction::Rearm { .. }));
+        assert_eq!(tw4.evaluate(&cfg2, &proc2, P, 0), TripAction::Normal);
+        assert!(matches!(tw4.evaluate(&cfg2, &proc0, P, 15), TripAction::Tripped { first_notice: true, .. }));
     }
 
     #[test]
-    fn device_loss_is_a_pause_and_never_spends_the_rearm_budget() {
+    fn device_loss_is_a_pause_and_never_counts_as_a_drop() {
         let cfg = Config { mode: 2, refused: vec![] };
         let mut at = parse_proc(BENCH_PROC);
         assert_eq!((at.dev_gone, at.reacq), (Some(0), Some(0)));
         let mut watch = TripWatch::default();
-        assert_eq!(watch.evaluate(&cfg, &at), TripAction::Normal);
+        assert_eq!(watch.evaluate(&cfg, &at, P, 0), TripAction::Normal);
         assert!(!watch.take_device_event());
 
         // Ten re-attaches in a row. Each time the module has already taken the
         // new devices by the next look: mode 0, bridge ready, counters up,
         // watchdog untouched. The keeper writes the mode again every time.
+        let mut now = 0;
         for n in 1..=10u32 {
+            now += 15;
             at.mode = Some(0);
             at.dev_gone = Some(2 * n);
             at.reacq = Some(n);
             assert!(at.bridge_ready());
-            assert_eq!(watch.evaluate(&cfg, &at), TripAction::Apply, "re-attach {n}");
+            assert_eq!(watch.evaluate(&cfg, &at, P, now), TripAction::Apply, "re-attach {n}");
             assert!(watch.take_device_event());
             assert!(!watch.take_device_event());
             at.mode = Some(2);
-            watch.note_applied(2, &at);
-            assert_eq!(watch.evaluate(&cfg, &at), TripAction::Normal);
-            assert_eq!(watch.rearms(), 0);
+            watch.note_applied(2, &at, now);
+            assert_eq!(watch.evaluate(&cfg, &at, P, now + 1), TripAction::Normal);
+            assert_eq!(watch.drops(), 0);
             assert!(!watch.is_tripped());
         }
 
-        // A real watchdog trip afterwards still gets its one re-arm, then holds.
+        // A real watchdog trip afterwards waits its minute.
         at.mode = Some(0);
         at.wd_trips = Some(1);
         at.wd_reason = Some("modified".into());
-        assert!(matches!(watch.evaluate(&cfg, &at), TripAction::Rearm { .. }));
-        at.mode = Some(2);
-        watch.note_applied(2, &at);
-        at.mode = Some(0);
-        at.wd_trips = Some(2);
         assert!(matches!(
-            watch.evaluate(&cfg, &at),
-            TripAction::Tripped { first_notice: true, .. }
+            watch.evaluate(&cfg, &at, P, 200),
+            TripAction::Tripped { first_notice: true, wait: 60, .. }
         ));
-        // A device loss does not release a tripped unit.
+        // A device loss while waiting neither ends nor restarts the wait.
         at.dev_gone = Some(99);
         assert!(matches!(
-            watch.evaluate(&cfg, &at),
-            TripAction::Tripped { first_notice: false, .. }
+            watch.evaluate(&cfg, &at, P, 230),
+            TripAction::Tripped { first_notice: false, wait: 60, .. }
         ));
         assert!(watch.is_tripped());
+        assert!(matches!(watch.evaluate(&cfg, &at, P, 260), TripAction::Rearm { drops: 1, .. }));
+        at.mode = Some(2);
+        watch.note_applied(2, &at, 260);
+        // Re-attaches every 20 minutes write the mode again; they do not
+        // restart the clean hour, which counts from the re-arm.
+        for t in [260 + 1200, 260 + 2400] {
+            at.mode = Some(0);
+            at.dev_gone = Some(at.dev_gone.unwrap_or(0) + 2);
+            assert_eq!(watch.evaluate(&cfg, &at, P, t), TripAction::Apply);
+            at.mode = Some(2);
+            watch.note_applied(2, &at, t);
+        }
+        assert_eq!(watch.drops(), 1);
+        assert_eq!(watch.evaluate(&cfg, &at, P, 260 + CLEAN_SECS), TripAction::Normal);
+        assert_eq!(watch.drops(), 0, "an hour since the re-arm forgets the drop");
 
         // A keeper that starts after a device loss sees no watchdog trip and
         // simply applies the mode.
@@ -1075,19 +1142,19 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         after.mode = Some(0);
         after.dev_gone = Some(4);
         after.reacq = Some(2);
-        assert_eq!(fresh.evaluate(&cfg, &after), TripAction::Apply);
-        assert_eq!(fresh.rearms(), 0);
+        assert_eq!(fresh.evaluate(&cfg, &after, P, 0), TripAction::Apply);
+        assert_eq!(fresh.drops(), 0);
 
-        // A trip and a device loss in the same interval: the trip still counts
-        // on the next drop, because the watchdog counter moved.
+        // A trip and a device loss in the same interval: the trip still counts,
+        // because the watchdog counter moved.
         let mut both = TripWatch::default();
         let mut p = parse_proc(BENCH_PROC);
-        assert_eq!(both.evaluate(&cfg, &p), TripAction::Normal);
+        assert_eq!(both.evaluate(&cfg, &p, P, 0), TripAction::Normal);
         p.mode = Some(0);
         p.dev_gone = Some(1);
         p.wd_trips = Some(1);
         p.wd_reason = Some("tx_stall".into());
-        assert!(matches!(both.evaluate(&cfg, &p), TripAction::Rearm { .. }));
+        assert!(matches!(both.evaluate(&cfg, &p, P, 15), TripAction::Tripped { first_notice: true, .. }));
     }
 
     #[test]

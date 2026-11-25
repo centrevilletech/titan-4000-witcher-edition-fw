@@ -14,8 +14,9 @@
 //! boot and whether its rollbacks were the image's or the network's, the
 //! download clamp module, the passthrough bridge fast path, the
 //! off switches for those latency features, the carrier picker, the radio
-//! profile guard's trial, strike and retry rules, the opt-in CPU trims, and
-//! the sign-in limits of the web service and recovery page.
+//! profile guard's trial, strike and retry rules, the opt-in CPU trims, the
+//! waits of retries that never give up, and the sign-in limits of the web
+//! service and recovery page.
 #![forbid(unsafe_code)]
 
 pub mod carrier_pick;
@@ -43,6 +44,7 @@ pub mod prefix;
 pub mod qctrl;
 pub mod ra;
 pub mod reboots;
+pub mod retry;
 pub mod sas_nat;
 pub mod sha256;
 pub mod sign_in;

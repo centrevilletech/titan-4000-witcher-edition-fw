@@ -2,7 +2,7 @@
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
  * k1fp_core.h - Portable decision, classification, lease, watchdog, TX-ring,
- * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.2.
+ * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.2.1.
  *
  * No kernel headers here. The includer must provide u8/u16/u32/u64/s32 and
  * memcmp/memcpy/memset. The same header compiles into the ARMv7 kernel module
@@ -846,8 +846,37 @@ struct k1_wd_cfg {
 	u32 mod_win_ms;      /* sliding burst window (2 x half-window) for mod_limit (ms) */
 	u32 mismatch_limit;  /* lease mismatch delta in 1 s window before trip (0 = off) */
 	u32 stall_ms;        /* full ring or stopped queue with frozen tail before trip */
-	u32 ringfull_ms;     /* persistent full ring (even if crawling) before trip */
+	u32 ringfull_ms;     /* persistent full ring (even if crawling) before trip (0 = off) */
 };
+
+/*
+ * The watchdog's settings at load (2.2.1). Each one is also a /proc/k1fp knob.
+ *
+ * A stall is a TX tail that does not move while the ring is full or the queue
+ * stopped. 2.2 also tripped on a ring that stayed full for 500 ms while it
+ * drained ("even if crawling"), and on a tail frozen for 500 ms. Neither is
+ * evidence against the fast path, which only hands frames to dev_queue_xmit
+ * like the stock bridge (txirq, the one feature that changes eth0's TX
+ * completion, is off unless an operator writes it and has its own guard):
+ *  - A router port linked at 100 Mb/s under a faster download keeps the ring
+ *    full while it drains at line rate, so 2.2 tripped within a second of
+ *    every such download. ringfull_ms is now off by default.
+ *  - A router's 802.3x PAUSE stops the MAC (the driver obeys PAUSE; Witcher
+ *    only stops the Titan sending it). One pause at 100 Mb/s lasts up to
+ *    336 ms, so two in a row tripped 2.2. stall_ms is now 2 s: a real stall
+ *    is a frozen tail that stays frozen, and it still trips.
+ */
+#define K1_WD_STALL_MS     2000u
+#define K1_WD_RINGFULL_MS  0u
+
+static inline void k1_wd_defaults(struct k1_wd_cfg *cfg)
+{
+	cfg->mod_limit = 20u;
+	cfg->mod_win_ms = K1_WD_MOD_WIN_MS;
+	cfg->mismatch_limit = 64u;
+	cfg->stall_ms = K1_WD_STALL_MS;
+	cfg->ringfull_ms = K1_WD_RINGFULL_MS;
+}
 
 struct k1_wd_state {
 	u32 prev_mod_d;

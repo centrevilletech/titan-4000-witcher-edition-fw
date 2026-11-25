@@ -14,7 +14,8 @@
 //! modes and knobs, and `clamp=off` in the latency switches turns it off
 //! (`effective`). The keeper:
 //! - loads it only when the effective mode is not 0, once the customer port
-//!   and the management bearer have been up for `SETTLE_SECS`;
+//!   and the customer bearer have been up for `SETTLE_SECS`, and tries a
+//!   failed load again after a wait that doubles (`retry::MODULES`);
 //! - loads only bytes that match the digest built into the keeper
 //!   (`device/qctrl/SHA256SUMS`): a copy staged in `/mnt/titan-api/qctrl/`
 //!   when there is one, else the image's, from a private copy in RAM;
@@ -40,7 +41,7 @@ pub const MODES: [u32; 4] = [0, 2, 3, 6];
 /// v1.0.17), 2 the clamp alone, 0 leaves the clamp off unless an operator
 /// turns it on. It must be one of `MODES`.
 pub const DEFAULT_MODE: u32 = 3;
-/// Seconds the customer port and the management bearer stay up before a load.
+/// Seconds the customer port and the customer bearer stay up before a load.
 pub const SETTLE_SECS: u64 = 30;
 /// Seconds between config and `/proc` checks.
 pub const CHECK_EVERY: u64 = 15;
@@ -148,8 +149,9 @@ pub fn parse_config(text: &str) -> Config {
 /// - `clamp=off` in the latency switches: mode 0;
 /// - the operator's `qctrl/config` (`staged`) when there is one;
 /// - else `DEFAULT_MODE` with the module's own knobs, unless CAKE shapes
-///   downloads: only a radio profile's `sqm` action loads `sch_cake`, and
-///   the clamp has not been tested beside it, so the default stands aside.
+///   traffic (`cake_shaping`): only a radio profile's `sqm` action installs
+///   it, and the clamp has not been tested beside it, so the default stands
+///   aside while it is there and comes back when it is gone.
 pub fn effective(switch_on: bool, staged: Option<&str>, cake: bool) -> (Config, Source) {
     if !switch_on {
         return (Config::default(), Source::Off);
@@ -163,9 +165,17 @@ pub fn effective(switch_on: bool, staged: Option<&str>, cake: bool) -> (Config, 
     (Config { mode: DEFAULT_MODE, ..Config::default() }, Source::Default)
 }
 
-/// `sch_cake` is loaded (`/proc/modules`).
-pub fn cake_loaded(modules: &str) -> bool {
-    modules.lines().any(|line| line.split_whitespace().next() == Some("sch_cake"))
+/// A CAKE qdisc is installed, from `/proc/modules`. Every qdisc holds a
+/// reference to its module from creation to destruction (Linux 3.10
+/// `qdisc_lookup_ops` and `qdisc_destroy`), so `sch_cake`'s use count, the
+/// third field, is the number of CAKE qdiscs. Reverting a radio profile's
+/// `sqm` removes them but leaves the module loaded, at 0. A count that
+/// cannot be read counts as in use.
+pub fn cake_shaping(modules: &str) -> bool {
+    modules.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("sch_cake") && fields.nth(1) != Some("0")
+    })
 }
 
 /// What `/proc/titan_qctrl` shows.
@@ -372,8 +382,27 @@ mod tests {
         let (config, source) = effective(true, None, true);
         assert_eq!(config.mode, 0);
         assert!(matches!(source, Source::Aside(_)));
-        assert!(cake_loaded(MODULES));
-        assert!(!cake_loaded("titan_qctrl 47104 0 - Live 0x7f0b4000\nsch_cake_old 1 0 - Live 0x0\n"));
+    }
+
+    #[test]
+    fn the_default_stands_aside_only_while_a_cake_qdisc_is_installed() {
+        let with = |cake: &str| format!("titan_qctrl 47104 0 - Live 0x7f0b4000\n{cake}");
+        // A radio profile's sqm installs CAKE on lte0pdn2 and eth0: two qdiscs.
+        assert!(cake_shaping(&with("sch_cake 31676 2 - Live 0x7f0a0000\n")));
+        assert!(cake_shaping(&with("sch_cake 31676 1 - Live 0x7f0a0000\n")));
+        // Reverted or removed: the qdiscs are gone and the module stays loaded
+        // at 0. v1.0.17 read this as CAKE and kept the clamp at mode 0 until
+        // the next reboot, so the unit had neither.
+        let reverted = with("sch_cake 31676 0 - Live 0x7f0a0000\n");
+        assert!(!cake_shaping(&reverted));
+        assert_eq!(effective(true, None, cake_shaping(&reverted)).0.mode, DEFAULT_MODE);
+        assert!(!cake_shaping(MODULES), "MODULES has sch_cake loaded with no qdisc");
+        // Never loaded, or another module whose name only starts the same.
+        assert!(!cake_shaping(&with("")));
+        assert!(!cake_shaping(&with("sch_cake_old 1 3 - Live 0x0\n")));
+        // A count that cannot be read keeps the clamp aside, as before.
+        assert!(cake_shaping(&with("sch_cake 31676 - - Live 0x7f0a0000\n")));
+        assert!(cake_shaping(&with("sch_cake 31676\n")));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * test_k1fp.c - Userspace unit, integration, and fuzz test suite for
- * k1fp 2.2 (device/fastpath/source/k1fp_core.h).
+ * k1fp 2.2.1 (device/fastpath/source/k1fp_core.h).
  *
  * Compiled and executed on the host with AddressSanitizer + UBSan via
  * device/fastpath/test/run.sh.
@@ -654,6 +654,98 @@ static void test_watchdog(void)
 	CHECK(k1_wd_tick(&w, &cfg, 1, 1, 0, 1, 1, 7, 0, 0, 0, 400) == K1_WD_NONE, "reset after down");
 }
 
+/*
+ * 2.2.1: the default settings (k1_wd_defaults) on a busy but healthy port,
+ * against 2.2's settings, which tripped on it. One tick is the module's
+ * 100 ms timer. eth0's ring has 256 descriptors here; at 100 Mb/s it sends
+ * about 812 full-size frames per tick, so a full ring's tail moves every tick.
+ */
+static const struct k1_wd_cfg k1_wd_cfg_v22 = {
+	.mod_limit = 20, .mod_win_ms = 10000,
+	.mismatch_limit = 64, .stall_ms = 500, .ringfull_ms = 500
+};
+
+/* Ticks until a trip (0 = none in `ticks`) with the ring full every tick, the
+ * tail advancing `step` descriptors per tick except while `frozen(i)`. */
+static int k1_wd_ticks_to_trip(const struct k1_wd_cfg *cfg, int ticks, u32 step,
+			       int (*frozen)(int), int *reason)
+{
+	struct k1_wd_state w;
+	u32 tail = 7;
+	int i, r;
+
+	k1_wd_arm(&w, 0, 0, 0, tail);
+	for (i = 1; i <= ticks; i++) {
+		if (!frozen || !frozen(i))
+			tail = (tail + step) % 256u;
+		r = k1_wd_tick(&w, cfg, 1, 1, 0, 1, 1, tail, 0, 0, 0, 100);
+		if (r != K1_WD_NONE) {
+			*reason = r;
+			return i;
+		}
+	}
+	*reason = K1_WD_NONE;
+	return 0;
+}
+
+/* A router that pauses the Titan twice in a row at 100 Mb/s (2 x 336 ms, so
+ * 7 ticks frozen) every 10 s. */
+static int k1_pause_pair(int i) { return i % 100 >= 1 && i % 100 <= 7; }
+/* Five pauses in a row (1.68 s, 17 ticks frozen), then traffic again. */
+static int k1_pause_five(int i) { return i >= 10 && i < 27; }
+/* A wedged ring: from tick 10 the tail never moves again. */
+static int k1_wedged(int i) { return i >= 10; }
+
+static void test_watchdog_defaults(void)
+{
+	struct k1_wd_cfg cfg;
+	int reason, at;
+
+	k1_wd_defaults(&cfg);
+	CHECK(cfg.mod_limit == 20 && cfg.mod_win_ms == K1_WD_MOD_WIN_MS && cfg.mismatch_limit == 64,
+	      "burst and mismatch limits unchanged from 2.2");
+	CHECK(cfg.stall_ms == 2000 && cfg.ringfull_ms == 0, "stall 2 s, ring-full rule off");
+
+	/* A 100 Mb/s router port under a faster download: full ring, draining at line rate. */
+	at = k1_wd_ticks_to_trip(&k1_wd_cfg_v22, 600, 812 % 256, NULL, &reason);
+	CHECK(at == 5 && reason == K1_WD_RINGFULL, "2.2 tripped a busy 100 Mb/s port at 500 ms (at %d, %d)", at, reason);
+	at = k1_wd_ticks_to_trip(&cfg, 600, 812 % 256, NULL, &reason);
+	CHECK(at == 0, "a busy 100 Mb/s port runs 60 s without a trip (tripped at tick %d, reason %d)", at, reason);
+
+	/* Two back-to-back PAUSE frames every 10 s. */
+	at = k1_wd_ticks_to_trip(&k1_wd_cfg_v22, 600, 812 % 256, k1_pause_pair, &reason);
+	CHECK(at > 0 && reason == K1_WD_TXSTALL, "2.2 tripped on two PAUSE frames in a row (%d)", reason);
+	at = k1_wd_ticks_to_trip(&cfg, 600, 812 % 256, k1_pause_pair, &reason);
+	CHECK(at == 0, "paired PAUSE frames for 60 s never trip (tick %d, reason %d)", at, reason);
+
+	/* Five pauses in a row (1.7 s) still do not; the port drains afterwards. */
+	at = k1_wd_ticks_to_trip(&cfg, 600, 812 % 256, k1_pause_five, &reason);
+	CHECK(at == 0, "1.7 s of PAUSE does not trip (tick %d, reason %d)", at, reason);
+
+	/* A real stall still trips: the tail freezes at tick 10 and stays frozen. */
+	at = k1_wd_ticks_to_trip(&cfg, 600, 812 % 256, k1_wedged, &reason);
+	CHECK(at == 9 + 20 && reason == K1_WD_TXSTALL, "a frozen tail trips after 2 s (at %d, %d)", at, reason);
+
+	/* A stopped queue with a frozen tail and the ring not full is a stall too. */
+	{
+		struct k1_wd_state w;
+		int i, r = K1_WD_NONE;
+
+		k1_wd_arm(&w, 0, 0, 0, 42);
+		for (i = 0; i < 19; i++) {
+			r = k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 1, 42, 0, 0, 0, 100);
+			CHECK(r == K1_WD_NONE, "stopped queue < 2 s (tick %d)", i);
+		}
+		r = k1_wd_tick(&w, &cfg, 1, 1, 0, 0, 1, 42, 0, 0, 0, 100);
+		CHECK(r == K1_WD_TXSTALL, "stopped queue with a frozen tail trips at 2 s");
+	}
+
+	/* The ring-full rule still works for an operator who turns it on (txirq tests). */
+	cfg.ringfull_ms = 500;
+	at = k1_wd_ticks_to_trip(&cfg, 600, 812 % 256, NULL, &reason);
+	CHECK(at == 5 && reason == K1_WD_RINGFULL, "wd_ringfull_ms 500 still trips at 500 ms (%d)", at);
+}
+
 static void test_tx_ring_model(void)
 {
 	/* Verify K1c F1/F6/F12 TX ring helper invariants */
@@ -915,6 +1007,7 @@ int main(void)
 	test_cbrs_and_proof_invariants();
 	test_diag_ring();
 	test_watchdog();
+	test_watchdog_defaults();
 	test_tx_ring_model();
 	test_reacquire();
 	test_sha256_vectors();
@@ -922,6 +1015,6 @@ int main(void)
 		fprintf(stderr, "FAILED: %d check(s) failed\n", fails);
 		return 1;
 	}
-	printf("PASS: all k1fp 2.2 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, device re-acquire, SHA-256)\n");
+	printf("PASS: all k1fp 2.2.1 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, busy-port and PAUSE defaults, txring, device re-acquire, SHA-256)\n");
 	return 0;
 }

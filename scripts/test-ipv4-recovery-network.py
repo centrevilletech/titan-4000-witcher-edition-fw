@@ -48,13 +48,18 @@ The fast path runs first with a bogus staged module (refused before insmod),
 then with the real pinned clamp and fast path modules against a stub insmod
 and a fake /proc/k1fp: clamp loads before fast path, mode 2 is read back,
 grant leases renew every second and revoke immediately on gate close, a change
-in qctrl_present is logged, watchdog trips re-arm at most once per boot before
-holding at mode 0 in state=tripped, and mode=0 rolls back live.
+in qctrl_present is logged, every watchdog trip holds mode 0 in state=tripped
+for a wait that doubles (TITAN_RETRY_SECS shortens it here) and then re-arms,
+for as long as it takes, the fast path switch turned off and on starts the
+waits over, and mode=0 rolls back live.
 Since v1.0.17 both are on by default: with no config of their own they load
 from a directory standing in for the image's copies, the clamp in mode 3
 (read back from a fake /proc/titan_qctrl) and the fast path in mode 2, and the
 latency switch file turns each off and on live. modem=off there rolls the
-modem words back to 0, and on writes them again.
+modem words back to 0, and on writes them again. An insmod that fails once is
+tried again. The default clamp stands aside while sch_cake is in use and comes
+back once a reverted profile leaves it loaded at 0. Without the Witcher volume
+and with the management bearer down, both defaults still load from the image.
 """
 import errno
 import hashlib
@@ -287,7 +292,7 @@ for line in sys.stdin:
     def write_k1fp_proc():
         s = fp_state
         text = (
-            "titan_k1fp v2.2\n"
+            "titan_k1fp v2.2.1\n"
             f"mode={s['mode']} lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n"
             f"require_grant=1 grant_left_ms={s['grant_left_ms']} gate={s['gate']} v4=1 v6=1 lease_ms=60 sample_ms=20\n"
             f"qctrl: qctrl_present={s['qctrl_present']} qctrl_dl_calls=0 qctrl_dl_drop=0 qctrl_dl_stolen=0 qctrl_ul_stock=0\n"
@@ -383,7 +388,7 @@ for line in sys.stdin:
              TITAN_TK_QUIET_UTC='',TITAN_TK_CONFIRM_SECS='20',TITAN_TK_SEARCH_SECS='45',TITAN_TK_RECHECK_SECS='3600',TITAN_TK_PROBE_EVERY='5',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
              TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
-             TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',
+             TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',TITAN_RETRY_SECS='3',
              TITAN_CARRIER_DIR='/tmp/carrier-watch',TITAN_CBRS_LOG='/tmp/cbrslog0.txt',TITAN_CARRIER_STATUS='/tmp/carrier.status')
     keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     def log():
@@ -768,13 +773,14 @@ for line in sys.stdin:
         # process cannot arm, so any reboot now is the boot confirm's. The
         # modem stays attached (a cell in view), so the confirm's clock runs;
         # this harness sets it to 20 s (TITAN_TK_CONFIRM_SECS).
-        def restart(extra=None):
+        def restart(extra=None, without=()):
             nonlocal keeper
             keeper.terminate();keeper.wait(timeout=5)
             Path('/tmp/reboot-actions').unlink(missing_ok=True)
             # A new boot: nothing has answered through the core yet.
             Path('/tmp/runtime/heard-through-core').unlink(missing_ok=True)
-            keeper=subprocess.Popen([str(BINARY),'run'],env=dict(env,**(extra or {})),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            run_env={k:v for k,v in dict(env,**(extra or {})).items() if k not in without}
+            keeper=subprocess.Popen([str(BINARY),'run'],env=run_env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         def uptime():
             return int(float(Path('/proc/uptime').read_text().split()[0]))
         def strikes(n):
@@ -1458,7 +1464,7 @@ if mod == 'titan_qctrl.ko':
 elif mod == 'titan_k1fp.ko':
     qpresent = 1 if 'titan_qctrl ' in mods else 0
     Path('/tmp/k1fp-proc').write_text(
-        'titan_k1fp v2.2\n'
+        'titan_k1fp v2.2.1\n'
         'mode=0 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1\n'
         'require_grant=1 grant_left_ms=0 gate=closed v4=1 v6=1 lease_ms=60 sample_ms=20\n'
         f'qctrl: qctrl_present={qpresent} qctrl_dl_calls=0 qctrl_dl_drop=0 qctrl_dl_stolen=0 qctrl_ul_stock=0\n'
@@ -1532,35 +1538,46 @@ else:
         wait_for(lambda: 'fast path: download clamp unloaded (qctrl_present=0)' in log(), 25)
         assert 'qctrl_present=0\n' in fp_status(), fp_status()
         print('PASS: fast path noticed and logged qctrl_present change.', flush=True)
-        # Watchdog trip #1: keeper logs reason and re-arms mode 2 once.
-        with fp_lock:
-            fp_state['mode'] = 0
-            fp_state['wd_trips'] = 1
-            fp_state['wd_reason'] = 'tx_stall'
-            write_k1fp_proc()
-        wait_for(lambda: 'tx_stall' in log() and fp_state['mode'] == 2 and 'state=applied\n' in fp_status() and 'wd_trips=1\n' in fp_status(), 25)
-        assert 're-arming mode 2' in log(), log()
-        print('PASS: first watchdog trip logged reason and re-armed once.', flush=True)
-        # Watchdog trip #2: keeper does NOT re-arm; stays at mode 0 in state=tripped.
-        with fp_lock:
-            fp_state['mode'] = 0
-            fp_state['wd_trips'] = 2
-            fp_state['wd_reason'] = 'ring_full'
-            write_k1fp_proc()
+        # Every watchdog trip holds mode 0 for a wait that doubles with each trip
+        # in a row (3, 6, 12 s here; 1, 2, 4 min on a unit), then re-arms. There
+        # is no budget: v1.0.17's first draft held the second trip at mode 0
+        # until the config changed or the unit rebooted.
+        def trip(n, reason):
+            with fp_lock:
+                fp_state['mode'] = 0
+                fp_state['wd_trips'] = n
+                fp_state['wd_reason'] = reason
+                write_k1fp_proc()
+        for n, reason, wait in ((1, 'tx_stall', 3), (2, 'ring_full', 6), (3, 'modified', 12)):
+            before_trip = len(log())
+            trip(n, reason)
+            wait_for(lambda: 'state=tripped\n' in fp_status() and reason in log()[before_trip:], 25)
+            st = fp_status()
+            assert f'trying mode 2 again after {wait} s' in st and 'active_mode=0\n' in st, st
+            assert fp_state['mode'] == 0, fp_state
+            wait_for(lambda: fp_state['mode'] == 2 and 'state=applied\n' in fp_status() and f'wd_trips={n}\n' in fp_status(), 40)
+            assert f're-arming mode 2 (drop {n} in a row: watchdog tripped (reason={reason}' in log(), log()
+            assert log()[before_trip:].count('fast path tripped') == 1, log()[before_trip:]
+        print('PASS: three watchdog trips in a row each held mode 0 for a doubling wait (3, 6, 12 s) and re-armed.', flush=True)
+        # The Fast path switch turned off and on starts the waits over: the
+        # next trip waits the first wait again, not 24 s.
+        Path('/tmp/latency').mkdir(exist_ok=True)
+        Path('/tmp/latency/config').write_text('fastpath=off\n')
+        wait_for(lambda: 'state=off\n' in fp_status() and fp_state['mode'] == 0, 30)
+        Path('/tmp/latency/config').write_text('fastpath=on\n')
+        wait_for(lambda: 'state=applied\n' in fp_status() and fp_state['mode'] == 2, 30)
+        trip(4, 'tx_stall')
         wait_for(lambda: 'state=tripped\n' in fp_status(), 25)
-        assert 'ring_full' in log() and fp_state['mode'] == 0, (fp_state, fp_status())
-        assert 'active_mode=0\n' in fp_status(), fp_status()
-        until = time.monotonic() + 16
-        wait_for(lambda: time.monotonic() >= until, 20)
-        assert 'state=tripped\n' in fp_status() and fp_state['mode'] == 0, (fp_state, fp_status())
-        assert log().count('ring_full') == 1, log()
-        print('PASS: second watchdog trip stayed at mode 0 in state=tripped and logged once.', flush=True)
+        assert 'trying mode 2 again after 3 s' in fp_status(), fp_status()
+        wait_for(lambda: fp_state['mode'] == 2 and 'state=applied\n' in fp_status(), 40)
+        Path('/tmp/latency/config').unlink()
+        print('PASS: the fast path switch turned off and on started the re-arm waits over.', flush=True)
         # Live rollback via config change: mode=0 clears tripped state to off.
         Path('/tmp/fastpath/config').write_text('mode=0\n')
         wait_for(lambda: 'state=off\n' in fp_status(), 25)
         assert fp_state['mode'] == 0 and 'mode=0\n' in fp_status(), (fp_state, fp_status())
         print('PASS: live rollback (mode=0 in fastpath/config) moved fast path to state=off.', flush=True)
-        # Adopting an already-loaded titan_k1fp v2.2 module (loaded by hand, even
+        # Adopting an already-loaded titan_k1fp v2.2.1 module (loaded by hand, even
         # without a staged .ko): keeper logs adoption, does not run insmod, takes
         # over mode and drives the 1 Hz grant lease.
         Path('/tmp/fastpath/titan_k1fp.ko').unlink(missing_ok=True)
@@ -1585,7 +1602,7 @@ else:
         with fp_lock:
             adopt_renews = [c for _, c in k1fp_cmds[before_adopt_renew:] if c == 'grant 5']
         assert len(adopt_renews) >= 2, (adopt_renews, k1fp_cmds)
-        print('PASS: adopted pre-loaded titan_k1fp v2.2 without insmod and drove the grant lease.', flush=True)
+        print('PASS: adopted pre-loaded titan_k1fp v2.2.1 without insmod and drove the grant lease.', flush=True)
         # Wrong version string in /proc/k1fp is still refused (never adopted).
         Path('/tmp/fastpath.status').unlink(missing_ok=True)
         before_refuse_log = len(log())
@@ -1633,7 +1650,7 @@ else:
         assert Path('/tmp/insmod-calls').read_text().splitlines() == ['titan_qctrl.ko', 'titan_k1fp.ko']
         new_log = log()[before_defaults:]
         assert 'download clamp: loaded titan_qctrl v0.3-q3 from the firmware image' in new_log, new_log
-        assert 'fast path: loaded titan_k1fp v2.2 from the firmware image' in new_log, new_log
+        assert 'fast path: loaded titan_k1fp v2.2.1 from the firmware image' in new_log, new_log
         assert 'mode=3\n' in q_status() and 'the firmware default' in q_status() and q_state['mode'] == 3, (q_status(), q_state)
         assert 'mode=2\n' in fp_status() and 'active_mode=2\n' in fp_status() and 'the firmware default' in fp_status(), fp_status()
         print('PASS: with no config of their own the clamp (mode 3) and the fast path (mode 2) loaded from the image.', flush=True)
@@ -1649,14 +1666,79 @@ else:
         assert fp_state['mode'] == 2 and q_state['mode'] == 3, (fp_state, q_state)
         assert Path('/tmp/insmod-calls').read_text().splitlines() == ['titan_qctrl.ko', 'titan_k1fp.ko'], 'no reload'
         print('PASS: clamp=off and fastpath=off turned both to mode 0 live, and on again put back 3 and 2.', flush=True)
-        # The default clamp stands aside while a radio profile's CAKE is loaded.
-        Path('/tmp/proc-modules').write_text(Path('/tmp/proc-modules').read_text() + 'sch_cake 31676 0 - Live 0x7f0a0000\n')
+        # The default clamp stands aside while a radio profile's CAKE qdiscs are
+        # installed: sch_cake in use, here by two (lte0pdn2 and eth0).
+        mods = Path('/tmp/proc-modules').read_text()
+        Path('/tmp/proc-modules').write_text(mods + 'sch_cake 31676 2 - Live 0x7f0a0000\n')
         wait_for(lambda: 'state=off\n' in q_status() and 'CAKE' in q_status(), 30)
         assert q_state['mode'] == 0, q_state
-        Path('/tmp/proc-modules').write_text(Path('/tmp/proc-modules').read_text().replace('sch_cake 31676 0 - Live 0x7f0a0000\n', ''))
+        # The profile is reverted: its qdiscs are gone and sch_cake stays loaded
+        # with no user. The clamp comes back; v1.0.17's first draft kept it
+        # aside until a reboot, so the unit had neither.
+        Path('/tmp/proc-modules').write_text(mods + 'sch_cake 31676 0 - Live 0x7f0a0000\n')
         wait_for(lambda: 'state=applied\n' in q_status() and q_state['mode'] == 3, 30)
+        # Applied again later in the same boot: aside again, and back once it goes.
+        Path('/tmp/proc-modules').write_text(mods + 'sch_cake 31676 2 - Live 0x7f0a0000\n')
+        wait_for(lambda: 'state=off\n' in q_status() and q_state['mode'] == 0, 30)
+        Path('/tmp/proc-modules').write_text(mods + 'sch_cake 31676 0 - Live 0x7f0a0000\n')
+        wait_for(lambda: 'state=applied\n' in q_status() and q_state['mode'] == 3, 30)
+        Path('/tmp/proc-modules').write_text(mods)
         Path('/tmp/latency/config').unlink()
-        print('PASS: the default clamp stood aside while sch_cake was loaded and came back after.', flush=True)
+        print('PASS: the default clamp stood aside while CAKE was in use and came back after each revert, sch_cake still loaded.', flush=True)
+        # A load that fails once (insmod refused: the bridge rebuilt at that
+        # moment, ENOMEM) is tried again after the first wait, for both.
+        def fresh_modules():
+            # Stop the running keeper first, so it cannot load a module (or
+            # take a fail-once flag) between this reset and the restart.
+            keeper.terminate();keeper.wait(timeout=5)
+            for stale in ('/tmp/qctrl-proc', '/tmp/k1fp-proc', '/tmp/insmod-calls', '/tmp/qctrl.status', '/tmp/fastpath.status'):
+                Path(stale).unlink(missing_ok=True)
+            Path('/tmp/proc-modules').write_text('')
+            with fp_lock:
+                fp_state.update(mode=0, gate='closed', grant_left_ms=0, qctrl_present=1, wd_trips=0, wd_reason='none')
+                k1fp_cmds.clear()
+            with q_lock:
+                q_state.update(q_defaults)
+        fresh_modules()
+        stub = insmod_stub.read_text()
+        insmod_stub.write_text(stub.replace("mod = os.path.basename(sys.argv[1])\n", """mod = os.path.basename(sys.argv[1])
+once = Path('/tmp/insmod-fail-once-' + mod)
+if once.exists():
+    once.unlink()
+    with open('/tmp/insmod-calls', 'a') as f:
+        f.write(mod + ' failed\\n')
+    sys.stderr.write('insmod: ERROR: could not insert module: Cannot allocate memory\\n')
+    sys.exit(1)
+""", 1))
+        for name in ('titan_qctrl.ko', 'titan_k1fp.ko'):
+            Path('/tmp/insmod-fail-once-' + name).write_text('')
+        before_retry = len(log())
+        restart()
+        wait_for(lambda: 'state=applied\n' in fp_status() and 'state=applied\n' in q_status(), 150)
+        calls = Path('/tmp/insmod-calls').read_text().splitlines()
+        assert sorted(calls) == sorted(['titan_qctrl.ko failed', 'titan_qctrl.ko', 'titan_k1fp.ko failed', 'titan_k1fp.ko']), calls
+        retried = log()[before_retry:]
+        assert 'download clamp failed: not loaded: insmod failed: insmod: ERROR: could not insert module: Cannot allocate memory; trying again in 3 s' in retried, retried
+        assert 'fast path failed: not loaded: insmod failed: insmod: ERROR: could not insert module: Cannot allocate memory; trying again in 3 s' in retried, retried
+        assert q_state['mode'] == 3 and fp_state['mode'] == 2, (q_state, fp_state)
+        insmod_stub.write_text(stub)
+        print('PASS: an insmod that failed once was tried again, and the clamp and the fast path loaded.', flush=True)
+        # A unit without the Witcher volume, and with its management bearer
+        # down, still gets both defaults from the image. v1.0.17's first draft
+        # left both off without the volume, and the clamp waited for lte0pdn0.
+        run(ip, 'link', 'set', 'lte0pdn0', 'down')
+        fresh_modules()
+        before_bare = len(log())
+        restart(without=('TITAN_QCTRL_DIR', 'TITAN_FASTPATH_DIR'))
+        wait_for(lambda: 'state=applied\n' in fp_status() and 'state=applied\n' in q_status(), 120)
+        bare = log()[before_bare:]
+        assert 'download clamp: loaded titan_qctrl v0.3-q3 from the firmware image' in bare, bare
+        assert 'fast path: loaded titan_k1fp v2.2.1 from the firmware image' in bare, bare
+        assert 'mode=3\n' in q_status() and 'the firmware default' in q_status(), q_status()
+        assert 'mode=2\n' in fp_status() and 'the firmware default' in fp_status(), fp_status()
+        run(ip, 'link', 'set', 'lte0pdn0', 'up')
+        restart()
+        print('PASS: with no Witcher volume and the management bearer down, the clamp and the fast path loaded from the image.', flush=True)
         # Router swap, last, so no timed step above moves against the deaf
         # watchdog's rounds. The vendor kernel addresses the bearer's IPv4 to the MAC
         # it stored at boot, the router's here, so with the bearer bridged the

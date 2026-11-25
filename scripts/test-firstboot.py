@@ -283,6 +283,108 @@ class LauncherOrderTests(unittest.TestCase):
         self.assertFalse((self.root/'order').exists())
 
 
+class RouteLoopTests(unittest.TestCase):
+    """The launcher's restore-routes-loop against a routing table the test edits.
+
+    A bearer drop removes the bearer's connected route and every route through
+    it, as Linux does. The stand-in `titan-api --restore-routes` adds the saved
+    route back only while its gateway is reachable, like `route add`.
+    """
+    write = FirstBootTests.write
+    HEADER = 'Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n'
+    # 10.200.0.0/30 on lte0pdn0: the management bearer is up.
+    CONNECTED = 'lte0pdn0\t0000C80A\t00000000\t0001\t0\t0\t0\tFCFFFFFF\t0\t0\t0\n'
+    # The administrator's route: 192.168.0.0/16 via 10.200.0.2 on lte0pdn0.
+    SAVED = 'lte0pdn0\t0000A8C0\t0200C80A\t0003\t0\t0\t0\t0000FFFF\t0\t0\t0\n'
+
+    def setUp(self):
+        FirstBootTests.setUp(self)
+        self.write('bin/sleep', '#!/bin/sh\nexec /bin/sleep 0.05\n').chmod(0o755)
+        bundle = self.root/'usr/lib/titan-api'
+        bundle.mkdir(parents=True)
+        bundle.chmod(0o755)
+        runtime = self.root/'tmp/witcher-api'
+        runtime.mkdir(parents=True)
+        runtime.chmod(0o755)
+        self.table = self.write('proc/net/route', self.HEADER + self.CONNECTED)
+        self.uptime = self.write('proc/uptime', '100.00 50.00\n')
+        self.calls = self.root/'restore-calls'
+        self.write('tmp/witcher-api/titan-api', f'''#!/bin/sh
+[ "$1" = --restore-routes ] || exit 64
+echo call >> "{self.calls}"
+grep -q '^lte0pdn0	0000C80A' "{self.table}" || {{ echo 'route: SIOCADDRT: Network is unreachable' >&2; exit 1; }}
+grep -q '^lte0pdn0	0000A8C0' "{self.table}" || printf '%s' '{self.SAVED}' >> "{self.table}"
+''').chmod(0o755)
+        text = (REPO/'overlay/usr/lib/titan-api/start-titan-api.sh').read_text()
+        text = re.sub(r'/(?:mnt|tmp|sys|etc|proc)(?=[/\s\"\'])', lambda m: str(self.root)+m.group(), text)
+        text = text.replace('[ "$3" = 500 ]', f'[ "$3" = {os.getuid()} ]')
+        launcher = self.write('usr/lib/titan-api/start-titan-api.sh', text)
+        launcher.chmod(0o755)
+        self.log = open(self.root/'routes.log', 'w+')
+        self.addCleanup(self.log.close)
+        self.loop = subprocess.Popen(['sh', str(launcher), 'restore-routes-loop'], env=self.env,
+                                     stdout=self.log, stderr=subprocess.STDOUT)
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        if self.loop.poll() is None:
+            self.loop.kill()
+        self.loop.wait(timeout=5)
+
+    def restores(self):
+        return len(self.calls.read_text().splitlines()) if self.calls.exists() else 0
+
+    @staticmethod
+    def put(path, text):
+        """Replace a file in one step, as the kernel shows a new table: the loop
+        must never read one half written."""
+        new = path.with_name(path.name + '.new')
+        new.write_text(text)
+        os.replace(new, path)
+
+    def until(self, predicate, what, seconds=5):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            self.assertIsNone(self.loop.poll(), 'the route loop exited')
+            time.sleep(0.02)
+        self.fail(f'timed out waiting for {what}; log: {(self.root/"routes.log").read_text()}')
+
+    def idle(self, seconds=0.6):
+        """Several loop rounds (50 ms each here) with nothing changing."""
+        before = self.restores()
+        time.sleep(seconds)
+        self.assertEqual(self.restores(), before, 'restored with no change to the routing table')
+
+    def test_routes_come_back_after_every_bearer_drop(self):
+        # At start the bearer is up and the saved route is missing: restored at once.
+        self.until(lambda: self.SAVED in self.table.read_text(), 'the first restore')
+        self.assertEqual(self.restores(), 1)
+        # An unchanged table runs nothing.
+        self.idle()
+        for drop in range(3):
+            # The bearer drops: its routes go with it. The restore fails while
+            # the gateway is unreachable, and waits instead of spinning.
+            self.put(self.table, self.HEADER)
+            self.until(lambda: self.restores() == 2 + 3 * drop, f'a try after drop {drop}')
+            self.idle()
+            # The wait doubles: 15 s, then 30 s, by the uptime clock.
+            self.put(self.uptime, f'{116 + 100 * drop}.00 50.00\n')
+            self.until(lambda: self.restores() == 3 + 3 * drop, f'the retry after 15 s, drop {drop}')
+            self.put(self.uptime, f'{130 + 100 * drop}.00 50.00\n')
+            self.idle()
+            # The bearer is back: the table changes and the route is restored at once.
+            self.put(self.table, self.HEADER + self.CONNECTED)
+            self.until(lambda: self.SAVED in self.table.read_text(), f'the restore after drop {drop}')
+            self.assertEqual(self.restores(), 4 + 3 * drop)
+            self.idle()
+        log = (self.root/'routes.log').read_text()
+        self.assertIn('trying again in 15 s or when the routing table changes', log)
+        self.assertIn('trying again in 30 s or when the routing table changes', log)
+        self.assertEqual(log.count('Configured routes are restored.'), 3, log)
+
+
 class ServiceControlTests(unittest.TestCase):
     write = FirstBootTests.write
 

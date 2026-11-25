@@ -2,6 +2,7 @@
 
 use titan_pd_model::pace::Pace;
 use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
+use titan_pd_model::retry::Backoff;
 
 use crate::{qctrl_io, staged};
 use crate::files::read_file;
@@ -9,20 +10,21 @@ use crate::netdev::carrier_up;
 use crate::status_file::StatusFile;
 
 use super::{CUSTOMER, Keeper};
-use super::mgmt_v6::mgmt_address_up;
 
 /// The download clamp's progress this boot.
 #[derive(Default)]
 pub(super) struct QctrlWatch {
     checked_at: Pace,
-    /// The customer port and the management bearer were both up since then.
+    /// The customer port and the customer bearer were both up since then.
     up_since: Option<u64>,
     /// The last status, so the file and the log change only on news.
     status: StatusFile,
     /// True while configured with a non-zero mode and still waiting to load.
     pub(super) waiting: bool,
-    /// A load failed for this config. It is not retried until the config changes.
+    /// The config the last load failed for. It is tried again when `retry`
+    /// is ready, and at once for another config or after the clamp was off.
     failed_for: Option<qctrl::Config>,
+    retry: Backoff,
     refused_logged: Vec<String>,
 }
 
@@ -34,20 +36,19 @@ impl QctrlWatch {
 }
 
 impl Keeper {
-    /// Load the download clamp once the customer port and LTE are up, and keep
-    /// its mode: the default, the operator's `qctrl/config`, or off by the
-    /// latency switch (`qctrl::effective`). Runs in every mode.
+    /// Load the download clamp once the customer port and the customer
+    /// bearer are up, and keep its mode: the default, the operator's
+    /// `qctrl/config`, or off by the latency switch (`qctrl::effective`).
+    /// Runs in every mode. Without the Witcher volume the default loads from
+    /// the image; the operator's files count again once it is mounted.
     pub(super) fn maintain_qctrl(&mut self) {
         if !self.qctrl.checked_at.ready(self.now, qctrl::CHECK_EVERY) {
             return;
         }
-        let Some(dir) = qctrl_io::MODULE.staged_dir() else {
-            self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
-            return;
-        };
+        let dir = qctrl_io::MODULE.staged_dir();
         let modules = read_file(staged::modules_path());
-        let operator = staged::operator_config(&dir);
-        let cake = qctrl::cake_loaded(&modules);
+        let operator = dir.as_deref().and_then(staged::operator_config);
+        let cake = qctrl::cake_shaping(&modules);
         let (config, source) = qctrl::effective(self.switches.now.clamp, operator.as_deref(), cake);
         let from = source.describe("clamp", "qctrl/config");
         if config.refused != self.qctrl.refused_logged {
@@ -58,7 +59,12 @@ impl Keeper {
             }
             self.qctrl.refused_logged = config.refused.clone();
         }
-        let up = carrier_up(CUSTOMER) && (config.mode == 0 || mgmt_address_up());
+        if self.qctrl.failed_for.as_ref().is_some_and(|failed| *failed != config) {
+            // Another config, or the switch turned off and on: try at once.
+            self.qctrl.failed_for = None;
+            self.qctrl.retry.reset();
+        }
+        let up = carrier_up(CUSTOMER) && (config.mode == 0 || carrier_up(&self.bearer));
         if !up {
             self.qctrl.up_since = None;
         } else if self.qctrl.up_since.is_none() {
@@ -89,14 +95,19 @@ impl Keeper {
                     );
                     return;
                 }
-                if self.qctrl.failed_for.as_ref() == Some(&config) {
+                if !self.qctrl.retry.ready(self.now) {
                     return;
                 }
-                match qctrl_io::MODULE.load_any(&dir) {
-                    Ok(origin) => self.note(&format!("download clamp: loaded {} from {origin}", qctrl::VERSION_LINE)),
+                match qctrl_io::MODULE.load_any(dir.as_deref()) {
+                    Ok(origin) => {
+                        self.qctrl.failed_for = None;
+                        self.qctrl.retry.reset();
+                        self.note(&format!("download clamp: loaded {} from {origin}", qctrl::VERSION_LINE));
+                    }
                     Err(err) => {
+                        let wait = self.qctrl.retry.failed(self.now, staged::retry_policy());
                         self.qctrl.failed_for = Some(config.clone());
-                        self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
+                        self.qctrl_status("failed", &format!("not loaded: {err}; trying again in {wait} s"), &config);
                         return;
                     }
                 }
