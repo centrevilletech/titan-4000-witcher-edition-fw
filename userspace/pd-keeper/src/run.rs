@@ -61,6 +61,7 @@ use titan_sys::ifaddrs::InterfaceAddrs;
 use titan_sys::process::SpawnExt;
 use titan_sys::socket::{Socket, SocketExt};
 
+use crate::clock::{monotonic, unix_now};
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
@@ -3482,13 +3483,6 @@ fn server_duid() -> Vec<u8> {
     duid
 }
 
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn format_delegation(mac: [u8; 6], at: u64) -> String {
     format!("mac={}\ndelegated_at={at}\n", ipv4::mac_text(mac))
 }
@@ -4120,10 +4114,6 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
 
 fn read_file(path: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
-}
-
-pub(super) fn monotonic() -> u64 {
-    titan_sys::kernel::monotonic_secs()
 }
 
 fn state_dir() -> PathBuf {

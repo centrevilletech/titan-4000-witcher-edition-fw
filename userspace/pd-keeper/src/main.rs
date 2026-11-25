@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use titan_pd_model::config::{self, Pending, Recovery};
 use titan_pd_model::wear;
@@ -27,6 +27,7 @@ mod bench;
 mod capture;
 mod carrier_pick_io;
 mod carrier_watch_io;
+mod clock;
 mod cpu_trims_io;
 mod fastpath_io;
 mod radio;
@@ -129,7 +130,7 @@ fn recover_pending() {
         guard_running(),
         config::confirmed(&pending.token, &confirm_file),
         first,
-        wall_now(),
+        clock::unix_now(),
         pending.not_before,
     );
     match decision {
@@ -174,13 +175,6 @@ fn wait_for_nvram_cache() {
     while !ready() && start.elapsed() < Duration::from_secs(60) {
         thread::sleep(Duration::from_secs(1));
     }
-}
-
-fn wall_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 fn guard_running() -> bool {
@@ -242,7 +236,7 @@ pub fn log_ram(line: &str) {
 fn stamped(line: &str) -> String {
     let up = fs::read_to_string("/proc/uptime").unwrap_or_default();
     let up = up.split_whitespace().next().unwrap_or("?").to_owned();
-    format!("{} up={up} {line}", wall_now())
+    format!("{} up={up} {line}", clock::unix_now())
 }
 
 /// Append one line, moving a full log to `keeper.log.1` first.

@@ -148,7 +148,7 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
         // The session stopped before its own `arm1log 1`.
         let _ = crate::radio_modem::console("arm1log 1");
     }
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     for status in &report.status {
         let _ = fs::write(layer_status_path(status.group), status.text(now));
     }

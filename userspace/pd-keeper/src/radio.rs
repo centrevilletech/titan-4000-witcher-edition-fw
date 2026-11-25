@@ -320,7 +320,7 @@ pub fn transition_in_progress(now: u64) -> bool {
         .is_some_and(|until| until > now && until - now <= 185)
 }
 fn transition(seconds: u64) -> io::Result<()> {
-    let until = crate::run::monotonic() + seconds;
+    let until = crate::clock::monotonic() + seconds;
     atomic(&ram("radio-transition"), until.to_string().as_bytes())
 }
 
@@ -448,9 +448,9 @@ pub fn guard() -> io::Result<()> {
             }
         } else {
             let mut checked = Ok(());
-            if watch.due(crate::run::monotonic(), media() == "ATTACHED") {
+            if watch.due(crate::clock::monotonic(), media() == "ATTACHED") {
                 checked = run_worker("check", 35)
-                    .and_then(|()| watch.carriers(&desired, crate::run::monotonic()));
+                    .and_then(|()| watch.carriers(&desired, crate::clock::monotonic()));
             }
             // A failed picker re-attach is handled like a failed enforcement.
             if let (Ok(()), Some(p)) = (&checked, desired.picker()) {
@@ -664,7 +664,7 @@ fn sample(p: &Profile, base: u32) -> io::Result<()> {
     let delta = n
         .checked_sub(base)
         .ok_or_else(|| fail("modem counters reset"))?;
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     let prev = json_file("radio-counters")["last_failure_uptime"].as_u64();
     let storm = titan_pd_model::radio::storm(delta, prev, now);
     let last = if delta > 0 { Some(now) } else { prev };
@@ -803,7 +803,7 @@ fn enforce(p: &Profile) -> io::Result<()> {
     let hours = cycle_hours.ok_or_else(|| fail("radio cycles are off"))?;
     // Read every condition again right before acting. The guard's
     // over-cap timer is the only value carried in.
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     let before = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
     let mode_grant = nvram_field(b"cbrs_mode_grant=");
     let grant_state = nvram_field(b"cbrs_grant_state=");
@@ -975,7 +975,7 @@ fn arm_index(op: &str) -> io::Result<usize> {
 }
 
 fn minute_utc() -> Option<u16> {
-    let unix = carrier_pick_io::unix_now();
+    let unix = crate::clock::unix_now();
     // A unit without network time reads 1970 or 2013: no radio cycle then.
     (unix > 1_704_067_200).then_some(((unix % 86_400) / 60) as u16)
 }
@@ -1001,7 +1001,7 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
         eprintln!("radio-worker: picker cycle skipped: not attached with a held SAS grant");
         return Ok(());
     }
-    let now = crate::run::monotonic();
+    let now = crate::clock::monotonic();
     atomic(&ram("radio-last-cycle"), now.to_string().as_bytes())?;
     crate::log(&format!(
         "carrier picker: re-attaching on arm {i} (EARFCN {} PCI {}, {}-carrier cap)",
@@ -1133,7 +1133,7 @@ fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(),
 
 impl PickWatch {
     fn tick(&mut self, p: &Picker) -> io::Result<()> {
-        let now = crate::run::monotonic();
+        let now = crate::clock::monotonic();
         if let Some((rx, tx)) = carrier_pick_io::counters(&carrier_pick_io::customer_dev()) {
             self.traffic.push((now, rx, tx));
         }
@@ -1226,7 +1226,7 @@ impl PickWatch {
                     run_worker(&format!("pick-cycle-{i}"), 175)?;
                     self.visit = Some(Visit {
                         arm: i,
-                        since: crate::run::monotonic(),
+                        since: crate::clock::monotonic(),
                         granted_at: None,
                         purpose: Purpose::Survey,
                     });
@@ -1240,7 +1240,7 @@ impl PickWatch {
                     *record = Record {
                         arms: p.arms.clone(),
                         chosen,
-                        surveyed_at: Some(carrier_pick_io::unix_now()),
+                        surveyed_at: Some(crate::clock::unix_now()),
                         results: survey.results,
                     };
                     atomic(&disk("pick.json"), &serde_json::to_vec(&*record)?)?;
@@ -1259,7 +1259,7 @@ impl PickWatch {
         let forced = ram("pick-survey-now").exists();
         let due = forced
             || record.surveyed_at.is_none_or(|t| {
-                carrier_pick_io::unix_now().saturating_sub(t) >= u64::from(p.survey_hours) * 3600
+                crate::clock::unix_now().saturating_sub(t) >= u64::from(p.survey_hours) * 3600
             });
         if due {
             match pick_gate(p, forced, here.is_some(), idle) {
@@ -1299,7 +1299,7 @@ impl PickWatch {
         run_worker(&format!("pick-cycle-{c}"), 175)?;
         self.visit = Some(Visit {
             arm: c,
-            since: crate::run::monotonic(),
+            since: crate::clock::monotonic(),
             granted_at: None,
             purpose: Purpose::Hold,
         });

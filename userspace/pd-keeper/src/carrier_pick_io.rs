@@ -9,7 +9,7 @@ use std::{
     net::{Ipv4Addr, UdpSocket},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use titan_pd_model::{
     carrier_pick::{self as pick, Measure},
@@ -184,13 +184,6 @@ pub fn round_trip(probe: Ipv4Addr) -> Option<u32> {
     pick::ping_avg_ms(&String::from_utf8_lossy(&out.stdout))
 }
 
-pub fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 fn kbps(value: &str) -> Option<u32> {
     value.parse::<u64>().ok().map(|bps| u32::try_from(bps / 1000).unwrap_or(u32::MAX))
 }
@@ -224,6 +217,6 @@ pub fn measure(probe: Ipv4Addr, sink: Ipv4Addr, arm: usize) -> io::Result<Measur
         scc_sinr_db: serving[1..].to_vec(),
         dl_max_kbps: kbps(&dl_max),
         ul_max_kbps: kbps(&ul_max),
-        at: unix_now(),
+        at: crate::clock::unix_now(),
     })
 }
