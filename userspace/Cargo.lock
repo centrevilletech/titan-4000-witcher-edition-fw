@@ -129,6 +129,7 @@ version = "1.0.15"
 dependencies = [
  "libc",
  "serde_json",
+ "titan-sys",
 ]
 
 [[package]]
