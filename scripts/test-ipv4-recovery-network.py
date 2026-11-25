@@ -366,6 +366,7 @@ for line in sys.stdin:
              TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
              TITAN_QCTRL_PROC_WRITE='/tmp/qctrl-ctl',TITAN_MODULES_DIR='/tmp/image-modules',TITAN_LATENCY_DIR='/tmp/latency',
+             TITAN_TK_QUIET_UTC='',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
              TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
              TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',
@@ -747,6 +748,26 @@ for line in sys.stdin:
         assert 'quarantined it, rebooting onto stock modem firmware' in log()
         assert any('192.0.2.9' in call for call in Path('/tmp/ping-calls').read_text().splitlines())
         print('PASS: a staged boot with no answer quarantined its image and asked for one reboot.',flush=True)
+        # The same failure while the SAS CPAS window is open (here a window
+        # around now): the quarantine is written at once, the reboot waits.
+        Path('/tmp/tk.result').unlink()
+        Path('/tmp/tk/quarantine').unlink()
+        Path('/tmp/tk/strikes').write_text('strikes=1\n')
+        Path('/tmp/reboot-actions').unlink(missing_ok=True)
+        minute=time.gmtime().tm_hour*60+time.gmtime().tm_min
+        window='%02d:%02d-%02d:%02d'%(((minute-60)%1440)//60,(minute-60)%60,((minute+60)%1440)//60,(minute+60)%60)
+        keeper.terminate();keeper.wait(timeout=5)
+        keeper=subprocess.Popen([str(BINARY),'run'],env=dict(env,TITAN_TK_QUIET_UTC=window),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        wait_for(lambda:'the reboot onto stock modem firmware waits for it to end' in log(),max(90,300-up+90))
+        assert Path('/tmp/tk/quarantine').read_text()==bad+'\n' and Path('/tmp/tk/strikes').read_text()=='strikes=2\n'
+        until=time.monotonic()+5
+        wait_for(lambda:time.monotonic()>=until,8)
+        assert not Path('/tmp/reboot-actions').exists(), 'rebooted inside the CPAS window'
+        # A keeper that starts once the window is over owes that reboot.
+        restart()
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),20)
+        assert 'rebooting onto stock modem firmware, outside the SAS CPAS window' in log(), log()
+        print('PASS: inside the CPAS window the rollback quarantined at once and rebooted only once outside it.',flush=True)
         assert not Path('/tmp/dm-log').exists(), 'a modem console session ran before any boot confirm'
         # A staged image whose boot answers through the core.
         good='b'*64

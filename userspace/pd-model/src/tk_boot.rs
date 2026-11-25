@@ -22,7 +22,12 @@
 //!   boot again (`/var/run/witcher-tk.result`).
 //! - Even with no keeper at all, the strike count stops the hook after
 //!   `STRIKE_LIMIT` staged boots without a confirm.
+//! - While the SAS CPAS window is open (`CPAS_QUIET`) the rollback reboot
+//!   waits for it to end; the quarantine is recorded at once, so any boot in
+//!   between is stock (`reboot_waits`).
 use std::net::IpAddr;
+
+use crate::carrier_watch::{QuietWindow, parse_quiet_window};
 
 /// Seconds after the load for the management bearer to answer.
 pub const CONFIRM_SECS: u64 = 300;
@@ -36,6 +41,30 @@ pub const PROBE_TIMEOUT: u64 = 6;
 /// keeper that restarts late still looks before it acts.
 pub const MIN_ROUNDS: u32 = 2;
 const MAX_TARGETS: usize = 4;
+
+/// The SAS CPAS window, 06:45 to 10:15 UTC with a margin: no new grants are
+/// issued in it, so a reboot then can leave a unit without grants for hours.
+pub const CPAS_QUIET: QuietWindow = QuietWindow { start_min: 6 * 60 + 45, end_min: 10 * 60 + 15 };
+/// Wall clock seconds before which the clock is not set (2026-01-01). The
+/// vendor boots with a 2013 date until the network sets it.
+pub const CLOCK_SET_AFTER: u64 = 1_767_225_600;
+
+/// The window a rollback reboot waits out: `CPAS_QUIET`, another
+/// `HH:MM-HH:MM` (tests), or none for an empty text.
+pub fn quiet_window(text: Option<&str>) -> Option<QuietWindow> {
+    match text {
+        None => Some(CPAS_QUIET),
+        Some("") => None,
+        Some(text) => parse_quiet_window(text).or(Some(CPAS_QUIET)),
+    }
+}
+
+/// A rollback reboot waits: the clock is set and `wall` is in the window.
+/// With the clock unset the unit has not reached the network, so it holds no
+/// grants a reboot could lose.
+pub fn reboot_waits(window: Option<QuietWindow>, wall: u64) -> bool {
+    wall >= CLOCK_SET_AFTER && window.is_some_and(|w| w.contains(wall))
+}
 
 /// Where the N4 modem image keeps its patch magic, read with `vm 0x847ed600 4`.
 pub const MAGIC_ADDR: u32 = 0x847e_d600;
@@ -437,6 +466,24 @@ mod tests {
             describe(&parse_status("state=stock\nreason=quarantined\n")).as_deref(),
             Some("tk boot: stock modem firmware (quarantined)")
         );
+    }
+
+    #[test]
+    fn a_rollback_reboot_waits_out_the_cpas_window_when_the_clock_is_set() {
+        let day = 1_795_305_600; // 2026-11-22T00:00:00Z
+        let at = |h: u64, m: u64| day + h * 3600 + m * 60;
+        let cpas = quiet_window(None);
+        assert_eq!(cpas, Some(CPAS_QUIET));
+        assert!(!reboot_waits(cpas, at(6, 44)));
+        assert!(reboot_waits(cpas, at(6, 45)));
+        assert!(reboot_waits(cpas, at(10, 14)));
+        assert!(!reboot_waits(cpas, at(10, 15)));
+        assert!(!reboot_waits(cpas, at(23, 0)));
+        // A 2013 clock: no network yet, nothing to lose.
+        assert!(!reboot_waits(cpas, 1_370_000_000 + 7 * 3600));
+        assert!(!reboot_waits(quiet_window(Some("")), at(8, 0)));
+        assert!(reboot_waits(quiet_window(Some("23:00-01:00")), at(0, 30)));
+        assert_eq!(quiet_window(Some("nonsense")), Some(CPAS_QUIET));
     }
 
     #[test]

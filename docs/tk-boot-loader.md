@@ -233,6 +233,12 @@ staged an image this boot. On any other boot it never reboots for this.
   `strikes=2`, reads both back, and reboots once onto stock firmware. If the
   read-back does not show that the hook will refuse the image, it does not
   reboot.
+- If the SAS CPAS window is open (06:45 to 10:15 UTC; no new grants are
+  issued then), the quarantine and strike record are still written at once,
+  so any boot from then on is stock, but the reboot waits for the window to
+  end. With the clock not yet set (a unit that never reached the network)
+  it does not wait. A keeper that restarts in the meantime owes the same
+  reboot once the record reads back.
 - `/var/run/witcher-tk.result` records the outcome, so a keeper that restarts
   does not judge the boot again.
 

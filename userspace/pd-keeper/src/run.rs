@@ -239,6 +239,8 @@ struct Keeper {
     tk_last_round: Pace,
     /// The boot hook's status, read once at start.
     tk_status: tk_boot::BootStatus,
+    /// A rollback reboot waits for the SAS CPAS window to end.
+    tk_reboot_waits: bool,
     /// Modem feature flags after a confirmed staged boot (see
     /// `titan_pd_model::tk_flags`), and the DM session running for them.
     tk_flags: Option<tk_flags::Control>,
@@ -379,6 +381,7 @@ impl Keeper {
             tk_probe: None,
             tk_last_round: Pace::default(),
             tk_status: tk_boot::BootStatus::default(),
+            tk_reboot_waits: false,
             tk_flags: None,
             tk_flags_job: None,
             tk_flags_config_at: Pace::default(),

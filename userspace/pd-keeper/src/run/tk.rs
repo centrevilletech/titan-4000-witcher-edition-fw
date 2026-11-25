@@ -11,6 +11,7 @@ use titan_pd_model::deaf;
 use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 
+use crate::clock::unix_now;
 use crate::tk_flags_io;
 use crate::files::{read_file, write_durably};
 use crate::paths::{env_or, state_dir, tk_dir};
@@ -32,8 +33,20 @@ impl Keeper {
             if let Some(line) = tk_boot::describe(&status) {
                 self.note(&line);
             }
+            let result = read_file(tk_result_path());
             let decided = fs::metadata(tk_result_path()).is_ok();
             self.tk_confirm = tk_boot::Confirm::arm(&status, self.now, decided);
+            // An earlier keeper rolled this boot back and its reboot is still
+            // owed (it waited for the CPAS window, or this keeper restarted).
+            // It is owed only once the record makes the hook refuse the image.
+            if let (Some(sha), Some(dir)) = (result.trim().strip_prefix("rollback="), tk_dir()) {
+                self.tk_reboot_waits = status.staged.as_deref() == Some(sha)
+                    && tk_boot::refused(
+                        tk_boot::parse_strikes(&read_file(dir.join("strikes"))),
+                        &tk_boot::parse_quarantine(&read_file(dir.join("quarantine"))),
+                        sha,
+                    );
+            }
             self.tk_status = status.clone();
             // A keeper that restarts after the confirm takes the flags over.
             match tk_flags::armed_sha(&status, &read_file(&tk_result_path())) {
@@ -56,6 +69,14 @@ impl Keeper {
                     "tk boot confirm armed: without a management answer through the core in {left} s the keeper quarantines this image and reboots onto stock modem firmware"
                 ));
             }
+        }
+        if self.tk_reboot_waits
+            && self.reboot_asked_at.is_none()
+            && !tk_boot::reboot_waits(cpas_window(), unix_now())
+        {
+            self.tk_reboot_waits = false;
+            self.note("tk boot confirm: rebooting onto stock modem firmware, outside the SAS CPAS window");
+            self.request_reboot();
         }
         if self.tk_confirm.is_none() || self.reboot_asked_at.is_some() {
             return;
@@ -145,6 +166,14 @@ impl Keeper {
             self.note(&format!(
                 "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}, and the quarantine could not be recorded; not rebooting"
             ));
+            return;
+        }
+        if tk_boot::reboot_waits(cpas_window(), unix_now()) {
+            // The record already keeps any boot from here on stock.
+            self.note(&format!(
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; quarantined it. The SAS CPAS window is open, so the reboot onto stock modem firmware waits for it to end"
+            ));
+            self.tk_reboot_waits = true;
             return;
         }
         self.note(&format!(
@@ -348,6 +377,12 @@ impl Keeper {
         };
         deaf::targets(&settings, &bearer_dns)
     }
+}
+
+/// The window a rollback reboot waits out (`TITAN_TK_QUIET_UTC` in tests:
+/// `HH:MM-HH:MM`, or empty for none).
+fn cpas_window() -> Option<titan_pd_model::carrier_watch::QuietWindow> {
+    tk_boot::quiet_window(std::env::var("TITAN_TK_QUIET_UTC").ok().as_deref())
 }
 
 fn tk_status_path() -> String {
