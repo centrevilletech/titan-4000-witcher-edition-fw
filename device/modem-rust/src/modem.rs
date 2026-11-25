@@ -19,7 +19,7 @@ use core::panic::PanicInfo;
 use modem_atlas::l2::{PdcpUlSduEntry, PdcpUlSduWindow, Rbc};
 use modem_atlas::patches::{N4ExtCounters, N4State};
 
-use crate::block::{M1Block, SELECTOR_NONE};
+use crate::block::{M1Block, SELECTOR_MAX, SELECTOR_NONE, SELECTOR_Q1};
 use crate::pie::{Arrival, Decision};
 use hw::{Packet, Shared, field};
 
@@ -39,10 +39,10 @@ static M1_BLK: M1Block = M1Block::new();
 /// The hook-4 shim, first in `.m1code` at `0x841d_e8dc` (R4's Rust N4 calls that
 /// address directly).
 ///
-/// - Selector 0, or any value above 2: N4 v2. Runs the two displaced instructions and
+/// - Selector 0, or any value above 3: N4 v2. Runs the two displaced instructions and
 ///   returns, using no stack.
-/// - Selector 1 or 2: calls `hw::m1_decide` on an 8-byte-aligned stack, keeping `r2`,
-///   then takes Exit B or Exit D.
+/// - Selector 1, 2 or 3: calls `hw::m1_decide` on an 8-byte-aligned stack, keeping
+///   `r2`, then takes Exit B or Exit D.
 // SAFETY (attributes): exported once under this name so the image builder can find it;
 // placed by `link-m1.ld`; naked because hook 4's register contract is not AAPCS.
 #[unsafe(no_mangle)]
@@ -54,7 +54,7 @@ extern "C" fn m1_aqm_shim() {
         "movt r0, #:upper16:{block}",
         "ldr r1, [r0, #{selector}]",
         "cbz r1, 2f",
-        "cmp r1, #{none}",
+        "cmp r1, #{max}",
         "bhi 2f",
         "mov r3, sp",
         "bic r1, r3, #7",
@@ -81,7 +81,7 @@ extern "C" fn m1_aqm_shim() {
         "bx lr",
         block = sym M1_BLK,
         selector = const core::mem::offset_of!(M1Block, selector),
-        none = const SELECTOR_NONE,
+        max = const SELECTOR_MAX,
         decide = sym hw::m1_decide,
         enqueue_lo = const EXIT_ENQUEUE & 0xffff,
         enqueue_hi = const EXIT_ENQUEUE >> 16,
@@ -90,12 +90,13 @@ extern "C" fn m1_aqm_shim() {
     );
 }
 
-/// One bulk packet under selector 1 or 2. Returns true to drop it.
+/// One bulk packet under selector 1, 2 or 3. Returns true to drop it.
 fn on_packet(packet: Packet<'_>) -> bool {
     if hw::N4.get(field!(N4State, flags)) & N4_AQM_ON != N4_AQM_ON {
         return false;
     }
-    if M1_BLK.selector.get() == SELECTOR_NONE {
+    let selector = M1_BLK.selector.get();
+    if selector == SELECTOR_NONE {
         M1_BLK.record_bypass();
         return false;
     }
@@ -109,8 +110,17 @@ fn on_packet(packet: Packet<'_>) -> bool {
         g_ema: hw::N4.get(field!(N4State, g_ema)),
         min_len: hw::N4.get(field!(N4State, aqm_minlen)),
     };
-    M1_BLK.record_pdcp_hol(pdcp_hol_age_ms(rbc, packet.now));
-    let decision = M1_BLK.decide(arrival, packet.ip);
+    // Selector 1 records the PDCP telemetry on every packet; selector 3 with its
+    // periodic update.
+    let decision = if selector == SELECTOR_Q1 {
+        if M1_BLK.q1_tick(&arrival) {
+            M1_BLK.record_pdcp_hol(pdcp_hol_age_ms(rbc, packet.now));
+        }
+        M1_BLK.decide_q1(arrival, packet.ip)
+    } else {
+        M1_BLK.record_pdcp_hol(pdcp_hol_age_ms(rbc, packet.now));
+        M1_BLK.decide(arrival, packet.ip)
+    };
     mirror_in_n4(decision);
     decision.is_drop()
 }

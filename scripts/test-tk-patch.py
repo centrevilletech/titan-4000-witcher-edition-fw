@@ -48,6 +48,9 @@ BENCH = {
     # The release image (lane R1, build-combined): N6H + R4's Rust N4 + R1's PIE.
     'n6h-r4-r1': ('f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42',
                   '3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb'),
+    # Lane Q1 (build.sh): the release image plus selector 3, M1 block version 0x20261127.
+    'n6h-r4-q1': ('832c601a75f3000c9ae62c3dfdf9842bafcbc699136ec826393a6f2c3578bbf6',
+                  '98a79d3296fa87e95a4fc12d527181db9c3171e637a724986cb45a333f6a986f'),
 }
 failures = []
 

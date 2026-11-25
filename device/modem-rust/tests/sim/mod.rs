@@ -331,7 +331,7 @@ pub fn run(scenario: &Scenario, aqm: &mut dyn Aqm) -> Outcome {
                 if measuring {
                     sent += 1;
                 }
-                match aqm.decide(ring1_bytes + staging_bytes, g_ema, PKT, t) {
+                match aqm.decide(ring1_bytes + staging_bytes, g_ema, PKT, t, fid) {
                     Verdict::Pass => {
                         ring1.push_back(idx);
                         ring1_bytes += PKT;

@@ -55,7 +55,7 @@ wait for it.
 | Input | How |
 | --- | --- |
 | The stock image | The NAND banks named `tk` and `tk2` in `/proc/mtd` (`mtd17`, `mtd18`): a gzip stream at offset 0, then `0xff` padding. It reads `/dev/mtdN` read-only, erase block by erase block, and skips blocks the bad block table marks bad, as the vendor kernel does for `modem.ko`. The only ioctl is `MEMGETBADBLOCK`. Either bank serves if it holds the exact stock image. |
-| The manifest | Built into the keeper: `userspace/tk-patch/manifests/n6h-r4-r1.manifest` (`manifests::RELEASE`). The other manifests in the tree (N6H, M1, R1, R4) are not in the keeper, because each would cost about 20 KiB of flash. They build on a host with `tk-patch build`, and CI proves them. |
+| The manifest | Built into the keeper: `userspace/tk-patch/manifests/n6h-r4-r1.manifest` (`manifests::RELEASE`). The other manifests in the tree (N6H, M1, R1, R4, and lane Q1's `n6h-r4-q1`: the release image plus selector 3) are not in the keeper, because each would cost about 20 KiB of flash. They build on a host with `tk-patch build`, and CI proves them. |
 
 ## What it checks
 
@@ -109,6 +109,7 @@ opens but does not decompress is not a fallback (see
 | `r1` | `f434277d…` | `186697f3…` (4655738 bytes) |
 | `r4` | `60ab8fe7…` | `4ced9782…` (4655937 bytes) |
 | `n6h-r4-r1` (release) | `f1aa8add…` | `3348aa36…` (4656029 bytes) |
+| `n6h-r4-q1` | `832c601a…` | `98a79d32…` (4656432 bytes) |
 
 ## The manifest
 
