@@ -1,7 +1,7 @@
 # Building the modem image on the unit
 
 Status: opt-in. Nothing runs it but an operator. It builds one image, the
-release image the keeper carries, and hands it to the
+v1.0.16 release image (below), and hands it to the
 [boot-time loader](tk-boot-loader.md), which stays off until then.
 
 ## Why
@@ -11,6 +11,24 @@ built on a workstation with `tkpatch.py` from the stock image, then copied to
 each unit by hand. Now a unit builds its own image. It reads the stock modem
 firmware from its own NAND, applies a manifest that holds only Witcher's bytes
 and hashes, and writes the gzip file the loader stages.
+
+## The release image
+
+`n6h-r4-r1`, the only manifest the keeper carries (`manifests::RELEASE`):
+
+| Layer | From | What it adds |
+| --- | --- | --- |
+| N6H | lane N6H | The latency image: N4's uplink AQM v2 and grant hold, N5's sparse-flow lane, the IMG2 to IMG4 data-path patches, U2's LNK-FIX filter, baked radio stability defaults. |
+| R4 | lane R4, PR #39 | N4's uplink engine rewritten in Rust (`no_std`, Thumb-2). |
+| R1 | lane R1, PR #42 | M1's Rust PIE uplink AQM, hardened, with the overload latch. M1 block version `0x20261126`. |
+
+Lane R1 built and verified it as `build-combined`: R4's stack spec with its two
+`m1_*` sites replaced by R1's. The spec is `becd500c…`, `tk.bin` is
+`f1aa8add…`, and `tk.gz` is `3348aa36…`. The unit's build reproduces both
+files byte for byte (see [Tests](#tests)). Every feature boots off. The keeper
+turns on the ones `tk/config` lists after the boot confirm, and it manages
+the PIE selector of M1 block `0x20261126` (see
+[Modem feature flags](tk-boot-loader.md#modem-feature-flags)).
 
 ## Use
 
@@ -24,8 +42,8 @@ grants 07:00 to 10:00 UTC; avoid 06:45 to 10:15). From there the loader takes
 over: the strike count, the boot confirm and the rollback to stock firmware.
 
 ```text
-manifest m1: 70 sites; image cd7effdd…; gzip e47b0435… (4655664 bytes)
-tk (mtd17, 0 bad blocks skipped): stock 555362d9…; built image cd7effdd…, gzip e47b0435… (4655664 bytes)
+manifest n6h-r4-r1: 71 sites; image f1aa8add…; gzip 3348aa36… (4656029 bytes)
+tk (mtd17, 0 bad blocks skipped): stock 555362d9…; built image f1aa8add…, gzip 3348aa36… (4656029 bytes)
 staged /mnt/titan-api/tk/active.gz: the next boot loads it (reboot outside the SAS window)
 ```
 
@@ -37,7 +55,7 @@ wait for it.
 | Input | How |
 | --- | --- |
 | The stock image | The NAND banks named `tk` and `tk2` in `/proc/mtd` (`mtd17`, `mtd18`): a gzip stream at offset 0, then `0xff` padding. It reads `/dev/mtdN` read-only, erase block by erase block, and skips blocks the bad block table marks bad, as the vendor kernel does for `modem.ko`. The only ioctl is `MEMGETBADBLOCK`. Either bank serves if it holds the exact stock image. |
-| The manifest | Built into the keeper: `userspace/tk-patch/manifests/m1.manifest` (`manifests::RELEASE`). |
+| The manifest | Built into the keeper: `userspace/tk-patch/manifests/n6h-r4-r1.manifest` (`manifests::RELEASE`). The other manifests in the tree (N6H, M1, R1, R4) are not in the keeper, because each would cost about 20 KiB of flash. They build on a host with `tk-patch build`, and CI proves them. |
 
 ## What it checks
 
@@ -87,19 +105,20 @@ opens but does not decompress is not a fallback (see
 | Manifest | Image (`tk.bin`) | Gzip (`tk.gz`) |
 | --- | --- | --- |
 | `n6h` | `a2fc8994…` | `a1fc066a…` (4655428 bytes) |
-| `m1` (release) | `cd7effdd…` | `e47b0435…` (4655664 bytes) |
+| `m1` | `cd7effdd…` | `e47b0435…` (4655664 bytes) |
 | `r1` | `f434277d…` | `186697f3…` (4655738 bytes) |
 | `r4` | `60ab8fe7…` | `4ced9782…` (4655937 bytes) |
+| `n6h-r4-r1` (release) | `f1aa8add…` | `3348aa36…` (4656029 bytes) |
 
 ## The manifest
 
 ```text
 witcher-tk-manifest 1
-name m1
+name n6h-r4-r1
 base 0x84100000
 stock 9553965 <SHA-256 of the stock image>
 image 9553965 <SHA-256 of the patched image>
-gzip 4655664 <SHA-256 of the gzip file>
+gzip 4656029 <SHA-256 of the gzip file>
 site 0x841108f8 4 img4_u3_kvp <SHA-256 of the 4 stock bytes there> ecf2d3f9
 site 0x843de954 888 img2_cave_a_print_dbinfo <SHA-256> <hex> @0x842d8bd1:61 <hex>
 ```
@@ -182,8 +201,8 @@ not manage (`tk_flags::M1_VERSIONS`).
   - the whole pipeline.
 - The CI job "Modem image builder against the bench images" downloads the stock
   `.prg` (the vendor's public file, pinned by SHA-256). It then:
-  - rebuilds N6H, M1 and R4 and requires the Python builds' `tk.bin` and
-    `tk.gz` hashes;
+  - rebuilds every manifest in the tree (N6H, M1, R1, R4 and the release
+    image) and requires the Python builds' `tk.bin` and `tk.gz` hashes;
   - turns each manifest back into a spec and through the Rust converter, which
     must give the same text;
   - checks `tk-patch gzip` against Python's zlib on about 30 more inputs.

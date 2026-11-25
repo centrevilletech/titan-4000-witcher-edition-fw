@@ -45,6 +45,9 @@ BENCH = {
            '186697f32b8831a35e96ca90745c2f7c20bd6d664d4de51da7bdaf61b9abdd1c'),
     'r4': ('60ab8fe7d50f6b44d2ece1d08b50bcc72f2b3e45195f71b0a2378369386ce376',
            '4ced9782d5e0143f5c0426ac24b08dabfc90c2afb9d823d022fe98bcae6c9831'),
+    # The release image (lane R1, build-combined): N6H + R4's Rust N4 + R1's PIE.
+    'n6h-r4-r1': ('f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42',
+                  '3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb'),
 }
 failures = []
 
