@@ -98,7 +98,10 @@ for line in sys.stdin:
     for o in out:
         print(o)
     sys.stdout.flush()
-os.unlink('/tmp/console-active')
+try:
+    os.unlink('/tmp/console-active')
+except FileNotFoundError:
+    pass
 '''
 
 

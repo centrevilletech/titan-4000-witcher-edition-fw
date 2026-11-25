@@ -1378,11 +1378,13 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
 
 /// The way back after a visit no covering grant reached (`PickWatch`): to
 /// where the unit was before it, which held its grants then. It has no grant
-/// to protect, so only the CPAS window, the clock and the daily cap hold it.
+/// to protect, so it waits for no grant and not for the cycle margin either:
+/// only the reboot gate's own CPAS window and clock (`back_hold`) and the
+/// daily cap hold it.
 fn pick_back() -> io::Result<()> {
     let back: Arm = serde_json::from_slice(&fs::read(ram("radio-pick-back"))?)
         .map_err(|_| fail("no way back recorded"))?;
-    if let Some(why) = cycle_hold() {
+    if let Some(why) = back_hold() {
         return Err(not_now(why));
     }
     if let Some(why) = cycle_cap(reboots::SLOTS_BACK) {
@@ -1538,6 +1540,14 @@ fn cycle_hold() -> Option<&'static str> {
     guard_model::cycle_hold(crate::run::reboot::cpas_window(), unix_now())
 }
 
+/// Why the picker's way back must wait: the reboot gate's own window and
+/// clock rule, without the cycle margin. A visit starts before 06:30 and its
+/// grant wait ends by 06:45, so with the margin the way back would wait until
+/// 10:30 on an arm with no grant.
+fn back_hold() -> Option<&'static str> {
+    crate::run::reboot::hold_now()
+}
+
 /// The radio cycle log (`radio/cycles`), kept like the keeper's reboot log.
 fn cycle_log(wall: u64) -> Vec<reboots::Entry> {
     let entries = reboots::parse(&read_file(disk("cycles")));
@@ -1642,7 +1652,7 @@ impl PickWatch {
                 self.forget_back()?;
                 crate::log("carrier picker: grants cover the unit where it is; no way back needed");
             } else {
-                if let Some(why) = cycle_hold().map(str::to_owned).or_else(|| cycle_cap(reboots::SLOTS_BACK)) {
+                if let Some(why) = back_hold().map(str::to_owned).or_else(|| cycle_cap(reboots::SLOTS_BACK)) {
                     return say("waiting", format!("back to EARFCN {} PCI {}: {why}", back.earfcn, back.pci));
                 }
                 run_worker("pick-back", PICK_CYCLE_SECS)?;

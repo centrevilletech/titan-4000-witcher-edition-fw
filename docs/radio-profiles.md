@@ -194,8 +194,11 @@ after 6 hours is dropped. When no covering grant arrives within 10 minutes of
 a visit, the survey stops and the picker goes straight back to where the unit
 was before the visit, which held its grants then: that arm, or that primary
 cell with the stock cap. That way back has no grant to protect, so it waits
-only for the CPAS window, the clock and the daily cap, and the customer is
-not waited for. It is skipped when grants cover the unit where it is by then.
+for no grant and not for the customer, and only for the keeper's own reboot
+window (06:45 to 10:15 UTC, without the 15-minute margin), the clock and the
+daily cap. A visit starts before 06:30 and its grant wait ends before 06:45,
+so the way back is not held for hours. It is skipped when grants cover the
+unit where it is by then.
 Up to v1.0.16 the unit stayed on the ungranted arm, and the grant check kept
 it from ever coming back. If the unit leaves the held arm (a reboot, the
 tower), the picker returns to the arm with one cycle, at most every 6 hours,

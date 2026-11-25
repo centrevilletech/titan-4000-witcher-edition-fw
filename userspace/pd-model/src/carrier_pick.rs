@@ -46,9 +46,10 @@
 //!
 //! A visit that no covering grant reaches within `GRANT_WAIT` goes straight
 //! back to where the unit was before it, which held its grants then. That
-//! way back has no grant to protect, so it waits only for the CPAS window,
-//! the clock and the daily cap, never for a grant (v1.0.17; before, the grant
-//! gate kept a unit on an arm the SAS would not grant).
+//! way back has no grant to protect, so it waits only for the keeper's reboot
+//! window (`tk_boot::CPAS_QUIET`, without the margin), the clock and the
+//! daily cap, never for a grant (v1.0.17; before, the grant gate kept a unit
+//! on an arm the SAS would not grant).
 
 use crate::radio::Cell;
 use crate::radio_guard::CYCLE_MARGIN_MIN;
