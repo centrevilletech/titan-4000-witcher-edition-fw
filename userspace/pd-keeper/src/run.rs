@@ -65,7 +65,7 @@ use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, nvram, qc
 use crate::clock::{monotonic, unix_now};
 use crate::command::{command_stdout, run_status};
 use crate::files::read_file;
-use crate::netdev::{bridge_ports, carrier_up, interface_index, interface_mac, read_mac, rx_packets};
+use crate::netdev::{carrier_up, interface_index, interface_mac, read_mac, rx_packets};
 use crate::paths::state_dir;
 
 use self::if_inet6::{link_local, live_prefix, proc_if_inet6_addrs};
@@ -76,6 +76,7 @@ use self::wire::{ControlSockets, send_ipv6, send_marked_frame};
 mod flow;
 mod if_inet6;
 mod kmsg;
+mod mode;
 mod packet;
 mod wire;
 
@@ -83,8 +84,6 @@ const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
 /// The customer bearer when neither the bridge nor the vendor names one.
 const DEFAULT_BEARER: &str = "lte0pdn1";
-/// How often the vendor mode is asked when the bridge has no LTE port.
-const MODE_EVERY: u64 = 5;
 /// Seconds between reads of `tk/config` for flag changes.
 const TK_FLAGS_CONFIG_EVERY: u64 = 15;
 const RA_INTERVAL: u64 = 45;
@@ -1666,46 +1665,6 @@ impl Keeper {
         }
     }
 
-    /// Which bearer carries the customer, and whether it is bridged to the
-    /// LAN port. The bridge answers both without a fork. Only when it has no
-    /// LTE port is the vendor asked, and then at most every `MODE_EVERY` s.
-    fn refresh_mode(&mut self) {
-        let ports = bridge_ports();
-        if let Some(port) = extdev::bridged_bearer(ports.iter().map(String::as_str)) {
-            self.bearer = port;
-            self.passthrough = true;
-            self.bridged = true;
-            if self.bridged_since.is_none() {
-                self.bridged_since = Some(self.now);
-                // The vendor adds the SAS SNAT rule during this setup and its
-                // firewall restarts can drop it again. Check it every second.
-                self.sas_watch.burst(self.now);
-                self.last_flood = 0;
-            }
-            self.mode_checked = None;
-            return;
-        }
-        self.bridged = false;
-        self.bridged_since = None;
-        if self
-            .mode_checked
-            .is_some_and(|last| self.now.saturating_sub(last) < MODE_EVERY)
-        {
-            return;
-        }
-        self.mode_checked = Some(self.now);
-        // A failed or empty read keeps the last mode. Taking it for NAT stopped
-        // the responder and removed the port filter, and the SQM under it.
-        if let Some(mode) = vendor_passthrough(&self.nvram_get_cached("router_disable")) {
-            self.passthrough = mode;
-        }
-        let named = self.nvram_get_cached("pdn_data_ifname");
-        let named = named.rsplit(':').next().unwrap_or("").trim();
-        if extdev::is_lte_bearer(named) {
-            self.bearer = named.to_owned();
-        }
-    }
-
     /// Reboot a unit that stays attached but hears nothing through the core.
     /// Runs in NAT and in passthrough. See `titan_pd_model::deaf`.
     fn maintain_deaf_watchdog(&mut self) {
@@ -3242,19 +3201,6 @@ fn bearer_up(own_prefix: bool, bridged: bool, carrier: bool) -> bool {
     carrier && (own_prefix || bridged)
 }
 
-/// `nvram_get 0 router_disable`: `Some(true)` for passthrough, `Some(false)`
-/// for NAT, `None` for a failed or empty read.
-fn vendor_passthrough(output: &str) -> Option<bool> {
-    if !output.contains(':') {
-        return None;
-    }
-    match output.rsplit(':').next().unwrap_or("").trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
-}
-
 /// A neighbour probe for fe80::1 from a router other than the one we
 /// delegated to: that router has no prefix (the stuck-prefix case), and the
 /// earlier delegation must not keep the health check quiet for two hours.
@@ -3471,15 +3417,6 @@ mod tests {
         assert!(bearer_up(true, true, true));
         assert!(!bearer_up(true, true, false));
         assert!(!bearer_up(false, false, true));
-    }
-
-    #[test]
-    fn an_unreadable_vendor_mode_keeps_the_last_one() {
-        assert_eq!(vendor_passthrough("nvram_get success: 1\n"), Some(true));
-        assert_eq!(vendor_passthrough("nvram_get success: 0\n"), Some(false));
-        assert_eq!(vendor_passthrough("nvram_get success: \n"), None);
-        assert_eq!(vendor_passthrough(""), None);
-        assert_eq!(vendor_passthrough("nvram_get failed\n"), None);
     }
 
     #[test]
