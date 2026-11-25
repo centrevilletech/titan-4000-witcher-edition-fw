@@ -102,19 +102,24 @@ def main():
     exe('/tmp/bin/reboot', 'echo "reboot $*" >> /tmp/reboot-actions')
     exe('/tmp/bin/insmod', 'echo "insmod $*" >> /tmp/insmod-calls; exit 1')
     # A modem console (DM) stand-in: `vm` dumps print most significant byte
-    # first under the unit's column header; `wm` writes a RAM file. Each patch
-    # layer's magic shows only while its marker file exists.
+    # first under the unit's column header, 16 bytes to a row; `wm` writes a
+    # RAM file. Each patch layer's magic shows only while its marker file
+    # exists. The M1 block's marker holds its build version, in hex.
     lted = Path('/tmp/bin/lted_cli')
     lted.write_text(r'''#!/usr/bin/env python3
 import json, os, sys
 ram = json.load(open('/tmp/dm-ram.json')) if os.path.exists('/tmp/dm-ram.json') else {}
 HEADER = '           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C'
 MAGICS = {
-    0x847ed600: ('/tmp/dm-magic', '4e 34 56 32'),
-    0x847ecfe8: ('/tmp/dm-magic-img4', '49 4d 47 34'),
-    0x84489a64: ('/tmp/dm-magic-n5', '4e 35 46 4c'),
-    0x8418ff00: ('/tmp/dm-magic-n6', '55 32 48 46'),
+    0x847ed600: ('/tmp/dm-magic', 0x4e345632),
+    0x847ecfe8: ('/tmp/dm-magic-img4', 0x494d4734),
+    0x84489a64: ('/tmp/dm-magic-n5', 0x4e35464c),
+    0x8418ff00: ('/tmp/dm-magic-n6', 0x55324846),
+    0x841b5900: ('/tmp/dm-magic-m1', 0x4d315049),
 }
+M1 = '/tmp/dm-magic-m1'
+# Counters of a PIE that has run (seen, PIE drops, CE marks, hard drops, peak delay).
+M1_COUNTERS = {0x841b5960: 28025, 0x841b5968: 130, 0x841b596c: 7, 0x841b5970: 90, 0x841b5980: 97612}
 BOOT_DEFAULTS = {
     0x847ed608: 0x4000,
     0x847ed60c: 0x6000,
@@ -125,8 +130,24 @@ BOOT_DEFAULTS = {
     0x84489a84: 0x4000,
     0x84489a88: 0x6000,
 }
-def dump(addr, shown):
-    sys.stdout.write('\n-----\n HEX DUMP  | 4(0x4) Bytes @ 0x%08X\n-----\n%s\n-----\n\x1b[1;32m0x%08X\x1b[0m | %s  .. .. .. ..  .. .. .. ..  .. .. .. .. \n-----\nDM> ' % (addr, HEADER, addr, shown))
+def word(addr):
+    if addr in MAGICS:
+        marker, value = MAGICS[addr]
+        return value if os.path.exists(marker) else 0
+    if 0x841b5900 < addr < 0x841b5a00 and os.path.exists(M1):
+        if addr == 0x841b5904:
+            return int(open(M1).read().strip(), 16)
+        if str(addr) not in ram:
+            return M1_COUNTERS.get(addr, 0)
+    return ram.get(str(addr), BOOT_DEFAULTS.get(addr, 0))
+def dump(addr, length):
+    words = [word(addr + 4 * i) for i in range((length + 3) // 4)]
+    rows = ''
+    for at in range(0, len(words), 4):
+        cells = [' '.join('%02x' % b for b in w.to_bytes(4, 'big')) for w in words[at:at + 4]]
+        cells += ['.. .. .. ..'] * (4 - len(cells))
+        rows += '\x1b[1;32m0x%08X\x1b[0m | %s \n' % (addr + 4 * at, '  '.join(cells))
+    sys.stdout.write('\n-----\n HEX DUMP  | %d(0x%x) Bytes @ 0x%08X\n-----\n%s\n-----\n%s-----\nDM> ' % (length, length, addr, HEADER, rows))
 for line in sys.stdin:
     line = line.strip()
     with open('/tmp/dm-log', 'a') as log:
@@ -135,13 +156,7 @@ for line in sys.stdin:
     if line == 'exit':
         break
     if len(words) == 3 and words[0] == 'vm':
-        addr = int(words[1], 16)
-        if addr in MAGICS:
-            marker, text = MAGICS[addr]
-            dump(addr, text if os.path.exists(marker) else '00 00 00 00')
-        else:
-            val = ram.get(str(addr), BOOT_DEFAULTS.get(addr, 0))
-            dump(addr, ' '.join('%02x' % b for b in val.to_bytes(4, 'big')))
+        dump(int(words[1], 16), int(words[2]))
     elif len(words) == 3 and words[0] == 'wm':
         addr, value = int(words[1], 16), int(words[2], 16)
         ram[str(addr)] = value
@@ -300,7 +315,7 @@ for line in sys.stdin:
 
     env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
              TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
-             TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_TK_HANDS_OFF='/tmp/tk.hands-off',
+             TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_TK_HANDS_OFF='/tmp/tk.hands-off',TITAN_TK_M1='/tmp/tk.m1',
              TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
@@ -844,6 +859,30 @@ for line in sys.stdin:
         Path('/tmp/tk/config').write_text('enabled=1\nsha256=' + good + '\n')
         wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed608)) == 0x4000 and dm_ram().get(str(0x847ed60c)) == 0x6000, 60)
         print('PASS: manage=off held state=hands-off; config removal restored N4 PDCP 0x4000/0x6000 and N5/IMG4/N6 zeros.', flush=True)
+        # M1 (Rust PIE): a build the keeper does not accept blocks every write;
+        # an accepted one gets N4 AQM v2 first and the selector last, with its
+        # counters in tk.m1; dropping the line writes the selector 0 first.
+        assert not Path('/tmp/tk.m1').exists()
+        Path('/tmp/dm-magic-m1').write_text('20261126\n')
+        dm_m1_before = len(Path('/tmp/dm-log').read_text().splitlines())
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256=' + good + '\nwm=0x847ed604:0x15\nwm=0x841b5908:0x1\n')
+        wait_for(lambda: 'shows version 0x20261126' in flags(), 45)
+        assert 'state=waiting-magic\n' in flags(), flags()
+        assert 'tk flags: the M1 patch at 0x841b5900 shows version 0x20261126; this keeper accepts 0x20261125' in log(), log()
+        dm_m1 = Path('/tmp/dm-log').read_text().splitlines()[dm_m1_before:]
+        assert 'vm 0x841b5900 8' in dm_m1, dm_m1
+        assert not any(l.startswith('wm ') for l in dm_m1), dm_m1
+        assert not Path('/tmp/tk.m1').exists()
+        Path('/tmp/dm-magic-m1').write_text('20261125\n')
+        wait_for(lambda: 'state=applied\n' in flags() and (dm_ram() or {}).get(str(0x841b5908)) == 1 and Path('/tmp/tk.m1').exists(), 60)
+        m1_wms = [l for l in Path('/tmp/dm-log').read_text().splitlines()[dm_m1_before:] if l.startswith('wm ')]
+        assert m1_wms == ['wm 0x847ed604 0x15', 'wm 0x841b5908 0x1'], m1_wms
+        m1_status = Path('/tmp/tk.m1').read_text()
+        assert m1_status.startswith('version=0x20261125\nselector=1\nseen=28025\npie_drops=130\nce_marks=7\nhard_drops=90\npeak_qdelay_us=97612\nupdated='), m1_status
+        Path('/tmp/tk/config').write_text('enabled=1\nsha256=' + good + '\nwm=0x847ed604:0x15\n')
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x841b5908)) == 0 and 'selector=0\n' in Path('/tmp/tk.m1').read_text(), 60)
+        assert dm_ram().get(str(0x847ed604)) == 0x15, dm_ram()
+        print('PASS: the M1 selector waited for an accepted build, went out after N4 AQM v2, reported its counters and rolled back to 0.', flush=True)
         # A modem firmware load in the kernel log starts the flags over.
         with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
         wait_for(lambda:'modem restart seen' in log(),10)

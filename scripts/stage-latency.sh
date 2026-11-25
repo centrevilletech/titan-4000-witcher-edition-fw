@@ -18,8 +18,9 @@
 #   --target ADDR        Ping responder for the boot confirm (up to 4). Without
 #                        one the keeper uses the deaf watchdog's targets.
 #   --profile NAME       Modem switch profile: latency (inspects tk.gz magics
-#                        for N4 / IMG4 / N5 / N6 and writes the proven set) or
-#                        stock (writes no wm= lines).
+#                        for N4 / IMG4 / N5 / N6 / M1 and writes the proven
+#                        set; M1 adds the Rust PIE selector) or stock (writes
+#                        no wm= lines).
 #   --flags HEX          0x847ed604 value (default 0x15: AQM v2 + grant hold;
 #                        overrides profile)
 #   --hold HEX           0x84f93008 grant-hold size in bytes (default 0x140;
@@ -99,7 +100,7 @@ while [ $# -gt 0 ]; do
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -116,7 +117,7 @@ status() {
 show() { echo "== $1"; if [ -e "$1" ]; then cat "$1"; else echo "(none)"; fi; }
 echo "== /etc/witcher-release"; cat /etc/witcher-release 2>/dev/null || echo "(none)"
 for f in /var/run/witcher-tk.status /var/run/witcher-tk.result /var/run/witcher-tk.flags \
-         /var/run/witcher-tk.hands-off \
+         /var/run/witcher-tk.m1 /var/run/witcher-tk.hands-off \
          /var/run/witcher-qctrl.status /var/run/witcher-fastpath.status \
          /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
          /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed \
@@ -215,6 +216,8 @@ HAS_IMG4=0
 HAS_N5=0
 HAS_N6=0
 IS_N6H=0
+HAS_M1=0
+M1_VERSION=-
 
 inspect_tk_magics() {
   python3 - "$1" <<'PY'
@@ -226,24 +229,34 @@ CHECKS = [
     ("n5",   0x84489a64, 0x4e35464c),
     ("n6",   0x8418ff00, 0x55324846),
     ("n6h",  0x8418ff04, 0x4e364803),
+    ("m1",   0x841b5900, 0x4d315049),
 ]
+# M1 builds the keeper accepts: M1_VERSIONS in userspace/pd-model/src/tk_flags.rs
+# (scripts/test-tk-stage.py checks that both lists match).
+M1_VERSIONS = (0x20261125,)
 with gzip.open(sys.argv[1], "rb") as fh:
     data = fh.read()
 
-found = {}
-for name, va, want in CHECKS:
+def word(va):
     off = va - BASE
     if 0 <= off <= len(data) - 4:
-        val = struct.unpack_from("<I", data, off)[0]
-        found[name] = (val == want)
-    else:
-        found[name] = False
+        return struct.unpack_from("<I", data, off)[0]
+    return None
+
+found = {name: word(va) == want for name, va, want in CHECKS}
+m1_version = word(0x841b5904) if found["m1"] else None
+# 1: an M1 block the keeper writes; 2: an M1 block of a build it refuses.
+m1 = 0
+if m1_version is not None:
+    m1 = 1 if m1_version in M1_VERSIONS else 2
 
 print(
     int(found["img4"]),
     int(found["n5"]),
     int(found["n6"]),
     int(found["n6"] and found["n6h"]),
+    m1,
+    "-" if m1_version is None else "0x%08x" % m1_version,
 )
 PY
 }
@@ -256,7 +269,7 @@ if [ "$STAGE_TK" = 1 ]; then
   [ $((16#$flg & 0xe2)) -eq 0 ] || die "$TK has gzip header flags 0x$flg; the modem reader takes only FTEXT/FNAME"
   TK_SHA=$(sha256sum "$TK" | cut -d' ' -f1)
   if [ "$PROFILE" = "latency" ]; then
-    read -r HAS_IMG4 HAS_N5 HAS_N6 IS_N6H < <(inspect_tk_magics "$TK") || die "could not decompress $TK to read patch magics"
+    read -r HAS_IMG4 HAS_N5 HAS_N6 IS_N6H HAS_M1 M1_VERSION < <(inspect_tk_magics "$TK") || die "could not decompress $TK to read patch magics"
     if [ "$HAS_N6" = 1 ]; then
       if [ "$IS_N6H" = 1 ]; then DETECTED_TIER="N6H"; else DETECTED_TIER="N6"; fi
     elif [ "$HAS_N5" = 1 ]; then
@@ -265,6 +278,11 @@ if [ "$STAGE_TK" = 1 ]; then
       DETECTED_TIER="IMG4"
     else
       DETECTED_TIER="N4"
+    fi
+    if [ "$HAS_M1" = 1 ]; then
+      DETECTED_TIER="$DETECTED_TIER + M1 $M1_VERSION"
+    elif [ "$HAS_M1" = 2 ]; then
+      DETECTED_TIER="$DETECTED_TIER + M1 $M1_VERSION, not accepted"
     fi
   fi
 fi
@@ -321,6 +339,11 @@ wm=0x84489a6c:0x1"
         TK_CONFIG="$TK_CONFIG
 wm=0x8418ff08:0x1"
       fi
+      # The Rust PIE replaces the N4 AQM v2 and runs only with its bits 0x5.
+      if [ "$HAS_M1" = 1 ] && [ $((flags & 0x5)) -eq 5 ]; then
+        TK_CONFIG="$TK_CONFIG
+wm=0x841b5908:0x1"
+      fi
     fi
   fi
 fi
@@ -359,6 +382,13 @@ fi
 [ "$STAGE_FP" = 1 ] && { echo "--- fastpath/config"; echo "$FASTPATH_CONFIG"; }
 if [ "$STAGE_TK" = 1 ] && [ "${#TARGETS[@]}" -eq 0 ]; then
   echo "note: no --target; the boot confirm uses the deaf watchdog's targets"
+fi
+if [ "$STAGE_TK" = 1 ] && [ "$WRITE_FLAGS" = 1 ] && [ "$PROFILE" = latency ]; then
+  if [ "$HAS_M1" = 2 ]; then
+    echo "note: the image's M1 block is build $M1_VERSION, which this keeper does not accept; no M1 selector line (with one the keeper would write nothing)"
+  elif [ "$HAS_M1" = 1 ] && [ $((flags & 0x5)) -ne 5 ]; then
+    echo "note: --flags $FLAGS has no N4 AQM v2 (bits 0x5), which the Rust PIE replaces; no M1 selector line"
+  fi
 fi
 if [ "$DRY" = 1 ]; then
   echo "dry run: nothing changed"
@@ -437,6 +467,9 @@ After the boot, run this script with --status. Expect:
   witcher-tk.flags   state=applied (within 1 to 3 minutes of the confirm)
   witcher-qctrl.status state=applied (about 30 s after LTE comes up)
 EOF
+  if grep -q '^wm=0x841b5908:' <<<"$TK_CONFIG"; then
+    echo "  witcher-tk.m1      selector=1 and the Rust PIE counters (once the flags apply)"
+  fi
   if [ "$STAGE_FP" = 1 ]; then
     echo "  witcher-fastpath.status state=applied (about 30 s after eth0 and lte0pdn2 are up in IP passthrough)"
   fi

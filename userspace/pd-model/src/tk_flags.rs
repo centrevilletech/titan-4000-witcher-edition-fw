@@ -21,15 +21,21 @@
 //!     refused; bit 1 requires N4 flags bit 0)
 //! - N6 (`0x8418ff00` = `55 32 48 46` `"U2HF"`):
 //!   - `0x8418ff08` `U2_FLAGS` (0 or 1)
+//! - M1 (`0x841b5900` = `4d 31 50 49` `"M1PI"`, then a build version in
+//!   `M1_VERSIONS` at `0x841b5904`):
+//!   - `0x841b5908` `M1_SELECT` (0 N4 AQM v2, the boot value and rollback; 1 Rust
+//!     PIE; 2 no AQM). The block's counters are read, never written (`STATUS`).
 //!
 //! Forbidden addresses (TRCP, W5, UHQ, U3T, R17, X4/HRB, DSR, U14, PHR, RF,
-//! power, MPR, calibration, and every address outside `TABLE`) are refused.
+//! power, MPR, calibration, the M1 tunables, state and counters, and every
+//! address outside `TABLE`) are refused.
 //!
 //! Guards:
 //! - Only addresses on `TABLE` and values passing their range and cross-word
-//!   rules are accepted.
+//!   rules (`REQUIRES`, `MIN_MAX`) are accepted.
 //! - Nothing is written unless every patch layer's magic for that session reads
-//!   back in the same session (N4 through `tk_boot::flag_writes_allowed`).
+//!   back in the same session (N4 through `tk_boot::flag_writes_allowed`), and,
+//!   for a layer with a version word (M1), one of its accepted versions.
 //! - Write order: reducing/disabling flags first (reverse dependency order),
 //!   then parameters, then enabling flags (`N4_FLAGS` before `N5_FLAGS`).
 //! - Sessions that would exceed `MAX_SESSION_SECS` split into consecutive
@@ -50,16 +56,12 @@ pub enum MagicGroup {
     Img4,
     N5,
     N6,
+    M1,
 }
 
 impl MagicGroup {
     pub fn name(self) -> &'static str {
-        match self {
-            MagicGroup::N4 => "N4",
-            MagicGroup::Img4 => "IMG4",
-            MagicGroup::N5 => "N5",
-            MagicGroup::N6 => "N6",
-        }
+        magic_spec(self).name
     }
 }
 
@@ -70,6 +72,10 @@ pub struct MagicSpec {
     pub name: &'static str,
     pub addr: u32,
     pub bytes: [u8; 4],
+    /// Build versions accepted in the word after the magic (`addr + 4`), as
+    /// the console shows it (most significant byte first, like `bytes`).
+    /// Empty for a layer without a version word.
+    pub versions: &'static [u32],
 }
 
 /// N4 patch magic address (`0x847ed600`, `"N4V2"`).
@@ -84,31 +90,48 @@ pub const N6_MAGIC_ADDR: u32 = 0x8418_ff00;
 pub const N6_DEFAULTS_ADDR: u32 = 0x8418_ff04;
 pub const N6_DEFAULTS_STOCK: u32 = 0x4e36_0000;
 pub const N6H_DEFAULTS: u32 = 0x4e36_4803;
+/// M1 Rust PIE uplink AQM block (`0x841b5900..0x841b5a00`, magic `"M1PI"`).
+pub const M1_MAGIC_ADDR: u32 = 0x841b_5900;
+/// M1 builds whose selector and counters sit where `TABLE` and `STATUS` say
+/// (`device/modem-rust/src/pie.rs`, `M1Block`). A build not on this list
+/// writes nothing.
+pub const M1_VERSIONS: [u32; 1] = [0x2026_1125];
 
-pub const MAGICS: [MagicSpec; 4] = [
+pub const MAGICS: [MagicSpec; 5] = [
     MagicSpec {
         group: MagicGroup::N4,
         name: "N4",
         addr: N4_MAGIC_ADDR,
         bytes: MAGIC,
+        versions: &[],
     },
     MagicSpec {
         group: MagicGroup::Img4,
         name: "IMG4",
         addr: IMG4_MAGIC_ADDR,
         bytes: *b"IMG4",
+        versions: &[],
     },
     MagicSpec {
         group: MagicGroup::N5,
         name: "N5",
         addr: N5_MAGIC_ADDR,
         bytes: *b"N5FL",
+        versions: &[],
     },
     MagicSpec {
         group: MagicGroup::N6,
         name: "N6",
         addr: N6_MAGIC_ADDR,
         bytes: *b"U2HF",
+        versions: &[],
+    },
+    MagicSpec {
+        group: MagicGroup::M1,
+        name: "M1",
+        addr: M1_MAGIC_ADDR,
+        bytes: *b"M1PI",
+        versions: &M1_VERSIONS,
     },
 ];
 
@@ -159,6 +182,11 @@ pub const N5_PDCP_K_Q4_ADDR: u32 = 0x8448_9a8c;
 
 /// N6 LNK-FIX master switch (`0x8418ff08`, 0 or 1).
 pub const U2_FLAGS_ADDR: u32 = 0x8418_ff08;
+
+/// M1 uplink AQM selector (`0x841b5908`): 0 N4 AQM v2 (boot value and
+/// rollback), 1 Rust PIE, 2 no AQM. The modem acts on 1 or 2 only while
+/// `N4_FLAGS` has bits `0x5`; otherwise it enqueues as with the N4 AQM off.
+pub const M1_SELECT_ADDR: u32 = 0x841b_5908;
 
 /// AQM v2 (`0x1 | 0x4`) and the grant-hold rescue (`0x10`). Bits `0x2` (lead),
 /// `0x8` (stock sparse promotion) and `0x20` must stay off.
@@ -235,8 +263,9 @@ const LNK_ALLOWED: [u32; 2] = [0, 2];
 
 /// Complete allow-list of managed modem words in canonical apply order:
 /// parameters before flags, and prerequisite flags (`N4_FLAGS`) before
-/// dependent flags (`N5_FLAGS`).
-pub const TABLE: [WordSpec; 18] = [
+/// dependent flags (`N5_FLAGS`). The M1 selector comes last: it switches the
+/// uplink AQM only after every other layer is set, and goes back to 0 first.
+pub const TABLE: [WordSpec; 19] = [
     // N4 parameters
     WordSpec {
         name: "HOLD_MARGIN",
@@ -423,6 +452,95 @@ pub const TABLE: [WordSpec; 18] = [
         off_value: 0,
         boot_default: 0,
     },
+    WordSpec {
+        name: "M1_SELECT",
+        addr: M1_SELECT_ADDR,
+        magic: MagicGroup::M1,
+        kind: Kind::Flag,
+        allowed: AllowedValues::Range { min: 0, max: 2 },
+        off_value: 0,
+        boot_default: 0,
+    },
+];
+
+/// When a cross-word rule applies to its word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum When {
+    /// The word has any of these bits set.
+    AnyBit(u32),
+    /// The word holds this value. Only the rule admits it: it is not in the
+    /// word's `allowed` set (`LNK` 1).
+    Value(u32),
+}
+
+/// A cross-word rule: `word` matching `when` needs every bit of `bits` set in
+/// `needs`. `parse_writes` refuses it with `reason` unless `needs` has those
+/// bits in the same config. A session refuses it unless `needs` has them in
+/// the same session or already in modem RAM, and it checks the magic of the
+/// layer `needs` belongs to as well.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Requires {
+    pub word: u32,
+    pub when: When,
+    pub needs: u32,
+    pub bits: u32,
+    pub reason: &'static str,
+}
+
+impl Requires {
+    fn applies(&self, write: Write) -> bool {
+        write.addr == self.word
+            && match self.when {
+                When::AnyBit(bits) => write.value & bits != 0,
+                When::Value(value) => write.value == value,
+            }
+    }
+
+    fn met_by(&self, value: u32) -> bool {
+        value & self.bits == self.bits
+    }
+}
+
+/// Every cross-word rule, checked in this order.
+pub const REQUIRES: [Requires; 2] = [
+    Requires {
+        word: N5_FLAGS_ADDR,
+        when: When::AnyBit(0x2),
+        needs: FLAGS_ADDR,
+        bits: 0x1,
+        reason: "N5_FLAGS bit 1 requires N4_FLAGS bit 0",
+    },
+    Requires {
+        word: LNK_ADDR,
+        when: When::Value(1),
+        needs: U2_FLAGS_ADDR,
+        bits: 0x1,
+        reason: "LNK value 1 requires N6 magic and U2_FLAGS bit 0 in the same config",
+    },
+];
+
+/// A value only a cross-word rule admits (`LNK` 1).
+fn rule_admits(addr: u32, value: u32) -> bool {
+    REQUIRES
+        .iter()
+        .any(|rule| rule.word == addr && rule.when == When::Value(value))
+}
+
+/// Word pairs whose first may not exceed the second. An omitted side counts
+/// at its boot value.
+const MIN_MAX: [(u32, u32, &str); 2] = [
+    (N4_PDCP_MIN_ADDR, N4_PDCP_MAX_ADDR, "N4 PDCP min exceeds max"),
+    (N5_PDCP_MIN_ADDR, N5_PDCP_MAX_ADDR, "N5 PDCP min exceeds max"),
+];
+
+/// Bits refused with a reason of their own.
+const REFUSED_BITS: [(u32, u32, &str); 2] = [
+    (
+        FLAGS_ADDR,
+        0x8,
+        "N4 flags bit 3 (0x8, stock sparse promotion) is refused",
+    ),
+    (N5_FLAGS_ADDR, 0x4, "N5_FLAGS bit 2 (0x4) is refused"),
 ];
 
 pub fn find_word(addr: u32) -> Option<&'static WordSpec> {
@@ -563,13 +681,19 @@ impl Parsed {
 }
 
 fn refuse_reason_for_value(spec: &WordSpec, value: u32, ack: bool) -> String {
+    if let Some(rule) = REQUIRES
+        .iter()
+        .find(|rule| rule.word == spec.addr && rule.when == When::Value(value))
+    {
+        return rule.reason.into();
+    }
     match spec.allowed {
         AllowedValues::Bitmask(mask) => {
-            if spec.addr == FLAGS_ADDR && (value & 0x8) != 0 {
-                return "N4 flags bit 3 (0x8, stock sparse promotion) is refused".into();
-            }
-            if spec.addr == N5_FLAGS_ADDR && (value & 0x4) != 0 {
-                return "N5_FLAGS bit 2 (0x4) is refused".into();
+            if let Some((_, _, reason)) = REFUSED_BITS
+                .iter()
+                .find(|(addr, bits, _)| *addr == spec.addr && value & bits != 0)
+            {
+                return (*reason).into();
             }
             format!(
                 "{} value 0x{value:x} sets bits outside mask 0x{mask:x}",
@@ -595,9 +719,6 @@ fn refuse_reason_for_value(spec: &WordSpec, value: u32, ack: bool) -> String {
             }
         }
         AllowedValues::OneOf(list) => {
-            if spec.addr == LNK_ADDR && value == 1 {
-                return "LNK value 1 requires N6 magic and U2_FLAGS bit 0 in the same config".into();
-            }
             format!("{} value 0x{value:x} not in allowed set {:?}", spec.name, list)
         }
     }
@@ -658,8 +779,8 @@ pub fn parse_writes(config: &str) -> Parsed {
             parsed.refuse(line, format!("address 0x{addr:08x} is not on the allow-list"));
             continue;
         };
-        let provisional_lnk1 = spec.addr == LNK_ADDR && value == 1;
-        if !provisional_lnk1 && !spec.value_ok(value, parsed.hold_ack) {
+        // A value only a cross-word rule admits waits for that rule below.
+        if !rule_admits(addr, value) && !spec.value_ok(value, parsed.hold_ack) {
             let reason = refuse_reason_for_value(spec, value, parsed.hold_ack);
             parsed.refuse(line, reason);
             continue;
@@ -668,57 +789,20 @@ pub fn parse_writes(config: &str) -> Parsed {
         found.push((Write { addr, value }, line.trim().to_owned()));
     }
 
-    // Cross-word rule 1: N4 PDCP min <= max (defaulting omitted side to boot default).
-    check_min_max(
-        &mut found,
-        &mut parsed,
-        N4_PDCP_MIN_ADDR,
-        N4_PDCP_MAX_ADDR,
-        PDCP_MIN_DEFAULT,
-        PDCP_MAX_DEFAULT,
-        "N4 PDCP min exceeds max",
-    );
-
-    // Cross-word rule 2: N5 PDCP min <= max (defaulting omitted side to boot default).
-    check_min_max(
-        &mut found,
-        &mut parsed,
-        N5_PDCP_MIN_ADDR,
-        N5_PDCP_MAX_ADDR,
-        PDCP_MIN_DEFAULT,
-        PDCP_MAX_DEFAULT,
-        "N5 PDCP min exceeds max",
-    );
-
-    // Cross-word rule 3: N5_FLAGS bit 1 requires N4_FLAGS bit 0.
-    if let Some(pos) = found.iter().position(|(w, _)| w.addr == N5_FLAGS_ADDR) {
-        let n5_val = found[pos].0.value;
-        if (n5_val & 0x2) != 0 {
-            let n4_bit0 = found
-                .iter()
-                .find(|(w, _)| w.addr == FLAGS_ADDR)
-                .is_some_and(|(w, _)| (w.value & 0x1) != 0);
-            if !n4_bit0 {
-                let (_, raw) = found.remove(pos);
-                parsed.refuse(&raw, "N5_FLAGS bit 1 requires N4_FLAGS bit 0");
-            }
-        }
+    for (min_addr, max_addr, reason) in MIN_MAX {
+        check_min_max(&mut found, &mut parsed, min_addr, max_addr, reason);
     }
 
-    // Cross-word rule 4: LNK=1 requires N6 magic and U2_FLAGS bit 0 in the same config.
-    if let Some(pos) = found.iter().position(|(w, _)| w.addr == LNK_ADDR) {
-        if found[pos].0.value == 1 {
-            let u2_bit0 = found
-                .iter()
-                .find(|(w, _)| w.addr == U2_FLAGS_ADDR)
-                .is_some_and(|(w, _)| (w.value & 0x1) != 0);
-            if !u2_bit0 {
-                let (_, raw) = found.remove(pos);
-                parsed.refuse(
-                    &raw,
-                    "LNK value 1 requires N6 magic and U2_FLAGS bit 0 in the same config",
-                );
-            }
+    for rule in &REQUIRES {
+        let Some(pos) = found.iter().position(|(w, _)| rule.applies(*w)) else {
+            continue;
+        };
+        let met = found
+            .iter()
+            .any(|(w, _)| w.addr == rule.needs && rule.met_by(w.value));
+        if !met {
+            let (_, raw) = found.remove(pos);
+            parsed.refuse(&raw, rule.reason);
         }
     }
 
@@ -735,8 +819,6 @@ fn check_min_max(
     parsed: &mut Parsed,
     min_addr: u32,
     max_addr: u32,
-    default_min: u32,
-    default_max: u32,
     reason: &str,
 ) {
     let min_entry = found.iter().find(|(w, _)| w.addr == min_addr).map(|(w, _)| w.value);
@@ -744,8 +826,9 @@ fn check_min_max(
     if min_entry.is_none() && max_entry.is_none() {
         return;
     }
-    let eff_min = min_entry.unwrap_or(default_min);
-    let eff_max = max_entry.unwrap_or(default_max);
+    let boot = |addr: u32| find_word(addr).map_or(0, |spec| spec.boot_default);
+    let eff_min = min_entry.unwrap_or_else(|| boot(min_addr));
+    let eff_max = max_entry.unwrap_or_else(|| boot(max_addr));
     if eff_min > eff_max {
         let mut rejected = Vec::new();
         found.retain(|(w, raw)| {
@@ -847,17 +930,24 @@ fn is_flag_reducing(spec: &WordSpec, current: Option<u32>, next: u32) -> bool {
 pub fn write_order_from(writes: &[Write], prev: &[Write]) -> Vec<Write> {
     let mut ordered = writes.to_vec();
     ordered.sort_by_key(|w| {
-        let pos = table_position(w.addr);
         let cur = prev.iter().find(|p| p.addr == w.addr).map(|p| p.value);
-        match find_word(w.addr) {
-            Some(spec) if spec.kind == Kind::Flag && is_flag_reducing(spec, cur, w.value) => {
-                (0u8, TABLE.len().saturating_sub(pos))
-            }
-            Some(spec) if spec.kind == Kind::Param => (1u8, pos),
-            _ => (2u8, pos),
-        }
+        order_key(w, cur)
     });
     ordered
+}
+
+/// A write's place in a session, given the value it replaces: reducing flags
+/// first in reverse `TABLE` order, then parameters, then enabling flags in
+/// `TABLE` order.
+fn order_key(write: &Write, current: Option<u32>) -> (u8, usize) {
+    let pos = table_position(write.addr);
+    match find_word(write.addr) {
+        Some(spec) if spec.kind == Kind::Flag && is_flag_reducing(spec, current, write.value) => {
+            (0, TABLE.len().saturating_sub(pos))
+        }
+        Some(spec) if spec.kind == Kind::Param => (1, pos),
+        _ => (2, pos),
+    }
 }
 
 /// The order `wm` lines go out from a fresh boot state.
@@ -870,25 +960,13 @@ pub fn write_order(writes: &[Write]) -> Vec<Write> {
 /// `0x3 -> 0x1`, or `LNK 1 -> 2`) also goes in tier 0 before any parameter changes.
 fn write_order_with_current(need: &[(Write, Option<u32>)]) -> Vec<Write> {
     let mut items = need.to_vec();
-    items.sort_by_key(|(w, current)| {
-        let pos = table_position(w.addr);
-        match find_word(w.addr) {
-            Some(spec) if spec.kind == Kind::Flag => {
-                if is_flag_reducing(spec, *current, w.value) {
-                    (0u8, TABLE.len().saturating_sub(pos))
-                } else {
-                    (2u8, pos)
-                }
-            }
-            Some(spec) if spec.kind == Kind::Param => (1u8, pos),
-            _ => (2u8, pos),
-        }
-    });
+    items.sort_by_key(|(w, current)| order_key(w, *current));
     items.into_iter().map(|(w, _)| w).collect()
 }
 
 /// Distinct patch magics required by `writes`, in canonical `MagicGroup` order.
-/// Includes cross-word magic dependencies (`N6` for `LNK=1`, `N4` for `N5_FLAGS` bit 1).
+/// Includes the magic of every word a `REQUIRES` rule needs (`N6` for `LNK=1`,
+/// `N4` for `N5_FLAGS` bit 1).
 pub fn required_magics(writes: &[Write]) -> Vec<MagicSpec> {
     let mut groups: Vec<MagicGroup> = Vec::new();
     let mut add = |group: MagicGroup| {
@@ -899,11 +977,10 @@ pub fn required_magics(writes: &[Write]) -> Vec<MagicSpec> {
     for write in writes {
         if let Some(spec) = find_word(write.addr) {
             add(spec.magic);
-            if write.addr == LNK_ADDR && write.value == 1 {
-                add(MagicGroup::N6);
-            }
-            if write.addr == N5_FLAGS_ADDR && (write.value & 0x2) != 0 {
-                add(MagicGroup::N4);
+            for rule in REQUIRES.iter().filter(|rule| rule.applies(*write)) {
+                if let Some(needs) = find_word(rule.needs) {
+                    add(needs.magic);
+                }
             }
         }
     }
@@ -924,24 +1001,16 @@ fn merge_magics(a: &[MagicSpec], b: &[MagicSpec]) -> Vec<MagicSpec> {
 
 /// Cross-word prerequisites that must already hold in modem RAM when the
 /// prerequisite word is not written in the same session:
-/// `(dependent_write, prereq_addr, required_bit)`.
-fn prereq_reads_needed(writes: &[Write]) -> Vec<(Write, u32, u32)> {
+/// `(dependent_write, rule)`.
+fn prereq_reads_needed(writes: &[Write]) -> Vec<(Write, &'static Requires)> {
     let mut checks = Vec::new();
     for &write in writes {
-        if write.addr == N5_FLAGS_ADDR && (write.value & 0x2) != 0 {
+        for rule in REQUIRES.iter().filter(|rule| rule.applies(write)) {
             let in_batch = writes
                 .iter()
-                .any(|w| w.addr == FLAGS_ADDR && (w.value & 0x1) != 0);
+                .any(|w| w.addr == rule.needs && rule.met_by(w.value));
             if !in_batch {
-                checks.push((write, FLAGS_ADDR, 0x1));
-            }
-        }
-        if write.addr == LNK_ADDR && write.value == 1 {
-            let in_batch = writes
-                .iter()
-                .any(|w| w.addr == U2_FLAGS_ADDR && (w.value & 0x1) != 0);
-            if !in_batch {
-                checks.push((write, U2_FLAGS_ADDR, 0x1));
+                checks.push((write, rule));
             }
         }
     }
@@ -970,7 +1039,8 @@ fn session_budget_secs_with_magics(
         // read only
         Session::Check => 3,
     };
-    overhead + magics * 3 + prereqs * 3 + (writes.len() as u64) * per_word
+    let status_reads = status_specs(writes).len() as u64;
+    overhead + magics * 3 + prereqs * 3 + (writes.len() as u64) * per_word + status_reads * 3
 }
 
 /// Estimated worst-case wall-clock seconds for one DM session at 3 s per line.
@@ -1069,21 +1139,8 @@ pub fn vm_word(output: &str, addr: u32) -> Option<u32> {
         let head = head.trim();
         let words: Vec<&str> = rest.split_whitespace().collect();
         if head.is_empty() {
-            let offsets: Option<Vec<usize>> = words
-                .iter()
-                .map(|w| {
-                    (w.len() == 2)
-                        .then(|| u8::from_str_radix(w, 16).ok())
-                        .flatten()
-                        .map(usize::from)
-                })
-                .collect();
-            if let Some(offsets) = offsets {
-                let mut sorted = offsets.clone();
-                sorted.sort_unstable();
-                if sorted.len() >= 4 && sorted.iter().enumerate().all(|(i, v)| i == *v) {
-                    order = Some(offsets);
-                }
+            if let Some(offsets) = header_order(&words) {
+                order = Some(offsets);
             }
             continue;
         }
@@ -1111,8 +1168,194 @@ pub fn vm_word(output: &str, addr: u32) -> Option<u32> {
     found
 }
 
+/// The byte offset each column of a `vm` dump shows, from its header line
+/// (`| 03 02 01 00  07 06 05 04 ...` on the unit). `None` for any other line.
+fn header_order(words: &[&str]) -> Option<Vec<usize>> {
+    let offsets: Vec<usize> = words
+        .iter()
+        .map(|w| {
+            (w.len() == 2)
+                .then(|| u8::from_str_radix(w, 16).ok())
+                .flatten()
+                .map(usize::from)
+        })
+        .collect::<Option<_>>()?;
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    (sorted.len() >= 4 && sorted.iter().enumerate().all(|(i, v)| i == *v)).then_some(offsets)
+}
+
+/// The bytes at `addr..addr + len` in a `vm` dump of one or more 16-byte rows
+/// (`vm 0x841b5900 160`), in memory order. Each row's columns map back
+/// through the column header, as in `vm_word`. `None` when any byte is
+/// missing or no header came before its row.
+pub fn vm_memory(output: &str, addr: u32, len: u32) -> Option<Vec<u8>> {
+    let mut bytes = vec![None; len as usize];
+    let mut order: Option<Vec<usize>> = None;
+    for raw in output.lines() {
+        let line = tk_boot::strip_escapes(raw);
+        let Some((head, rest)) = line.split_once('|') else {
+            continue;
+        };
+        let head = head.trim();
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        if head.is_empty() {
+            if let Some(offsets) = header_order(&words) {
+                order = Some(offsets);
+            }
+            continue;
+        }
+        let Some(row) = head
+            .strip_prefix("0x")
+            .or_else(|| head.strip_prefix("0X"))
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        else {
+            continue;
+        };
+        let Some(order) = order.as_ref() else {
+            continue;
+        };
+        for (column, word) in words.iter().enumerate() {
+            let Some(&offset) = order.get(column) else {
+                break;
+            };
+            let Some(at) = (u64::from(row) + offset as u64).checked_sub(u64::from(addr)) else {
+                continue;
+            };
+            if at < u64::from(len) && word.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(word, 16) {
+                    bytes[at as usize] = Some(byte);
+                }
+            }
+        }
+    }
+    bytes.into_iter().collect()
+}
+
 pub fn read_cmd(addr: u32) -> String {
     format!("vm 0x{addr:08x} 4")
+}
+
+/// The console line that reads a layer's magic: `vm <addr> 4`, or
+/// `vm <addr> 8` when its version word follows.
+pub fn magic_read_cmd(spec: &MagicSpec) -> String {
+    if spec.versions.is_empty() {
+        read_cmd(spec.addr)
+    } else {
+        format!("vm 0x{:08x} 8", spec.addr)
+    }
+}
+
+/// Read-only words of a patch layer, reported but never written. One `vm`
+/// line reads them at the end of a verified session that holds a word of the
+/// layer, into `/var/run/` + `status_file(group)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StatusSpec {
+    pub group: MagicGroup,
+    /// Bytes read from the layer's magic on (`vm <magic addr> <len>`).
+    pub len: u32,
+    /// `(key, address)` of each reported word, in file order.
+    pub fields: &'static [(&'static str, u32)],
+}
+
+/// The M1 selector and counters (`M1Block` in `device/modem-rust/src/pie.rs`),
+/// read the way the bench read them: `vm 0x841b5900 160`.
+pub const STATUS: [StatusSpec; 1] = [StatusSpec {
+    group: MagicGroup::M1,
+    len: 160,
+    fields: &[
+        ("selector", M1_SELECT_ADDR),
+        ("seen", 0x841b_5960),
+        ("pie_drops", 0x841b_5968),
+        ("ce_marks", 0x841b_596c),
+        ("hard_drops", 0x841b_5970),
+        ("peak_qdelay_us", 0x841b_5980),
+    ],
+}];
+
+/// One layer's status words, read at the end of a verified session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerStatus {
+    pub group: MagicGroup,
+    /// The block's version word, for a layer that has one.
+    pub version: Option<u32>,
+    /// `(key, value)` for each of `StatusSpec::fields`, in order.
+    pub fields: Vec<(&'static str, u32)>,
+}
+
+impl LayerStatus {
+    /// The status file: `version=`, one decimal `key=value` line per field,
+    /// then `updated=` on the keeper's clock.
+    pub fn text(&self, now: u64) -> String {
+        let version = self
+            .version
+            .map(|v| format!("version=0x{v:08x}\n"))
+            .unwrap_or_default();
+        let fields: String = self
+            .fields
+            .iter()
+            .map(|(key, value)| format!("{key}={value}\n"))
+            .collect();
+        format!("{version}{fields}updated={now}\n")
+    }
+}
+
+/// The status file of `group` in `/var/run` (`witcher-tk.m1`).
+pub fn status_file(group: MagicGroup) -> String {
+    format!("witcher-tk.{}", group.name().to_ascii_lowercase())
+}
+
+/// The console line that reads `spec`'s block.
+pub fn status_read_cmd(spec: &StatusSpec) -> String {
+    format!("vm 0x{:08x} {}", magic_spec(spec.group).addr, spec.len)
+}
+
+/// `spec`'s words in a `vm` dump of its block, when the dump shows the
+/// layer's magic and, for a layer with a version word, an accepted version.
+pub fn read_status(spec: &StatusSpec, output: &str) -> Option<LayerStatus> {
+    let magic = magic_spec(spec.group);
+    let block = vm_memory(output, magic.addr, spec.len)?;
+    let word = |addr: u32| -> Option<u32> {
+        let at = addr.checked_sub(magic.addr)? as usize;
+        block
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if word(magic.addr)? != u32::from_be_bytes(magic.bytes) {
+        return None;
+    }
+    let version = if magic.versions.is_empty() {
+        None
+    } else {
+        let version = word(magic.addr + 4)?;
+        if !magic.versions.contains(&version) {
+            return None;
+        }
+        Some(version)
+    };
+    let fields = spec
+        .fields
+        .iter()
+        .map(|&(key, addr)| word(addr).map(|value| (key, value)))
+        .collect::<Option<Vec<_>>>()?;
+    Some(LayerStatus {
+        group: spec.group,
+        version,
+        fields,
+    })
+}
+
+/// The status blocks a session over `writes` reads: those of every layer
+/// with a word in it.
+fn status_specs(writes: &[Write]) -> Vec<&'static StatusSpec> {
+    STATUS
+        .iter()
+        .filter(|spec| {
+            writes
+                .iter()
+                .any(|w| find_word(w.addr).is_some_and(|word| word.magic == spec.group))
+        })
+        .collect()
 }
 
 /// `wm 0x84f93008 0x140`. Zero goes out as `0`, the form the bench used.
@@ -1146,6 +1389,9 @@ pub enum Outcome {
     /// A magic read printed other bytes: stock firmware, wrong image tier, or
     /// the patch has not run yet. Nothing was written.
     NoMagic(MagicGroup),
+    /// A layer showed its magic but a build version this keeper does not
+    /// accept (`got` is `None` when no version printed). Nothing was written.
+    WrongVersion { group: MagicGroup, got: Option<u32> },
     /// Every word read back as wanted. `wrote` counts the `wm` lines sent.
     Verified { wrote: usize },
     /// Check only: a word read back other than wanted, or not at all.
@@ -1164,8 +1410,24 @@ pub enum Outcome {
     Busy,
 }
 
+/// What one DM session did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Report {
+    pub outcome: Outcome,
+    /// A `wm` line went out.
+    pub sent: bool,
+    /// The status blocks read at its end (`STATUS`).
+    pub status: Vec<LayerStatus>,
+}
+
 /// Run one planned DM session. Returns the outcome and whether any `wm` line went out.
 pub fn run_plan(console: &mut dyn Console, plan: &Plan) -> (Outcome, bool) {
+    let report = run_plan_report(console, plan);
+    (report.outcome, report.sent)
+}
+
+/// Run one planned DM session and keep the status blocks it read.
+pub fn run_plan_report(console: &mut dyn Console, plan: &Plan) -> Report {
     run_session_inner(console, &plan.writes, &plan.magics, plan.session, plan.hold_ack)
 }
 
@@ -1185,7 +1447,8 @@ pub fn run_session_with_ack(
     session: Session,
     hold_ack: bool,
 ) -> (Outcome, bool) {
-    run_session_inner(console, writes, &[], session, hold_ack)
+    let report = run_session_inner(console, writes, &[], session, hold_ack);
+    (report.outcome, report.sent)
 }
 
 fn run_session_inner(
@@ -1194,8 +1457,9 @@ fn run_session_inner(
     extra_magics: &[MagicSpec],
     session: Session,
     hold_ack: bool,
-) -> (Outcome, bool) {
+) -> Report {
     let mut sent = false;
+    let mut status = Vec::new();
     console.command("arm1log 2");
     if session == Session::Apply {
         // Leave logging mode (`quit 1`) and drop leftover debug categories,
@@ -1203,9 +1467,21 @@ fn run_session_inner(
         console.command("quit 0");
         console.command("dbg revert");
     }
-    let outcome = session_body(console, writes, extra_magics, session, hold_ack, &mut sent);
+    let outcome = session_body(
+        console,
+        writes,
+        extra_magics,
+        session,
+        hold_ack,
+        &mut sent,
+        &mut status,
+    );
     console.command("arm1log 1");
-    (outcome, sent)
+    Report {
+        outcome,
+        sent,
+        status,
+    }
 }
 
 fn magic_matches(spec: MagicSpec, output: &str) -> bool {
@@ -1216,6 +1492,32 @@ fn magic_matches(spec: MagicSpec, output: &str) -> bool {
         .is_some_and(|bytes| bytes.len() >= 4 && bytes[..4] == spec.bytes)
 }
 
+/// Why a layer's magic read allows no write, or `None` when it shows the
+/// magic and, for a layer with a version word, an accepted version.
+fn magic_refusal(spec: MagicSpec, reply: &str) -> Option<Outcome> {
+    let Some(shown) = tk_boot::vm_bytes(reply, spec.addr) else {
+        return Some(Outcome::NoReply);
+    };
+    if !magic_matches(spec, reply) {
+        return Some(Outcome::NoMagic(spec.group));
+    }
+    if spec.versions.is_empty() {
+        return None;
+    }
+    // The console shows each word most significant byte first, as the magic
+    // just matched in `bytes` order.
+    let got = shown
+        .get(4..8)
+        .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    if got.is_some_and(|version| spec.versions.contains(&version)) {
+        return None;
+    }
+    Some(Outcome::WrongVersion {
+        group: spec.group,
+        got,
+    })
+}
+
 fn session_body(
     console: &mut dyn Console,
     writes: &[Write],
@@ -1223,12 +1525,13 @@ fn session_body(
     session: Session,
     hold_ack: bool,
     sent: &mut bool,
+    status: &mut Vec<LayerStatus>,
 ) -> Outcome {
     // Reject any disallowed address or out-of-range value before sending any
     // write, even if a caller bypassed `parse_writes`.
     for write in writes {
         let ok = session_value_ok(write.addr, write.value, hold_ack)
-            || (write.addr == LNK_ADDR && write.value == 1);
+            || rule_admits(write.addr, write.value);
         if !ok {
             return Outcome::Unverified {
                 addr: write.addr,
@@ -1238,32 +1541,17 @@ fn session_body(
         }
     }
     // Reject in-batch cross-word contradictions before touching the console.
-    if let Some(n5) = writes
-        .iter()
-        .find(|w| w.addr == N5_FLAGS_ADDR && (w.value & 0x2) != 0)
-    {
+    for rule in &REQUIRES {
+        let Some(dep) = writes.iter().find(|w| rule.applies(**w)) else {
+            continue;
+        };
         if writes
             .iter()
-            .any(|w| w.addr == FLAGS_ADDR && (w.value & 0x1) == 0)
+            .any(|w| w.addr == rule.needs && !rule.met_by(w.value))
         {
             return Outcome::Unverified {
-                addr: n5.addr,
-                wanted: n5.value,
-                got: None,
-            };
-        }
-    }
-    if let Some(lnk) = writes
-        .iter()
-        .find(|w| w.addr == LNK_ADDR && w.value == 1)
-    {
-        if writes
-            .iter()
-            .any(|w| w.addr == U2_FLAGS_ADDR && (w.value & 0x1) == 0)
-        {
-            return Outcome::Unverified {
-                addr: lnk.addr,
-                wanted: lnk.value,
+                addr: dep.addr,
+                wanted: dep.value,
                 got: None,
             };
         }
@@ -1275,18 +1563,15 @@ fn session_body(
         magics
     };
     for spec in magics {
-        let reply = console.command(&read_cmd(spec.addr));
-        if tk_boot::vm_bytes(&reply, spec.addr).is_none() {
-            return Outcome::NoReply;
-        }
-        if !magic_matches(spec, &reply) {
-            return Outcome::NoMagic(spec.group);
+        let reply = console.command(&magic_read_cmd(&spec));
+        if let Some(refusal) = magic_refusal(spec, &reply) {
+            return refusal;
         }
     }
     if session == Session::Apply {
-        for (dep, prereq_addr, req_bit) in prereq_reads_needed(writes) {
-            let got = vm_word(&console.command(&read_cmd(prereq_addr)), prereq_addr);
-            if !got.is_some_and(|v| (v & req_bit) != 0) {
+        for (dep, rule) in prereq_reads_needed(writes) {
+            let got = vm_word(&console.command(&read_cmd(rule.needs)), rule.needs);
+            if !got.is_some_and(|v| rule.met_by(v)) {
                 return Outcome::Unverified {
                     addr: dep.addr,
                     wanted: dep.value,
@@ -1309,27 +1594,30 @@ fn session_body(
             need.push((*write, got));
         }
     }
-    if need.is_empty() {
-        return Outcome::Verified { wrote: 0 };
-    }
-    let ordered = write_order_with_current(&need);
-    for write in &ordered {
-        console.command(&write_cmd(write));
-        *sent = true;
-    }
-    for write in &ordered {
-        let got = vm_word(&console.command(&read_cmd(write.addr)), write.addr);
-        if got != Some(write.value) {
-            return Outcome::Unverified {
-                addr: write.addr,
-                wanted: write.value,
-                got,
-            };
+    if !need.is_empty() {
+        let ordered = write_order_with_current(&need);
+        for write in &ordered {
+            console.command(&write_cmd(write));
+            *sent = true;
+        }
+        for write in &ordered {
+            let got = vm_word(&console.command(&read_cmd(write.addr)), write.addr);
+            if got != Some(write.value) {
+                return Outcome::Unverified {
+                    addr: write.addr,
+                    wanted: write.value,
+                    got,
+                };
+            }
         }
     }
-    Outcome::Verified {
-        wrote: ordered.len(),
+    // Every word reads as wanted: report the layers' counters while the
+    // console is open (one line per layer).
+    for spec in status_specs(writes) {
+        let reply = console.command(&status_read_cmd(spec));
+        status.extend(read_status(spec, &reply));
     }
+    Outcome::Verified { wrote: need.len() }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1637,7 +1925,7 @@ impl Control {
                     };
                     return Some(format!("tk flags: {}", self.detail));
                 }
-                Outcome::NoMagic(group) => {
+                Outcome::NoMagic(group) | Outcome::WrongVersion { group, .. } => {
                     self.state = State::Failed;
                     self.batch_index = 0;
                     self.batch_wrote = 0;
@@ -1717,8 +2005,6 @@ impl Control {
             }
             Outcome::NoMagic(group) => {
                 let spec = magic_spec(*group);
-                self.batch_index = 0;
-                self.batch_wrote = 0;
                 let line = (was != State::WaitingMagic).then(|| {
                     if was == State::Applied {
                         format!(
@@ -1737,13 +2023,23 @@ impl Control {
                         )
                     }
                 });
-                self.state = State::WaitingMagic;
-                self.next_at = now.saturating_add(self.magic_wait);
-                self.magic_wait = (self.magic_wait.saturating_mul(2)).min(MAGIC_MAX);
-                self.detail = format!(
-                    "waiting for the {} patch magic at 0x{:08x}; nothing written",
-                    spec.name, spec.addr
+                self.wait_for_layer(
+                    now,
+                    format!(
+                        "waiting for the {} patch magic at 0x{:08x}; nothing written",
+                        spec.name, spec.addr
+                    ),
                 );
+                line
+            }
+            Outcome::WrongVersion { group, got } => {
+                // A build the keeper does not know: never write, look again
+                // as for a missing magic. Unlike a magic that has yet to
+                // show, it is news each time the reason changes.
+                let detail = wrong_version_text(*group, *got);
+                let line = (was != State::WaitingMagic || self.detail != detail)
+                    .then(|| format!("tk flags: {detail}"));
+                self.wait_for_layer(now, detail);
                 line
             }
             Outcome::NoReply if was == State::Applied => {
@@ -1800,6 +2096,17 @@ impl Control {
         }
     }
 
+    /// Nothing was written because a layer did not show (its magic, or an
+    /// accepted version): look again later, backing off up to `MAGIC_MAX`.
+    fn wait_for_layer(&mut self, now: u64, detail: String) {
+        self.batch_index = 0;
+        self.batch_wrote = 0;
+        self.state = State::WaitingMagic;
+        self.next_at = now.saturating_add(self.magic_wait);
+        self.magic_wait = (self.magic_wait.saturating_mul(2)).min(MAGIC_MAX);
+        self.detail = detail;
+    }
+
     /// `/var/run/witcher-tk.flags`.
     pub fn status(&self, now: u64) -> String {
         format!(
@@ -1817,10 +2124,29 @@ pub fn idle_status(reason: &str, now: u64) -> String {
     format!("state=off\ndetail={reason}\nwant=none\nattempts=0\nupdated={now}\n")
 }
 
+fn wrong_version_text(group: MagicGroup, got: Option<u32>) -> String {
+    let spec = magic_spec(group);
+    let shown = got.map_or_else(
+        || "no readable version".to_owned(),
+        |v| format!("version 0x{v:08x}"),
+    );
+    let accepted = spec
+        .versions
+        .iter()
+        .map(|v| format!("0x{v:08x}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "the {} patch at 0x{:08x} shows {shown}; this keeper accepts {accepted}; nothing written",
+        spec.name, spec.addr
+    )
+}
+
 pub fn describe(outcome: &Outcome) -> String {
     match outcome {
         Outcome::NoReply => "no console reply to the magic read".into(),
         Outcome::NoMagic(group) => format!("no {} patch magic", group.name()),
+        Outcome::WrongVersion { group, got } => wrong_version_text(*group, *got),
         Outcome::Verified { wrote } => format!("verified ({wrote} written)"),
         Outcome::Differs { addr, wanted, got } | Outcome::Unverified { addr, wanted, got } => {
             format!(
@@ -1838,12 +2164,58 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     const HEADER: &str = "           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C";
+    const RULE: &str = "----------------------------------------------------------------------------";
 
-    fn dump(addr: u32, shown: &str) -> String {
+    /// A `vm` dump around `rows`, as the unit prints it.
+    fn frame(addr: u32, len: usize, rows: &str) -> String {
         format!(
-            "\n----------------------------------------------------------------------------\n HEX DUMP  | 4(0x4) Bytes @ 0x{addr:08X}\n----------------------------------------------------------------------------\n{HEADER}\n----------------------------------------------------------------------------\n\u{1b}[1;32m0x{addr:08X}\u{1b}[0m | {shown}  .. .. .. ..  .. .. .. ..  .. .. .. .. \n----------------------------------------------------------------------------\nDM> "
+            "\n{RULE}\n HEX DUMP  | {len}(0x{len:x}) Bytes @ 0x{addr:08X}\n{RULE}\n{HEADER}\n{RULE}\n{rows}{RULE}\nDM> "
         )
     }
+
+    fn dump(addr: u32, shown: &str) -> String {
+        frame(
+            addr,
+            4,
+            &format!("\u{1b}[1;32m0x{addr:08X}\u{1b}[0m | {shown}  .. .. .. ..  .. .. .. ..  .. .. .. .. \n"),
+        )
+    }
+
+    /// A `vm` dump of `words` from `addr` on, four words to a row.
+    fn dump_words(addr: u32, words: &[u32]) -> String {
+        let rows: String = words
+            .chunks(4)
+            .zip((addr..).step_by(16))
+            .map(|(row, at)| {
+                let mut cells: Vec<String> = row.iter().map(|w| shown(*w)).collect();
+                cells.resize(4, ".. .. .. ..".to_owned());
+                format!("\u{1b}[1;32m0x{at:08X}\u{1b}[0m | {} \n", cells.join("  "))
+            })
+            .collect();
+        frame(addr, words.len() * 4, &rows)
+    }
+
+    /// `vm 0x841b5900 160` on the bench Titan with the Rust PIE on, after a
+    /// 4-stream CUBIC upload (2026-11-25, run `m1-s1-cubic4-a`).
+    const M1_BENCH_DUMP: &str = concat!(
+        "----------------------------------------------------------------------------\n",
+        " HEX DUMP  | 160(0xa0) Bytes @ 0x841B5900\n",
+        "----------------------------------------------------------------------------\n",
+        "           | 03 02 01 00  07 06 05 04  0B 0A 09 08  0F 0E 0D 0C\n",
+        "----------------------------------------------------------------------------\n",
+        "0x841B5900 | 4d 31 50 49  20 26 11 25  00 00 00 01  00 00 00 0e \n",
+        "0x841B5910 | 00 00 00 0f  00 00 00 37  00 00 01 00  00 00 0a 00 \n",
+        "0x841B5920 | 00 00 01 f4  00 00 c3 50  00 19 99 9a  00 00 05 64 \n",
+        "0x841B5930 | 00 00 00 03  00 05 1e b8  00 00 00 00  00 00 00 00 \n",
+        "0x841B5940 | 00 00 00 00  00 fe 5c f7  00 00 22 d5  00 00 1e 15 \n",
+        "0x841B5950 | 00 00 00 00  00 09 87 2f  00 00 05 63  ba b2 bc be \n",
+        "0x841B5960 | 00 00 6d 79  00 00 6c 9d  00 00 00 82  00 00 00 00 \n",
+        "0x841B5970 | 00 00 00 5a  00 00 00 00  00 00 00 81  00 00 04 ac \n",
+        "0x841B5980 | 00 01 7d 4c  00 05 1e b8  00 00 00 00  00 00 00 01 \n",
+        "0x841B5990 | 00 00 00 3f  00 00 00 d1  00 00 00 00  00 00 00 00 \n",
+        "----------------------------------------------------------------------------\n",
+        "DM> ",
+    );
 
     /// Show a word the way the unit's console does: most significant first.
     fn shown(value: u32) -> String {
@@ -1855,6 +2227,8 @@ mod tests {
     struct Fake {
         ram: HashMap<u32, u32>,
         magics: HashSet<MagicGroup>,
+        /// The version word a layer with one shows after its magic.
+        version: u32,
         logging: bool,
         /// `wm` lines that change nothing (a write that does not stick).
         broken: bool,
@@ -1873,16 +2247,7 @@ mod tests {
         }
 
         fn all_magics() -> Self {
-            Self::with_magics(
-                [
-                    MagicGroup::N4,
-                    MagicGroup::Img4,
-                    MagicGroup::N5,
-                    MagicGroup::N6,
-                ]
-                .into_iter()
-                .collect(),
-            )
+            Self::with_magics(MAGICS.iter().map(|m| m.group).collect())
         }
 
         fn with_magics(magics: HashSet<MagicGroup>) -> Self {
@@ -1899,6 +2264,7 @@ mod tests {
             Self {
                 ram,
                 magics,
+                version: M1_VERSIONS[0],
                 logging: false,
                 broken: false,
                 broken_addr: None,
@@ -1913,6 +2279,33 @@ mod tests {
                 self.magics.remove(&MagicGroup::N4);
             }
         }
+
+        /// The word the modem shows at `addr`: a layer's magic and version
+        /// while the layer is present (0 otherwise), else RAM.
+        fn word(&self, addr: u32) -> u32 {
+            for spec in &MAGICS {
+                let present = self.magics.contains(&spec.group);
+                if addr == spec.addr {
+                    return if present {
+                        u32::from_be_bytes(spec.bytes)
+                    } else {
+                        0
+                    };
+                }
+                if addr == spec.addr + 4 && !spec.versions.is_empty() && present {
+                    return self.version;
+                }
+            }
+            *self.ram.get(&addr).unwrap_or(&0)
+        }
+    }
+
+    fn wm_lines(fake: &Fake) -> Vec<&str> {
+        fake.sent
+            .iter()
+            .map(String::as_str)
+            .filter(|l| l.starts_with("wm "))
+            .collect()
     }
 
     impl Console for Fake {
@@ -1927,20 +2320,13 @@ mod tests {
             }
             let words: Vec<&str> = line.split_whitespace().collect();
             match words.as_slice() {
-                ["vm", addr, "4"] => {
+                ["vm", addr, len] => {
                     let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap();
-                    if let Some(spec) = MAGICS.iter().find(|m| m.addr == addr) {
-                        let text = if self.magics.contains(&spec.group) {
-                            format!(
-                                "{:02x} {:02x} {:02x} {:02x}",
-                                spec.bytes[0], spec.bytes[1], spec.bytes[2], spec.bytes[3]
-                            )
-                        } else {
-                            "00 00 00 00".to_owned()
-                        };
-                        return dump(addr, &text);
-                    }
-                    dump(addr, &shown(*self.ram.get(&addr).unwrap_or(&0)))
+                    let len: u32 = len.parse().unwrap();
+                    let memory: Vec<u32> = (0..len.div_ceil(4))
+                        .map(|i| self.word(addr + 4 * i))
+                        .collect();
+                    dump_words(addr, &memory)
                 }
                 ["wm", addr, value] => {
                     let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap();
@@ -3056,5 +3442,321 @@ wm=0x8418ff08:0x1
         assert!(modem_loaded("[   42.1] read from nand mtd=tk0"));
         assert!(modem_loaded("<4>[ 7.0] read from fs"));
         assert!(!modem_loaded("modem: no such fw files!"));
+    }
+
+    fn m1_profile() -> Vec<Write> {
+        parse_writes("enabled=1\nwm=0x847ed604:0x15\nwm=0x841b5908:0x1\n").writes
+    }
+
+    #[test]
+    fn the_m1_selector_is_bounded_and_the_rest_of_its_block_is_never_written() {
+        for v in 0..=2 {
+            assert!(value_ok(M1_SELECT_ADDR, v), "{v}");
+        }
+        for v in [3, 4, 0x10, u32::MAX] {
+            assert!(!value_ok(M1_SELECT_ADDR, v), "{v}");
+        }
+        let parsed = parse_writes("enabled=1\nwm=0x841b5908:0x2\nwm=0x841b5908:3\n");
+        assert_eq!(
+            parsed.writes,
+            vec![Write {
+                addr: M1_SELECT_ADDR,
+                value: 2
+            }]
+        );
+        assert_eq!(
+            parsed.refused_reasons,
+            vec![(
+                "wm=0x841b5908:3".to_owned(),
+                "M1_SELECT value 3 outside allowed range 0..=2".to_owned()
+            )]
+        );
+        assert_eq!(off_value(M1_SELECT_ADDR), Some(0));
+        assert_eq!(find_word(M1_SELECT_ADDR).map(|w| w.magic), Some(MagicGroup::M1));
+        // Magic, version, tunables, live state and counters: never on the list.
+        for addr in (M1_MAGIC_ADDR..M1_MAGIC_ADDR + 0x100).step_by(4) {
+            if addr == M1_SELECT_ADDR {
+                continue;
+            }
+            assert!(find_word(addr).is_none(), "0x{addr:08x}");
+            let line = format!("wm=0x{addr:08x}:0x1");
+            assert_eq!(parse_writes(&line).refused, vec![line.clone()]);
+            let mut fake = Fake::all_magics();
+            let bad = [Write { addr, value: 1 }];
+            let (outcome, sent) = run_session(&mut fake, &bad, Session::Apply);
+            assert!(matches!(outcome, Outcome::Unverified { .. }), "0x{addr:08x}");
+            assert!(!sent);
+        }
+    }
+
+    #[test]
+    fn the_m1_selector_needs_its_magic_and_an_accepted_version() {
+        // No M1 block: nothing is written.
+        let mut n4_only = Fake::new(true);
+        let (outcome, sent) = run_session(&mut n4_only, &m1_profile(), Session::Apply);
+        assert_eq!(outcome, Outcome::NoMagic(MagicGroup::M1));
+        assert!(!sent);
+        // One line reads the magic and the version.
+        assert!(
+            n4_only.sent.iter().any(|l| l == "vm 0x841b5900 8"),
+            "{:?}",
+            n4_only.sent
+        );
+        // An M1 build this keeper does not know: nothing is written.
+        let mut newer = Fake::all_magics();
+        newer.version = 0x2026_1126;
+        let (outcome, sent) = run_session(&mut newer, &m1_profile(), Session::Apply);
+        assert_eq!(
+            outcome,
+            Outcome::WrongVersion {
+                group: MagicGroup::M1,
+                got: Some(0x2026_1126)
+            }
+        );
+        assert!(!sent);
+        assert!(wm_lines(&newer).is_empty());
+        // A magic line that shows no version is refused the same way.
+        let cut = dump(M1_MAGIC_ADDR, "4d 31 50 49");
+        assert_eq!(
+            magic_refusal(magic_spec(MagicGroup::M1), &cut),
+            Some(Outcome::WrongVersion {
+                group: MagicGroup::M1,
+                got: None
+            })
+        );
+        // An accepted build: N4 flags first, the selector last, both read back.
+        let mut fake = Fake::all_magics();
+        let (outcome, sent) = run_session(&mut fake, &m1_profile(), Session::Apply);
+        assert_eq!(outcome, Outcome::Verified { wrote: 2 });
+        assert!(sent);
+        assert_eq!(wm_lines(&fake), vec!["wm 0x847ed604 0x15", "wm 0x841b5908 0x1"]);
+        // Rollback: the selector goes back to 0 first.
+        fake.sent.clear();
+        let off = rollback_values(&m1_profile());
+        let (outcome, _) = run_session(&mut fake, &off, Session::Apply);
+        assert_eq!(outcome, Outcome::Verified { wrote: 2 });
+        assert_eq!(wm_lines(&fake), vec!["wm 0x841b5908 0", "wm 0x847ed604 0"]);
+        assert_eq!(fake.ram.get(&M1_SELECT_ADDR), Some(&0));
+    }
+
+    #[test]
+    fn the_bench_m1_dump_reads_as_its_counters() {
+        let status = read_status(&STATUS[0], M1_BENCH_DUMP).unwrap();
+        assert_eq!(status.group, MagicGroup::M1);
+        assert_eq!(status.version, Some(0x2026_1125));
+        assert_eq!(
+            status.fields,
+            vec![
+                ("selector", 1),
+                ("seen", 28025),
+                ("pie_drops", 130),
+                ("ce_marks", 0),
+                ("hard_drops", 90),
+                ("peak_qdelay_us", 97612),
+            ]
+        );
+        // Every packet the PIE saw was enqueued or dropped.
+        let block = vm_memory(M1_BENCH_DUMP, M1_MAGIC_ADDR, 160).unwrap();
+        let word = |at: usize| u32::from_le_bytes(block[at..at + 4].try_into().unwrap());
+        assert_eq!(word(0x60), word(0x64) + word(0x68) + word(0x70));
+        // The same dump passes the session's magic and version check.
+        assert_eq!(magic_refusal(magic_spec(MagicGroup::M1), M1_BENCH_DUMP), None);
+        // Another build, stock bytes, no header or a lost row: nothing is read.
+        for text in [
+            M1_BENCH_DUMP.replace("20 26 11 25", "20 26 11 26"),
+            M1_BENCH_DUMP.replace("4d 31 50 49", "68 1a d1 0d"),
+            M1_BENCH_DUMP.replace(HEADER, ""),
+            M1_BENCH_DUMP
+                .lines()
+                .filter(|l| !l.starts_with("0x841B5980"))
+                .map(|l| format!("{l}\n"))
+                .collect(),
+        ] {
+            assert_eq!(read_status(&STATUS[0], &text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_multi_row_dump_reads_in_memory_order() {
+        let words = [0x4d31_5049, 0x2026_1125, 1, 14, 15, 55];
+        let text = dump_words(M1_MAGIC_ADDR, &words);
+        let block = vm_memory(&text, M1_MAGIC_ADDR, 24).unwrap();
+        for (i, w) in words.iter().enumerate() {
+            let at = i * 4;
+            assert_eq!(u32::from_le_bytes(block[at..at + 4].try_into().unwrap()), *w);
+        }
+        // A window inside the dump, and one past its end.
+        assert_eq!(vm_memory(&text, M1_SELECT_ADDR, 4), Some(vec![1, 0, 0, 0]));
+        assert_eq!(vm_memory(&text, M1_MAGIC_ADDR, 28), None);
+        // `vm_word` still reads only the word that starts a row.
+        assert_eq!(vm_word(&text, M1_MAGIC_ADDR), Some(0x4d31_5049));
+        assert_eq!(vm_word(&text, M1_SELECT_ADDR), None);
+    }
+
+    #[test]
+    fn a_verified_m1_session_reads_its_counters_in_one_line() {
+        let mut fake = Fake::all_magics();
+        for (addr, value) in [
+            (0x841b_5960, 28025),
+            (0x841b_5968, 130),
+            (0x841b_596c, 7),
+            (0x841b_5970, 90),
+            (0x841b_5980, 97612),
+        ] {
+            fake.ram.insert(addr, value);
+        }
+        let report = run_session_inner(&mut fake, &m1_profile(), &[], Session::Apply, false);
+        assert_eq!(report.outcome, Outcome::Verified { wrote: 2 });
+        assert_eq!(
+            report.status,
+            vec![LayerStatus {
+                group: MagicGroup::M1,
+                version: Some(0x2026_1125),
+                fields: vec![
+                    ("selector", 1),
+                    ("seen", 28025),
+                    ("pie_drops", 130),
+                    ("ce_marks", 7),
+                    ("hard_drops", 90),
+                    ("peak_qdelay_us", 97612),
+                ],
+            }]
+        );
+        assert_eq!(
+            report.status[0].text(42),
+            "version=0x20261125\nselector=1\nseen=28025\npie_drops=130\nce_marks=7\nhard_drops=90\npeak_qdelay_us=97612\nupdated=42\n"
+        );
+        assert_eq!(status_file(MagicGroup::M1), "witcher-tk.m1");
+        // One line, after every read-back, before `arm1log 1`.
+        let n = fake.sent.len();
+        assert_eq!(fake.sent[n - 2..], ["vm 0x841b5900 160", "arm1log 1"]);
+        assert_eq!(
+            fake.sent.iter().filter(|l| *l == "vm 0x841b5900 160").count(),
+            1
+        );
+        // A read-only check reads it too, and its budget counts the line.
+        let report = run_session_inner(&mut fake, &m1_profile(), &[], Session::Check, false);
+        assert_eq!(report.outcome, Outcome::Verified { wrote: 0 });
+        assert_eq!(report.status.len(), 1);
+        assert_eq!(session_budget_secs(&m1_profile(), Session::Check), 4 + 2 * 3 + 2 * 3 + 3);
+        // A failed session, or one without an M1 word, reads no block.
+        let mut broken = Fake::all_magics();
+        broken.broken_addr = Some(M1_SELECT_ADDR);
+        let report = run_session_inner(&mut broken, &m1_profile(), &[], Session::Apply, false);
+        assert!(matches!(
+            report.outcome,
+            Outcome::Unverified {
+                addr: M1_SELECT_ADDR,
+                ..
+            }
+        ));
+        assert!(report.status.is_empty());
+        assert!(!broken.sent.iter().any(|l| l.starts_with("vm 0x841b5900 1")));
+        let mut plain = Fake::all_magics();
+        let report = run_session_inner(&mut plain, &n4(), &[], Session::Apply, false);
+        assert_eq!(report.outcome, Outcome::Verified { wrote: 2 });
+        assert!(report.status.is_empty());
+        assert!(!plain.sent.iter().any(|l| l.starts_with("vm 0x841b5900")));
+    }
+
+    #[test]
+    fn the_control_waits_for_an_accepted_m1_build_and_says_which() {
+        let mut control = Control::new(m1_profile(), 0);
+        let mut fake = Fake::all_magics();
+        fake.version = 0x2026_1126;
+        let line = drive(&mut control, &mut fake, 0).unwrap();
+        assert!(
+            line.contains(
+                "the M1 patch at 0x841b5900 shows version 0x20261126; this keeper accepts 0x20261125; nothing written"
+            ),
+            "{line}"
+        );
+        assert_eq!(control.state(), State::WaitingMagic);
+        assert!(control.status(0).contains("detail=the M1 patch"), "{}", control.status(0));
+        // The same reason again is no news, and nothing is ever written.
+        assert_eq!(drive(&mut control, &mut fake, MAGIC_FIRST), None);
+        assert!(wm_lines(&fake).is_empty());
+        // After a modem restart onto an accepted build the words go out.
+        fake.version = M1_VERSIONS[0];
+        control.modem_restarted(100);
+        let line = drive(&mut control, &mut fake, 100 + AFTER_RESTART).unwrap();
+        assert!(line.contains("written and read back"), "{line}");
+        assert_eq!(fake.ram.get(&M1_SELECT_ADDR), Some(&1));
+        assert_eq!(control.state(), State::Applied);
+    }
+
+    #[test]
+    fn the_n6h_profile_with_m1_splits_safely_and_rolls_the_selector_back_first() {
+        let config = format!("{}wm=0x841b5908:0x1\n", n6_latency_config());
+        let writes = parse_writes(&config).writes;
+        assert_eq!(writes.len(), 11);
+        assert_eq!(
+            writes.last(),
+            Some(&Write {
+                addr: M1_SELECT_ADDR,
+                value: 1
+            })
+        );
+        let batches = split_sessions(&writes, Session::Apply);
+        for b in &batches {
+            assert!(
+                session_budget_secs(b, Session::Apply) <= MAX_SESSION_SECS,
+                "batch exceeded budget: {b:?}"
+            );
+        }
+        // The selector goes out last, after N4_FLAGS and every other layer.
+        let flat: Vec<Write> = batches.iter().flatten().copied().collect();
+        assert_eq!(flat.last().map(|w| w.addr), Some(M1_SELECT_ADDR));
+        let mut control = Control::new(writes.clone(), 0);
+        let mut fake = Fake::all_magics();
+        let mut sessions = 0;
+        while control.state() != State::Applied {
+            drive(&mut control, &mut fake, 0);
+            sessions += 1;
+            assert!(sessions <= 5);
+        }
+        assert_eq!(sessions, batches.len());
+        for w in &writes {
+            assert_eq!(fake.ram.get(&w.addr), Some(&w.value), "0x{:08x}", w.addr);
+        }
+        // The 10-minute check is one session within budget and reads the block.
+        let plan = control.due(CHECK_EVERY).unwrap();
+        assert_eq!(plan.session, Session::Check);
+        assert_eq!(plan.total_batches, 1);
+        assert!(session_budget_secs(&plan.writes, Session::Check) <= MAX_SESSION_SECS);
+        let report = run_plan_report(&mut fake, &plan);
+        assert_eq!(report.outcome, Outcome::Verified { wrote: 0 });
+        assert_eq!(report.status.len(), 1);
+        control.finished(CHECK_EVERY, &plan, &report.outcome, report.sent);
+        // Turning it all off writes the selector back to 0 before anything else.
+        let off = wanted("enabled=0\n", control.wanted());
+        control.set_wanted(off, CHECK_EVERY + 1).unwrap();
+        fake.sent.clear();
+        while control.state() != State::Applied {
+            drive(&mut control, &mut fake, CHECK_EVERY + 1);
+        }
+        assert_eq!(wm_lines(&fake)[0], "wm 0x841b5908 0");
+        for w in &writes {
+            assert_eq!(
+                fake.ram.get(&w.addr).copied(),
+                off_value(w.addr),
+                "0x{:08x}",
+                w.addr
+            );
+        }
+    }
+
+    #[test]
+    fn every_layer_names_itself_from_the_magic_table() {
+        for spec in &MAGICS {
+            assert_eq!(spec.group.name(), spec.name);
+            assert_eq!(magic_spec(spec.group), *spec);
+        }
+        for word in &TABLE {
+            magic_spec(word.magic);
+        }
+        for rule in &REQUIRES {
+            assert!(find_word(rule.word).is_some() && find_word(rule.needs).is_some());
+        }
     }
 }

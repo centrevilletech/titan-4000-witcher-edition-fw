@@ -4,7 +4,9 @@
 //! the keeper's packet loop never waits for the modem. Each line goes out
 //! about 3 s after the one before, and the session reads what the console
 //! printed in between. The decisions (what to send, what a reply means) are
-//! in the model crate and tested there.
+//! in the model crate and tested there. A session that reads a layer's
+//! counters (`tk_flags::STATUS`) writes them to `/var/run/witcher-tk.<layer>`.
+use std::fs;
 use std::io::{Read, Write as _};
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
@@ -12,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use titan_pd_model::tk_flags::{self, Console, Outcome, Plan};
+use titan_pd_model::tk_flags::{self, Console, MagicGroup, Outcome, Plan};
 
 /// Console output kept per session. A busy log beyond this is dropped, and
 /// a read-back lost that way counts as missing.
@@ -24,6 +26,12 @@ const RADIO_CONSOLE: &str = "/tmp/titan-pd-keeper/radio-console-open";
 
 fn cli_path() -> String {
     std::env::var("TITAN_LTED_CLI").unwrap_or_else(|_| "/usr/lte/lted_cli".into())
+}
+
+/// `/var/run/witcher-tk.m1` for M1; `TITAN_TK_M1` overrides it.
+fn layer_status_path(group: MagicGroup) -> String {
+    std::env::var(format!("TITAN_TK_{}", group.name()))
+        .unwrap_or_else(|_| format!("/var/run/{}", tk_flags::status_file(group)))
 }
 
 /// Time between two lines. 3 s on the unit, as on the bench.
@@ -117,7 +125,7 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
         deadline: Instant::now() + SESSION_LIMIT,
         timed_out: false,
     };
-    let result = tk_flags::run_plan(&mut cli, plan);
+    let report = tk_flags::run_plan_report(&mut cli, plan);
     if let Some(mut input) = cli.input.take() {
         let _ = writeln!(input, "exit");
     }
@@ -140,7 +148,11 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
         // The session stopped before its own `arm1log 1`.
         let _ = crate::radio_modem::console("arm1log 1");
     }
-    result
+    let now = crate::run::monotonic();
+    for status in &report.status {
+        let _ = fs::write(layer_status_path(status.group), status.text(now));
+    }
+    (report.outcome, report.sent)
 }
 
 /// Start a session on its own thread.

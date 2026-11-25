@@ -207,11 +207,14 @@ layer's magic word:
 | N5 | `0x84489a8c` | `N5_PDCP_K_Q4` | `0..=64` | `0` | Adaptive PDCP multiplier in Q4 |
 | N5 | `0x84489a6c` | `N5_FLAGS` | `0..=3` (bit `0x4` refused) | `0` | `0x1` sparse flow lane, `0x2` N5 PDCP staging override (requires `N4_FLAGS` bit `0x1`), `0x3` both |
 | N6 (`0x8418ff00`: `55 32 48 46`) | `0x8418ff08` | `U2_FLAGS` | `0` or `1` | `0` | LNK-FIX post-ACK filter + per-carrier counters (same magic on N6 and N6H; `0x8418ff04` distinguishes N6 `4e 36 00 00` from N6H `4e 36 48 03`) |
+| M1 (`0x841b5900`: `4d 31 50 49`, then an accepted build version at `0x841b5904`: `20 26 11 25`) | `0x841b5908` | `M1_SELECT` | `0..=2` | `0` | Uplink AQM: `0` N4 AQM v2 (the boot value), `1` Rust PIE, `2` no AQM. `1` and `2` act only while `N4_FLAGS` has bits `0x5`; without them the modem enqueues as with the N4 AQM off. |
 
 **Never on the allow-list (always refused and logged):** IMG4 words `TRCP`
 (`0x847ecf1c/20/24`), `W5` (`0x847ece88..94`), `UHQ` (`0x847ecff0`), `U3T`
 (`0x847ecff4`), `R17` (`0x847ecff8/fc`), `X4`/`HRB` (`0x847ecf14`), `DSR`
-(`0x847ecf18`), `U14` (`0x847ecf28/2c`), `PHR` (`0x847ecf10`), any RF,
+(`0x847ecf18`), `U14` (`0x847ecf28/2c`), `PHR` (`0x847ecf10`), the rest of the
+M1 block (magic, version, the PIE tunables at `+0x0c..+0x37`, its live state
+and its counters: the keeper only reads them, see [Status](#status)), any RF,
 transmit power, MPR or calibration address, and any address not in the table
 above.
 
@@ -222,6 +225,10 @@ above.
 - `LNK=1` (`0x847ed554`) is refused unless the N6 magic (`0x8418ff00`: `55 32 48 46`)
   is present in the same session and `U2_FLAGS` bit 0 (`0x1`) is requested in
   the same config (`U2_FLAGS` is written before `LNK` and disabled after `LNK`).
+- `M1_SELECT` has no rule of its own: the modem itself runs the PIE (or no
+  AQM) only while `N4_FLAGS` has bits `0x5`. Turning the selector on comes
+  after every other word, and turning it off comes before every other word
+  (it is last in the table).
 - `HOLD_MARGIN` above `0x200` (up to `0x800`) requires an explicit
   `hold_ack=prb-tax` line in `tk/config`. **Tower cost:** while the unit is
   active, a larger hold margin makes the modem ask for bigger standing padding
@@ -230,12 +237,20 @@ above.
   enable `hold_ack=prb-tax` on a loaded cell without checking sector uplink
   utilization.
 
+The rules are tables in `titan_pd_model::tk_flags` (`REQUIRES`, `MIN_MAX`), so
+a new rule, like a new word, is one table entry.
+
 **Profiles in `scripts/stage-latency.sh`:**
 - `--profile latency`: inspects the local `tk.gz` magic bytes (N4, IMG4, N5,
-  N6/N6H) and writes the proven `wm=` set for that image (for N6/N6H: N4 AQM v2
+  N6/N6H, M1) and writes the proven `wm=` set for that image (for N6/N6H: N4 AQM v2
   + hold `0x140`, G1A/G1B/G1C/TK1, N5 sparse lane + 8/12 KB PDCP staging, and
   `U2_FLAGS=1`). `--flags`, `--hold`, and `--hold-ack prb-tax` override profile
   values.
+  - An image with the M1 block of an accepted build also gets
+    `wm=0x841b5908:0x1` (Rust PIE), as the last line. It does not when
+    `--flags` lacks the N4 AQM v2 bits `0x5`, or when the block's build is not
+    one the keeper accepts: with an unaccepted M1 build in `tk/config` the
+    keeper would write nothing at all. The script says why in a `note:` line.
 - `--profile stock`: writes no `wm=` lines.
 
 Example `tk/config` for an N6/N6H image:
@@ -255,6 +270,12 @@ wm=0x84489a6c:0x3
 wm=0x8418ff08:0x1
 ```
 
+An M1 image (N6H plus the Rust PIE) adds one line at the end:
+
+```
+wm=0x841b5908:0x1
+```
+
 A value is hex with `0x` or decimal. Any disallowed `wm=` line is ignored and
 logged with the reason.
 
@@ -266,11 +287,16 @@ logged with the reason.
    written. A keeper that restarts after the confirm takes over.
 2. Each write session opens the modem console (`/usr/lte/lted_cli`) and sends
    one line about every 3 s: `arm1log 2`, `quit 0`, `dbg revert`, then `vm` for
-   every patch layer magic required by the words in that session.
+   every patch layer magic required by the words in that session. For M1 one
+   line reads the magic and the version together: `vm 0x841b5900 8`.
 3. It writes only if every required magic reads back in the same session (N4
-   through `tk_boot::flag_writes_allowed`). The N4 magic appears only after the
-   first uplink transport block. Until then the keeper writes nothing and asks
-   again after 15 s, then 30 s, doubling up to 10 minutes.
+   through `tk_boot::flag_writes_allowed`), and for M1 only if the version is
+   one this keeper accepts (`tk_flags::M1_VERSIONS`, today `0x20261125`). The
+   N4 magic appears only after the first uplink transport block. Until then
+   the keeper writes nothing and asks again after 15 s, then 30 s, doubling up
+   to 10 minutes. An unaccepted M1 build waits the same way: nothing is
+   written for any layer, the status names the build it saw, and `keeper.log`
+   says so once per reason.
 4. It reads each word first and writes only what differs, in safe order:
    - First: flags that disable or reduce behaviour (reverse dependency order:
      `N5_FLAGS` before `N4_FLAGS`, all disabling flags before any parameter
@@ -282,7 +308,11 @@ logged with the reason.
    latency profile), the keeper splits the apply into consecutive sessions in
    write order (parameters first, then flags), so a failed session never leaves
    an enabled flag without its dependent parameter.
-6. It reads every write back in the same session, then sends `arm1log 1`.
+6. It reads every write back in the same session. When every word reads as
+   wanted and the session holds `M1_SELECT`, one more line reads the M1 block
+   (`vm 0x841b5900 160`, the bench's own read) into `/var/run/witcher-tk.m1`
+   (see [Status](#status)). Then it sends `arm1log 1`. The session budget
+   counts that line.
 
 The console prints a dump's bytes most significant first, under a header that
 names each column's byte offset:
@@ -321,6 +351,7 @@ with a fresh read of every configured word.
 | Case | What the keeper does |
 | --- | --- |
 | No patch magic | Writes nothing, waits (15 s doubling to 10 min). Not a failure. |
+| M1 magic with a build version this keeper does not accept | The same: writes nothing for any layer and waits. `detail` names the version it saw and the ones it accepts. |
 | No reply to the magic read, or a read-back missing or wrong | Tries again after 20 s. After 3 failed sessions it stops. If any write went out since the last modem restart, it rolls every managed word back to its documented off value (`0x4000`/`0x6000` for N4 PDCP limits, `0` for N5 tunables, flags and hold; magic still required, disabling flags first) and reads them back. The status says `failed` and whether the rollback read back. |
 | Applied | A read-only check every 10 minutes. A word that reads back wrong is written again. Three checks with no reply start a write session, which resets the console. |
 | Modem restart | The kernel log shows `read from nand` or `read from fs` after the keeper started. It starts over 30 s later. A crash reload runs stock NAND firmware, which never shows the magic, so nothing is written then. |
@@ -344,6 +375,13 @@ at the next check. Either set hands-off for manual bench work or edit
   write the kill switch in a `lted_cli` session (after `arm1log 2`), then read
   back.
 
+**The Rust PIE (M1) alone:** write `wm=0x841b5908:0` in `tk/config`, or delete
+the line. Within about 15 s the keeper writes `0` (the N4 AQM v2 again) as the
+first word of the session and reads it back; the other words stay. A reboot or
+a modem restart also brings back `0`, the selector's boot value, until the
+keeper writes it again from `tk/config`. By hand (hands-off set):
+`wm 0x841b5908 0`, then `vm 0x841b5908 4`.
+
 ### Status
 
 `/var/run/witcher-tk.flags`:
@@ -356,6 +394,25 @@ at the next check. Either set hands-off for manual bench work or edit
 | `attempts` | Failed sessions in a row |
 
 `keeper.log` lines start with `tk flags`.
+
+`/var/run/witcher-tk.m1`, written at the end of each verified session that
+holds `M1_SELECT` (the apply, then the 10-minute check), from the same console
+session as the read-back:
+
+| Line | Values |
+| --- | --- |
+| `version` | The M1 build, `0x20261125` |
+| `selector` | `0` N4 AQM v2, `1` Rust PIE, `2` no AQM |
+| `seen` | Packets the PIE evaluated (`+0x60`) |
+| `pie_drops` | Probabilistic PIE drops (`+0x68`) |
+| `ce_marks` | ECN CE marks (`+0x6c`) |
+| `hard_drops` | Drops at the overload ceiling (`+0x70`) |
+| `peak_qdelay_us` | Peak estimated queue delay, in microseconds (`+0x80`) |
+| `updated` | The keeper's clock (seconds since boot), as in `witcher-tk.flags` |
+
+Counters are decimal, count from the modem's start and wrap at 2^32; the
+keeper never writes them. It writes the file only from a dump that shows the
+M1 magic and an accepted version, so a stale file keeps its old `updated`.
 
 ## Files
 
@@ -376,6 +433,7 @@ In RAM:
 | `/var/run/witcher-tk.status` | `state=staged` or `state=stock`, `reason`, `sha256`, `strikes`, `loaded_at`, `source` (`fs`, `nand`, `unknown`), `firmware` (`clean`, `dirty`) |
 | `/var/run/witcher-tk.result` | `confirmed=<hash>` or `rollback=<hash>` |
 | `/var/run/witcher-tk.flags` | The flag writes (see [Status](#status)) |
+| `/var/run/witcher-tk.m1` | The M1 selector and PIE counters (see [Status](#status)) |
 | `/var/run/witcher-tk.hands-off` | Optional operator marker file to pause all modem console sessions (`state=hands-off`) |
 
 `keeper.log` lines start with `tk boot` or `tk flags`. A default unit logs none.
