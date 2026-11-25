@@ -27,10 +27,11 @@
 //! `titan_pd_model::qctrl`).
 
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::{self, ErrorKind, Read};
 use std::net::Ipv6Addr;
-use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::os::fd::{AsFd, BorrowedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -57,6 +58,7 @@ use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
+use titan_sys::socket::{Socket, SocketExt};
 
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
@@ -94,8 +96,6 @@ const REBOOT_FORCE_AFTER: u64 = 45;
 /// After the forced attempt also fails, go back to watching.
 const REBOOT_GIVE_UP_AFTER: u64 = 120;
 
-const SO_MARK: libc::c_int = 36;
-const PACKET_OUTGOING: u8 = 4;
 /// Modest receive buffer for control-plane packet sockets (kernel doubles this).
 const CONTROL_RCVBUF: libc::c_int = 65_536;
 /// Source link-layer address of the core's router advertisement on this EPC.
@@ -103,24 +103,11 @@ const CONTROL_RCVBUF: libc::c_int = 65_536;
 /// out lte0pdn1. Addressing them to eth0 makes the bridge deliver them locally.
 const CORE_MAC: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x01, 0x01];
 
-struct Packet {
-    fd: libc::c_int,
-}
-
-impl Drop for Packet {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
-            self.fd = -1;
-        }
-    }
-}
-
 /// Keeps `br0` subscribed to IPv6 link-local control multicast groups so Linux
 /// bridge MLD snooping always delivers RS and DHCPv6 frames to `br0`.
 struct Ipv6Socket {
-    packet: Packet,
-    _mcast_guard: Option<Packet>,
+    packet: Socket,
+    _mcast_guard: Option<Socket>,
 }
 
 /// Protocol-specific `AF_PACKET` (`ptype_base`) receive sockets bound to `br0`,
@@ -129,10 +116,10 @@ struct Ipv6Socket {
 /// and bridge-forwarded customer traffic never enters `ptype_base`.
 struct ControlSockets {
     bridge_ifindex: i32,
-    arp: Packet,
-    dhcp: Packet,
+    arp: Socket,
+    dhcp: Socket,
     ipv6: Option<Ipv6Socket>,
-    tx_ipv6: Packet,
+    tx_ipv6: Socket,
 }
 
 type FileFingerprint = (u64, u64, i64, i64);
@@ -325,7 +312,7 @@ struct DeafProbe {
 /// read, starting with the oldest one still held, so the first ticks replay
 /// what happened before the keeper started.
 struct KernelLog {
-    fd: libc::c_int,
+    file: fs::File,
     pending: Vec<u8>,
 }
 
@@ -338,23 +325,20 @@ impl KernelLog {
             // The vendor image ships no /dev/kmsg node. Character device 1,11
             // is the kernel log on Linux, so make one in RAM.
             let node = "/tmp/titan-kmsg";
-            let name = std::ffi::CString::new(node).ok()?;
-            let device: libc::dev_t = (1 << 8) | 11;
-            unsafe { libc::mknod(name.as_ptr(), libc::S_IFCHR | 0o600, device) };
+            let _ = titan_sys::kernel::make_char_device(Path::new(node), 0o600, 1, 11);
             Self::open_path(node)
         })
     }
 
+    /// Opened `O_RDONLY | O_NONBLOCK | O_CLOEXEC`: std adds `O_CLOEXEC`.
     fn open_path(path: &str) -> Option<Self> {
-        let path = std::ffi::CString::new(path).ok()?;
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            )
-        };
-        (fd >= 0).then(|| Self {
-            fd,
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        Some(Self {
+            file,
             pending: Vec::new(),
         })
     }
@@ -363,8 +347,9 @@ impl KernelLog {
     /// cleanly. Regular files (used in tests) are always readable and must not
     /// be passed to `poll`.
     fn is_pollable(&self) -> bool {
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        unsafe { libc::fstat(self.fd, &mut st) == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR }
+        self.file
+            .metadata()
+            .is_ok_and(|meta| meta.file_type().is_char_device())
     }
 
     /// Complete lines that have arrived since the last call, and whether the
@@ -374,42 +359,31 @@ impl KernelLog {
         let mut buf = [0u8; 4096];
         let mut drained = false;
         for _ in 0..KMSG_PER_TICK {
-            let read = unsafe { libc::read(self.fd, buf.as_mut_ptr().cast(), buf.len()) };
-            if read > 0 {
-                self.pending.extend_from_slice(&buf[..read as usize]);
-                while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-                    let line: Vec<u8> = self.pending.drain(..=end).collect();
-                    lines.push(String::from_utf8_lossy(&line).trim_end().to_owned());
+            match self.file.read(&mut buf) {
+                Ok(0) => {
+                    drained = true;
+                    break;
                 }
-                if self.pending.len() > 16 * 1024 {
-                    self.pending.clear();
+                Ok(read) => {
+                    self.pending.extend_from_slice(&buf[..read]);
+                    while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                        let line: Vec<u8> = self.pending.drain(..=end).collect();
+                        lines.push(String::from_utf8_lossy(&line).trim_end().to_owned());
+                    }
+                    if self.pending.len() > 16 * 1024 {
+                        self.pending.clear();
+                    }
                 }
-                continue;
-            }
-            if read == 0 {
-                drained = true;
-                break;
-            }
-            match io::Error::last_os_error().raw_os_error() {
                 // Records were overwritten before they were read. The next read resumes.
-                Some(libc::EPIPE) | Some(libc::EINTR) => continue,
+                Err(err) if matches!(err.raw_os_error(), Some(libc::EPIPE) | Some(libc::EINTR)) => {}
                 // Nothing more for now (EAGAIN), or a log that cannot be read.
-                _ => {
+                Err(_) => {
                     drained = true;
                     break;
                 }
             }
         }
         (lines, drained)
-    }
-}
-
-impl Drop for KernelLog {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe { libc::close(self.fd) };
-            self.fd = -1;
-        }
     }
 }
 
@@ -556,51 +530,26 @@ impl Keeper {
         let fast = self.deaf_probe.is_some()
             || self.tk_probe.is_some()
             || (self.kernel_log.is_some() && !self.kmsg_drained);
-        let timeout_ms: libc::c_int = if fast { 200 } else { 1000 };
-        let mut fds = [libc::pollfd {
-            fd: -1,
-            events: 0,
-            revents: 0,
-        }; 4];
-        let mut nfds: usize = 0;
-        if let Some(sockets) = &self.sockets {
-            fds[nfds] = libc::pollfd {
-                fd: sockets.arp.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            nfds += 1;
-            fds[nfds] = libc::pollfd {
-                fd: sockets.dhcp.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            nfds += 1;
-            if let Some(ipv6) = &sockets.ipv6 {
-                fds[nfds] = libc::pollfd {
-                    fd: ipv6.packet.fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                nfds += 1;
-            }
-        }
-        if let Some(klog) = &self.kernel_log {
-            if klog.is_pollable() {
-                fds[nfds] = libc::pollfd {
-                    fd: klog.fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                nfds += 1;
-            }
-        }
-        if nfds == 0 {
-            thread::sleep(Duration::from_millis(timeout_ms as u64));
+        let timeout = Duration::from_millis(if fast { 200 } else { 1000 });
+        let sockets = self.sockets.as_ref();
+        let fds: [Option<BorrowedFd<'_>>; 4] = [
+            sockets.map(|sockets| sockets.arp.as_fd()),
+            sockets.map(|sockets| sockets.dhcp.as_fd()),
+            sockets
+                .and_then(|sockets| sockets.ipv6.as_ref())
+                .map(|ipv6| ipv6.packet.as_fd()),
+            self.kernel_log
+                .as_ref()
+                .filter(|klog| klog.is_pollable())
+                .map(|klog| klog.file.as_fd()),
+        ];
+        if fds.iter().all(Option::is_none) {
+            thread::sleep(timeout);
             return;
         }
-        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds as libc::nfds_t, timeout_ms) };
-        if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+        if titan_sys::poll::wait_readable(&fds, timeout)
+            .is_err_and(|err| err.kind() != ErrorKind::Interrupted)
+        {
             thread::sleep(Duration::from_millis(200));
         }
     }
@@ -1024,7 +973,7 @@ impl Keeper {
             return;
         };
         let ifindex = interface_index(CUSTOMER).unwrap_or(0);
-        match send_ipv6(sockets.tx_ipv6.fd, ifindex, dest_mac, packet) {
+        match send_ipv6(&sockets.tx_ipv6, ifindex, dest_mac, packet) {
             Ok(()) => self.note(why),
             Err(err) => self.note(&format!("send failed ({why}): {err}")),
         }
@@ -1032,15 +981,14 @@ impl Keeper {
 
     fn sniff_core_ra(&mut self) -> Result<Sniff, String> {
         self.ensure_sockets(true)?;
-        let fd = {
+        {
             let ipv6 = self
                 .sockets
                 .as_ref()
                 .and_then(|sockets| sockets.ipv6.as_ref())
                 .ok_or("IPv6 control socket is not open")?;
-            crate::capture::install_ipv6(ipv6.packet.fd, true)?;
-            ipv6.packet.fd
-        };
+            crate::capture::install_ipv6(ipv6.packet.as_fd(), true)?;
+        }
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
@@ -1058,12 +1006,12 @@ impl Keeper {
                     }
                 }
             }
-            let mut pfd = libc::pollfd {
-                fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let _ = unsafe { libc::poll(&mut pfd, 1, 200) };
+            let ipv6 = self
+                .sockets
+                .as_ref()
+                .and_then(|sockets| sockets.ipv6.as_ref())
+                .map(|ipv6| ipv6.packet.as_fd());
+            let _ = titan_sys::poll::wait_readable(&[ipv6], Duration::from_millis(200));
         }
         if found.prefixes.is_empty() {
             self.note("no core advertisement seen before the filter; withdrawing the link prefix");
@@ -1074,7 +1022,7 @@ impl Keeper {
             ));
         }
         let restore = if let Some(ipv6) = self.sockets.as_ref().and_then(|s| s.ipv6.as_ref()) {
-            crate::capture::install_ipv6(ipv6.packet.fd, false)
+            crate::capture::install_ipv6(ipv6.packet.as_fd(), false)
         } else {
             Ok(())
         };
@@ -1189,32 +1137,19 @@ impl Keeper {
     }
 
     fn drain_arp(&mut self) {
-        let Some(fd) = self.sockets.as_ref().map(|sockets| sockets.arp.fd) else {
-            return;
-        };
         loop {
             let mut buf = [0u8; 256];
-            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                    (&mut addr as *mut libc::sockaddr_ll).cast(),
-                    &mut len,
-                )
+            let Some(received) = self.sockets.as_ref().map(|sockets| sockets.arp.recv_link(&mut buf))
+            else {
+                return;
             };
-            if n < 0 {
+            let Ok((len, peer)) = received else {
                 break;
-            }
-            if addr.sll_pkttype == PACKET_OUTGOING || addr.sll_halen < 6 {
+            };
+            let Some(mac) = peer.mac().filter(|_| !peer.outgoing()) else {
                 continue;
-            }
-            let packet = &buf[..n as usize];
-            let mut mac = [0u8; 6];
-            mac.copy_from_slice(&addr.sll_addr[..6]);
+            };
+            let packet = &buf[..len];
             match self.ipv4_watch.reply(self.now, packet, mac) {
                 Some(Armed::First) => {
                     self.note("IPv4 router answered local ARP; automatic recovery is armed")
@@ -1230,30 +1165,19 @@ impl Keeper {
     }
 
     fn drain_dhcp(&mut self) {
-        let Some(fd) = self.sockets.as_ref().map(|sockets| sockets.dhcp.fd) else {
-            return;
-        };
         loop {
             let mut buf = [0u8; 2048];
-            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                    (&mut addr as *mut libc::sockaddr_ll).cast(),
-                    &mut len,
-                )
+            let Some(received) = self.sockets.as_ref().map(|sockets| sockets.dhcp.recv_link(&mut buf))
+            else {
+                return;
             };
-            if n < 0 {
+            let Ok((len, peer)) = received else {
                 break;
-            }
-            if addr.sll_pkttype == PACKET_OUTGOING {
+            };
+            if peer.outgoing() {
                 continue;
             }
-            let packet = &buf[..n as usize];
+            let packet = &buf[..len];
             if let Some(mac) = dhcp_client_mac(packet) {
                 self.discover = Some(mac);
             }
@@ -1261,48 +1185,32 @@ impl Keeper {
     }
 
     fn collect_ipv6(&mut self) -> Vec<Event> {
-        let Some(fd) = self
-            .sockets
-            .as_ref()
-            .and_then(|sockets| sockets.ipv6.as_ref())
-            .map(|ipv6| ipv6.packet.fd)
-        else {
-            return Vec::new();
-        };
         let mut our = None;
         let mut delegated = None;
         let mut loaded_context = false;
         let mut events = Vec::new();
         loop {
             let mut buf = [0u8; 2048];
-            let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-            let mut len = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    fd,
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    0,
-                    (&mut addr as *mut libc::sockaddr_ll).cast(),
-                    &mut len,
-                )
-            };
-            if n < 0 {
+            let Some(received) = self
+                .sockets
+                .as_ref()
+                .and_then(|sockets| sockets.ipv6.as_ref())
+                .map(|ipv6| ipv6.packet.recv_link(&mut buf))
+            else {
                 break;
-            }
+            };
+            let Ok((len, peer)) = received else {
+                break;
+            };
             if !loaded_context {
                 our = link_local(&read_file("/proc/net/if_inet6"), BRIDGE);
                 delegated = self.serving_block().map(|block| block.delegated57());
                 loaded_context = true;
             }
-            let packet = &buf[..n as usize];
-            let outgoing = addr.sll_pkttype == PACKET_OUTGOING;
+            let packet = &buf[..len];
+            let outgoing = peer.outgoing();
             let mut kind = classify_ipv6(packet, delegated, our);
-            let mac = (addr.sll_halen >= 6).then(|| {
-                let mut mac = [0u8; 6];
-                mac.copy_from_slice(&addr.sll_addr[..6]);
-                mac
-            });
+            let mac = peer.mac();
             let source_mac = (!outgoing).then_some(mac).flatten();
             match kind {
                 Class::DhcpV6 {
@@ -3531,145 +3439,54 @@ fn open_protocol_packet<F>(
     ifindex: i32,
     protocol: libc::c_int,
     install_filter: F,
-) -> Result<Packet, String>
+) -> Result<Socket, String>
 where
-    F: FnOnce(libc::c_int) -> Result<(), String>,
+    F: FnOnce(BorrowedFd<'_>) -> Result<(), String>,
 {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "control packet socket ({protocol:#x}): {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let socket = Packet { fd };
-    let _ = setsockopt_int(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, CONTROL_RCVBUF);
-    install_filter(fd)?;
-    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-    addr.sll_family = libc::AF_PACKET as libc::sa_family_t;
-    addr.sll_protocol = (protocol as u16).to_be();
-    addr.sll_ifindex = ifindex;
-    let bound = unsafe {
-        libc::bind(
-            fd,
-            (&addr as *const libc::sockaddr_ll).cast(),
-            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        )
-    };
-    if bound != 0 {
-        let err = io::Error::last_os_error();
-        return Err(format!("bind bridge control socket ({protocol:#x}): {err}"));
-    }
+    let socket = Socket::packet_datagram()
+        .map_err(|err| format!("control packet socket ({protocol:#x}): {err}"))?;
+    let _ = socket.set_recv_buffer(CONTROL_RCVBUF);
+    install_filter(socket.as_fd())?;
+    socket
+        .bind_link(ifindex, protocol as u16)
+        .map_err(|err| format!("bind bridge control socket ({protocol:#x}): {err}"))?;
     Ok(socket)
 }
 
 /// Unbound protocol-0 AF_PACKET socket for sending marked IPv6 control frames
 /// out `eth0` without registering any receive tap.
-fn open_tx_ipv6() -> Result<Packet, String> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_PACKET,
-            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-            0,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "IPv6 send socket: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let socket = Packet { fd };
-    setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32)?;
+fn open_tx_ipv6() -> Result<Socket, String> {
+    let socket = Socket::packet_datagram().map_err(|err| format!("IPv6 send socket: {err}"))?;
+    socket.set_mark(filter::MARK).map_err(|err| err.to_string())?;
     Ok(socket)
 }
 
 /// Subscribe `br0` to All-Routers (`ff02::2`) and All-DHCP-Relay-Agents-and-Servers
 /// (`ff02::1:2`) so bridge MLD snooping never drops IPv6 PD control frames.
-fn join_ipv6_control_multicast(ifindex: i32) -> Option<Packet> {
-    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return None;
-    }
-    let socket = Packet { fd };
+fn join_ipv6_control_multicast(ifindex: i32) -> Option<Socket> {
+    let socket = Socket::ipv6_datagram().ok()?;
     let groups = [
         Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2),
         Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2),
     ];
     for group in groups {
-        let mreq = libc::ipv6_mreq {
-            ipv6mr_multiaddr: libc::in6_addr {
-                s6_addr: group.octets(),
-            },
-            ipv6mr_interface: ifindex as u32,
-        };
-        let _ = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::IPPROTO_IPV6,
-                libc::IPV6_ADD_MEMBERSHIP,
-                (&mreq as *const libc::ipv6_mreq).cast(),
-                std::mem::size_of::<libc::ipv6_mreq>() as libc::socklen_t,
-            )
-        };
+        let _ = socket.join_ipv6_multicast(group, ifindex as u32);
     }
     Some(socket)
 }
 
-fn send_ipv6(
-    fd: libc::c_int,
-    ifindex: i32,
-    dest_mac: [u8; 6],
-    packet: &[u8],
-) -> Result<(), String> {
-    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-    addr.sll_family = libc::AF_PACKET as libc::sa_family_t;
-    addr.sll_protocol = (libc::ETH_P_IPV6 as u16).to_be();
-    addr.sll_ifindex = ifindex;
-    addr.sll_halen = 6;
-    addr.sll_addr[..6].copy_from_slice(&dest_mac);
-    let sent = unsafe {
-        libc::sendto(
-            fd,
-            packet.as_ptr().cast(),
-            packet.len(),
-            0,
-            (&addr as *const libc::sockaddr_ll).cast(),
-            std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-        )
-    };
-    if sent == packet.len() as isize {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error().to_string())
-    }
+fn send_ipv6(socket: &Socket, ifindex: i32, dest_mac: [u8; 6], packet: &[u8]) -> Result<(), String> {
+    let sent = socket.send_link(packet, ifindex, libc::ETH_P_IPV6 as u16, dest_mac);
+    sent_whole(sent, packet.len())
 }
 
-fn setsockopt_int(
-    fd: libc::c_int,
-    level: libc::c_int,
-    name: libc::c_int,
-    value: libc::c_int,
-) -> Result<(), String> {
-    let rc = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            (&value as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error().to_string())
+/// A datagram goes out whole or not at all. A short count, which a packet
+/// socket never returns, reports `errno` as it stands, as the keeper always did.
+fn sent_whole(sent: io::Result<usize>, len: usize) -> Result<(), String> {
+    match sent {
+        Ok(sent) if sent == len => Ok(()),
+        Ok(_) => Err(io::Error::last_os_error().to_string()),
+        Err(err) => Err(err.to_string()),
     }
 }
 
@@ -3773,38 +3590,12 @@ fn send_marked_frame(ifindex: i32, frame: &[u8]) -> Result<(), String> {
     if frame.len() < 14 {
         return Err("Ethernet frame is truncated".into());
     }
-    let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(format!("raw send socket: {}", io::Error::last_os_error()));
-    }
-    let marked = setsockopt_int(fd, libc::SOL_SOCKET, SO_MARK, filter::MARK as i32);
-    let result = marked.and_then(|_| {
-        let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
-        addr.sll_family = libc::AF_PACKET as libc::sa_family_t;
-        addr.sll_protocol = u16::from_be_bytes([frame[12], frame[13]]).to_be();
-        addr.sll_ifindex = ifindex;
-        addr.sll_halen = 6;
-        if frame.len() >= 6 {
-            addr.sll_addr[..6].copy_from_slice(&frame[..6]);
-        }
-        let sent = unsafe {
-            libc::sendto(
-                fd,
-                frame.as_ptr().cast(),
-                frame.len(),
-                0,
-                (&addr as *const libc::sockaddr_ll).cast(),
-                std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-            )
-        };
-        if sent == frame.len() as isize {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error().to_string())
-        }
-    });
-    unsafe { libc::close(fd) };
-    result
+    let socket = Socket::packet_raw().map_err(|err| format!("raw send socket: {err}"))?;
+    socket.set_mark(filter::MARK).map_err(|err| err.to_string())?;
+    let mut dest = [0u8; 6];
+    dest.copy_from_slice(&frame[..6]);
+    let protocol = u16::from_be_bytes([frame[12], frame[13]]);
+    sent_whole(socket.send_link(frame, ifindex, protocol, dest), frame.len())
 }
 
 pub fn link_local(text: &str, dev: &str) -> Option<[u8; 16]> {
@@ -4321,88 +4112,25 @@ fn solicit_mgmt(src: Ipv6Addr) -> Result<(), String> {
     let mac = read_mac(mgmt::MGMT_DEV)?;
     let ifindex = interface_index(mgmt::MGMT_DEV).ok_or("lte0pdn0 has no interface index")?;
     let packet = mgmt::solicitation(mac);
-    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
-    if fd < 0 {
-        return Err(format!("socket: {}", io::Error::last_os_error()));
-    }
     // Closed when this function returns, including on the error paths below.
-    let _close = Packet { fd };
-    let mut local: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    local.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-    local.sin6_addr.s6_addr = src.octets();
-    local.sin6_scope_id = ifindex as u32;
-    let bound = unsafe {
-        libc::bind(
-            fd,
-            (&local as *const libc::sockaddr_in6).cast(),
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        )
-    };
-    if bound < 0 {
-        return Err(format!("bind: {}", io::Error::last_os_error()));
-    }
-    let name = std::ffi::CString::new(mgmt::MGMT_DEV).map_err(|err| err.to_string())?;
-    let device = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            name.as_ptr().cast(),
-            name.as_bytes_with_nul().len() as libc::socklen_t,
-        )
-    };
-    if device < 0 {
-        return Err(format!("bind to device: {}", io::Error::last_os_error()));
-    }
-    let hops: libc::c_int = 255;
-    let hops_set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MULTICAST_HOPS,
-            (&hops as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if hops_set < 0 {
-        return Err(format!("hop limit: {}", io::Error::last_os_error()));
-    }
-    let index: libc::c_int = ifindex;
-    let iface_set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_MULTICAST_IF,
-            (&index as *const libc::c_int).cast(),
-            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    };
-    if iface_set < 0 {
-        return Err(format!(
-            "multicast interface: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    let mut dest: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
-    dest.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-    dest.sin6_scope_id = ifindex as u32;
-    dest.sin6_addr.s6_addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2).octets();
-    let sent = unsafe {
-        libc::sendto(
-            fd,
-            packet.as_ptr().cast(),
-            packet.len(),
-            0,
-            (&dest as *const libc::sockaddr_in6).cast(),
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        )
-    };
-    if sent < 0 {
-        return Err(format!(
-            "router solicitation: {}",
-            io::Error::last_os_error()
-        ));
-    }
+    let socket = Socket::icmpv6_raw().map_err(|err| format!("socket: {err}"))?;
+    let scope = ifindex as u32;
+    socket
+        .bind_ipv6(src, scope)
+        .map_err(|err| format!("bind: {err}"))?;
+    socket
+        .bind_to_device(mgmt::MGMT_DEV)
+        .map_err(|err| format!("bind to device: {err}"))?;
+    socket
+        .set_ipv6_multicast_hops(255)
+        .map_err(|err| format!("hop limit: {err}"))?;
+    socket
+        .set_ipv6_multicast_if(ifindex)
+        .map_err(|err| format!("multicast interface: {err}"))?;
+    let all_routers = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+    socket
+        .send_ipv6(&packet, all_routers, scope)
+        .map_err(|err| format!("router solicitation: {err}"))?;
     Ok(())
 }
 

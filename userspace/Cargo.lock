@@ -99,6 +99,7 @@ dependencies = [
  "libc",
  "serde_json",
  "titan-pd-model",
+ "titan-sys",
 ]
 
 [[package]]

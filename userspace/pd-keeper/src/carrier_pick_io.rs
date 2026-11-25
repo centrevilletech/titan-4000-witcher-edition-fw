@@ -7,7 +7,6 @@
 use std::{
     fs, io,
     net::{Ipv4Addr, UdpSocket},
-    os::fd::AsRawFd,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,6 +16,7 @@ use titan_pd_model::{
     mgmt::MGMT_DEV,
     radio::{self as model, Cell},
 };
+use titan_sys::socket::SocketExt;
 
 fn fail(s: &str) -> io::Error {
     io::Error::other(s.to_owned())
@@ -119,19 +119,7 @@ impl Samples {
 /// A socket that can only leave through the management bearer.
 fn mgmt_socket() -> io::Result<UdpSocket> {
     let udp = UdpSocket::bind("0.0.0.0:0")?;
-    let dev = MGMT_DEV.as_bytes();
-    let rc = unsafe {
-        libc::setsockopt(
-            udp.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_BINDTODEVICE,
-            dev.as_ptr().cast(),
-            dev.len() as libc::socklen_t,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    udp.bind_to_device(MGMT_DEV)?;
     // A full modem queue drops the packet here instead of stalling the pace.
     udp.set_nonblocking(true)?;
     Ok(udp)
