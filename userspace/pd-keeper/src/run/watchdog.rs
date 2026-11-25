@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::mgmt;
 
-use crate::log;
+use crate::{log, nvram};
 use crate::files::read_file;
 use crate::paths::state_dir;
 
@@ -105,7 +105,7 @@ impl Keeper {
     fn maintain_vendor_watchdog(&mut self, settings: &deaf::Settings) {
         let value = self
             .read_nvram_cache()
-            .and_then(|cache| deaf::nvram_field(cache, "detection_enable"))
+            .and_then(|cache| nvram::field(cache, "detection_enable"))
             .map(str::to_owned);
         if !deaf::vendor_watchdog_must_stop(settings, value.as_deref()) {
             return;

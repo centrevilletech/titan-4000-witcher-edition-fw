@@ -31,6 +31,7 @@ pub mod host_mac;
 pub mod ipv4;
 pub mod ipv4_health;
 pub mod mgmt;
+pub mod nvram;
 pub mod prefix;
 pub mod qctrl;
 pub mod ra;

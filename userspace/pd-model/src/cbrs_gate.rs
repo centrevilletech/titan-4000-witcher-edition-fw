@@ -47,7 +47,7 @@
 //! `ip6tables -F`). So while the gate is closed the keeper reads both chains
 //! every second and puts back what is missing.
 
-use crate::deaf::nvram_field;
+use crate::nvram::field as nvram_field;
 
 /// Seconds between two reads of the grant.
 pub const INTERVAL: u64 = 1;

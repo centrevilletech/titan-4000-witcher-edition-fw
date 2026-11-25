@@ -8,7 +8,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
+pub use titan_pd_model::nvram::{field, raw, text};
 use titan_sys::process::Signal;
+
+/// The vendor's RAM cache as the radio profile and the carrier picker read it.
+const VENDOR_CACHE: &str = "/tmp/nvram.cfg";
 
 /// The vendor's RAM configuration cache.
 pub fn cache_path() -> PathBuf {
@@ -18,15 +22,19 @@ pub fn cache_path() -> PathBuf {
 /// Read one key from a NUL- or newline-delimited NVRAM cache snapshot,
 /// formatted the same way as `nvram_get 0 <key>`.
 pub fn get_from_cache(cache: &[u8], key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    for record in cache.split(|&b| b == 0 || b == b'\n') {
-        let Some(rest) = record.strip_prefix(prefix.as_bytes()) else {
-            continue;
-        };
-        let value = String::from_utf8_lossy(rest);
-        return Some(format!("nvram_get success: {value}\n"));
-    }
-    None
+    raw(cache, key).map(|value| format!("nvram_get success: {}\n", String::from_utf8_lossy(value)))
+}
+
+/// Values from one read of `/tmp/nvram.cfg`: trimmed text, empty when missing.
+pub fn read_values<const N: usize>(keys: [&str; N]) -> [String; N] {
+    let cache = fs::read(VENDOR_CACHE).unwrap_or_default();
+    keys.map(|key| text(&cache, key))
+}
+
+/// One value from `/tmp/nvram.cfg`, as `read_values` reads it.
+pub fn read_value(key: &str) -> String {
+    let [value] = read_values([key]);
+    value
 }
 
 /// The vendor's `titan-nvram` tool (`TITAN_NVRAM` in tests).

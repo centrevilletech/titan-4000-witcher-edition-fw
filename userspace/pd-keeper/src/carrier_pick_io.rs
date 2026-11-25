@@ -18,38 +18,21 @@ use titan_pd_model::{
 };
 use titan_sys::socket::SocketExt;
 
+use crate::nvram;
+
 fn fail(s: &str) -> io::Error {
     io::Error::other(s.to_owned())
 }
 
-/// Values of the vendor's RAM configuration cache, read in one pass.
-fn nvram_values<const N: usize>(keys: [&str; N]) -> [String; N] {
-    let raw = fs::read("/tmp/nvram.cfg").unwrap_or_default();
-    let lines: Vec<&[u8]> = raw.split(|b| *b == 0 || *b == b'\n').collect();
-    keys.map(|key| {
-        let key = format!("{key}=");
-        lines
-            .iter()
-            .find_map(|s| s.strip_prefix(key.as_bytes()))
-            .map(|s| String::from_utf8_lossy(s).trim().to_string())
-            .unwrap_or_default()
-    })
-}
-
-/// One value of the vendor's RAM configuration cache.
-pub fn nvram(key: &str) -> String {
-    let [value] = nvram_values([key]);
-    value
-}
 
 /// Where the unit is attached now: primary cell and carrier count.
 pub fn attach() -> Option<(Cell, u8)> {
-    if nvram("sqns_connection_mediaState") != "ATTACHED" {
+    if nvram::read_value("sqns_connection_mediaState") != "ATTACHED" {
         return None;
     }
-    let earfcn = nvram("sqns_radio_earfcnDl").parse().ok()?;
-    let pci = nvram("sqns_radio_pci").parse().ok()?;
-    let carriers = model::carriers(&nvram("sqns_connection_sccInfo"))?;
+    let earfcn = nvram::read_value("sqns_radio_earfcnDl").parse().ok()?;
+    let pci = nvram::read_value("sqns_radio_pci").parse().ok()?;
+    let carriers = model::carriers(&nvram::read_value("sqns_connection_sccInfo"))?;
     Some((Cell { earfcn, pci }, carriers))
 }
 
@@ -58,18 +41,18 @@ pub fn granted() -> bool {
     let Some((cell, _)) = attach() else {
         return false;
     };
-    if nvram("cbrs_mode_grant") != "1" || nvram("cbrs_grant_state") != "2" {
+    if nvram::read_value("cbrs_mode_grant") != "1" || nvram::read_value("cbrs_grant_state") != "2" {
         return false;
     }
     let log = fs::read("/mnt/cbrslog0.txt").unwrap_or_default();
     let grants = pick::grants(&String::from_utf8_lossy(&log));
-    let bw = nvram("sqns_radio_bandwidthDl").parse().unwrap_or(20_000);
-    pick::covered(cell.earfcn, pick::ul_scc(&nvram("sqns_connection_uplinkScc")), bw, &grants)
+    let bw = nvram::read_value("sqns_radio_bandwidthDl").parse().unwrap_or(20_000);
+    pick::covered(cell.earfcn, pick::ul_scc(&nvram::read_value("sqns_connection_uplinkScc")), bw, &grants)
 }
 
 /// The customer bearer's interface, as the vendor names it.
 pub fn customer_dev() -> String {
-    let dev = nvram("pdn_data_ifname");
+    let dev = nvram::read_value("pdn_data_ifname");
     if dev.starts_with("lte0pdn") { dev } else { "lte0pdn2".into() }
 }
 
@@ -97,7 +80,7 @@ struct Samples {
 
 impl Samples {
     fn take(&mut self, t: f64) {
-        let [ul, sinr, scc, rank] = nvram_values([
+        let [ul, sinr, scc, rank] = nvram::read_values([
             "sqns_radio_ulThroughput",
             "sqns_radio_SINR",
             "sqns_connection_downlinkSccEx",
@@ -192,8 +175,8 @@ fn kbps(value: &str) -> Option<u32> {
 /// upload burst to `sink`.
 pub fn measure(probe: Ipv4Addr, sink: Ipv4Addr, arm: usize) -> io::Result<Measure> {
     let (pcell, carriers) = attach().ok_or_else(|| fail("not attached"))?;
-    let ul_scc = pick::ul_scc(&nvram("sqns_connection_uplinkScc"));
-    let rsrp_dbm = pick::hundredths(&nvram("sqns_radio_RSRP"));
+    let ul_scc = pick::ul_scc(&nvram::read_value("sqns_connection_uplinkScc"));
+    let rsrp_dbm = pick::hundredths(&nvram::read_value("sqns_radio_RSRP"));
     let rtt_ms = round_trip(probe);
     let samples = burst(sink)?;
     if attach() != Some((pcell, carriers)) {
@@ -203,7 +186,7 @@ pub fn measure(probe: Ipv4Addr, sink: Ipv4Addr, arm: usize) -> io::Result<Measur
         .ok_or_else(|| fail("SINR unreadable"))?;
     let layers = pick::median(&samples.rank).unwrap_or(2);
     let ul_kbps = pick::ul_from_reports(&samples.ul, 0.5).ok_or_else(|| fail("no fresh upload report"))?;
-    let [dl_max, ul_max] = nvram_values(["sqns_radio_dlMaxThroughput", "sqns_radio_ulMaxThroughput"]);
+    let [dl_max, ul_max] = nvram::read_values(["sqns_radio_dlMaxThroughput", "sqns_radio_ulMaxThroughput"]);
     Ok(Measure {
         arm,
         pcell,

@@ -6,8 +6,8 @@
 //! written while attached waits for the next attach. The only radio cycle is
 //! the opt-in enforcement re-attach, gated by `titan_pd_model::radio::cycle_gate`.
 use crate::{
-    carrier_pick_io,
-    radio_modem::{cfun, console},
+    carrier_pick_io, nvram,
+    radio_modem::{cfun, console, media},
     radio_sqm,
 };
 use serde_json::{Value, json};
@@ -503,7 +503,7 @@ impl CarrierWatch {
             return rm(ram("radio-carriers"));
         };
         let attached = media() == "ATTACHED";
-        let carriers = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
+        let carriers = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
         let over = attached && carriers.is_some_and(|n| n > cap);
         if !over {
             self.over_since = None;
@@ -524,8 +524,8 @@ impl CarrierWatch {
             }
         }
         let last_cycle = last_cycle();
-        let mode_grant = nvram_field(b"cbrs_mode_grant=");
-        let grant_state = nvram_field(b"cbrs_grant_state=");
+        let mode_grant = nvram::read_value("cbrs_mode_grant");
+        let grant_state = nvram::read_value("cbrs_grant_state");
         let verdict = model::cycle_gate(model::Gate {
             cap,
             cycle_hours,
@@ -566,21 +566,8 @@ fn last_cycle() -> u64 {
         .unwrap_or(0)
 }
 
-fn nvram_field(key: &[u8]) -> String {
-    let raw = fs::read("/tmp/nvram.cfg").unwrap_or_default();
-    let value = |name: &[u8]| {
-        raw.split(|b| *b == 0 || *b == b'\n')
-            .find_map(|s| s.strip_prefix(name))
-            .map(|s| String::from_utf8_lossy(s).trim().to_string())
-            .unwrap_or_default()
-    };
-    value(key)
-}
-fn media() -> String {
-    nvram_field(b"sqns_connection_mediaState=")
-}
 fn ready() -> bool {
-    nvram_field(b"sqns_identity_boardName=") == "GDM7243AP-ODU-E-B48"
+    nvram::read_value("sqns_identity_boardName") == "GDM7243AP-ODU-E-B48"
         && fs::metadata("/var/tmp/lted-daemon").is_ok_and(|m| m.file_type().is_socket())
         && ["lted", "lteatcm", "ucid"].iter().all(|name| {
             Command::new("pidof")
@@ -804,9 +791,9 @@ fn enforce(p: &Profile) -> io::Result<()> {
     // Read every condition again right before acting. The guard's
     // over-cap timer is the only value carried in.
     let now = crate::clock::monotonic();
-    let before = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
-    let mode_grant = nvram_field(b"cbrs_mode_grant=");
-    let grant_state = nvram_field(b"cbrs_grant_state=");
+    let before = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
+    let mode_grant = nvram::read_value("cbrs_mode_grant");
+    let grant_state = nvram::read_value("cbrs_grant_state");
     let fresh = model::cycle_gate(model::Gate {
         cap,
         cycle_hours,
@@ -858,7 +845,7 @@ fn enforce(p: &Profile) -> io::Result<()> {
     } else {
         Ok(())
     };
-    let after = model::carriers(&nvram_field(b"sqns_connection_sccInfo="));
+    let after = model::carriers(&nvram::read_value("sqns_connection_sccInfo"));
     crate::log(&format!(
         "radio profile: enforcement re-attach {}; carriers now {}{}",
         if attached { "attached" } else { "did not attach within 90 s" },
@@ -995,8 +982,8 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
         Some(_) => {}
     }
     if media() != "ATTACHED"
-        || nvram_field(b"cbrs_mode_grant=") != "1"
-        || nvram_field(b"cbrs_grant_state=") != "2"
+        || nvram::read_value("cbrs_mode_grant") != "1"
+        || nvram::read_value("cbrs_grant_state") != "2"
     {
         eprintln!("radio-worker: picker cycle skipped: not attached with a held SAS grant");
         return Ok(());
@@ -1125,8 +1112,8 @@ fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(),
         window: p.window,
         forced,
         attached,
-        mode_grant: nvram_field(b"cbrs_mode_grant=") == "1",
-        grant_state: nvram_field(b"cbrs_grant_state=").parse().unwrap_or(0),
+        mode_grant: nvram::read_value("cbrs_mode_grant") == "1",
+        grant_state: nvram::read_value("cbrs_grant_state").parse().unwrap_or(0),
         idle,
     })
 }

@@ -89,11 +89,7 @@ const OFF_SECS: u64 = 20;
 
 /// The vendor's attach state from its RAM configuration cache.
 pub fn media() -> String {
-    let raw = std::fs::read("/tmp/nvram.cfg").unwrap_or_default();
-    raw.split(|b| *b == 0 || *b == b'\n')
-        .find_map(|s| s.strip_prefix(b"sqns_connection_mediaState=".as_slice()))
-        .map(|s| String::from_utf8_lossy(s).trim().to_string())
-        .unwrap_or_default()
+    crate::nvram::read_value("sqns_connection_mediaState")
 }
 
 /// Switch the radio. `AT+CFUN?` is no read-back on this stack: on the bench it
