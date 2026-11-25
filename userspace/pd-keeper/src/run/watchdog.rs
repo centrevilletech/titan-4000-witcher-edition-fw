@@ -3,7 +3,8 @@
 //! runs. See `titan_pd_model::deaf`.
 
 use std::fs;
-use std::process::{Command, Stdio};
+use std::net::IpAddr;
+use std::process::{Child, Command, Stdio};
 
 use titan_pd_model::deaf::{self, Action as DeafAction};
 use titan_pd_model::mgmt;
@@ -19,10 +20,45 @@ const REBOOT_FORCE_AFTER: u64 = 45;
 /// After the forced attempt also fails, go back to watching.
 const REBOOT_GIVE_UP_AFTER: u64 = 120;
 
-/// One round of pings, collected on later ticks so the wire loop keeps running.
-pub(super) struct DeafProbe {
-    pub(super) children: Vec<std::process::Child>,
-    pub(super) started: u64,
+/// One ping to each target, collected on later ticks so the wire loop keeps
+/// running. The deaf watchdog and the tk boot confirm each run one.
+pub(super) struct PingRound {
+    children: Vec<Child>,
+    started: u64,
+}
+
+impl PingRound {
+    /// Start a round, or `None` when no ping could start.
+    pub(super) fn start(targets: &[IpAddr], now: u64) -> Option<Self> {
+        let children = spawn_pings(targets);
+        (!children.is_empty()).then_some(Self {
+            children,
+            started: now,
+        })
+    }
+
+    /// Whether a target answered: once one has, once every ping has ended,
+    /// or `timeout` seconds after the start. `None` while the round is open.
+    /// An answered round's pings are stopped and reaped.
+    pub(super) fn poll(&mut self, now: u64, timeout: u64) -> Option<bool> {
+        let mut heard = false;
+        let mut running = false;
+        for child in &mut self.children {
+            match child.try_wait() {
+                Ok(Some(status)) => heard |= status.success(),
+                Ok(None) => running = true,
+                Err(_) => {}
+            }
+        }
+        if !heard && running && now.saturating_sub(self.started) < timeout {
+            return None;
+        }
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        Some(heard)
+    }
 }
 
 impl Keeper {
@@ -44,25 +80,10 @@ impl Keeper {
             return;
         }
         if let Some(mut probe) = self.deaf_probe.take() {
-            let mut heard = false;
-            let mut running = false;
-            for child in probe.children.iter_mut() {
-                match child.try_wait() {
-                    Ok(Some(status)) => heard |= status.success(),
-                    Ok(None) => running = true,
-                    Err(_) => {}
-                }
+            match probe.poll(self.now, deaf::PROBE_TIMEOUT) {
+                None => self.deaf_probe = Some(probe),
+                Some(heard) => self.deaf_round(Some(heard)),
             }
-            let timed_out = self.now.saturating_sub(probe.started) >= deaf::PROBE_TIMEOUT;
-            if !heard && running && !timed_out {
-                self.deaf_probe = Some(probe);
-                return;
-            }
-            for child in probe.children.iter_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            self.deaf_round(Some(heard));
             return;
         }
         if self
@@ -85,15 +106,10 @@ impl Keeper {
             String::new()
         };
         let targets = deaf::targets(&settings, &bearer_dns);
-        let children = spawn_pings(&targets);
-        if children.is_empty() {
-            self.deaf_round(None);
-            return;
+        match PingRound::start(&targets, self.now) {
+            Some(round) => self.deaf_probe = Some(round),
+            None => self.deaf_round(None),
         }
-        self.deaf_probe = Some(DeafProbe {
-            children,
-            started: self.now,
-        });
     }
 
     /// Run one watchdog, not two. The vendor's (`ucid`, nvram `detection_enable`)
@@ -197,8 +213,8 @@ fn reboot_program() -> String {
     env_or("TITAN_REBOOT", "reboot")
 }
 
-/// One ping to each target, collected on later ticks.
-pub(super) fn spawn_pings(targets: &[std::net::IpAddr]) -> Vec<std::process::Child> {
+/// One ping to each target.
+fn spawn_pings(targets: &[IpAddr]) -> Vec<Child> {
     targets
         .iter()
         .filter_map(|target| {

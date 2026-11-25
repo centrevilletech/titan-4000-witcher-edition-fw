@@ -2,10 +2,21 @@
 //! text concurrently and bound the capture even when diagnostic logging is busy.
 use std::{
     io::{self, Read, Write},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     thread,
     time::Duration,
 };
+
+/// Start the vendor's modem console `program` with stdin and stdout piped
+/// and its stderr on stdout.
+pub fn spawn_console(program: &str) -> io::Result<Child> {
+    Command::new("/bin/sh")
+        .args(["-c", "exec \"$0\" 2>&1", program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+}
 
 pub fn console(cmd: &str) -> io::Result<String> {
     let dm = !cmd.starts_with("AT") && cmd != "arm1log 1";
@@ -13,12 +24,7 @@ pub fn console(cmd: &str) -> io::Result<String> {
     if dm {
         std::fs::write(marker, b"1")?;
     }
-    let mut child = Command::new("/bin/sh")
-        .args(["-c", "exec /usr/lte/lted_cli 2>&1"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let mut child = spawn_console("/usr/lte/lted_cli")?;
     let mut out = child.stdout.take().unwrap();
     let capture = thread::spawn(move || -> io::Result<Vec<u8>> {
         let mut buf = [0; 4096];

@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::{Read, Write as _};
 use std::path::Path;
-use std::process::{ChildStdin, Command, Stdio};
+use std::process::ChildStdin;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +25,7 @@ const SESSION_LIMIT: Duration = Duration::from_secs(90);
 const RADIO_CONSOLE: &str = "/tmp/titan-pd-keeper/radio-console-open";
 
 fn cli_path() -> String {
-    std::env::var("TITAN_LTED_CLI").unwrap_or_else(|_| "/usr/lte/lted_cli".into())
+    crate::paths::env_or("TITAN_LTED_CLI", "/usr/lte/lted_cli")
 }
 
 /// `/var/run/witcher-tk.m1` for M1; `TITAN_TK_M1` overrides it.
@@ -88,12 +88,7 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
     if Path::new(RADIO_CONSOLE).exists() {
         return (Outcome::Busy, false);
     }
-    let spawned = Command::new("/bin/sh")
-        .args(["-c", "exec \"$0\" 2>&1", &cli_path()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn();
+    let spawned = crate::radio_modem::spawn_console(&cli_path());
     let Ok(mut child) = spawned else {
         return (Outcome::NoReply, false);
     };
