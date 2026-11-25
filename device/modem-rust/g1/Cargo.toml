@@ -1,0 +1,13 @@
+[package]
+name = "witcher-modem-g1"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Boot-off, read-only no_std Rust Thumb-2 MAC UL timeline tracer for Titan 4000 modem firmware"
+
+[dependencies]
+modem-atlas = { path = "../atlas" }
+
+[lib]
+name = "witcher_modem_g1"
+crate-type = ["rlib", "staticlib"]

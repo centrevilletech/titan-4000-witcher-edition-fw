@@ -48,6 +48,9 @@ BENCH = {
     # The release image (lane R1, build-combined): N6H + R4's Rust N4 + R1's PIE.
     'n6h-r4-r1': ('f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42',
                   '3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb'),
+    # Lane G1: v1.0.16 plus the boot-off MAC UL timeline tracer.
+    'n6h-r4-r1-g1': ('7e7121c5e68980c5d3f3141ce061f7c257e8789c0b5189b63e897b04272504d7',
+                     '63ff32325cbf1936896849804df65481ba0298cc81d1d5cdcd9ed7becaa457ca'),
 }
 failures = []
 
