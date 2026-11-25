@@ -1655,6 +1655,9 @@ else:
         # A load that fails once (insmod refused: the bridge rebuilt at that
         # moment, ENOMEM) is tried again after the first wait, for both.
         def fresh_modules():
+            # Stop the running keeper first, so it cannot load a module (or
+            # take a fail-once flag) between this reset and the restart.
+            keeper.terminate();keeper.wait(timeout=5)
             for stale in ('/tmp/qctrl-proc', '/tmp/k1fp-proc', '/tmp/insmod-calls', '/tmp/qctrl.status', '/tmp/fastpath.status'):
                 Path(stale).unlink(missing_ok=True)
             Path('/tmp/proc-modules').write_text('')
