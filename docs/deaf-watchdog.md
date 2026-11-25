@@ -171,8 +171,10 @@ every 15 s. The keeper never commits it, so the saved setting stays as it was,
 and a unit flashed back to stock keeps its vendor watchdog. The check repeats
 each round and does nothing once the value is 0.
 
-To run the vendor watchdog instead, set `enabled=0` in `watchdog.conf`. The
-keeper then leaves `detection_enable` alone.
+Since v1.0.17 the vendor watchdog stays off in RAM when `enabled=0` turns
+this one off too: it reboots with no backoff and inside the SAS CPAS window
+(06:45-10:15 UTC), where a reboot can leave a unit without grants for hours.
+With `enabled=0` no watchdog reboots the unit.
 
 ### Log lines
 
@@ -192,7 +194,8 @@ In `/mnt/titan-api/pd/keeper.log`:
   wedge. A vendor ping watchdog (`detection_enable` in nvram) does clear a
   wedged unit with `kern reboot`. It also reboots a unit after about 110
   seconds without its ping target, with no backoff. Run one or the other:
-  since v1.0.12 the keeper turns the vendor one off in RAM while this one is on.
+  since v1.0.12 the keeper turns the vendor one off in RAM while this one is
+  on, and since v1.0.17 while it is off too.
 - The passthrough driver serves one LAN device. The vendor kernel stores one
   host MAC for its IPv4. After a router swap the keeper moves it to the router
   that holds the DHCP lease. See [router swaps](ipv4-recovery.md#router-swaps).

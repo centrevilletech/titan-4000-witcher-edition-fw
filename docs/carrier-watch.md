@@ -55,9 +55,10 @@ In `mode=regrant`, the keeper never forces a re-grant when any of these hold:
 
 - **CPAS quiet window:** Google's SAS issues no new grants during daily CPAS
   (07:00-10:00 UTC). Dropping grants then can leave the PCell ungranted for
-  hours. Default `quiet_utc=06:45-10:00` blocks forced re-grants during the
-  window, logs `carrier watch: uncovered, quiet window, waiting` once every
-  10 minutes, and re-checks at 10:00 UTC.
+  hours. Default `quiet_utc=06:45-10:15` (since v1.0.17 the same window as
+  every keeper reboot; it ended at 10:00 before) blocks forced re-grants
+  during the window, logs `carrier watch: uncovered, quiet window, waiting`
+  once every 10 minutes, and re-checks at 10:15 UTC.
 - **Vendor re-grant already in flight:** `cbrs_mode_grant=0` suppresses
   detection and forced re-grants.
 - **Unsane clock:** before NTP corrects the Titan's 2013 boot clock, forced
@@ -77,7 +78,7 @@ keeper restart is needed.
 | Key | Values | Default | Meaning |
 | --- | --- | --- | --- |
 | `mode` | `off`, `log`, `regrant` | `log` | Policy when a transmit carrier leaves the held grants. |
-| `quiet_utc` | `HH:MM-HH:MM` or empty | `06:45-10:00` | Daily UTC window that blocks forced re-grants (supports crossing midnight). Empty disables. |
+| `quiet_utc` | `HH:MM-HH:MM` or empty | `06:45-10:15` | Daily UTC window that blocks forced re-grants (supports crossing midnight). Empty disables. |
 | `debounce_secs` | `1` to `60` | `3` | Consecutive uncovered seconds before entering `uncovered`. |
 | `hide_grant` | `0` to `7` or `none` | `none` | Test-only dry-run option. Hides one grant slot from the comparator and suppresses forced re-grants. |
 
@@ -115,7 +116,7 @@ ssh -p 2222 root@<unit> 'rm -f /mnt/titan-api/carrier-watch/config'
 To enable forced re-grants on one unit:
 
 ```sh
-ssh -p 2222 root@<unit> 'mkdir -p /mnt/titan-api/carrier-watch && printf "mode=regrant\nquiet_utc=06:45-10:00\n" > /mnt/titan-api/carrier-watch/config && sync'
+ssh -p 2222 root@<unit> 'mkdir -p /mnt/titan-api/carrier-watch && printf "mode=regrant\nquiet_utc=06:45-10:15\n" > /mnt/titan-api/carrier-watch/config && sync'
 ```
 
 Rollback (live, takes effect within 5 seconds, no reboot):

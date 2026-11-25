@@ -1,32 +1,16 @@
 //! File helpers shared by the keeper's modules.
 
 use std::fs;
-use std::io::{self, Write};
 use std::path::Path;
+
+/// Durable writes (`titan_pd_model::durable`): write and sync a temporary
+/// file, rename it over the old one, then sync the directory, so a power cut
+/// leaves either the old contents or the new ones.
+pub use titan_pd_model::durable::{replace as replace_durably, write as write_durably};
 
 /// The file's text, or empty when it is missing, unreadable or not UTF-8.
 pub fn read_file(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path.as_ref()).unwrap_or_default()
-}
-
-/// Replace `path` with `bytes` through the temporary file `temp`: write and
-/// sync it, rename it over `path`, then sync the directory, so a power cut
-/// leaves either the old contents or the new ones.
-pub fn write_durably(path: &Path, temp: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = fs::File::create(temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    replace_durably(temp, path)
-}
-
-/// The end of a durable write, for a file written and synced some other way
-/// (streamed, say): rename `temp` over `path`, then sync the directory.
-pub fn replace_durably(temp: &Path, path: &Path) -> io::Result<()> {
-    fs::rename(temp, path)?;
-    match path.parent() {
-        Some(dir) => fs::File::open(dir)?.sync_all(),
-        None => Ok(()),
-    }
 }
 
 #[cfg(test)]

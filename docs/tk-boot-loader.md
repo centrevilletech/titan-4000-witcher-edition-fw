@@ -529,10 +529,11 @@ with a fresh read of every configured word.
 | --- | --- |
 | No patch magic | Writes nothing, waits (15 s doubling to 10 min). Not a failure. |
 | M1 magic with a build version this keeper does not accept | The same: writes nothing for any layer and waits. `detail` names the version it saw and the ones it accepts. |
-| No reply to the magic read, or a read-back missing or wrong | Tries again after 20 s. After 3 failed sessions it stops. If any write went out since the last modem restart, it rolls every managed word back to its documented off value (`0x4000`/`0x6000` for N4 PDCP limits, `0` for N5 tunables, flags and hold; magic still required, disabling flags first) and reads them back. The status says `failed` and whether the rollback read back. |
+| No reply at all (another console client, `lted` restarting, a modem that is not up) | Nothing went out, so it is not a failure and costs no attempt: the same session again after 15 s, doubling to 10 minutes. One log line per silent stretch. Words already applied stay as they are. |
+| A read-back missing or wrong | Tries again after 20 s. After 3 failed sessions in a row, if any write went out since the last modem restart, it rolls every managed word back to its documented off value (`0x4000`/`0x6000` for N4 PDCP limits, `0` for N5 tunables, flags and hold; magic still required, disabling flags first) and reads them back. The off values are where it waits, not where it stops (`state=retrying`): it writes the wanted values again after 5 minutes, doubling to 1 hour for each round that fails again, forever. A rollback that does not read back is tried again after 15 s, doubling to 10 minutes. Once the words read back the backoff starts again at 5 minutes. Before v1.0.17 it stopped here until the next modem restart. |
 | Applied | A read-only check every 10 minutes. A word that reads back wrong is written again. Three checks with no reply start a write session, which resets the console. |
 | Modem restart | The kernel log shows `read from nand` or `read from fs` after the keeper started. It starts over 30 s later. A crash reload runs stock NAND firmware, which never shows the magic, so nothing is written then. |
-| Another console session | The radio profile's marker file is present: the keeper waits 20 s and counts no failure. |
+| Another console session | The radio profile's marker file is present: the keeper waits 20 s and counts no failure. A console that never exited (stuck in the kernel) is not waited for: no new one starts until it is gone, and the keeper looks again later. |
 | Hands-off (`manage=off` or `/var/run/witcher-tk.hands-off`) | Stops all console sessions and checks; status says `state=hands-off`. Removing it resumes with a fresh read. |
 | `tk/config` changed | Read every 15 s. New values are written at once (or queued while hands-off). `enabled=0`, a deleted file, or dropped `wm=` lines roll those managed words back to their documented off values. |
 
@@ -570,8 +571,8 @@ keeper writes it again from `tk/config`. By hand (hands-off set):
 
 | Line | Values |
 | --- | --- |
-| `state` | `off`, `pending`, `waiting-magic`, `applied`, `zeroing`, `failed`, `hands-off` |
-| `detail` | Why, in words. On `failed`: what went wrong and whether the rollback read back. |
+| `state` | `off`, `pending`, `waiting-magic`, `applied`, `zeroing`, `retrying`, `hands-off` |
+| `detail` | Why, in words. On `zeroing` and `retrying`: what went wrong, whether the rollback read back, and when the next try is. |
 | `want` | The words and values the keeper keeps, or `none` |
 | `attempts` | Failed sessions in a row |
 

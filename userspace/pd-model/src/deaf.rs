@@ -130,10 +130,12 @@ fn atoi(text: &str) -> i64 {
 }
 
 /// The vendor ping watchdog in `ucid` runs while `detection_enable` is not 0.
-/// It must stop while this watchdog is on. With this one off, the operator's
-/// vendor setting stands. A missing key means the cache is not ready yet.
-pub fn vendor_watchdog_must_stop(settings: &Settings, detection_enable: Option<&str>) -> bool {
-    settings.enabled && detection_enable.is_some_and(|value| atoi(value) != 0)
+/// It stays off (in RAM) whether this watchdog is on or off (v1.0.17): it
+/// reboots about 110 s after its target stops answering, with no backoff and
+/// no regard for the SAS CPAS window. A missing key means the cache is not
+/// ready yet.
+pub fn vendor_watchdog_must_stop(detection_enable: Option<&str>) -> bool {
+    detection_enable.is_some_and(|value| atoi(value) != 0)
 }
 
 /// `nvram_get 0 sqns_connection_mediaState` reports `ATTACHED`.
@@ -504,20 +506,19 @@ nonsense
     }
 
     #[test]
-    fn the_vendor_ping_watchdog_stops_only_while_ours_is_on() {
-        let ours = Settings::default();
-        assert!(vendor_watchdog_must_stop(&ours, Some("1")));
-        assert!(vendor_watchdog_must_stop(&ours, Some(" 2")));
-        assert!(vendor_watchdog_must_stop(&ours, Some("1x")));
+    fn the_vendor_ping_watchdog_stays_off_whether_ours_is_on_or_off() {
+        assert!(vendor_watchdog_must_stop(Some("1")));
+        assert!(vendor_watchdog_must_stop(Some(" 2")));
+        assert!(vendor_watchdog_must_stop(Some("1x")));
         // Already off, unreadable as a number (ucid reads 0), or not in the
         // cache yet: nothing to do. Repeating the check is a no-op.
-        assert!(!vendor_watchdog_must_stop(&ours, Some("0")));
-        assert!(!vendor_watchdog_must_stop(&ours, Some("")));
-        assert!(!vendor_watchdog_must_stop(&ours, Some("off")));
-        assert!(!vendor_watchdog_must_stop(&ours, None));
-        // An operator who turned ours off keeps the vendor one as saved.
-        let off = parse_settings("enabled=0\n");
-        assert!(!vendor_watchdog_must_stop(&off, Some("1")));
+        assert!(!vendor_watchdog_must_stop(Some("0")));
+        assert!(!vendor_watchdog_must_stop(Some("")));
+        assert!(!vendor_watchdog_must_stop(Some("off")));
+        assert!(!vendor_watchdog_must_stop(None));
+        // The landmine: turning ours off used to bring back the vendor one,
+        // with no backoff and no CPAS window. It is the same either way now.
+        assert!(!parse_settings("enabled=0\n").enabled);
     }
 
     #[test]

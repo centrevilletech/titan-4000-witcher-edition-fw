@@ -239,7 +239,7 @@ impl Keeper {
                     "{} (one {program} renegotiation of eth0; budget step {repeats}; this is not an LTE re-attach)",
                     health::decision_reason(decision)
                 ));
-                let _ = Command::new(program).args(args).status();
+                let _ = crate::command::output(Command::new(program).args(args));
                 self.now = monotonic();
                 self.note("Ethernet renegotiation requested");
             }

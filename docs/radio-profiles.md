@@ -168,9 +168,10 @@ line per visit and one per survey.
 
 A radio cycle starts only when all of these hold, read fresh each time:
 
-- The time is outside 06:30 to 10:30 UTC, which is CPAS with 30 minutes on
-  each side. No new SAS grants are issued in that window, and a carrier change
-  gives back every grant.
+- The time is outside 06:45 to 10:15 UTC, the SAS CPAS window every keeper
+  reboot also waits out (CPAS is 07:00 to 10:00; up to v1.0.16 the picker
+  used 06:30 to 10:30). No new SAS grants are issued in that window, and a
+  carrier change gives back every grant.
 - The time is inside `window_utc`. An operator request through `survey` lifts
   this one rule.
 - The unit is attached and holds its SAS grant (`cbrs_mode_grant` 1,

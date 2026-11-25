@@ -4,7 +4,6 @@
 //! gate (`super::reboot`): never in the SAS CPAS window, never with the
 //! clock unset, and within the keeper's daily cap (v1.0.17).
 
-use std::fs;
 use std::net::{IpAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 
@@ -73,9 +72,9 @@ impl PingRound {
         if !heard && running && now.saturating_sub(self.started) < timeout {
             return None;
         }
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        // Stopped and reaped without waiting on one that does not die.
+        for child in self.children.drain(..) {
+            crate::command::stop(child, "ping");
         }
         Some(heard)
     }
@@ -90,7 +89,7 @@ impl Keeper {
             if !self.reboot_forced && waited >= REBOOT_FORCE_AFTER {
                 self.reboot_forced = true;
                 log("watchdog reboot did not happen; forcing it");
-                let _ = Command::new(reboot_program()).arg("-f").status();
+                let _ = crate::command::output(Command::new(reboot_program()).arg("-f"));
             } else if self.reboot_forced && waited >= REBOOT_GIVE_UP_AFTER {
                 self.reboot_asked_at = None;
                 self.reboot_forced = false;
@@ -128,18 +127,18 @@ impl Keeper {
         }
     }
 
-    /// Run one watchdog, not two. The vendor's (`ucid`, nvram `detection_enable`)
-    /// reboots after about 110 s without its ping target and has no backoff, so
-    /// two setting saves in a row can reboot the unit. `ucid` reads the flag from
+    /// Keep the vendor's ping watchdog (`ucid`, nvram `detection_enable`) off,
+    /// with this watchdog on or off. It reboots after about 110 s without its
+    /// ping target, with no backoff and at any hour, CPAS included, so two
+    /// setting saves in a row can reboot the unit. `ucid` reads the flag from
     /// the RAM cache every 15 s, so clearing it there is enough and nothing is
-    /// committed to flash. An operator who turns this watchdog off keeps the
-    /// vendor setting as saved.
+    /// committed to flash: a unit flashed back to stock keeps its setting.
     fn maintain_vendor_watchdog(&mut self, settings: &deaf::Settings) {
         let value = self
             .read_nvram_cache()
             .and_then(|cache| nvram::field(cache, "detection_enable"))
             .map(str::to_owned);
-        if !deaf::vendor_watchdog_must_stop(settings, value.as_deref()) {
+        if !deaf::vendor_watchdog_must_stop(value.as_deref()) {
             return;
         }
         let was = value.as_deref().unwrap_or("").trim().to_owned();
@@ -149,8 +148,13 @@ impl Keeper {
             return;
         }
         if done {
+            let covered = if settings.enabled {
+                "the keeper's deaf watchdog covers this unit"
+            } else {
+                "it reboots with no backoff and in the SAS CPAS window, so it stays off although the keeper's deaf watchdog is off too"
+            };
             self.note(&format!(
-                "vendor ping watchdog: turned off in RAM for this boot (detection_enable was {was}); the keeper's deaf watchdog covers this unit"
+                "vendor ping watchdog: turned off in RAM for this boot (detection_enable was {was}); {covered}"
             ));
         } else {
             self.note("vendor ping watchdog: could not turn it off; two watchdogs may reboot this unit");
@@ -291,9 +295,8 @@ fn dns_answered(socket: &UdpSocket, id: u16) -> bool {
     false
 }
 
-/// Write the strike count through a temporary file, so a power cut cannot
-/// leave a torn record.
+/// Write the strike count durably, so a power cut cannot leave a torn record.
 fn store_strikes(path: &std::path::Path, strikes: u32) -> bool {
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, deaf::format_strikes(strikes)).is_ok() && fs::rename(&temp, path).is_ok()
+    crate::files::write_durably(path, &path.with_extension("tmp"), deaf::format_strikes(strikes).as_bytes())
+        .is_ok()
 }

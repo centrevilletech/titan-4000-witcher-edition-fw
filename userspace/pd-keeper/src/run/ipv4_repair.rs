@@ -152,7 +152,7 @@ impl Keeper {
             {
                 return;
             }
-            let Ok(ps) = Command::new("ps").output() else { return };
+            let Ok(ps) = crate::command::output(&mut Command::new("ps")) else { return };
             let listing = String::from_utf8_lossy(&ps.stdout);
             if !ps.status.success() || listing.trim().is_empty() || !customer_dhcp_pids(&listing).is_empty() {
                 return;
@@ -352,8 +352,8 @@ impl Keeper {
                 if matches!(decision, Decision::LinkDrop { .. }) {
                     let (program, args) = link_recovery();
                     self.note("IPv4 router still misses ARP after DHCP repair; requesting one Ethernet renegotiation");
-                    match Command::new(program).args(args).status() {
-                        Ok(status) if status.success() => self.note("IPv4 Ethernet renegotiation requested; waiting for a new successful ARP baseline"),
+                    match crate::command::output(Command::new(program).args(args)) {
+                        Ok(out) if out.status.success() => self.note("IPv4 Ethernet renegotiation requested; waiting for a new successful ARP baseline"),
                         _ => self.note("IPv4 Ethernet renegotiation command failed; automatic retries are disarmed"),
                     }
                 } else {
@@ -422,9 +422,7 @@ fn flood_rules_present(listing: &str, bearer: &str) -> bool {
 
 fn ebtables(args: &str) -> Result<(), String> {
     let program = ebtables_program();
-    let output = Command::new(program)
-        .args(args.split_whitespace())
-        .output()
+    let output = crate::command::output(Command::new(program).args(args.split_whitespace()))
         .map_err(|err| err.to_string())?;
     if output.status.success() || args.starts_with("-D") {
         return Ok(());

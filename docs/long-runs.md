@@ -70,8 +70,8 @@ since v1.0.13. See [IPv6 router health](ipv6-health.md#a-busy-link-is-never-cut)
 
 ## The vendor ping watchdog
 
-While the keeper's own watchdog is on, the keeper turns off the stock ping
-watchdog in RAM. See [the deaf-unit fault](deaf-watchdog.md#the-vendor-ping-watchdog).
+The keeper keeps the stock ping watchdog off in RAM, whether its own watchdog
+is on or off (v1.0.17). See [the deaf-unit fault](deaf-watchdog.md#the-vendor-ping-watchdog).
 
 ## Not changed
 

@@ -41,9 +41,14 @@
 //! - Sessions that would exceed `MAX_SESSION_SECS` split into consecutive
 //!   sessions in write order so no session leaves a half-applied enable.
 //! - A write counts only when its read-back matches in the same session.
-//! - After `MAX_ATTEMPTS` failed sessions the keeper rolls every managed word
-//!   back to its documented off value (magic still required) and stops until
-//!   the next modem restart.
+//! - After `MAX_ATTEMPTS` failed sessions in a row, if a write may have
+//!   landed, the keeper rolls every managed word back to its documented off
+//!   value (magic still required). The off values are a safe place to wait,
+//!   not an end: it writes the wanted values again after a backoff
+//!   (`BACKOFF_FIRST` doubling to `BACKOFF_MAX`), forever, and retries a
+//!   rollback that did not read back the same way. A console that does not
+//!   answer sends nothing, so it costs no attempt: the keeper looks again
+//!   later, backing off as for a missing magic.
 //! - A bench/maintenance hold (`manage=off` in `tk/config` or the hands-off
 //!   marker file) pauses all console sessions and reports `state=hands-off`.
 use crate::tk_boot::{self, BootStatus, MAGIC, MAGIC_ADDR, Source};
@@ -559,11 +564,18 @@ pub fn off_value(addr: u32) -> Option<u32> {
     find_word(addr).map(|spec| spec.off_value)
 }
 
-/// Failed write sessions before the keeper gives up.
+/// Failed write sessions in a row before the managed words go back to their
+/// off values (when a write may have landed) and the keeper backs off.
 pub const MAX_ATTEMPTS: u32 = 3;
 /// Seconds between a failed session and the next try.
 pub const RETRY_SECS: u64 = 20;
-/// First wait for the patch magic. It doubles up to `MAGIC_MAX`.
+/// The wait after `MAX_ATTEMPTS` failed sessions, and after each failed round
+/// or rollback since. It doubles up to `BACKOFF_MAX` and starts again once the
+/// wanted words read back. The keeper never stops trying.
+pub const BACKOFF_FIRST: u64 = 300;
+pub const BACKOFF_MAX: u64 = 3600;
+/// First wait for the patch magic, or for a console that answers nothing. It
+/// doubles up to `MAGIC_MAX`.
 pub const MAGIC_FIRST: u64 = 15;
 pub const MAGIC_MAX: u64 = 600;
 /// Seconds between read-only checks once the flags hold.
@@ -1628,10 +1640,12 @@ pub enum State {
     WaitingMagic,
     /// Every word read back as wanted. Read-only checks follow.
     Applied,
-    /// Giving up: writing documented off values to every managed word.
+    /// After failed sessions: writing documented off values to every managed
+    /// word, the safe place to wait.
     Zeroing,
-    /// Gave up until the next modem restart.
-    Failed,
+    /// After failed sessions: the managed words are at their off values (or
+    /// were never written). A write session follows after the backoff.
+    Retrying,
     /// Bench/maintenance hold: keeper does not open console sessions.
     HandsOff,
 }
@@ -1643,7 +1657,7 @@ impl State {
             State::WaitingMagic => "waiting-magic",
             State::Applied => "applied",
             State::Zeroing => "zeroing",
-            State::Failed => "failed",
+            State::Retrying => "retrying",
             State::HandsOff => "hands-off",
         }
     }
@@ -1677,7 +1691,12 @@ pub struct Control {
     batch_index: usize,
     batch_wrote: usize,
     next_at: u64,
+    /// The next wait for a layer that has not shown, or a silent console.
     magic_wait: u64,
+    /// The next wait after a failed round or rollback (`BACKOFF_FIRST` up).
+    backoff: u64,
+    /// The last session got no console reply (logged once per stretch).
+    silent: bool,
     /// A `wm` line went out since the last modem restart.
     ever_wrote: bool,
     detail: String,
@@ -1717,6 +1736,8 @@ impl Control {
             batch_wrote: 0,
             next_at: now,
             magic_wait: MAGIC_FIRST,
+            backoff: BACKOFF_FIRST,
+            silent: false,
             ever_wrote: false,
             detail: "waiting for the first write session".into(),
         }
@@ -1765,13 +1786,7 @@ impl Control {
                     return (false, None);
                 }
                 self.hands_off_reason = None;
-                self.state = State::Pending;
-                self.attempts = 0;
-                self.check_misses = 0;
-                self.batch_index = 0;
-                self.batch_wrote = 0;
-                self.magic_wait = MAGIC_FIRST;
-                self.next_at = now;
+                self.start_over(now);
                 self.detail = "hands-off cleared; reading modem words".into();
                 (
                     true,
@@ -1783,24 +1798,21 @@ impl Control {
         }
     }
 
-    /// The session to run now, if one is due.
+    /// The session to run now, if one is due. One is always due again later:
+    /// only hands-off, or no words to manage, stops them.
     pub fn due(&self, now: u64) -> Option<Plan> {
-        if self.state == State::HandsOff
-            || self.state == State::Failed
-            || now < self.next_at
-            || self.wanted.is_empty()
-        {
+        if self.state == State::HandsOff || now < self.next_at || self.wanted.is_empty() {
             return None;
         }
         let (session, target, prev): (Session, Vec<Write>, &[Write]) = match self.state {
-            State::Pending | State::WaitingMagic => (
+            State::Pending | State::WaitingMagic | State::Retrying => (
                 Session::Apply,
                 self.wanted.clone(),
                 self.prev_wanted.as_slice(),
             ),
             State::Applied => (Session::Check, self.wanted.clone(), &[]),
             State::Zeroing => (Session::Apply, rollback_values(&self.wanted), &[]),
-            State::Failed | State::HandsOff => return None,
+            State::HandsOff => return None,
         };
         let batches = split_sessions_from(&target, prev, session);
         if batches.is_empty() {
@@ -1850,11 +1862,7 @@ impl Control {
             ));
         }
         let line = format!("tk flags: tk/config changed: writing {next} (was {was})");
-        self.state = State::Pending;
-        self.attempts = 0;
-        self.check_misses = 0;
-        self.magic_wait = MAGIC_FIRST;
-        self.next_at = now;
+        self.start_over(now);
         self.detail = "tk/config changed; a write session is due".into();
         Some(line)
     }
@@ -1869,16 +1877,14 @@ impl Control {
         if self.state == State::HandsOff {
             return "tk flags: modem restart seen while hands-off; staying hands-off".into();
         }
-        self.state = State::Pending;
-        self.attempts = 0;
-        self.check_misses = 0;
-        self.magic_wait = MAGIC_FIRST;
-        self.next_at = now.saturating_add(AFTER_RESTART);
+        self.start_over(now.saturating_add(AFTER_RESTART));
         self.detail = "modem restart seen; writing again once the patch magic shows".into();
         "tk flags: modem restart seen; the flags are written again once the patch magic shows (a crash reload runs stock firmware, which never shows it)".into()
     }
 
-    /// A session finished. Returns a log line when there is news.
+    /// A session finished. Returns a log line when there is news. Every
+    /// outcome leaves another session due later: failures back off, they
+    /// never stop.
     pub fn finished(
         &mut self,
         now: u64,
@@ -1891,61 +1897,11 @@ impl Control {
         if was == State::HandsOff {
             return None;
         }
+        if !matches!(outcome, Outcome::NoReply | Outcome::Busy) {
+            self.silent = false;
+        }
         if was == State::Zeroing {
-            match outcome {
-                Outcome::Busy => {
-                    self.state = State::Zeroing;
-                    self.next_at = now.saturating_add(RETRY_SECS);
-                    return None;
-                }
-                Outcome::Verified { wrote } => {
-                    self.batch_wrote += *wrote;
-                    if plan.batch + 1 < plan.total_batches {
-                        self.batch_index = plan.batch + 1;
-                        self.next_at = now;
-                        self.detail = format!(
-                            "rollback session {} of {} verified; continuing",
-                            plan.batch + 1,
-                            plan.total_batches
-                        );
-                        return None;
-                    }
-                    self.state = State::Failed;
-                    self.batch_index = 0;
-                    self.batch_wrote = 0;
-                    let off = rollback_values(&self.wanted);
-                    let all_zero = off.iter().all(|w| w.value == 0);
-                    self.detail = if all_zero {
-                        format!("gave up after {MAX_ATTEMPTS} failed sessions; flags read back 0")
-                    } else {
-                        format!(
-                            "gave up after {MAX_ATTEMPTS} failed sessions; managed words read back at off values ({})",
-                            list(&off)
-                        )
-                    };
-                    return Some(format!("tk flags: {}", self.detail));
-                }
-                Outcome::NoMagic(group) | Outcome::WrongVersion { group, .. } => {
-                    self.state = State::Failed;
-                    self.batch_index = 0;
-                    self.batch_wrote = 0;
-                    self.detail = format!(
-                        "gave up; the {} patch magic is gone, so nothing more was written",
-                        group.name()
-                    );
-                    return Some(format!("tk flags: {}", self.detail));
-                }
-                other => {
-                    self.state = State::Failed;
-                    self.batch_index = 0;
-                    self.batch_wrote = 0;
-                    self.detail = format!(
-                        "gave up after {MAX_ATTEMPTS} failed sessions; flags NOT confirmed at off values ({})",
-                        describe(other)
-                    );
-                    return Some(format!("tk flags: {}", self.detail));
-                }
-            }
+            return self.rollback_finished(now, plan, outcome);
         }
         match outcome {
             Outcome::Busy => {
@@ -1960,7 +1916,7 @@ impl Control {
                 if plan.batch + 1 < plan.total_batches {
                     self.batch_index = plan.batch + 1;
                     self.next_at = now;
-                    if was == State::WaitingMagic {
+                    if matches!(was, State::WaitingMagic | State::Retrying) {
                         self.state = State::Pending;
                     }
                     self.detail = format!(
@@ -1973,6 +1929,7 @@ impl Control {
                 let total_wrote = self.batch_wrote;
                 self.batch_index = 0;
                 self.batch_wrote = 0;
+                self.backoff = BACKOFF_FIRST;
                 self.prev_wanted = self.wanted.clone();
                 self.state = State::Applied;
                 self.next_at = now.saturating_add(CHECK_EVERY);
@@ -2059,41 +2016,162 @@ impl Control {
                 }
                 None
             }
-            Outcome::NoReply | Outcome::Unverified { .. } => {
+            Outcome::NoReply => {
+                // Nothing went out: another console client, lted restarting
+                // or a modem that is not up. Not a failure: look again later.
+                self.no_reply(now, "no console reply; nothing was written")
+            }
+            Outcome::Unverified { .. } => {
                 self.attempts += 1;
                 let why = describe(outcome);
-                if self.attempts >= MAX_ATTEMPTS {
-                    self.batch_index = 0;
-                    self.batch_wrote = 0;
-                    if self.ever_wrote {
-                        self.state = State::Zeroing;
-                        self.next_at = now.saturating_add(RETRY_SECS);
-                        let off = rollback_values(&self.wanted);
-                        if off.iter().all(|w| w.value == 0) {
-                            self.detail =
-                                format!("giving up ({why}); writing 0 to every managed word");
-                        } else {
-                            self.detail = format!(
-                                "giving up ({why}); rolling every managed word back to its off value"
-                            );
-                        }
-                    } else {
-                        self.state = State::Failed;
-                        self.detail = format!(
-                            "gave up after {MAX_ATTEMPTS} sessions ({why}); nothing was written, flags stay 0"
-                        );
-                    }
-                    return Some(format!("tk flags: {}", self.detail));
+                if self.attempts < MAX_ATTEMPTS {
+                    self.state = State::Pending;
+                    self.next_at = now.saturating_add(RETRY_SECS);
+                    self.detail =
+                        format!("session {} of {MAX_ATTEMPTS} failed: {why}", self.attempts);
+                    return Some(format!(
+                        "tk flags: {}; trying again in {RETRY_SECS} s",
+                        self.detail
+                    ));
                 }
-                self.state = State::Pending;
-                self.next_at = now.saturating_add(RETRY_SECS);
-                self.detail = format!("session {} of {MAX_ATTEMPTS} failed: {why}", self.attempts);
-                Some(format!(
-                    "tk flags: {}; trying again in {RETRY_SECS} s",
-                    self.detail
-                ))
+                self.batch_index = 0;
+                self.batch_wrote = 0;
+                if self.ever_wrote {
+                    // A write may have landed: the off values first, at once.
+                    self.state = State::Zeroing;
+                    self.next_at = now.saturating_add(RETRY_SECS);
+                    self.detail = if rollback_values(&self.wanted).iter().all(|w| w.value == 0) {
+                        format!(
+                            "{} failed sessions in a row ({why}); writing 0 to every managed word until the next try",
+                            self.attempts
+                        )
+                    } else {
+                        format!(
+                            "{} failed sessions in a row ({why}); rolling every managed word back to its off value until the next try",
+                            self.attempts
+                        )
+                    };
+                } else {
+                    let wait = self.back_off(now);
+                    self.state = State::Retrying;
+                    self.detail = format!(
+                        "{} failed sessions in a row ({why}); nothing was written, so the words keep their boot values; trying again in {wait} s",
+                        self.attempts
+                    );
+                }
+                Some(format!("tk flags: {}", self.detail))
             }
         }
+    }
+
+    /// A rollback session (`State::Zeroing`) finished. A verified rollback
+    /// waits out the backoff at the off values, then writes the wanted values
+    /// again. One that did not read back is tried again later, backing off up
+    /// to `MAGIC_MAX`, so it lands soon after the console works again.
+    fn rollback_finished(&mut self, now: u64, plan: &Plan, outcome: &Outcome) -> Option<String> {
+        match outcome {
+            Outcome::Busy => {
+                self.next_at = now.saturating_add(RETRY_SECS);
+                None
+            }
+            Outcome::Verified { wrote } => {
+                self.magic_wait = MAGIC_FIRST;
+                self.batch_wrote += *wrote;
+                if plan.batch + 1 < plan.total_batches {
+                    self.batch_index = plan.batch + 1;
+                    self.next_at = now;
+                    self.detail = format!(
+                        "rollback session {} of {} verified; continuing",
+                        plan.batch + 1,
+                        plan.total_batches
+                    );
+                    return None;
+                }
+                self.batch_index = 0;
+                self.batch_wrote = 0;
+                let off = rollback_values(&self.wanted);
+                let read = if off.iter().all(|w| w.value == 0) {
+                    "flags read back 0".to_owned()
+                } else {
+                    format!("managed words read back at off values ({})", list(&off))
+                };
+                // The RAM now holds the off values: order the next write from them.
+                self.prev_wanted = off;
+                let wait = self.back_off(now);
+                self.state = State::Retrying;
+                self.detail = format!(
+                    "{} failed sessions in a row; {read}; writing the wanted values again in {wait} s",
+                    self.attempts
+                );
+                Some(format!("tk flags: {}", self.detail))
+            }
+            Outcome::NoMagic(group) | Outcome::WrongVersion { group, .. } => {
+                // Without the magic there is nothing of ours to roll back
+                // (stock firmware after a modem reload?). Write again once the
+                // layer shows: a fresh load starts at its off values.
+                let detail = format!(
+                    "the {} patch magic is gone, so the rollback wrote nothing; writing again once it shows",
+                    group.name()
+                );
+                let line = format!("tk flags: {detail}");
+                self.wait_for_layer(now, detail);
+                Some(line)
+            }
+            Outcome::NoReply => self.no_reply(now, "no console reply to the rollback; nothing was written"),
+            other => {
+                self.attempts = self.attempts.saturating_add(1);
+                let wait = self.later(now);
+                self.batch_index = 0;
+                self.batch_wrote = 0;
+                self.detail = format!(
+                    "the rollback did not read back ({}); trying it again in {wait} s",
+                    describe(other)
+                );
+                Some(format!("tk flags: {}", self.detail))
+            }
+        }
+    }
+
+    /// A session got no console reply, so nothing went out: try the same
+    /// session again later, backing off up to `MAGIC_MAX`. Logged once per
+    /// silent stretch.
+    fn no_reply(&mut self, now: u64, why: &str) -> Option<String> {
+        let wait = self.later(now);
+        self.detail = format!("{why}; trying again in {wait} s");
+        let first = !self.silent;
+        self.silent = true;
+        first.then(|| format!("tk flags: {}", self.detail))
+    }
+
+    /// The next session in `magic_wait` seconds, which doubles up to
+    /// `MAGIC_MAX`. Returns the wait.
+    fn later(&mut self, now: u64) -> u64 {
+        let wait = self.magic_wait;
+        self.next_at = now.saturating_add(wait);
+        self.magic_wait = wait.saturating_mul(2).min(MAGIC_MAX);
+        wait
+    }
+
+    /// The wait before the next round after a failed one, which doubles each
+    /// time up to `BACKOFF_MAX`. Returns it in seconds.
+    fn back_off(&mut self, now: u64) -> u64 {
+        let wait = self.backoff;
+        self.next_at = now.saturating_add(wait);
+        self.backoff = wait.saturating_mul(2).min(BACKOFF_MAX);
+        wait
+    }
+
+    /// Start over from a fresh read: no failures counted, no waits owed.
+    fn start_over(&mut self, next_at: u64) {
+        self.state = State::Pending;
+        self.attempts = 0;
+        self.check_misses = 0;
+        self.batch_index = 0;
+        self.batch_wrote = 0;
+        self.magic_wait = MAGIC_FIRST;
+        self.backoff = BACKOFF_FIRST;
+        self.silent = false;
+        self.next_at = next_at;
     }
 
     /// Nothing was written because a layer did not show (its magic, or an
@@ -2102,8 +2180,7 @@ impl Control {
         self.batch_index = 0;
         self.batch_wrote = 0;
         self.state = State::WaitingMagic;
-        self.next_at = now.saturating_add(self.magic_wait);
-        self.magic_wait = (self.magic_wait.saturating_mul(2)).min(MAGIC_MAX);
+        self.later(now);
         self.detail = detail;
     }
 
@@ -2234,6 +2311,11 @@ mod tests {
         broken: bool,
         /// If set, writes to this address fail to stick.
         broken_addr: Option<u32>,
+        /// Answers nothing, not even `quit 0`: another client holds the console.
+        dead: bool,
+        /// Every reply to a read but a magic's comes back cut short, as with
+        /// another client on the console. Writes still land.
+        cut_reads: bool,
         sent: Vec<String>,
     }
 
@@ -2268,6 +2350,8 @@ mod tests {
                 logging: false,
                 broken: false,
                 broken_addr: None,
+                dead: false,
+                cut_reads: false,
                 sent: Vec::new(),
             }
         }
@@ -2311,6 +2395,9 @@ mod tests {
     impl Console for Fake {
         fn command(&mut self, line: &str) -> String {
             self.sent.push(line.to_owned());
+            if self.dead {
+                return String::new();
+            }
             if line == "quit 0" {
                 self.logging = false;
                 return "\nDM> ".into();
@@ -2323,6 +2410,9 @@ mod tests {
                 ["vm", addr, len] => {
                     let addr = u32::from_str_radix(addr.trim_start_matches("0x"), 16).unwrap();
                     let len: u32 = len.parse().unwrap();
+                    if self.cut_reads && !MAGICS.iter().any(|m| m.addr == addr) {
+                        return String::new();
+                    }
                     let memory: Vec<u32> = (0..len.div_ceil(4))
                         .map(|i| self.word(addr + 4 * i))
                         .collect();
@@ -2343,6 +2433,10 @@ mod tests {
 
     fn n4() -> Vec<Write> {
         parse_writes("enabled=1\nwm=0x847ed604:0x15\nwm=0x84f93008:0x140\n").writes
+    }
+
+    fn n6_latency_profile() -> Vec<Write> {
+        parse_writes(n6_latency_config()).writes
     }
 
     fn n6_latency_config() -> &'static str {
@@ -3152,7 +3246,7 @@ wm=0x8418ff08:0x1
             rb_sessions += 1;
             assert!(rb_sessions <= 5);
         }
-        assert_eq!(control2.state(), State::Failed);
+        assert_eq!(control2.state(), State::Retrying);
         assert!(rb_line.unwrap().contains("flags read back 0"));
         for w in &n6_writes {
             assert_eq!(
@@ -3266,7 +3360,7 @@ wm=0x8418ff08:0x1
     }
 
     #[test]
-    fn three_failures_write_zero_and_stop() {
+    fn three_failures_roll_back_then_write_again_after_a_backoff() {
         let mut control = Control::new(n4(), 0);
         let mut fake = Fake::new(true);
         fake.broken = true;
@@ -3289,13 +3383,23 @@ wm=0x8418ff08:0x1
         // The broken writes never changed RAM, so the zeros read back as 0.
         let line = drive(&mut control, &mut fake, now).unwrap();
         assert!(line.contains("flags read back 0"), "{line}");
-        assert_eq!(control.state(), State::Failed);
-        assert_eq!(control.due(now + 100_000), None);
-        assert!(control.status(now).starts_with("state=failed\n"));
+        assert!(line.contains(&format!("again in {BACKOFF_FIRST} s")), "{line}");
+        assert_eq!(control.state(), State::Retrying);
+        assert!(control.status(now).starts_with("state=retrying\n"));
+        // The off values are where it waits, not where it stops.
+        assert_eq!(control.due(now + BACKOFF_FIRST - 1), None);
+        fake.broken = false;
+        let plan = control.due(now + BACKOFF_FIRST).unwrap();
+        assert_eq!(plan.session, Session::Apply);
+        assert_eq!(plan.writes, write_order(&n4()));
+        let line = drive(&mut control, &mut fake, now + BACKOFF_FIRST).unwrap();
+        assert!(line.contains("written and read back"), "{line}");
+        assert_eq!(control.state(), State::Applied);
+        assert_eq!(fake.ram.get(&FLAGS_ADDR), Some(&0x15));
     }
 
     #[test]
-    fn a_silent_console_gives_up_without_writing() {
+    fn a_silent_console_costs_no_attempt_and_is_tried_again_later() {
         let mut control = Control::new(n4(), 0);
         // `quit 0` would fix a console in logging mode; this one is dead.
         struct Dead;
@@ -3305,20 +3409,148 @@ wm=0x8418ff08:0x1
             }
         }
         let mut now = 0;
-        for _ in 0..MAX_ATTEMPTS {
+        let mut waits = Vec::new();
+        let mut lines = 0;
+        for _ in 0..12 {
             let plan = control.due(now).unwrap();
             let (outcome, sent) = run_plan(&mut Dead, &plan);
             assert_eq!(outcome, Outcome::NoReply);
             assert!(!sent);
-            control.finished(now, &plan, &outcome, sent);
-            now += RETRY_SECS;
+            lines += usize::from(control.finished(now, &plan, &outcome, sent).is_some());
+            let mut next = now;
+            while control.due(next).is_none() {
+                next += 1;
+            }
+            waits.push(next - now);
+            now = next;
         }
-        assert_eq!(control.state(), State::Failed);
-        assert!(
-            control.detail().contains("nothing was written"),
-            "{}",
-            control.detail()
-        );
+        // Never a rollback or a give-up: the same session, later each time.
+        assert_eq!(control.state(), State::Pending);
+        assert_eq!(control.status(now).lines().nth(3), Some("attempts=0"));
+        assert_eq!(waits[..7], [15, 30, 60, 120, 240, 480, 600]);
+        assert!(waits.iter().all(|w| *w <= MAGIC_MAX));
+        // One log line for the whole silent stretch.
+        assert_eq!(lines, 1);
+        assert!(control.detail().contains("nothing was written"), "{}", control.detail());
+        // A console that answers again gets the words written.
+        let mut fake = Fake::new(true);
+        let line = drive(&mut control, &mut fake, now).unwrap();
+        assert!(line.contains("written and read back"), "{line}");
+        assert_eq!(control.state(), State::Applied);
+    }
+
+    /// Run `control` on a simulated clock from `start` to `end`: each session
+    /// when it falls due, after `set` has put the console in its state for
+    /// that moment. A session takes `SESSION_TOOK` seconds, as on the unit.
+    fn run_clock(
+        control: &mut Control,
+        fake: &mut Fake,
+        start: u64,
+        end: u64,
+        mut set: impl FnMut(&mut Fake, u64),
+    ) -> Vec<(u64, Session, Outcome)> {
+        const SESSION_TOOK: u64 = 30;
+        let mut ran = Vec::new();
+        let mut now = start;
+        while now <= end {
+            let Some(plan) = control.due(now) else {
+                now += 1;
+                continue;
+            };
+            set(fake, now);
+            let (outcome, sent) = run_plan(fake, &plan);
+            control.finished(now, &plan, &outcome, sent);
+            ran.push((now, plan.session, outcome));
+            now += SESSION_TOOK;
+        }
+        ran
+    }
+
+    /// The bench case of 2026-11-25: another console client made our replies
+    /// come back cut short. Writes land, but no read-back arrives, so every
+    /// apply and every rollback is unverified while the console is busy.
+    #[test]
+    fn a_console_busy_for_ten_minutes_then_free_gets_the_words_back_by_itself() {
+        const BUSY_UNTIL: u64 = 600;
+        let mut control = Control::new(n6_latency_profile(), 0);
+        let mut fake = Fake::all_magics();
+        let cut = |fake: &mut Fake, now: u64| fake.cut_reads = now < BUSY_UNTIL;
+        let busy = run_clock(&mut control, &mut fake, 0, BUSY_UNTIL - 1, cut);
+        // It tried, rolled back, and backed off rather than hammering the console.
+        assert!(busy.iter().all(|(_, _, outcome)| matches!(outcome, Outcome::Unverified { .. })), "{busy:?}");
+        assert!(busy.len() <= 10, "{} sessions while busy: {busy:?}", busy.len());
+        assert!(busy.iter().filter(|(at, _, _)| *at >= BUSY_UNTIL / 2).count() <= 2, "{busy:?}");
+        assert!(matches!(control.state(), State::Zeroing | State::Retrying), "{:?}", control.state());
+        // Once the console is free, the rollback reads back, and after the
+        // backoff the wanted words go back in, with no operator and no restart.
+        let after = run_clock(&mut control, &mut fake, BUSY_UNTIL, BUSY_UNTIL + 2 * BACKOFF_MAX, cut);
+        assert_eq!(control.state(), State::Applied, "{after:?}");
+        for w in n6_latency_profile() {
+            assert_eq!(fake.ram.get(&w.addr), Some(&w.value), "0x{:08x}", w.addr);
+        }
+        let back = after.iter().position(|(_, s, o)| *s == Session::Check && matches!(o, Outcome::Verified { .. }));
+        let applied_at = after[back.unwrap()].0 - CHECK_EVERY;
+        assert!(applied_at < BUSY_UNTIL + BACKOFF_MAX, "words back only at {applied_at} s");
+        // And it stays applied: read-only checks, every one verified.
+        assert!(after.iter().filter(|(at, _, _)| *at > applied_at).all(|(_, s, o)| *s == Session::Check
+            && matches!(o, Outcome::Verified { .. })));
+    }
+
+    /// A console that answers nothing for ten minutes while the words are
+    /// applied: nothing went out, so nothing is rolled back.
+    #[test]
+    fn a_silent_console_for_ten_minutes_leaves_applied_words_alone() {
+        let mut control = Control::new(n4(), 0);
+        let mut fake = Fake::new(true);
+        drive(&mut control, &mut fake, 0);
+        assert_eq!(control.state(), State::Applied);
+        let writes_before = wm_lines(&fake).len();
+        let start = CHECK_EVERY;
+        let dead = |fake: &mut Fake, now: u64| fake.dead = now < start + 600;
+        let ran = run_clock(&mut control, &mut fake, start, start + 600 + 2 * MAGIC_MAX, dead);
+        assert!(ran.iter().any(|(_, _, o)| *o == Outcome::NoReply));
+        assert_eq!(control.state(), State::Applied, "{ran:?}");
+        // No rollback, and no write at all: the words never changed.
+        assert_eq!(wm_lines(&fake).len(), writes_before);
+        assert_eq!(fake.ram.get(&FLAGS_ADDR), Some(&0x15));
+    }
+
+    #[test]
+    fn the_backoff_doubles_to_its_cap_and_starts_again_once_the_words_read_back() {
+        // The apply sessions that failed on `FLAGS_ADDR` (rollbacks verify).
+        fn failed_applies(ran: &[(u64, Session, Outcome)]) -> Vec<u64> {
+            ran.iter()
+                .filter(|(_, _, o)| matches!(o, Outcome::Unverified { addr, .. } if *addr == FLAGS_ADDR))
+                .map(|(at, _, _)| *at)
+                .collect()
+        }
+        let gaps = |at: &[u64]| at.windows(2).map(|w| w[1] - w[0]).collect::<Vec<u64>>();
+        let mut control = Control::new(n4(), 0);
+        let mut fake = Fake::new(true);
+        // A word that never sticks, with read-backs that do arrive.
+        fake.broken_addr = Some(FLAGS_ADDR);
+        let ran = run_clock(&mut control, &mut fake, 0, 6 * BACKOFF_MAX, |_, _| {});
+        assert_ne!(control.state(), State::Applied);
+        let gaps_seen = gaps(&failed_applies(&ran));
+        // Three tries (due 20 s apart; a session takes 30 s here), then one
+        // round per backoff: the rollback's 30 s session plus 300, 600, 1200,
+        // 2400 and 3600 s, held at the cap from then on.
+        assert_eq!(gaps_seen[..2], [30, 30], "{gaps_seen:?}");
+        let rounds: Vec<u64> = gaps_seen[2..].iter().map(|g| g - 30).collect();
+        assert_eq!(rounds[..5], [300, 600, 1200, 2400, 3600], "{gaps_seen:?}");
+        assert!(rounds[5..].iter().all(|r| *r == BACKOFF_MAX), "{rounds:?}");
+        // Every failed round ends at the off values, read back.
+        assert!(control.state() == State::Retrying, "{:?}", control.state());
+        assert_eq!(fake.ram.get(&HOLD_ADDR), Some(&0));
+        // Fixed: the next round writes it, and a later failure starts the
+        // backoff again from BACKOFF_FIRST.
+        fake.broken_addr = None;
+        let fixed = run_clock(&mut control, &mut fake, 6 * BACKOFF_MAX + 1, 8 * BACKOFF_MAX, |_, _| {});
+        assert_eq!(control.state(), State::Applied, "{fixed:?}");
+        fake.broken_addr = Some(FLAGS_ADDR);
+        fake.ram.insert(FLAGS_ADDR, 0);
+        let again = run_clock(&mut control, &mut fake, 8 * BACKOFF_MAX + 1, 9 * BACKOFF_MAX, |_, _| {});
+        assert_eq!(gaps(&failed_applies(&again))[..3], [30, 30, 30 + BACKOFF_FIRST], "{again:?}");
     }
 
     #[test]
@@ -3345,7 +3577,7 @@ wm=0x8418ff08:0x1
         assert!(fake.ram.is_empty());
         // Even a failed control starts again after a restart.
         let mut failed = Control::new(n4(), 0);
-        failed.state = State::Failed;
+        failed.state = State::Retrying;
         failed.modem_restarted(5);
         assert_eq!(
             failed.due(5 + AFTER_RESTART).map(|p| p.session),

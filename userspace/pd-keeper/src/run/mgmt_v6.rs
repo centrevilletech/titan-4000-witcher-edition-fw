@@ -52,9 +52,11 @@ impl Keeper {
             None => return,
         };
         if assigned.is_some() && assigned != cached {
-            let _ = fs::write(
-                state_dir().join("mgmt-iid.txt"),
-                format!("{}\n", iid.token()),
+            let path = state_dir().join("mgmt-iid.txt");
+            let _ = crate::files::write_durably(
+                &path,
+                &path.with_extension("tmp"),
+                format!("{}\n", iid.token()).as_bytes(),
             );
         }
         let addrs = proc_if_inet6_addrs(mgmt::MGMT_DEV);
