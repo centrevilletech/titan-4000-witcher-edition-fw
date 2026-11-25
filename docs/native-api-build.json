@@ -1,14 +1,14 @@
 {
   "component": "titan-api",
-  "sha256": "c3c1425e604658818b5b1fbb92e6ac8c369cb416634779ebb7b2fa5346d0f188",
+  "sha256": "af3b032ed7d46ee9f802b499793f6e033ba8f68cfd261828b7cc75038a458683",
   "source_repository": "https://github.com/theedgemile/titan-4000-ops",
-  "source_commit": "6cced0159262be1801190edd84582d2ef708f326",
+  "source_commit": "72b60960096b3cf17e70031ecc01a1ea97d63117",
   "source_directory": "backend",
   "target": "armv7-unknown-linux-musleabi",
   "rustc": "1.99.0 (b940084d7 2026-09-28)",
   "zig": "0.14.1",
   "cargo_lock_sha256": "fb1fc9397950c8e2a215f8862a11444915fc779144808e60b5d5f6ae7e2e2030",
   "command": "cargo zigbuild --locked --release --target armv7-unknown-linux-musleabi -p titan-api (cargo-zigbuild 0.20.1, GitHub-hosted runner)",
-  "validation": "cargo fmt check; clippy for titan-api and titan-pd-model with warnings denied; 171 titan-api unit tests (one preexisting ignored), 9 integration tests and the titan-pd-model tests passed, with the Titan's poll backend",
-  "hardware_validation": "Not yet flashed; host regression tests and ARM cross-build only. Adds the Latency settings section for v1.0.17."
+  "validation": "cargo fmt check; clippy for titan-api and titan-pd-model with warnings denied; 173 titan-api unit tests (one preexisting ignored), 9 integration tests and 46 titan-pd-model tests passed, with the Titan's poll backend",
+  "hardware_validation": "Not yet flashed; host regression tests and ARM cross-build only. Adds the Latency settings section for v1.0.17, with the modem image's rollback state and its Retry action."
 }
