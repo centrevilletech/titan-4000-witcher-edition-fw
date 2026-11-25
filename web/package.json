@@ -10,7 +10,7 @@
     "test": "npm run test:json && npm run test:preview && npm run test:rust-device",
     "build:device": "vite build --mode device",
     "build:rust-device": "vite build --mode rust-device",
-    "test:json": "node --test tests/json-client.test.mjs tests/settings-model.test.mjs tests/firmware-reconnect.test.mjs tests/align-*.test.mjs",
+    "test:json": "node --test tests/json-client.test.mjs tests/settings-model.test.mjs tests/firmware-reconnect.test.mjs tests/cpas.test.mjs tests/align-*.test.mjs",
     "test:rust-device": "node tests/rust-device.mjs && node tests/rust-settings.mjs && node tests/dashboard.mjs && node tests/firmware-flow.mjs",
     "test:preview": "node tests/preview-suite.mjs",
     "test:version": "node tests/version.mjs",

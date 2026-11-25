@@ -165,8 +165,10 @@ cell in view the image simply waits, and when stock firmware finds no
 network either the unit goes straight back onto the image. The image stays
 quarantined only after two failures in a row where stock firmware answered,
 until **Retry** under **Network → Latency** or a new firmware. Every reboot
-the keeper starts waits out the SAS CPAS window, and there are at most four
-a day. See [latency features](docs/latency-switches.md),
+the keeper starts waits out the SAS CPAS window (06:45–10:15 UTC), and there
+are at most four a day. Inside that window the web UI warns before a restart,
+a firmware or SAS action, or a radio change: the SAS issues no new grants
+until it ends. See [latency features](docs/latency-switches.md),
 the [boot-time loader](docs/tk-boot-loader.md), the
 [download clamp](docs/download-clamp.md) and the [fast path](docs/fast-path.md).
 
@@ -183,7 +185,9 @@ The native SSH service rejects connections arriving over the customer LTE bearer
 Browser recovery is at `http://DEVICE_IP:8081/`, using the administrator
 password. It can open the factory desktop UI or retry Witcher while Linux
 and networking are working. If HTTPS initialization fails, HTTP setup remains
-available. See [first-boot HTTPS](docs/first-boot-https.md).
+available. If the Witcher web service stops, the factory UI serves while it
+is retried by itself, and a damaged seed or TLS identity is replaced. See
+[first-boot HTTPS](docs/first-boot-https.md).
 
 To return to stock, upload a compatible vendor `.prg` through
 **System → Firmware**. Select the older-image option for an intended downgrade.

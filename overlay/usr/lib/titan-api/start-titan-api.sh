@@ -163,10 +163,11 @@ if [ "$profile" = production ]; then
  }
  # The binary consumes and durably replaces a private per-unit seed; never ship one in a bundle.
  # A power loss before publication can leave an unused replacement file.
- # Preserve it privately for diagnosis; never credit that uncommitted seed.
- if [ -e /mnt/titan-api/seed.next ]; then
-  [ -f /mnt/titan-api/seed.next ] && [ ! -L /mnt/titan-api/seed.next ] || exit 77
-  mv /mnt/titan-api/seed.next "/mnt/titan-api/.interrupted-seed-$$"
+ # Never credit that uncommitted seed; keep the last one privately for
+ # diagnosis, in one slot (earlier builds kept every one).
+ if [ -e /mnt/titan-api/seed.next ] || [ -L /mnt/titan-api/seed.next ]; then
+  rm -rf /mnt/titan-api/.interrupted-seed /mnt/titan-api/.interrupted-seed-*
+  mv /mnt/titan-api/seed.next /mnt/titan-api/.interrupted-seed
   sync
  fi
  "$bundle/titan-api" --prepare-boot-entropy

@@ -146,7 +146,7 @@ def main():
     for helper, digest in (
         ('titan-device-helper','717a3514a66c9b4652aac904284e127c9085c51bab2d30055609d1f041924a71'),
         ('titan-nvram','adb7c44663d54a0eca5f63a862a5ec5dc6119e42cd62a67e904d4654472a2aab'),
-        ('titan-maintenance','ffec38ba88cbd58dffa6faccb246b4ff0a935ce07bff813a694090fde48de75c'),
+        ('titan-maintenance','c2f8ca884b9ce8dfa055efcf58bf91037c3c909522b23e03152538f9fea95cfd'),
         ('titan-seed-rng','560b690c716d1ef0449728e8e331d88d5925327457faaa7e4766b502f85c02ec'),
     ):
         path=os.path.join(d,'usr/lib/titan-api',helper)

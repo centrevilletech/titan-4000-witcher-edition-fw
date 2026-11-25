@@ -9,9 +9,12 @@
 #   stop | status | restart
 #
 # Exactly one web server is left running on every path: a native start that is
-# not healthy falls back to the vendor server. The vendor enable flags are only
-# changed in the native RAM cache; this script never commits configuration, never
-# writes flash, and never touches firmware banks.
+# not healthy falls back to the vendor server. That fallback is never for the
+# rest of the boot: the boot loop tries the native service again after a
+# minute, then doubling to half an hour, until it runs. Only an operator's
+# choice (the vendor command, or use-vendor-ui) ends the retries. The vendor
+# enable flags are only changed in the native RAM cache; this script never
+# commits configuration, never writes flash, and never touches firmware banks.
 set -u
 umask 077
 bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
@@ -36,6 +39,15 @@ shell_control=/etc/init.d/titan-sshd
 state_control=/etc/init.d/witcher-state
 setup_pid=/tmp/witcher-setup.pid
 boot_pid=/tmp/witcher-web-boot.pid
+seed=/mnt/titan-api/seed
+# Retry delays for the native service, in seconds.
+retry_first=60
+retry_cap=1800
+# A native service that ran this long before it stopped restarts at once.
+stable_secs=3600
+# Health answers that may fail in a row before a restart: one slow answer
+# under load is not a failed service.
+health_misses=3
 
 [ "$(id -u)" = 0 ] || { echo 'Service control requires root.' >&2; exit 77; }
 
@@ -95,12 +107,72 @@ start_vendor() {
  [ -n "$(vendor_pids)" ] || { note 'Vendor web server did not start.'; return 1; }
  return 0
 }
+running() { /bin/sh "$launcher" status > /dev/null 2>&1; }
 healthy() {
- /bin/sh "$launcher" status > /dev/null 2>&1 || return 1
+ running || return 1
  case "$(wget -q -T 5 -O - "$health_url" 2> /dev/null)" in
   *'"service":"titan-api"'*) return 0;;
  esac
  return 1
+}
+# A child that has exited but not been reaped still answers kill -0.
+alive() { kill -0 "$1" 2> /dev/null && ! grep -q '^State:.*Z' "/proc/$1/status" 2> /dev/null; }
+uptime_s() { cut -d. -f1 /proc/uptime; }
+next_delay() {
+ if [ "$1" -lt "$retry_first" ]; then echo "$retry_first"
+ elif [ $(($1 * 2)) -ge "$retry_cap" ]; then echo "$retry_cap"
+ else echo $(($1 * 2)); fi
+}
+# Sleep $1 seconds in 10 s steps; false as soon as the operator marker appears.
+pause() {
+ left=$1
+ while [ "$left" -gt 0 ]; do
+  [ ! -e "$vendor_marker" ] || return 1
+  sleep 10
+  left=$((left - 10))
+ done
+ [ ! -e "$vendor_marker" ]
+}
+# The boot seed, which the launcher's titan-api consumes and replaces. titan-api
+# moves a seed that fails its checks aside; a new one is made here before the
+# next start. Something that is not a regular file is moved aside here.
+seed_ready() {
+ [ ! -f "$seed" ] || [ -L "$seed" ] || return 0
+ if [ -e "$seed" ] || [ -L "$seed" ]; then
+  rm -rf "${seed%/*}/.invalid-seed"
+  mv "$seed" "${seed%/*}/.invalid-seed" || return 1
+  note 'The boot seed was not a regular file; moved it aside.'
+ fi
+ note 'Preparing per-unit entropy for automatic HTTPS startup.'
+ if "$bundle/witcher-firstboot" bootstrap >> "$log" 2>&1; then
+  note 'Autonomous entropy ready; starting the HTTPS login.'
+  return 0
+ fi
+ note 'Autonomous entropy failed; trusted-network browser setup remains available.'
+ return 1
+}
+# No seed, and the autonomous one failed: the browser setup page takes port 80
+# until an operator completes it, or a later autonomous seed works (no operator
+# may ever come). True once a seed exists.
+browser_setup() {
+ stop_vendor || return 1
+ # Recovery must be able to select the factory interface during setup.
+ unlock
+ "$bundle/witcher-firstboot" setup >> "$log" 2>&1 &
+ pid=$!
+ echo "$pid" > "$setup_pid"
+ setup_delay=$retry_first
+ while alive "$pid"; do
+  pause "$setup_delay" || break
+  alive "$pid" || break
+  if seed_ready; then note 'Autonomous entropy ready; closing browser setup.'; break; fi
+  setup_delay=$(next_delay "$setup_delay")
+ done
+ alive "$pid" && kill "$pid" 2> /dev/null
+ wait "$pid"
+ rm -f "$setup_pid"
+ relock
+ [ -f "$seed" ] && [ ! -e "$vendor_marker" ]
 }
 stop_setup() {
  pid=$(cat "$setup_pid" 2>/dev/null)
@@ -126,7 +198,8 @@ stop_boot() {
 take_over() {
  attempt=1
  while [ "$attempt" -le 3 ]; do
-  if stop_vendor && /bin/sh "$launcher" start production >> "$log" 2>&1; then
+  # seed_ready makes a new seed when titan-api moved a bad one aside.
+  if seed_ready && stop_vendor && /bin/sh "$launcher" start production >> "$log" 2>&1; then
    sleep 1
    if healthy; then note "Native web service active (attempt $attempt)."; return 0; fi
   fi
@@ -135,15 +208,63 @@ take_over() {
   attempt=$((attempt + 1))
   sleep 5
  done
- note 'Native web service is not healthy; restoring the vendor web server.'
- start_vendor
  return 1
+}
+# One try at the native service, under the lock. 0: it runs. 2: an operator
+# chose the vendor server. 1: not now; the caller serves the factory interface
+# and tries again later.
+native_once() {
+ if ! /bin/sh "$state_control" mount >> "$log" 2>&1; then
+  note 'Persistent state is unavailable; the factory interface serves until it mounts.'
+  return 1
+ fi
+ [ ! -e "$vendor_marker" ] || return 2
+ if ! seed_ready && ! browser_setup; then
+  [ ! -e "$vendor_marker" ] || return 2
+  note 'Setup stopped without a boot seed.'
+  return 1
+ fi
+ take_over
+}
+# Watch the running native service; return when it has to be restarted.
+supervise() {
+ health_ticks=0
+ misses=0
+ while :; do
+  sleep 10
+  [ ! -e "$vendor_marker" ] || exit 0
+  health_ticks=$((health_ticks + 1))
+  # The PID check is a fast hint only: a missing process is confirmed at
+  # once, and everything once a minute.
+  for service in api broker collector; do
+   if ! read -r pid < "/tmp/witcher-api/$service.pid"; then health_ticks=6; break; fi
+   case "$pid" in ''|*[!0-9]*) health_ticks=6; break;; esac
+   kill -0 "$pid" 2>/dev/null || { health_ticks=6; break; }
+  done
+  if [ "$health_ticks" -ge 6 ]; then
+   health_ticks=0
+   if healthy; then
+    misses=0
+   elif ! running; then
+    note 'Native service stopped; starting it again.'
+    return 0
+   else
+    misses=$((misses + 1))
+    note "Native service did not answer its health check ($misses of $health_misses)."
+    [ "$misses" -lt "$health_misses" ] || return 0
+   fi
+  fi
+  late=$(vendor_pids)
+  [ -z "$late" ] || { note "Stopping late vendor web server: $late"; stop_vendor; }
+ done
 }
 use_vendor() {
  /bin/sh "$launcher" stop >> "$log" 2>&1 || note 'Native service did not stop cleanly.'
  start_vendor
 }
 unlock() { rm -rf "$lock"; trap - EXIT HUP INT TERM; }
+# The boot loop waits for a command that holds the lock, rather than end.
+relock() { until locked 2> /dev/null; do sleep 5; done; }
 locked() {
  # mkdir is atomic; a lock whose owner is gone is taken over once.
  if ! mkdir "$lock" 2> /dev/null; then
@@ -179,10 +300,9 @@ case "${1:-}" in
   # Wait for the configuration cache, not LTE attachment or modem identity.
   waited=0
   until cache_ready; do
-   if [ "$waited" -ge 300 ]; then
+   if [ "$waited" = 300 ]; then
     # Without the cache nothing here may touch the enable flags either.
-    note 'Configuration cache is not ready; vendor web server left as it is.'
-    exit 1
+    note 'Configuration cache is not ready; vendor web server left as it is. Still waiting.'
    fi
    sleep 5
    waited=$((waited + 5))
@@ -193,68 +313,32 @@ case "${1:-}" in
    flag "$setting" 1 || note "Cannot enable $setting in the vendor cache."
   done
   flag web_wl_filter 0 || note 'Cannot clear vendor web source filtering.'
-  # The shell service normally mounts it first; this start must not race ahead.
-  if ! /bin/sh "$state_control" mount >> "$log" 2>&1; then
-   note 'Persistent state is unavailable; keeping factory desktop recovery.'
-   start_vendor
-   exit 1
-  fi
-  if [ -e "$vendor_marker" ]; then
-   note "Vendor web server kept: $vendor_marker exists."
-   start_vendor
-   exit $?
-  fi
-  if [ ! -e /mnt/titan-api/seed ] && [ ! -L /mnt/titan-api/seed ]; then
-   note 'Preparing per-unit entropy for automatic HTTPS startup.'
-   if "$bundle/witcher-firstboot" bootstrap >> "$log" 2>&1; then
-    note 'Autonomous entropy ready; starting the HTTPS login.'
-   else
-    note 'Autonomous entropy failed; trusted-network browser setup remains available.'
-   fi
-  fi
-  if [ ! -f /mnt/titan-api/seed ]; then
-   stop_vendor || { start_vendor; exit 1; }
-   # Recovery must be able to select the factory interface during setup.
-   unlock
-   "$bundle/witcher-firstboot" setup >> "$log" 2>&1 &
-   pid=$!
-   echo "$pid" > "$setup_pid"
-   wait "$pid"
-   result=$?
-   rm -f "$setup_pid"
-   locked || exit $?
-   if [ "$result" != 0 ] || [ -e "$vendor_marker" ]; then
-    note 'Setup stopped; restoring factory desktop recovery.'
-    start_vendor
-    exit 1
-   fi
-  fi
-  take_over || exit 1
-  unlock
-  # rcinit may still act on enable flags it read before the takeover.
-  health_ticks=0
+  delay=0
   while :; do
-   sleep 10
-   [ ! -e "$vendor_marker" ] || exit 0
-   health_ticks=$((health_ticks + 1))
-   # The PID check is a fast hint only. Confirm failures with the full
-   # identity and HTTP checks before changing which server is running.
-   for service in api broker collector; do
-    if ! read -r pid < "/tmp/witcher-api/$service.pid"; then health_ticks=6; break; fi
-    case "$pid" in ''|*[!0-9]*) health_ticks=6; break;; esac
-    kill -0 "$pid" 2>/dev/null || { health_ticks=6; break; }
-   done
-   if [ "$health_ticks" -ge 6 ]; then
-    health_ticks=0
-    if ! healthy; then
-     locked || exit $?
-     note 'Native service stopped; restoring factory desktop recovery.'
-     use_vendor
-     exit 1
-    fi
-   fi
-   late=$(vendor_pids)
-   [ -z "$late" ] || { note "Stopping late vendor web server: $late"; stop_vendor; }
+   native_once
+   case $? in
+    0)
+     started=$(uptime_s)
+     unlock
+     # rcinit may still act on enable flags it read before the takeover.
+     supervise
+     relock
+     /bin/sh "$launcher" stop >> "$log" 2>&1
+     # A service that ran long before it stopped starts again at once; one
+     # that keeps stopping waits longer each time.
+     if [ $(($(uptime_s) - started)) -ge "$stable_secs" ]; then delay=0; else delay=$(next_delay "$delay"); fi;;
+    2)
+     note "Vendor web server kept: $vendor_marker exists."
+     start_vendor
+     exit $?;;
+    *) delay=$(next_delay "$delay");;
+   esac
+   [ "$delay" -gt 0 ] || continue
+   note "The factory interface serves; Witcher's web service is tried again in $delay s."
+   start_vendor || note 'Factory interface did not start.'
+   unlock
+   pause "$delay" || exit 0
+   relock
   done
   ;;
  native|restart)
@@ -287,6 +371,7 @@ case "${1:-}" in
   sleep "$2"
   [ ! -e "$keep" ] || exit 0
   rm -f "$guard_pid"
+  stop_boot
   locked || exit $?
   note 'Guard expired; restoring the vendor web server.'
   use_vendor;;

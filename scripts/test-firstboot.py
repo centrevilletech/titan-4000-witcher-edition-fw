@@ -53,7 +53,11 @@ class FirstBootTests(unittest.TestCase):
             'id': 'echo 0', 'chown': 'exit 0', 'sync': 'exit 0', 'sleep': 'exit 0',
             'ubimkvol': 'echo "$*" >> "$FIXTURE_ROOT/allocations"; mkdir -p "$FIXTURE_ROOT/sys/class/ubi/ubi1_1"; echo data > "$FIXTURE_ROOT/sys/class/ubi/ubi1_1/name"',
             'mount': '[ "${FAIL_MOUNT:-0}" = 0 ] || exit 1; echo "ubi1:data $FIXTURE_ROOT/mnt/titan-api ubifs rw 0 0" >> "$FIXTURE_ROOT/proc/mounts"',
-            'openssl': 'if [ "$1" = rand ]; then printf "%032x" $$; exit 0; fi; [ "$1" != req ] || echo generate >> "$FIXTURE_ROOT/tls-calls"; while [ "$#" -gt 0 ]; do case "$1" in -keyout) shift; echo private > "$1";; -out) shift; [ "${FAIL_CERT:-0}" = 0 ] || exit 1; echo certificate > "$1";; esac; shift; done',
+            'openssl': 'if [ "$1" = rand ]; then printf "%032x" $$; exit 0; fi; '
+                       # x509 -pubkey and pkey -pubout: one public key for the fixture's pair.
+                       'if [ "$1" = x509 ] || [ "$1" = pkey ]; then kind=$1; while [ "$#" -gt 0 ]; do [ "$1" != -in ] || { shift; in=$1; }; shift; done; '
+                       'case "$kind:$(cat "$in")" in x509:certificate|pkey:private) echo public-key; exit 0;; esac; exit 1; fi; '
+                       '[ "$1" != req ] || echo generate >> "$FIXTURE_ROOT/tls-calls"; while [ "$#" -gt 0 ]; do case "$1" in -keyout) shift; echo private > "$1";; -out) shift; [ "${FAIL_CERT:-0}" = 0 ] || exit 1; echo certificate > "$1";; esac; shift; done',
         }.items():
             path = self.write('bin/' + name, '#!/bin/sh\nset -eu\n' + source + '\n')
             path.chmod(0o755)
@@ -100,11 +104,35 @@ class FirstBootTests(unittest.TestCase):
             self.assertFalse((self.root/'allocations').exists())
             path.write_text(original)
 
-    def test_unmounted_legacy_state_is_not_hidden_or_overwritten(self):
-        old = self.write('mnt/titan-api/seed', 'old seed')
+    def test_stray_files_in_the_bare_mount_point_move_aside_and_the_volume_mounts(self):
+        # The recovery page once wrote its marker into the bare mount point
+        # while the volume was not mounted, and every later boot then refused
+        # to mount the volume (lanes L2 #9, L3 #8).
+        self.write('mnt/titan-api/use-vendor-ui', '')
+        self.write('mnt/titan-api/seed', 'old seed')
+        result = self.state()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stray = self.root/'mnt/titan-api.stray-1'
+        self.assertEqual((stray/'seed').read_text(), 'old seed', 'never hidden or deleted')
+        self.assertTrue((stray/'use-vendor-ui').exists())
+        self.assertIn('ubi1:data', (self.root/'proc/mounts').read_text())
+        self.assertEqual(len((self.root/'allocations').read_text().splitlines()), 1)
+        self.assertIn('moved what was in the unmounted', result.stderr)
+        # The next time it is found unmounted with something in it: stray-2.
+        mounts = self.root/'proc/mounts'
+        mounts.write_text(''.join(line + '\n' for line in mounts.read_text().splitlines() if 'ubi1:data' not in line))
+        self.write('mnt/titan-api/use-vendor-ui', '')
+        self.assertEqual(self.state().returncode, 0)
+        self.assertTrue((self.root/'mnt/titan-api.stray-2/use-vendor-ui').exists())
+        self.assertEqual((stray/'seed').read_text(), 'old seed')
+
+    def test_nothing_moves_from_under_another_mount(self):
+        self.write('mnt/titan-api/file', 'on another filesystem')
+        with open(self.root/'proc/mounts', 'a') as mounts:
+            mounts.write(f'tmpfs {self.root}/mnt/titan-api tmpfs ro 0 0\n')
         self.assertNotEqual(self.state().returncode, 0)
-        self.assertEqual(old.read_text(), 'old seed')
-        self.assertFalse((self.root/'allocations').exists())
+        self.assertTrue((self.root/'mnt/titan-api/file').exists())
+        self.assertFalse((self.root/'mnt/titan-api.stray-1').exists())
 
     def test_symlink_state_is_rejected(self):
         (self.root/'mnt/titan-api').symlink_to(self.root/'tmp', target_is_directory=True)
@@ -149,11 +177,47 @@ class FirstBootTests(unittest.TestCase):
         public_key = subprocess.check_output(['openssl', 'pkey', '-in', str(pair/'key.pem'), '-pubout'])
         self.assertEqual(public_cert, public_key)
 
-    def test_existing_incomplete_tls_is_preserved(self):
+    def test_an_incomplete_or_damaged_identity_is_kept_aside_and_replaced(self):
+        # One that failed a check used to keep the web service off on every
+        # boot (lane L3 #15).
         key = self.write('mnt/titan-api/tls/key.pem', 'existing private key')
-        self.assertNotEqual(self.tls().returncode, 0)
-        self.assertEqual(key.read_text(), 'existing private key')
+        result = self.tls()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tls = self.root/'mnt/titan-api/tls'
+        self.assertEqual((tls/'broken/key.pem').read_text(), 'existing private key')
+        self.assertFalse(key.exists())
+        self.assertTrue((tls/'current/cert.pem').is_file())
+        self.assertEqual((self.root/'tls-calls').read_text(), 'generate\n')
+        # A current identity whose key no longer matches: the same, and
+        # broken/ keeps only the last one.
+        (tls/'current/key.pem').write_text('garbage')
+        self.assertEqual(self.tls().returncode, 0)
+        self.assertEqual((tls/'broken/current/key.pem').read_text(), 'garbage')
+        self.assertFalse((tls/'broken/key.pem').exists())
+        self.assertEqual((self.root/'tls-calls').read_text(), 'generate\ngenerate\n')
+        self.assertEqual((tls/'current/key.pem').read_text(), 'private\n')
+
+    def test_a_broken_legacy_pair_never_hides_a_good_current_identity(self):
+        # The launcher reads the legacy pair whenever either file exists.
+        tls = self.root/'mnt/titan-api/tls'
+        self.write('mnt/titan-api/tls/cert.pem', 'damaged\n')
+        self.write('mnt/titan-api/tls/current/cert.pem', 'certificate\n')
+        self.write('mnt/titan-api/tls/current/key.pem', 'private\n')
+        self.assertEqual(self.tls().returncode, 0)
+        self.assertFalse((tls/'cert.pem').exists())
+        self.assertEqual((tls/'broken/cert.pem').read_text(), 'damaged\n')
+        self.assertEqual((tls/'current/key.pem').read_text(), 'private\n')
+        self.assertFalse((self.root/'tls-calls').exists(), 'the good identity is kept')
+
+    def test_a_good_identity_is_kept_and_its_modes_put_right(self):
+        tls = self.root/'mnt/titan-api/tls'
+        self.write('mnt/titan-api/tls/current/cert.pem', 'certificate\n')
+        key = self.write('mnt/titan-api/tls/current/key.pem', 'private\n')
+        key.chmod(0o644)
+        self.assertEqual(self.tls().returncode, 0)
         self.assertFalse((self.root/'tls-calls').exists())
+        self.assertEqual(key.stat().st_mode & 0o777, 0o600)
+        self.assertFalse((tls/'broken').exists())
 
 
 class LauncherOrderTests(unittest.TestCase):
@@ -202,6 +266,17 @@ class LauncherOrderTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)  # fixture stops at TLS
         self.assertEqual((self.root/'order').read_text().splitlines(), ['entropy', 'tls'])
 
+    def test_a_leftover_next_seed_is_kept_in_one_slot_and_never_blocks_the_start(self):
+        state = self.root/'mnt/titan-api'
+        for n in (11, 12):
+            self.write(f'mnt/titan-api/.interrupted-seed-{n}', 'old')
+        (state/'seed.next').mkdir()  # not even a regular file
+        result = subprocess.run(['sh', str(self.launcher), 'start', 'production'], env=self.env, capture_output=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)  # fixture stops at TLS
+        self.assertEqual((self.root/'order').read_text().splitlines(), ['entropy', 'tls'])
+        self.assertEqual([p.name for p in state.glob('.interrupted-seed*')], ['.interrupted-seed'])
+        self.assertFalse((state/'seed.next').exists())
+
     def test_explicit_serial_mismatch_still_fails(self):
         result = subprocess.run(['sh', str(self.launcher), 'start', 'production'], env=dict(self.env, TITAN_EXPECTED_SERIAL='OTHER'), capture_output=True, timeout=10)
         self.assertNotEqual(result.returncode, 0)
@@ -219,12 +294,24 @@ class ServiceControlTests(unittest.TestCase):
             (self.root/name).mkdir(parents=True, exist_ok=True)
         self.write('mnt/titan-api/seed', 'fixture only')
         self.write('tmp/nvram.cfg', 'ready')
+        # The launcher's start fails while fail-native exists. Like titan-api, it
+        # moves a seed reading "bad" aside and fails. Its status fails while
+        # dead exists (a crashed api, broker or collector).
         self.exe('usr/lib/titan-api/start-titan-api.sh', '''echo "$*" >> "$FIXTURE_ROOT/launcher-calls"
-case "$1" in start) [ "${FAIL_NATIVE:-0}" = 0 ];; *) exit 0;; esac''')
+case "$1" in
+ start)
+  [ "${FAIL_NATIVE:-0}" = 0 ] && [ ! -f "$FIXTURE_ROOT/fail-native" ] || exit 1
+  if [ "$(cat "$FIXTURE_ROOT/mnt/titan-api/seed")" = bad ]; then mv "$FIXTURE_ROOT/mnt/titan-api/seed" "$FIXTURE_ROOT/mnt/titan-api/.invalid-seed"; exit 1; fi;;
+ status) [ ! -f "$FIXTURE_ROOT/dead" ];;
+ *) exit 0;;
+esac''')
         self.exe('usr/lib/titan-api/titan-nvram', 'cat >/dev/null')
-        for name in ('witcher-state', 'witcher-recovery-files', 'titan-sshd', 'titan-pd-keeper'):
+        for name in ('witcher-recovery-files', 'titan-sshd', 'titan-pd-keeper'):
             self.exe('etc/init.d/' + name, 'echo "${0##*/} $*" >> "$FIXTURE_ROOT/service-calls"')
-        self.exe('bin/wget', '[ ! -f "$FIXTURE_ROOT/fail-health" ] || exit 1; echo \'{"service":"titan-api"}\'')
+        # The state mount fails while fail-mount exists.
+        self.exe('etc/init.d/witcher-state', 'echo "${0##*/} $*" >> "$FIXTURE_ROOT/service-calls"; [ ! -f "$FIXTURE_ROOT/fail-mount" ]')
+        # One failed answer with fail-health-once, every one with fail-health.
+        self.exe('bin/wget', '[ ! -f "$FIXTURE_ROOT/fail-health" ] || exit 1; if [ -f "$FIXTURE_ROOT/fail-health-once" ]; then rm "$FIXTURE_ROOT/fail-health-once"; exit 1; fi; echo \'{"service":"titan-api"}\'')
         self.exe('bin/pidof', '[ ! -f "$FIXTURE_ROOT/vendor.pid" ] || cat "$FIXTURE_ROOT/vendor.pid"')
         # Real private child process, so /proc executable identity and signals are tested.
         source = self.write('vendor.c', '''#include <stdio.h>
@@ -259,12 +346,24 @@ FILE *f=fopen(path,"w"); if(!f)return 1;fprintf(f,"%d",getpid());fclose(f);for(;
         self.processes.append(process)
         return process
 
-    def wait_for(self, predicate):
-        end = time.monotonic() + 5
+    def wait_for(self, predicate, seconds=5):
+        end = time.monotonic() + seconds
         while time.monotonic() < end:
             if predicate(): return
             time.sleep(0.02)
         self.fail('Service control did not reach the expected state')
+
+    def log(self):
+        path = self.root/'tmp/titan-api-boot.log'
+        return path.read_text() if path.exists() else ''
+
+    def starts(self):
+        path = self.root/'launcher-calls'
+        return path.read_text().splitlines().count('start production') if path.exists() else 0
+
+    def vendor_running(self):
+        pid = self.root/'vendor.pid'
+        return pid.exists() and Path(f'/proc/{pid.read_text()}/exe').exists()
 
     def test_autonomous_seed_skips_browser_setup(self):
         (self.root/'mnt/titan-api/seed').unlink()
@@ -274,31 +373,95 @@ FILE *f=fopen(path,"w"); if(!f)return 1;fprintf(f,"%d",getpid());fclose(f);for(;
         self.assertIsNone(process.poll())
         self.assertEqual((self.root/'firstboot-calls').read_text().splitlines(), ['bootstrap'])
 
-    def test_failed_autonomous_seed_keeps_browser_fallback(self):
+    def test_failed_autonomous_seed_keeps_browser_fallback_and_tries_again(self):
+        # The setup page waits for an operator; no operator may ever come, so
+        # the autonomous seed is tried again meanwhile (lanes L2 #15, L3 #19).
         (self.root/'mnt/titan-api/seed').unlink()
-        self.exe('usr/lib/titan-api/witcher-firstboot', 'echo "$1" >> "$FIXTURE_ROOT/firstboot-calls"; [ "$1" != bootstrap ] || exit 1; exit 1')
+        self.exe('usr/lib/titan-api/witcher-firstboot', '''echo "$1" >> "$FIXTURE_ROOT/firstboot-calls"
+if [ "$1" = bootstrap ]; then [ -f "$FIXTURE_ROOT/entropy-ok" ] || exit 1; echo seed > "$FIXTURE_ROOT/mnt/titan-api/seed"; exit 0; fi
+while :; do /bin/sleep 1; done''')
         process = self.launch()
-        self.assertEqual(process.wait(timeout=5), 1)
-        self.assertEqual((self.root/'firstboot-calls').read_text().splitlines(), ['bootstrap', 'setup'])
-        self.assertFalse((self.root/'mnt/titan-api/seed').exists())
-        self.wait_for(lambda: (self.root/'vendor.pid').exists())
+        calls = lambda: (self.root/'firstboot-calls').read_text().splitlines() if (self.root/'firstboot-calls').exists() else []
+        self.wait_for(lambda: calls()[:2] == ['bootstrap', 'setup'])
+        self.wait_for(lambda: calls().count('bootstrap') >= 3)
+        self.assertEqual(calls().count('setup'), 1, 'one setup page, retried underneath')
+        self.assertIsNone(process.poll())
+        self.write('entropy-ok', '')
+        self.wait_for(lambda: 'Native web service active' in self.log())
+        self.assertIn('closing browser setup', self.log())
+        self.assertFalse((self.root/'tmp/witcher-setup.pid').exists())
 
-    def test_failed_native_start_restores_factory_server(self):
-        process = self.launch(FAIL_NATIVE='1')
-        self.assertEqual(process.wait(timeout=5), 1)
-        self.wait_for(lambda: (self.root/'vendor.pid').exists())
-        calls = (self.root/'launcher-calls').read_text().splitlines()
-        self.assertEqual(calls.count('start production'), 3)
+    def test_a_failed_native_start_serves_the_factory_interface_and_tries_again(self):
+        # Three failed starts used to mean the vendor UI for the rest of the
+        # boot (lanes L2 #6, L3 #6).
+        self.write('fail-native', 'now')
+        process = self.launch()
+        self.wait_for(lambda: self.vendor_running())
+        self.wait_for(lambda: 'tried again in 120 s' in self.log())
+        self.assertGreaterEqual(self.starts(), 6)
+        self.assertIn('tried again in 60 s', self.log())
+        self.assertIsNone(process.poll(), 'never given up for the boot')
+        (self.root/'fail-native').unlink()
+        self.wait_for(lambda: 'Native web service active' in self.log(), seconds=10)
+        self.wait_for(lambda: not self.vendor_running())
         self.assertIn('witcher-state mount', (self.root/'service-calls').read_text())
         self.assertIn('witcher-recovery-files ', (self.root/'service-calls').read_text())
 
-    def test_late_panel_failure_restores_factory_server(self):
+    def test_a_state_mount_failure_is_retried_until_it_mounts(self):
+        self.write('fail-mount', 'now')
         process = self.launch()
-        self.wait_for(lambda: (self.root/'tmp/titan-api-boot.log').exists() and 'Native web service active' in (self.root/'tmp/titan-api-boot.log').read_text())
+        self.wait_for(lambda: self.vendor_running())
+        self.wait_for(lambda: (self.root/'service-calls').read_text().count('witcher-state mount') >= 2)
+        self.assertEqual(self.starts(), 0)
+        (self.root/'fail-mount').unlink()
+        self.wait_for(lambda: 'Native web service active' in self.log(), seconds=10)
         self.assertIsNone(process.poll())
+
+    def test_one_slow_health_answer_is_not_a_failure(self):
+        process = self.launch()
+        self.wait_for(lambda: 'Native web service active' in self.log())
+        self.write('fail-health-once', 'now')
+        self.wait_for(lambda: not (self.root/'fail-health-once').exists())
+        self.wait_for(lambda: 'health check (1 of 3)' in self.log())
+        time.sleep(0.5)
+        self.assertEqual(self.starts(), 1, 'one miss restarts nothing')
+        self.assertFalse(self.vendor_running())
+        # Three in a row: the native service is started again.
         self.write('fail-health', 'now')
-        self.assertEqual(process.wait(timeout=5), 1)
-        self.wait_for(lambda: (self.root/'vendor.pid').exists())
+        self.wait_for(lambda: 'health check (3 of 3)' in self.log())
+        (self.root/'fail-health').unlink()
+        self.wait_for(lambda: self.log().count('Native web service active') == 2, seconds=10)
+        self.assertIsNone(process.poll())
+
+    def test_a_crashed_native_service_is_started_again(self):
+        process = self.launch()
+        self.wait_for(lambda: 'Native web service active' in self.log())
+        self.write('dead', 'api')
+        self.wait_for(lambda: 'Native service stopped; starting it again.' in self.log())
+        (self.root/'dead').unlink()
+        self.wait_for(lambda: self.log().count('Native web service active') == 2, seconds=10)
+        self.assertIsNone(process.poll())
+
+    def test_an_invalid_seed_is_replaced_and_the_service_starts(self):
+        # titan-api moves a seed that fails its checks aside (lane L3 #15).
+        self.write('mnt/titan-api/seed', 'bad')
+        self.exe('usr/lib/titan-api/witcher-firstboot', 'echo "$1" >> "$FIXTURE_ROOT/firstboot-calls"; [ "$1" = bootstrap ] && echo good > "$FIXTURE_ROOT/mnt/titan-api/seed"')
+        process = self.launch()
+        self.wait_for(lambda: 'Native web service active' in self.log())
+        self.assertEqual((self.root/'mnt/titan-api/.invalid-seed').read_text(), 'bad')
+        self.assertEqual((self.root/'firstboot-calls').read_text().splitlines(), ['bootstrap'])
+        self.assertIsNone(process.poll())
+
+    def test_guard_expiry_ends_the_retries(self):
+        process = self.launch()
+        self.wait_for(lambda: 'Native web service active' in self.log())
+        # The fixture's sleep returns at once, so the guard expires now.
+        guard = subprocess.Popen(['sh', str(self.control), 'guard-wait', '60'], env=self.env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.processes.append(guard)
+        self.assertEqual(guard.wait(timeout=5), 0)
+        self.wait_for(lambda: process.poll() is not None)
+        self.wait_for(lambda: self.vendor_running())
 
     def test_recovery_vendor_selection_stops_native_monitor(self):
         process = self.launch()

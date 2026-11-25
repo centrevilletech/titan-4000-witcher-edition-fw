@@ -4,16 +4,49 @@ set -eu
 umask 077
 tls=/mnt/titan-api/tls
 [ -d "$tls" ] && [ ! -L "$tls" ] || exit 77
-# Keep any previously installed identity intact, including incomplete legacy pairs.
-if [ -e "$tls/cert.pem" ] || [ -e "$tls/key.pem" ]; then
- [ -f "$tls/cert.pem" ] && [ -f "$tls/key.pem" ] || exit 77
+# True when directory $1 holds a certificate and the key it was made for.
+usable() {
+ for file in "$1/cert.pem" "$1/key.pem"; do
+  [ -f "$file" ] && [ ! -L "$file" ] && [ -s "$file" ] || return 1
+ done
+ cert=$(openssl x509 -in "$1/cert.pem" -noout -pubkey 2> /dev/null) || return 1
+ key=$(openssl pkey -in "$1/key.pem" -pubout 2> /dev/null) || return 1
+ [ -n "$cert" ] && [ "$cert" = "$key" ]
+}
+# Keep the identity in use, legacy pair first as the launcher reads it:
+# browsers have accepted it. Its modes are put right for the launcher's checks.
+keep() {
+ chown 0:0 "$1/cert.pem" "$1/key.pem"
+ chmod 600 "$1/key.pem"
+ chmod 644 "$1/cert.pem"
  exit 0
+}
+# One that fails a check (a file missing or empty, unreadable, or a key that is
+# not the certificate's) would keep the web service off on every boot. It moves
+# to $tls/broken, which keeps only the last one, and a new identity is made:
+# browsers then ask once to accept the unit's new certificate.
+broken=
+good=
+if [ -e "$tls/cert.pem" ] || [ -e "$tls/key.pem" ] || [ -L "$tls/cert.pem" ] || [ -L "$tls/key.pem" ]; then
+ if usable "$tls"; then keep "$tls"; fi
+ broken="cert.pem key.pem"
 fi
 if [ -e "$tls/current" ] || [ -L "$tls/current" ]; then
- [ -d "$tls/current" ] && [ ! -L "$tls/current" ] || exit 77
- [ -f "$tls/current/cert.pem" ] && [ -f "$tls/current/key.pem" ] || exit 77
- exit 0
+ if [ -d "$tls/current" ] && [ ! -L "$tls/current" ] && usable "$tls/current"; then good=$tls/current
+ else broken="$broken current"; fi
 fi
+# A broken legacy pair must go even when current is good: the launcher reads
+# the legacy pair whenever either of its files exists.
+if [ -n "$broken" ]; then
+ rm -rf "$tls/broken"
+ mkdir "$tls/broken"
+ for name in $broken; do
+  if [ -e "$tls/$name" ] || [ -L "$tls/$name" ]; then mv "$tls/$name" "$tls/broken/"; fi
+ done
+ sync
+ echo "A TLS identity failed its checks; it is kept in $tls/broken." >&2
+fi
+[ -z "$good" ] || keep "$good"
 # Stock BusyBox has no mktemp applet. The kernel is already seeded here.
 temporary=$tls/.new-$(openssl rand -hex 16)
 mkdir "$temporary"

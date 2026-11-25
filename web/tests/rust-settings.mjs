@@ -161,7 +161,17 @@ try{
  assert.equal(mutations.length,beforeRetry+1,'Cancel sends nothing');assert.equal(mutations.at(-1).path,'/api/v1/actions/latency.retry');assert.equal(mutations.at(-1).body.section,'latency');assert.deepEqual(mutations.at(-1).body.values,{});
  await expect(page.getByText('No rollbacks. After 2 failures where stock modem firmware answers, the image stays quarantined until Retry.',{exact:true})).toBeVisible();
  await expect(page.getByRole('button',{name:'Retry the modem image',exact:true})).toBeDisabled();
+ // Inside the SAS CPAS window an action that can take the unit off the air
+ // says so before it runs; outside it, the usual question only.
+ await page.clock.setFixedTime(new Date('2026-11-25T07:30:00Z'));
+ await open('restart');await page.getByRole('button',{name:'Restart device',exact:true}).click();
+ await expect(page.locator('#modal')).toContainText('It is 07:30 UTC, inside the SAS CPAS window (06:45–10:15 UTC).');
+ await expect(page.locator('#modal')).toContainText('Restart this Titan?');
+ const beforeCpas=mutations.length;await page.getByRole('button',{name:'Cancel',exact:true}).click();assert.equal(mutations.length,beforeCpas,'Cancel sends nothing');
+ await page.clock.setFixedTime(new Date('2026-11-25T12:00:00Z'));
+ await page.getByRole('button',{name:'Restart device',exact:true}).click();await expect(page.locator('#modal')).toContainText('Restart this Titan?');
+ await expect(page.locator('#modal')).not.toContainText('CPAS');await page.getByRole('button',{name:'Cancel',exact:true}).click();
  authenticated=false;await open('access').catch(()=>{});await expect(page.locator('#login-password')).toBeVisible();
  assert.deepEqual(errors,[]);assert.deepEqual(forbidden,[]);await expect(page.locator('iframe')).toHaveCount(0);
- console.log('PASS: all 22 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove, latency switches, modem image Retry and auth expiry.');
+ console.log('PASS: all 22 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove, latency switches, modem image Retry, the CPAS warning and auth expiry.');
 }finally{await browser.close();await server.close();}
