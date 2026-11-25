@@ -47,3 +47,14 @@ pub fn env_path_or(env: &str, default: &str) -> PathBuf {
 pub fn volume_config(env: &str, name: &str) -> Option<String> {
     fs::read_to_string(volume_dir(env, name)?.join("config")).ok()
 }
+
+/// `/etc/witcher-release` (`TITAN_WITCHER_RELEASE` in tests).
+pub fn release_file() -> PathBuf {
+    env_path_or("TITAN_WITCHER_RELEASE", "/etc/witcher-release")
+}
+
+/// This firmware build's id (`titan_pd_model::tk_boot::firmware_id`): what
+/// the boot hook and the keeper stamp on strikes, rollbacks and quarantines.
+pub fn firmware_id() -> String {
+    titan_pd_model::tk_boot::firmware_id(&std::fs::read(release_file()).unwrap_or_default())
+}

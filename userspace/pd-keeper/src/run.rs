@@ -101,6 +101,7 @@ mod mac;
 mod mgmt_v6;
 mod mode;
 mod packet;
+mod reboot;
 mod routes;
 mod sas;
 mod tk;
@@ -196,6 +197,10 @@ struct Keeper {
     last_deaf_round: Pace,
     reboot_asked_at: Option<u64>,
     reboot_forced: bool,
+    /// Something answered through the core this boot (`reboot::Kind`'s gate).
+    heard_this_boot: bool,
+    /// Why the deaf watchdog's due reboot waits, once noted.
+    deaf_reboot_held: Option<String>,
     /// The bearer bridged to the customer port, or the vendor's data bearer.
     bearer: String,
     mode_checked: Pace,
@@ -239,14 +244,16 @@ struct Keeper {
     tk_last_round: Pace,
     /// The boot hook's status, read once at start.
     tk_status: tk_boot::BootStatus,
-    /// A rollback reboot waits for the SAS CPAS window to end.
-    tk_reboot_waits: bool,
-    /// `tk_confirm` watches a stock boot to judge the default image's last
-    /// rollback (see `titan_pd_model::tk_verdict`), not a staged image.
-    tk_judging: bool,
-    /// The reboot to try the default image again after stock firmware
-    /// answered waits for a set clock and the end of the SAS CPAS window.
-    tk_retest_waits: bool,
+    /// The boot confirm's times (`tk_boot::Timing`) and this firmware build
+    /// (`tk_boot::firmware_id`), read once.
+    tk_timing: tk_boot::Timing,
+    tk_firmware: String,
+    /// The last line about a tk reboot that waits, so it is noted once.
+    tk_hold_noted: Option<String>,
+    /// A recorded rollback's reboot an earlier keeper process did not finish.
+    tk_away_owed: bool,
+    /// The reboot back onto this image after a verdict (`tk_verdict`).
+    tk_back_owed: Option<String>,
     /// Modem feature flags after a confirmed staged boot (see
     /// `titan_pd_model::tk_flags`), and the DM session running for them.
     tk_flags: Option<tk_flags::Control>,
@@ -360,6 +367,8 @@ impl Keeper {
             last_deaf_round: Pace::default(),
             reboot_asked_at: None,
             reboot_forced: false,
+            heard_this_boot: false,
+            deaf_reboot_held: None,
             bearer: DEFAULT_BEARER.to_owned(),
             mode_checked: Pace::default(),
             bridged: false,
@@ -387,9 +396,11 @@ impl Keeper {
             tk_probe: None,
             tk_last_round: Pace::default(),
             tk_status: tk_boot::BootStatus::default(),
-            tk_reboot_waits: false,
-            tk_judging: false,
-            tk_retest_waits: false,
+            tk_timing: tk_boot::Timing::default(),
+            tk_firmware: String::new(),
+            tk_hold_noted: None,
+            tk_away_owed: false,
+            tk_back_owed: None,
             tk_flags: None,
             tk_flags_job: None,
             tk_flags_config_at: Pace::default(),

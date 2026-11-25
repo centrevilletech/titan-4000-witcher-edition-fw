@@ -13,24 +13,43 @@
 //!   no status at all, the keeper never reboots for this reason.
 //! - An address on the management bearer plus one answer through the core
 //!   confirms the boot. The keeper then clears the strike count.
-//! - No confirm within `CONFIRM_SECS` of the load, after at least `MIN_ROUNDS`
-//!   probe rounds by this keeper process: quarantine the image's hash, set the
-//!   strike count to the limit, and reboot once onto stock firmware. The keeper
-//!   reboots only after reading back a record that makes the hook refuse the
-//!   image, so the same failure cannot repeat.
+//! - Only time with a cell in view counts against the image (v1.0.17): the
+//!   modem attached, or measuring a cell (`cell_seen`). After `CONFIRM_SECS`
+//!   of that without an answer, and at least `MIN_ROUNDS` probe rounds by
+//!   this keeper process, the image is compared with stock firmware (a
+//!   rollback). Time with no cell in view is waiting for the network, not a
+//!   failure: only `SEARCH_SECS` of it in a row asks for one comparison, which
+//!   catches an image that breaks cell search.
+//! - A rollback quarantines the image's hash, sets the strike count to the
+//!   limit and reboots once onto stock firmware. The keeper reboots only
+//!   after reading back a record that makes the hook refuse the image, so the
+//!   same failure cannot repeat.
 //! - A keeper that restarts after a confirm or rollback does not judge the
 //!   boot again (`/var/run/witcher-tk.result`).
 //! - Even with no keeper at all, the strike count stops the hook after
 //!   `STRIKE_LIMIT` staged boots without a confirm.
-//! - While the SAS CPAS window is open (`CPAS_QUIET`) the rollback reboot
-//!   waits for it to end; the quarantine is recorded at once, so any boot in
-//!   between is stock (`reboot_waits`).
+//! - Every reboot the keeper starts asks `reboot_hold` first: none while the
+//!   SAS CPAS window (`CPAS_QUIET`) is open, and none with the clock unset on
+//!   a boot that heard an answer through the core. A rollback that must wait
+//!   records nothing and keeps watching, so an answer meanwhile still
+//!   confirms the image.
 use std::net::IpAddr;
 
 use crate::carrier_watch::{QuietWindow, parse_quiet_window};
 
-/// Seconds after the load for the management bearer to answer.
+/// Seconds with a cell in view but no answer through the core before the
+/// image is compared with stock firmware.
 pub const CONFIRM_SECS: u64 = 300;
+/// Seconds in a row with no cell in view (the modem searching) before one
+/// comparison with stock firmware.
+pub const SEARCH_SECS: u64 = 1800;
+/// While the image waits for the network after a network verdict
+/// (`tk_verdict`), the seconds before it may be compared once more: the
+/// recheck for an image whose failure an outage hid.
+pub const RECHECK_SECS: u64 = 86_400;
+/// The most one gap between probe rounds adds to a clock, so a keeper that
+/// was paused does not count the pause.
+const MAX_STEP: u64 = 60;
 /// Staged boots without a confirm before the hook keeps stock firmware.
 pub const STRIKE_LIMIT: u32 = 2;
 /// Seconds between probe rounds while a confirm is pending.
@@ -59,19 +78,93 @@ pub fn quiet_window(text: Option<&str>) -> Option<QuietWindow> {
     }
 }
 
-/// A rollback reboot waits: the clock is set and `wall` is in the window.
-/// With the clock unset the unit has not reached the network, so it holds no
-/// grants a reboot could lose.
-pub fn reboot_waits(window: Option<QuietWindow>, wall: u64) -> bool {
-    wall >= CLOCK_SET_AFTER && window.is_some_and(|w| w.contains(wall))
+/// Why a reboot the keeper wants must wait, or `None` when it may go now.
+/// Every reboot the keeper starts asks: the boot confirm's, the verdict's and
+/// the deaf watchdog's. In the SAS CPAS window no new grants are issued, so a
+/// reboot then can leave the unit without one for hours.
+///
+/// - The clock is set: the window decides.
+/// - The clock is unset and something answered through the core this boot:
+///   the unit may hold a grant, so the reboot waits for the clock.
+/// - The clock is unset and nothing answered this boot: the unit has had no
+///   data path, so it holds no grant, and its clock cannot be set (the Titan
+///   has no battery clock and boots at 2013 until NTP sets it). Waiting
+///   would strand an image that breaks the data path, so it goes.
+pub fn reboot_hold(window: Option<QuietWindow>, wall: u64, heard_this_boot: bool) -> Option<&'static str> {
+    if wall >= CLOCK_SET_AFTER {
+        window
+            .is_some_and(|w| w.contains(wall))
+            .then_some("the SAS CPAS window is open")
+    } else {
+        heard_this_boot.then_some("the clock is not set yet")
+    }
 }
 
-/// A reboot to try an image again after stock firmware answered
-/// (`tk_verdict`) also waits while the clock is unset: that unit has just
-/// reached the network, so it may hold grants that a reboot inside the
-/// window would lose until the window ends.
-pub fn retest_waits(window: Option<QuietWindow>, wall: u64) -> bool {
-    wall < CLOCK_SET_AFTER || reboot_waits(window, wall)
+/// Times the boot confirm uses. Tests shorten them with
+/// `TITAN_TK_CONFIRM_SECS`, `TITAN_TK_SEARCH_SECS`, `TITAN_TK_RECHECK_SECS`
+/// and `TITAN_TK_PROBE_EVERY`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timing {
+    pub confirm: u64,
+    pub search: u64,
+    pub recheck: u64,
+    pub probe_every: u64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Self {
+            confirm: CONFIRM_SECS,
+            search: SEARCH_SECS,
+            recheck: RECHECK_SECS,
+            probe_every: PROBE_EVERY,
+        }
+    }
+}
+
+impl Timing {
+    /// The defaults, with any override `get` returns. A missing, unreadable
+    /// or zero value keeps the default.
+    pub fn with(get: impl Fn(&str) -> Option<String>) -> Self {
+        let read = |name: &str, fallback: u64| {
+            get(name)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(fallback)
+        };
+        let base = Self::default();
+        Self {
+            confirm: read("TITAN_TK_CONFIRM_SECS", base.confirm),
+            search: read("TITAN_TK_SEARCH_SECS", base.search),
+            recheck: read("TITAN_TK_RECHECK_SECS", base.recheck),
+            probe_every: read("TITAN_TK_PROBE_EVERY", base.probe_every),
+        }
+    }
+}
+
+/// The modem sees a cell: attached, or measuring one. `media` is
+/// `sqns_connection_mediaState` (as stored or as `nvram_get` prints it) and
+/// `rsrp` is `sqns_radio_RSRP`, hundredths of a dBm per carrier. A value
+/// inside -140 to -20 dBm is a measured cell; searching leaves it empty.
+pub fn cell_seen(media: &str, rsrp: &str) -> bool {
+    let media = media.rsplit(':').next().unwrap_or("").trim();
+    if matches!(media, "ATTACHED" | "CONNECTED") {
+        return true;
+    }
+    rsrp.split(',')
+        .any(|field| field.trim().parse::<i64>().is_ok_and(|value| (-14_000..=-2_000).contains(&value)))
+}
+
+/// A short id of the running firmware build: the first 16 hex digits of the
+/// SHA-256 of `/etc/witcher-release`, `unknown` without one. The boot hook
+/// computes the same with `sha256sum`. Strikes, rollbacks and quarantines
+/// recorded by another build no longer apply (`tk_default::plan`).
+pub fn firmware_id(release: &[u8]) -> String {
+    if release.is_empty() {
+        return "unknown".to_owned();
+    }
+    let hex = crate::sha256::hex(&crate::sha256::digest(release));
+    hex.get(..16).unwrap_or(&hex).to_owned()
 }
 
 /// Where the N4 modem image keeps its patch magic, read with `vm 0x847ed600 4`.
@@ -194,64 +287,137 @@ pub fn short(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 
+/// Why a comparison with stock firmware is due.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Why {
+    /// A cell in view for `Timing::confirm` seconds without an answer (on a
+    /// stock boot: no answer within that long of the load).
+    Blind,
+    /// No cell in view for `Timing::search` seconds in a row.
+    Search,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     Hold,
     Confirmed,
-    Rollback,
+    Rollback(Why),
 }
 
-/// A pending boot confirm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// The staged image's boot.
+    Image,
+    /// A stock boot judging the last rollback (`tk_verdict`): no answer by
+    /// `deadline`, keeper monotonic seconds, means stock failed as well.
+    Stock { deadline: u64 },
+}
+
+/// A pending boot confirm, or a stock boot's judging watch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Confirm {
     pub sha: String,
-    /// Keeper monotonic seconds.
-    pub deadline: u64,
+    /// The image waits for the network: its last rollback was the network's
+    /// (`tk_verdict`). It is compared again only after `Timing::recheck`.
+    pub waiting: bool,
+    mode: Mode,
+    timing: Timing,
+    armed_at: u64,
     rounds: u32,
+    last: Option<u64>,
+    /// Seconds with a cell in view and no answer.
+    blind: u64,
+    /// The first round of the current run with no cell in view.
+    searching_since: Option<u64>,
 }
 
 impl Confirm {
-    /// `now` is the keeper's monotonic clock in seconds since boot, the clock
-    /// `loaded_at` comes from. `decided` is true when a keeper process already
-    /// confirmed or rolled back this boot.
-    pub fn arm(status: &BootStatus, now: u64, decided: bool) -> Option<Self> {
+    /// `now` is the keeper's monotonic clock in seconds since boot. `decided`
+    /// is true when a keeper process already confirmed or rolled back this
+    /// boot. The clocks count from this keeper's rounds, so time before the
+    /// keeper started never counts against the image.
+    pub fn arm(status: &BootStatus, now: u64, decided: bool, timing: Timing, waiting: bool) -> Option<Self> {
         if decided {
             return None;
         }
-        let sha = status.staged.clone()?;
-        let base = status.loaded_at.filter(|at| *at <= now).unwrap_or(now);
         Some(Self {
-            sha,
-            deadline: base.saturating_add(CONFIRM_SECS),
+            sha: status.staged.clone()?,
+            waiting,
+            mode: Mode::Image,
+            timing,
+            armed_at: now,
             rounds: 0,
+            last: None,
+            blind: 0,
+            searching_since: None,
         })
     }
 
-    /// The same watch on a stock boot after a rollback of `sha`
-    /// (`tk_verdict`): `Confirmed` means stock firmware answered within
-    /// `CONFIRM_SECS` of its load, `Rollback` that it did not either.
-    pub fn watch(sha: &str, loaded_at: Option<u64>, now: u64) -> Self {
+    /// The watch on a stock boot after a rollback of `sha` (`tk_verdict`):
+    /// `Confirmed` means stock firmware answered within `Timing::confirm` of
+    /// its load, `Rollback` that it did not either.
+    pub fn watch(sha: &str, loaded_at: Option<u64>, now: u64, timing: Timing) -> Self {
         let base = loaded_at.filter(|at| *at <= now).unwrap_or(now);
         Self {
             sha: sha.to_ascii_lowercase(),
-            deadline: base.saturating_add(CONFIRM_SECS),
+            waiting: false,
+            mode: Mode::Stock {
+                deadline: base.saturating_add(timing.confirm),
+            },
+            timing,
+            armed_at: now,
             rounds: 0,
+            last: None,
+            blind: 0,
+            searching_since: None,
         }
     }
 
     /// One finished probe round. `mgmt_up` is an address on the management
     /// bearer. `heard` is `None` when no probe could run (no targets yet,
-    /// which is what a modem that never attaches looks like).
-    pub fn observe(&mut self, now: u64, mgmt_up: bool, heard: Option<bool>) -> Action {
+    /// which is what a modem that never attaches looks like). `cell` is
+    /// `cell_seen` for this round. A due rollback stays due round after round
+    /// until an answer confirms instead.
+    pub fn observe(&mut self, now: u64, mgmt_up: bool, heard: Option<bool>, cell: bool) -> Action {
         if mgmt_up && heard == Some(true) {
             return Action::Confirmed;
         }
         self.rounds = self.rounds.saturating_add(1);
-        if now >= self.deadline && self.rounds >= MIN_ROUNDS {
-            Action::Rollback
-        } else {
-            Action::Hold
+        let step = self.last.map_or(0, |last| now.saturating_sub(last).min(MAX_STEP));
+        self.last = Some(now);
+        if let Mode::Stock { deadline } = self.mode {
+            return if now >= deadline && self.rounds >= MIN_ROUNDS {
+                Action::Rollback(Why::Blind)
+            } else {
+                Action::Hold
+            };
         }
+        if cell {
+            self.blind = self.blind.saturating_add(step);
+            self.searching_since = None;
+        } else if self.searching_since.is_none() {
+            self.searching_since = Some(now);
+        }
+        if self.rounds < MIN_ROUNDS || (self.waiting && now.saturating_sub(self.armed_at) < self.timing.recheck) {
+            return Action::Hold;
+        }
+        if self.blind >= self.timing.confirm {
+            return Action::Rollback(Why::Blind);
+        }
+        match self.searching_since {
+            Some(since) if now.saturating_sub(since) >= self.timing.search => Action::Rollback(Why::Search),
+            _ => Action::Hold,
+        }
+    }
+
+    /// Seconds with a cell in view and no answer so far.
+    pub fn blind_secs(&self) -> u64 {
+        self.blind
+    }
+
+    /// A stock boot's judging watch, not an image's confirm.
+    pub fn judging(&self) -> bool {
+        matches!(self.mode, Mode::Stock { .. })
     }
 }
 
@@ -281,8 +447,15 @@ pub fn parse_strikes(text: &str) -> Option<u32> {
     value.parse().ok()
 }
 
-pub fn format_strikes(strikes: u32) -> String {
-    format!("strikes={strikes}\n")
+/// `strikes=N` and the firmware build that counted them (`firmware_id`).
+pub fn format_strikes(strikes: u32, firmware: &str) -> String {
+    format!("strikes={strikes}\nfirmware={firmware}\n")
+}
+
+/// The firmware build a strikes file names; `None` for one written before
+/// v1.0.17 (or by hand).
+pub fn strikes_firmware(text: &str) -> Option<String> {
+    value(text, "firmware").filter(|id| !id.is_empty())
 }
 
 /// Hashes in the quarantine file: one per line, comments allowed.
@@ -508,35 +681,48 @@ mod tests {
         assert_eq!(remove_quarantine(&text, A), format!("# keeper\n{} # bench\n", B.to_uppercase()));
         assert_eq!(remove_quarantine(&add_quarantine("", A), A), "");
         assert_eq!(parse_quarantine(&remove_quarantine(&text, "ff")), parse_quarantine(&text));
-        // A stock boot's watch starts from the modem load, like a confirm.
-        let watch = Confirm::watch(&A.to_uppercase(), Some(40), 100);
-        assert_eq!((watch.sha.as_str(), watch.deadline), (A, 40 + CONFIRM_SECS));
-        assert_eq!(Confirm::watch(A, Some(500), 100).deadline, 100 + CONFIRM_SECS);
-        // A retry after stock answered waits for a set clock as well as for
-        // the window's end; a rollback reboot only for the window.
-        let noon = 1_795_305_600 + 12 * 3600;
-        assert!(retest_waits(Some(CPAS_QUIET), 1_000) && !reboot_waits(Some(CPAS_QUIET), 1_000));
-        assert!(retest_waits(None, 1_000));
-        assert!(!retest_waits(Some(CPAS_QUIET), noon));
-        assert!(retest_waits(Some(CPAS_QUIET), noon - 4 * 3600));
     }
 
     #[test]
-    fn a_rollback_reboot_waits_out_the_cpas_window_when_the_clock_is_set() {
+    fn every_keeper_reboot_waits_out_the_cpas_window_and_for_a_set_clock() {
         let day = 1_795_305_600; // 2026-11-22T00:00:00Z
         let at = |h: u64, m: u64| day + h * 3600 + m * 60;
         let cpas = quiet_window(None);
         assert_eq!(cpas, Some(CPAS_QUIET));
-        assert!(!reboot_waits(cpas, at(6, 44)));
-        assert!(reboot_waits(cpas, at(6, 45)));
-        assert!(reboot_waits(cpas, at(10, 14)));
-        assert!(!reboot_waits(cpas, at(10, 15)));
-        assert!(!reboot_waits(cpas, at(23, 0)));
-        // A 2013 clock: no network yet, nothing to lose.
-        assert!(!reboot_waits(cpas, 1_370_000_000 + 7 * 3600));
-        assert!(!reboot_waits(quiet_window(Some("")), at(8, 0)));
-        assert!(reboot_waits(quiet_window(Some("23:00-01:00")), at(0, 30)));
+        for heard in [false, true] {
+            assert_eq!(reboot_hold(cpas, at(6, 44), heard), None);
+            assert_eq!(reboot_hold(cpas, at(6, 45), heard), Some("the SAS CPAS window is open"));
+            assert_eq!(reboot_hold(cpas, at(10, 14), heard), Some("the SAS CPAS window is open"));
+            assert_eq!(reboot_hold(cpas, at(10, 15), heard), None);
+            assert_eq!(reboot_hold(cpas, at(23, 0), heard), None);
+        }
+        // A 2013 clock on a boot that heard an answer: it may hold a grant,
+        // so it waits for the clock. One that heard nothing holds none.
+        let early = 1_370_000_000 + 7 * 3600;
+        assert_eq!(reboot_hold(cpas, early, true), Some("the clock is not set yet"));
+        assert_eq!(reboot_hold(cpas, early, false), None);
+        assert_eq!(reboot_hold(quiet_window(Some("")), at(8, 0), true), None);
+        assert!(reboot_hold(quiet_window(Some("23:00-01:00")), at(0, 30), false).is_some());
         assert_eq!(quiet_window(Some("nonsense")), Some(CPAS_QUIET));
+    }
+
+    #[test]
+    fn a_cell_is_an_attach_or_a_measured_rsrp() {
+        assert!(cell_seen("nvram_get success: ATTACHED\n", ""));
+        assert!(cell_seen("CONNECTED", ""));
+        assert!(cell_seen("CONNECTING", "-10790"));
+        assert!(cell_seen("DISCONNECTED", ",-11250"));
+        for searching in [("DISCONNECTED", ""), ("Not Searching", ""), ("", "0"), ("CONNECTING", "-32768"), ("", "garbage")] {
+            assert!(!cell_seen(searching.0, searching.1), "{searching:?}");
+        }
+        // The id of a firmware build, and of none.
+        assert_eq!(firmware_id(b""), "unknown");
+        let id = firmware_id(b"{\"version\":\"1.0.17\"}\n");
+        assert_eq!(id.len(), 16);
+        assert_ne!(id, firmware_id(b"{\"version\":\"1.0.18\"}\n"));
+        let timing = Timing::with(|name| (name == "TITAN_TK_SEARCH_SECS").then(|| "40".to_owned()));
+        assert_eq!((timing.confirm, timing.search), (CONFIRM_SECS, 40));
+        assert_eq!(Timing::with(|_| Some("0".to_owned())), Timing::default());
     }
 
     #[test]
@@ -563,81 +749,112 @@ mod tests {
             "garbage",
             "state=stock\nreason=strikes\n",
         ] {
-            if Confirm::arm(&parse_status(text), 1000, false).is_some() {
+            if Confirm::arm(&parse_status(text), 1000, false, Timing::default(), false).is_some() {
                 never += 1;
             }
         }
         assert_eq!(never, 0);
         // Already confirmed or rolled back by an earlier keeper process.
-        assert_eq!(Confirm::arm(&staged(17), 1000, true), None);
+        assert_eq!(Confirm::arm(&staged(17), 1000, true, Timing::default(), false), None);
     }
 
-    #[test]
-    fn the_window_counts_from_the_load() {
-        assert_eq!(
-            Confirm::arm(&staged(17), 90, false).unwrap().deadline,
-            17 + CONFIRM_SECS
-        );
-        // No load time, or one from a clock ahead of ours: count from now.
-        let mut status = staged(17);
-        status.loaded_at = None;
-        assert_eq!(
-            Confirm::arm(&status, 90, false).unwrap().deadline,
-            90 + CONFIRM_SECS
-        );
-        assert_eq!(
-            Confirm::arm(&staged(500), 90, false).unwrap().deadline,
-            90 + CONFIRM_SECS
-        );
+    /// Rounds every `PROBE_EVERY` from `start` until an action other than
+    /// `Hold`; `cell` and `heard` say what each round sees.
+    fn run(confirm: &mut Confirm, start: u64, until: u64, cell: impl Fn(u64) -> bool) -> (Action, u64) {
+        let mut now = start;
+        while now <= until {
+            let action = confirm.observe(now, cell(now), Some(false), cell(now));
+            if action != Action::Hold {
+                return (action, now);
+            }
+            now += PROBE_EVERY;
+        }
+        (Action::Hold, now)
+    }
+
+    fn image(now: u64) -> Confirm {
+        Confirm::arm(&staged(17), now, false, Timing::default(), false).unwrap()
     }
 
     #[test]
     fn an_answer_with_a_management_address_confirms() {
-        let mut confirm = Confirm::arm(&staged(17), 60, false).unwrap();
-        assert_eq!(confirm.observe(60, false, None), Action::Hold);
-        assert_eq!(confirm.observe(75, false, Some(true)), Action::Hold);
-        assert_eq!(confirm.observe(90, true, Some(false)), Action::Hold);
-        assert_eq!(confirm.observe(105, true, Some(true)), Action::Confirmed);
-        // An answer that lands after the window still confirms.
-        let mut late = Confirm::arm(&staged(17), 60, false).unwrap();
-        assert_eq!(late.observe(400, true, Some(true)), Action::Confirmed);
+        let mut confirm = image(60);
+        assert_eq!(confirm.observe(60, false, None, true), Action::Hold);
+        assert_eq!(confirm.observe(75, false, Some(true), true), Action::Hold);
+        assert_eq!(confirm.observe(90, true, Some(false), true), Action::Hold);
+        assert_eq!(confirm.observe(105, true, Some(true), true), Action::Confirmed);
+        // An answer that lands after a rollback fell due still confirms.
+        let mut late = image(60);
+        let (due, now) = run(&mut late, 60, 10_000, |_| true);
+        assert_eq!(due, Action::Rollback(Why::Blind));
+        assert_eq!(late.observe(now + PROBE_EVERY, true, Some(true), true), Action::Confirmed);
     }
 
     #[test]
-    fn silence_until_the_window_ends_rolls_back() {
-        let mut confirm = Confirm::arm(&staged(17), 60, false).unwrap();
-        let mut now = 60;
-        while now < 17 + CONFIRM_SECS {
-            assert_eq!(
-                confirm.observe(now, true, Some(false)),
-                Action::Hold,
-                "{now}"
-            );
-            now += PROBE_EVERY;
+    fn only_time_with_a_cell_in_view_counts_against_the_image() {
+        // A cell in view and no answer: compared after CONFIRM_SECS of it,
+        // counted from this keeper's rounds.
+        let (action, now) = run(&mut image(60), 60, 10_000, |_| true);
+        assert_eq!(action, Action::Rollback(Why::Blind));
+        assert_eq!(now, 60 + CONFIRM_SECS);
+        // A tower that is down: no cell, so nothing counts until 30 minutes
+        // in a row of searching ask for one comparison.
+        let (action, now) = run(&mut image(60), 60, 100_000, |_| false);
+        assert_eq!(action, Action::Rollback(Why::Search));
+        assert_eq!(now, 60 + SEARCH_SECS);
+        // A tower that flaps: a cell every few minutes resets the search, and
+        // only the minutes with the cell count toward the blind clock.
+        let mut flapping = image(60);
+        let (action, now) = run(&mut flapping, 60, 100_000, |now| (now / 60) % 10 == 0);
+        assert_eq!(action, Action::Rollback(Why::Blind));
+        assert!(now > 60 + 8 * CONFIRM_SECS, "{now}");
+        // A keeper paused for an hour counts a minute of it at most.
+        let mut paused = image(60);
+        assert_eq!(paused.observe(60, true, Some(false), true), Action::Hold);
+        assert_eq!(paused.observe(3660, true, Some(false), true), Action::Hold);
+        assert_eq!(paused.blind_secs(), 60);
+    }
+
+    #[test]
+    fn an_image_waiting_for_the_network_is_compared_again_only_after_the_recheck() {
+        let mut waiting = Confirm::arm(&staged(17), 60, false, Timing::default(), true).unwrap();
+        // Hours of a cell and no answer (a core outage) or of no cell: held.
+        let (action, _) = run(&mut waiting, 60, 60 + RECHECK_SECS - PROBE_EVERY, |now| now % 7200 < 3600);
+        assert_eq!(action, Action::Hold);
+        let (action, now) = run(&mut waiting, 60 + RECHECK_SECS, 60 + RECHECK_SECS + 3600, |_| true);
+        assert!(matches!(action, Action::Rollback(_)), "{action:?}");
+        assert_eq!(now, 60 + RECHECK_SECS);
+        // An answer ends the wait at any time.
+        let mut waiting = Confirm::arm(&staged(17), 60, false, Timing::default(), true).unwrap();
+        assert_eq!(waiting.observe(5000, true, Some(true), true), Action::Confirmed);
+    }
+
+    #[test]
+    fn a_stock_watch_counts_from_the_load_whatever_the_cell() {
+        let watch = Confirm::watch(&A.to_uppercase(), Some(40), 100, Timing::default());
+        assert_eq!(watch.sha, A);
+        assert!(watch.judging() && !image(60).judging());
+        for cell in [false, true] {
+            let mut watch = Confirm::watch(A, Some(40), 100, Timing::default());
+            let (action, now) = run(&mut watch, 100, 10_000, |_| cell);
+            assert_eq!(action, Action::Rollback(Why::Blind));
+            assert!(now >= 40 + CONFIRM_SECS && now < 40 + CONFIRM_SECS + PROBE_EVERY, "{now}");
         }
-        assert_eq!(confirm.observe(now, true, Some(false)), Action::Rollback);
-        // A modem that never attaches has no targets and no address.
-        let mut dead = Confirm::arm(&staged(17), 60, false).unwrap();
-        let mut now = 60;
-        let action = loop {
-            let action = dead.observe(now, false, None);
-            if action != Action::Hold {
-                break action;
-            }
-            now += PROBE_EVERY;
-        };
-        assert_eq!(action, Action::Rollback);
-        assert!(now >= 17 + CONFIRM_SECS);
+        // A load time ahead of the keeper's clock counts from now.
+        let mut ahead = Confirm::watch(A, Some(500), 100, Timing::default());
+        assert_eq!(run(&mut ahead, 100, 10_000, |_| false).1, 100 + CONFIRM_SECS);
+        let mut answered = Confirm::watch(A, Some(40), 100, Timing::default());
+        assert_eq!(answered.observe(110, true, Some(true), false), Action::Confirmed);
     }
 
     #[test]
     fn a_keeper_that_starts_late_looks_twice_first() {
-        let mut confirm = Confirm::arm(&staged(17), 900, false).unwrap();
-        assert_eq!(confirm.observe(900, false, None), Action::Hold);
-        assert_eq!(confirm.observe(915, false, None), Action::Rollback);
-        let mut confirm = Confirm::arm(&staged(17), 900, false).unwrap();
-        assert_eq!(confirm.observe(900, false, None), Action::Hold);
-        assert_eq!(confirm.observe(915, true, Some(true)), Action::Confirmed);
+        let mut watch = Confirm::watch(A, Some(17), 900, Timing::default());
+        assert_eq!(watch.observe(900, false, None, false), Action::Hold);
+        assert_eq!(watch.observe(915, false, None, false), Action::Rollback(Why::Blind));
+        let mut confirm = image(900);
+        assert_eq!(confirm.observe(900, false, None, true), Action::Hold);
+        assert_eq!(confirm.observe(915, true, Some(true), true), Action::Confirmed);
     }
 
     #[test]
@@ -655,9 +872,15 @@ mod tests {
             assert_eq!(parse_strikes(bad), None, "{bad:?}");
         }
         assert_eq!(
-            parse_strikes(&format_strikes(STRIKE_LIMIT)),
+            parse_strikes(&format_strikes(STRIKE_LIMIT, "0123456789abcdef")),
             Some(STRIKE_LIMIT)
         );
+        // The build that counted them; none before v1.0.17.
+        assert_eq!(
+            strikes_firmware(&format_strikes(1, "0123456789abcdef")).as_deref(),
+            Some("0123456789abcdef")
+        );
+        assert_eq!(strikes_firmware("strikes=2\n"), None);
     }
 
     #[test]
@@ -746,9 +969,9 @@ mod tests {
             };
             strikes = strike;
             loaded += 1;
-            let mut confirm = Confirm::arm(&staged(17), 60, false).unwrap();
+            let mut confirm = image(60);
             let mut now = 60;
-            while confirm.observe(now, false, None) == Action::Hold {
+            while confirm.observe(now, true, Some(false), true) == Action::Hold {
                 now += PROBE_EVERY;
             }
             if keeper_writes {
@@ -783,9 +1006,9 @@ mod tests {
                 panic!("a confirmed image was refused");
             };
             assert_eq!(strike, 1);
-            let mut confirm = Confirm::arm(&staged(17), 60, false).unwrap();
-            assert_eq!(confirm.observe(120, true, Some(true)), Action::Confirmed);
-            strikes = parse_strikes(&format_strikes(0)).unwrap();
+            let mut confirm = image(60);
+            assert_eq!(confirm.observe(120, true, Some(true), true), Action::Confirmed);
+            strikes = parse_strikes(&format_strikes(0, "f")).unwrap();
         }
     }
 

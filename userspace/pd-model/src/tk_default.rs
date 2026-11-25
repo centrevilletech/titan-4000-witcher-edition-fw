@@ -21,8 +21,17 @@
 //!   `enabled=0` there keeps stock firmware.
 //! - An `active.gz` with no config is an operator's, or one an operator
 //!   turned off by deleting the config: nothing is built over it.
-//! - A strike count at the limit, an unreadable one, or any quarantined hash
-//!   keeps stock firmware and builds nothing.
+//! - A rollback that waits for its stock verdict, or a quarantine that stuck
+//!   (`tk_verdict`), keeps stock firmware and builds nothing, and so does an
+//!   unreadable strike count, or one at the limit that this firmware build
+//!   counted (boots cut short; the keeper's stock boot judges them).
+//! - What another firmware build, or a rollback of another image, left
+//!   behind no longer applies (`stale`): the release image's quarantine line,
+//!   strikes at the limit and a verdict for another image or build are
+//!   cleared at boot (`Plan::Clear`), and the image loads. So a new firmware
+//!   always tries the image again, and nothing a network outage left in
+//!   older firmware keeps it off. Quarantine lines for other images (an
+//!   operator's) are left alone and do not block the default.
 //! - A bank that is not the pinned stock image builds nothing, now or on a
 //!   later boot of the same release image (`stock-mismatch` is recorded).
 //! - Each build is recorded before it starts, so a build that is killed or
@@ -30,6 +39,7 @@
 //!   image nothing is built for it again.
 use crate::sha256;
 use crate::tk_boot::{self, STRIKE_LIMIT};
+use crate::tk_verdict::Verdict;
 
 /// The first line of a config the firmware wrote, followed by the manifest
 /// name and the SHA-256 of the rest of the file.
@@ -73,6 +83,8 @@ pub enum Plan {
     Ready,
     /// Build the release image, then load it.
     Build,
+    /// Clear what no longer applies (`stale`, `clear`), then plan again.
+    Clear,
     /// Keep stock modem firmware, for this reason (the hook's `reason=`).
     Stock(&'static str),
 }
@@ -124,9 +136,12 @@ pub fn owner(config: Option<&str>, image: bool, record: Option<&str>, release: &
 /// Everything `plan` reads, for a `tk/` the firmware owns.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Inputs<'a> {
-    /// `tk/strikes` and `tk/quarantine`, when they exist.
+    /// `tk/strikes`, `tk/quarantine` and `tk/verdict`, when they exist.
     pub strikes: Option<&'a str>,
     pub quarantine: Option<&'a str>,
+    pub verdict: Option<&'a str>,
+    /// This firmware build (`tk_boot::firmware_id`).
+    pub firmware: &'a str,
     /// `tk/default`, the build record, when it exists.
     pub record: Option<&'a str>,
     /// The release image's gzip SHA-256 (the keeper's built-in manifest).
@@ -138,17 +153,23 @@ pub struct Inputs<'a> {
     pub bank: Option<&'a str>,
 }
 
-/// What this boot does. The strike and quarantine rules come first: a unit
-/// that rolled an image back keeps stock firmware until an operator says
-/// otherwise, and nothing is built for it.
+/// What this boot does. The rollback rules come first: a rollback waiting
+/// for its stock verdict, a quarantine that stuck, or this build's strikes
+/// at the limit keep stock firmware, and nothing is built. What no longer
+/// applies is cleared first.
 pub fn plan(i: &Inputs<'_>) -> Plan {
-    match i.strikes.map(tk_boot::parse_strikes) {
-        Some(None) => return Plan::Stock("strikes-unreadable"),
-        Some(Some(n)) if n >= STRIKE_LIMIT => return Plan::Stock("strikes"),
-        _ => {}
+    let strikes = i.strikes.map(tk_boot::parse_strikes);
+    if matches!(strikes, Some(None)) {
+        return Plan::Stock("strikes-unreadable");
     }
-    if i.quarantine.is_some_and(|text| !tk_boot::parse_quarantine(text).is_empty()) {
+    if Verdict::parse(i.verdict.unwrap_or("")).holds(i.release, i.firmware) {
         return Plan::Stock("quarantined");
+    }
+    if stale(i) {
+        return Plan::Clear;
+    }
+    if strikes.flatten().is_some_and(|n| n >= STRIKE_LIMIT) {
+        return Plan::Stock("strikes");
     }
     if i.cached {
         return Plan::Ready;
@@ -166,6 +187,57 @@ pub fn plan(i: &Inputs<'_>) -> Plan {
         return Plan::Stock("bank-unknown");
     }
     Plan::Build
+}
+
+/// Records that no longer apply to the release image under this firmware
+/// build: its quarantine line without a verdict that holds it, strikes at the
+/// limit that another build (or a firmware before v1.0.17) counted, and a
+/// verdict for another image or build. `plan` checks `holds` first, so this
+/// never clears a rollback that waits for its verdict or a quarantine that
+/// stuck under this build.
+pub fn stale(i: &Inputs<'_>) -> bool {
+    let listed = i
+        .quarantine
+        .is_some_and(|text| tk_boot::parse_quarantine(text).iter().any(|q| q.eq_ignore_ascii_case(i.release)));
+    let strikes = i.strikes.is_some_and(|text| {
+        tk_boot::parse_strikes(text).is_some_and(|n| n >= STRIKE_LIMIT)
+            && tk_boot::strikes_firmware(text).as_deref() != Some(i.firmware)
+    });
+    let verdict = i.verdict.is_some_and(|text| {
+        let verdict = Verdict::parse(text);
+        !verdict.gzip.is_empty() && !verdict.applies(i.release, i.firmware)
+    });
+    listed || strikes || verdict
+}
+
+/// What `Plan::Clear` writes: the quarantine without the release image's
+/// line, strikes at 0 for this build, and whether the verdict goes (one for
+/// another image or build). `None` leaves that file as it is.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cleared {
+    pub quarantine: Option<String>,
+    pub strikes: Option<String>,
+    pub drop_verdict: bool,
+}
+
+pub fn clear(i: &Inputs<'_>) -> Cleared {
+    let mut cleared = Cleared::default();
+    if let Some(text) = i.quarantine {
+        if tk_boot::parse_quarantine(text).iter().any(|q| q.eq_ignore_ascii_case(i.release)) {
+            cleared.quarantine = Some(tk_boot::remove_quarantine(text, i.release));
+        }
+    }
+    let other_build = i
+        .strikes
+        .is_some_and(|text| tk_boot::strikes_firmware(text).as_deref() != Some(i.firmware));
+    if other_build && i.strikes.and_then(tk_boot::parse_strikes).is_some_and(|n| n >= STRIKE_LIMIT) {
+        cleared.strikes = Some(tk_boot::format_strikes(0, i.firmware));
+    }
+    cleared.drop_verdict = i.verdict.is_some_and(|text| {
+        let verdict = Verdict::parse(text);
+        !verdict.gzip.is_empty() && !verdict.applies(i.release, i.firmware)
+    });
+    cleared
 }
 
 /// `tk/default`: the release image the last build was for, how many builds
@@ -220,8 +292,10 @@ mod tests {
 
     const RELEASE: &str = "3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb";
 
+    const BUILD: &str = "0123456789abcdef";
+
     fn inputs<'a>() -> Inputs<'a> {
-        Inputs { release: RELEASE, bank: Some("tk2"), ..Inputs::default() }
+        Inputs { release: RELEASE, bank: Some("tk2"), firmware: BUILD, ..Inputs::default() }
     }
 
     #[test]
@@ -289,16 +363,66 @@ mod tests {
         assert_eq!(owner(None, true, Some(&other), RELEASE), Owner::Operator);
     }
 
+    /// The plan once `Plan::Clear` has written what `clear` says.
+    fn plan_after_clear(i: &Inputs<'_>) -> (Plan, Cleared) {
+        let cleared = clear(i);
+        let quarantine = cleared.quarantine.clone().or(i.quarantine.map(str::to_owned));
+        let strikes = cleared.strikes.clone().or(i.strikes.map(str::to_owned));
+        let verdict = if cleared.drop_verdict { None } else { i.verdict };
+        let next = Inputs { quarantine: quarantine.as_deref(), strikes: strikes.as_deref(), verdict, ..*i };
+        (plan(&next), cleared)
+    }
+
     #[test]
-    fn strikes_and_quarantine_keep_stock_and_build_nothing() {
-        fn plan_with(strikes: Option<&str>, quarantine: Option<&str>) -> Plan {
-            plan(&Inputs { strikes, quarantine, cached: true, ..inputs() })
+    fn this_builds_rollbacks_and_strikes_keep_stock_and_build_nothing() {
+        let strikes = |n: u32| tk_boot::format_strikes(n, BUILD);
+        let pending = Verdict::default().rolled_back(RELEASE, BUILD).render();
+        let quarantine = format!("{RELEASE}\n");
+        let held = Inputs { strikes: Some(&strikes(2)), quarantine: Some(&quarantine), verdict: Some(&pending), cached: true, ..inputs() };
+        assert_eq!(plan(&held), Plan::Stock("quarantined"));
+        let (stuck, _) = Verdict::default().rolled_back(RELEASE, BUILD).judge(true).0.rolled_back(RELEASE, BUILD).judge(true);
+        let stuck = stuck.render();
+        assert_eq!(plan(&Inputs { verdict: Some(&stuck), ..held }), Plan::Stock("quarantined"));
+        // Boots cut short under this build: stock, and its keeper judges them.
+        assert_eq!(plan(&Inputs { strikes: Some(&strikes(2)), cached: true, ..inputs() }), Plan::Stock("strikes"));
+        assert_eq!(plan(&Inputs { strikes: Some("strikes=lots\n"), cached: true, ..inputs() }), Plan::Stock("strikes-unreadable"));
+        assert_eq!(plan(&Inputs { strikes: Some(&strikes(1)), cached: true, ..inputs() }), Plan::Ready);
+        // An operator's quarantine of another image does not block the default.
+        let other = format!("# keeper\n{}\n", "ab".repeat(32));
+        assert_eq!(plan(&Inputs { quarantine: Some(&other), cached: true, ..inputs() }), Plan::Ready);
+        assert_eq!(plan(&Inputs { quarantine: Some("# none yet\n"), cached: true, ..inputs() }), Plan::Ready);
+    }
+
+    #[test]
+    fn a_new_firmware_build_clears_what_an_older_one_left_and_loads_the_image() {
+        let old = "fedcba9876543210";
+        let (stuck, _) = Verdict::default().rolled_back(RELEASE, old).judge(true).0.rolled_back(RELEASE, old).judge(true);
+        let stuck = stuck.render();
+        let quarantine = format!("{}\n{RELEASE}\n", "ab".repeat(32));
+        let old_strikes = tk_boot::format_strikes(2, old);
+        let left = Inputs { strikes: Some(&old_strikes), quarantine: Some(&quarantine), verdict: Some(&stuck), cached: true, ..inputs() };
+        assert!(stale(&left));
+        assert_eq!(plan(&left), Plan::Clear);
+        let (next, cleared) = plan_after_clear(&left);
+        assert_eq!(next, Plan::Ready, "the image loads after the clear");
+        assert_eq!(cleared.quarantine.as_deref(), Some(format!("{}\n", "ab".repeat(32)).as_str()));
+        assert_eq!(cleared.strikes.as_deref(), Some(tk_boot::format_strikes(0, BUILD).as_str()));
+        assert!(cleared.drop_verdict);
+        // Strikes written before v1.0.17 name no build, and a quarantine line
+        // of the release image with no verdict at all is a leftover too.
+        for (strikes, quarantine) in [(Some("strikes=2\n"), None), (None, Some(quarantine.as_str()))] {
+            let left = Inputs { strikes, quarantine, cached: true, ..inputs() };
+            assert_eq!(plan(&left), Plan::Clear);
+            assert_eq!(plan_after_clear(&left).0, Plan::Ready);
         }
-        assert_eq!(plan_with(Some("strikes=2\n"), None), Plan::Stock("strikes"));
-        assert_eq!(plan_with(Some("strikes=lots\n"), None), Plan::Stock("strikes-unreadable"));
-        assert_eq!(plan_with(Some("strikes=1\n"), None), Plan::Ready);
-        assert_eq!(plan_with(None, Some(&format!("# keeper\n{}\n", "ab".repeat(32)))), Plan::Stock("quarantined"));
-        assert_eq!(plan_with(None, Some("# none yet\n")), Plan::Ready);
+        // A verdict this build wrote and that holds nothing is kept: its
+        // counts and its wait for the network still apply.
+        let waiting = Verdict::default().rolled_back(RELEASE, BUILD).judge(false).0.render();
+        let kept = Inputs { verdict: Some(&waiting), cached: true, ..inputs() };
+        assert!(!stale(&kept));
+        assert_eq!(plan(&kept), Plan::Ready);
+        // Nothing to clear without the release image's records.
+        assert_eq!(clear(&inputs()), Cleared::default());
     }
 
     #[test]

@@ -25,15 +25,17 @@ files standing in for the ebtables and ip6tables FORWARD chains, through stubs
 that print them the way the unit's tools do: this proves the keeper's
 decisions and commands, not the kernel tables.
 The boot confirm for a staged modem firmware image reads a status file standing
-in for the boot hook's and runs against the ping and reboot stubs: the main run
-has no staged image and must never reboot for it, then one staged boot gets no
-answer (quarantine, one reboot) and one gets an answer (strikes cleared).
-For the default image the quarantine is provisional: a stock boot with no
-answer either takes it back out (tower down at boot). A stock boot that does
-answer counts an image failure and reboots at once to try the image again: a
-retry that confirms clears the count (the tower was only late), and a second
-failure sticks. Two image boots cut short before their confirm (strikes at 2,
-no rollback) are judged the same way on the stock boot.
+in for the boot hook's and runs against the ping and reboot stubs, the
+vendor cache (attached with an RSRP, or searching) and a DNS stand-in for the
+bearer's DNS server. The main run has no staged image and must never reboot
+for it. Only time with a cell in view counts against an image (20 s here),
+and every keeper reboot passes the reboot gate (the CPAS window, the clock,
+four a day). For the default image no network condition may keep the unit
+off it: a tower down at the upgrade costs one comparison and one way back,
+and the image then waits with no second cycle; boots cut short and a
+flapping tower likewise; core up with ping unanswered confirms through DNS;
+a comparison inside the CPAS window or at the daily cap waits on the image.
+Only failures in a row where stock answers quarantine an image.
 The modem feature flags (v1.0.15) run against a stub modem console that prints
 `vm` dumps the way the unit's does and keeps its RAM in a file: no session
 before a confirmed staged boot, no write before the patch magic, then writes
@@ -78,7 +80,7 @@ def main():
         if os.geteuid() != 0:
             raise SystemExit('Run as root; this test creates isolated mount/network/PID namespaces.')
         subprocess.run(['unshare', '--mount', '--net', '--pid', '--fork', '--mount-proc',
-                        sys.executable, __file__, '--inner'], check=True, timeout=1500)
+                        sys.executable, __file__, '--inner'], check=True, timeout=2700)
         return
     run('mount', '--make-rprivate', '/')
     run('mount', '-t', 'tmpfs', 'tmpfs', '/tmp')
@@ -373,7 +375,7 @@ for line in sys.stdin:
              TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
              TITAN_QCTRL_PROC_WRITE='/tmp/qctrl-ctl',TITAN_MODULES_DIR='/tmp/image-modules',TITAN_LATENCY_DIR='/tmp/latency',
-             TITAN_TK_QUIET_UTC='',
+             TITAN_TK_QUIET_UTC='',TITAN_TK_CONFIRM_SECS='20',TITAN_TK_SEARCH_SECS='45',TITAN_TK_RECHECK_SECS='3600',TITAN_TK_PROBE_EVERY='5',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
              TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
              TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',
@@ -700,6 +702,8 @@ for line in sys.stdin:
         assert waited>=115, waited
         assert Path('/tmp/reboot-actions').read_text().splitlines()[0]=='reboot ', Path('/tmp/reboot-actions').read_text()
         assert 'rebooting (reboot 1 in a row)' in log()
+        # Through the keeper's reboot gate: counted against its daily cap.
+        assert Path('/tmp/pd/keeper-reboots').read_text().split()[1:]==['deaf'], Path('/tmp/pd/keeper-reboots').read_text()
         assert Path('/tmp/pd/watchdog-strikes.txt').read_text()=='strikes=1\n'
         print('PASS: deaf watchdog rebooted once after %d s of silence while attached.'%waited,flush=True)
         # Minutes of watchdog rounds later, the vendor flag was written once.
@@ -732,142 +736,260 @@ for line in sys.stdin:
         print('PASS: stock boot: no modem console session or flags; the clamp and the fast path are on by default.',flush=True)
         # A staged modem firmware image whose boot never answers. Nothing has
         # answered since `silent_from`; the deaf watchdog of a new keeper
-        # process cannot arm, so any reboot now is the boot confirm's.
-        def restart():
+        # process cannot arm, so any reboot now is the boot confirm's. The
+        # modem stays attached (a cell in view), so the confirm's clock runs;
+        # this harness sets it to 20 s (TITAN_TK_CONFIRM_SECS).
+        def restart(extra=None):
             nonlocal keeper
             keeper.terminate();keeper.wait(timeout=5)
             Path('/tmp/reboot-actions').unlink(missing_ok=True)
-            keeper=subprocess.Popen([str(BINARY),'run'],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            # A new boot: nothing has answered through the core yet.
+            Path('/tmp/runtime/heard-through-core').unlink(missing_ok=True)
+            keeper=subprocess.Popen([str(BINARY),'run'],env=dict(env,**(extra or {})),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
         def uptime():
             return int(float(Path('/proc/uptime').read_text().split()[0]))
+        def strikes(n):
+            return 'strikes=%d\nfirmware=unknown\n'%n
+        def reboots():
+            p=Path('/tmp/pd/keeper-reboots')
+            return [line.split()[1] for line in p.read_text().splitlines()] if p.exists() else []
+        def fresh_budget():
+            Path('/tmp/pd/keeper-reboots').unlink(missing_ok=True)
+        def quiet(seconds):
+            until=time.monotonic()+seconds
+            wait_for(lambda:time.monotonic()>=until or Path('/tmp/reboot-actions').exists(),seconds+5)
+            assert not Path('/tmp/reboot-actions').exists(), 'rebooted while it should wait'
         bad='a'*64
         Path('/tmp/tk').mkdir()
         Path('/tmp/tk/strikes').write_text('strikes=1\n')
         Path('/tmp/tk/config').write_text('enabled=1\nsha256='+bad+'\ntarget=192.0.2.9\n')
-        up=uptime()
-        Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(bad,max(0,up-400)))
+        Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(bad,uptime()))
+        fresh_budget()
         restart()
-        wait_for(lambda:Path('/tmp/reboot-actions').exists(),max(90,300-up+90))
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),90)
         assert Path('/tmp/reboot-actions').read_text().splitlines()[0]=='reboot ', Path('/tmp/reboot-actions').read_text()
         assert Path('/tmp/tk/quarantine').read_text()==bad+'\n'
-        assert Path('/tmp/tk/strikes').read_text()=='strikes=2\n'
+        assert Path('/tmp/tk/strikes').read_text()==strikes(2), Path('/tmp/tk/strikes').read_text()
         assert Path('/tmp/tk.result').read_text()=='rollback='+bad+'\n'
-        assert 'quarantined it, rebooting onto stock modem firmware' in log()
+        assert 'a cell in view for 20 s without a management answer' in log() and 'quarantined it, rebooting onto stock modem firmware' in log(), log()
         assert any('192.0.2.9' in call for call in Path('/tmp/ping-calls').read_text().splitlines())
-        print('PASS: a staged boot with no answer quarantined its image and asked for one reboot.',flush=True)
+        assert reboots()==['away'], reboots()
+        print('PASS: a staged boot with a cell in view and no answer for 20 s quarantined its image and asked for one reboot, through the reboot gate.',flush=True)
         # The same failure while the SAS CPAS window is open (here a window
-        # around now): the quarantine is written at once, the reboot waits.
+        # around now): the comparison waits and records nothing, so an answer
+        # meanwhile would still confirm the image.
         Path('/tmp/tk.result').unlink()
         Path('/tmp/tk/quarantine').unlink()
         Path('/tmp/tk/strikes').write_text('strikes=1\n')
-        Path('/tmp/reboot-actions').unlink(missing_ok=True)
+        fresh_budget()
         minute=time.gmtime().tm_hour*60+time.gmtime().tm_min
         window='%02d:%02d-%02d:%02d'%(((minute-60)%1440)//60,(minute-60)%60,((minute+60)%1440)//60,(minute+60)%60)
-        keeper.terminate();keeper.wait(timeout=5)
-        keeper=subprocess.Popen([str(BINARY),'run'],env=dict(env,TITAN_TK_QUIET_UTC=window),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-        wait_for(lambda:'the reboot onto stock modem firmware waits for it to end' in log(),max(90,300-up+90))
-        assert Path('/tmp/tk/quarantine').read_text()==bad+'\n' and Path('/tmp/tk/strikes').read_text()=='strikes=2\n'
-        until=time.monotonic()+5
-        wait_for(lambda:time.monotonic()>=until,8)
-        assert not Path('/tmp/reboot-actions').exists(), 'rebooted inside the CPAS window'
-        # A keeper that starts once the window is over owes that reboot.
+        before=len(log())
+        restart({'TITAN_TK_QUIET_UTC':window})
+        wait_for(lambda:'the comparison with stock modem firmware waits: the SAS CPAS window is open' in log()[before:],90)
+        quiet(8)
+        assert not Path('/tmp/tk/quarantine').exists() and Path('/tmp/tk/strikes').read_text()=='strikes=1\n'
+        assert not Path('/tmp/tk.result').exists() and reboots()==[]
+        # Once the window is over (a keeper without it), it goes ahead.
+        before=len(log())
         restart()
-        wait_for(lambda:Path('/tmp/reboot-actions').exists(),20)
-        assert 'rebooting onto stock modem firmware, outside the SAS CPAS window' in log(), log()
-        print('PASS: inside the CPAS window the rollback quarantined at once and rebooted only once outside it.',flush=True)
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),90)
+        assert 'quarantined it, rebooting onto stock modem firmware' in log()[before:], log()[before:]
+        assert Path('/tmp/tk/quarantine').read_text()==bad+'\n'
+        print('PASS: a comparison due inside the CPAS window waited and recorded nothing, and went ahead outside it.',flush=True)
         assert not Path('/tmp/dm-log').exists(), 'a modem console session ran before any boot confirm'
-        # The default image's rollback is provisional (tk_verdict). Tower down
-        # at boot: the image gets no answer, nor does stock firmware on the
-        # next boot, so the image comes out of quarantine for a later boot.
+        # The default image (v1.0.17): no network condition may keep a unit
+        # off it. The keeper reads the modem's view from the vendor cache:
+        # attached with a measured RSRP, or searching. A DNS stand-in answers
+        # questions to the bearer's DNS server (192.0.2.53) while /tmp/dns-ok
+        # exists; the ping stand-in answers while /tmp/ping-ok exists.
         image='d'*64
         # No wm= lines: a confirmed boot here starts no modem console session.
         body='# built at boot\nenabled=1\nsha256=%s\n'%image
         operator_config=Path('/tmp/tk/config').read_text()
         Path('/tmp/tk/config').write_text('# witcher-default n6h-r4-r1 %s\n%s'%(hashlib.sha256(body.encode()).hexdigest(),body))
+        run(ip,'addr','add','192.0.2.53/32','dev','lo')
+        dns_sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        dns_sock.bind(('192.0.2.53',53))
+        def dns_loop():
+            while True:
+                data,peer=dns_sock.recvfrom(512)
+                if Path('/tmp/dns-ok').exists() and len(data)>=12:
+                    dns_sock.sendto(data[:2]+bytes([data[2]|0x80])+data[3:],peer)
+        threading.Thread(target=dns_loop,daemon=True).start()
+        radio_lock=threading.Lock()
+        def radio(cell):
+            with radio_lock:
+                kept=[line for line in Path('/tmp/nvram-cache').read_text().splitlines()
+                      if not line.startswith(('sqns_connection_mediaState=','sqns_radio_RSRP='))]
+                lines=['sqns_connection_mediaState=ATTACHED','sqns_radio_RSRP=-10790'] if cell else ['sqns_connection_mediaState=DISCONNECTED','sqns_radio_RSRP=']
+                Path('/tmp/nvram-cache.radio').write_text('\n'.join(kept+lines)+'\n')
+                Path('/tmp/nvram-cache.radio').replace('/tmp/nvram-cache')
+        def core(up):
+            # The management address on lte0pdn0: the bearer is up.
+            have='10.200.1.2/30' in subprocess.check_output([ip,'addr','show','dev','lte0pdn0'],text=True)
+            if up and not have: run(ip,'addr','add','10.200.1.2/30','dev','lte0pdn0')
+            if not up and have: run(ip,'addr','del','10.200.1.2/30','dev','lte0pdn0')
+        def answers(ping=False,dns=False):
+            for name,on in (('/tmp/ping-ok',ping),('/tmp/dns-ok',dns)):
+                if on: Path(name).write_text('')
+                else: Path(name).unlink(missing_ok=True)
         def verdict():
             p=Path('/tmp/tk/verdict')
             return dict(l.split('=',1) for l in p.read_text().splitlines()) if p.exists() else {}
+        def record(genuine,network,pending,outage):
+            return {'gzip':image,'firmware':'unknown','genuine':str(genuine),'network':str(network),'pending':str(pending),'outage':str(outage)}
+        def quarantined():
+            p=Path('/tmp/tk/quarantine')
+            return p.exists() and image in p.read_text()
         def image_boot():
-            Path('/tmp/tk/strikes').write_text('strikes=1\n')
+            Path('/tmp/tk/strikes').write_text(strikes(1))
             Path('/tmp/tk.result').unlink(missing_ok=True)
-            Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(image,max(0,uptime()-400)))
-            restart()
-            wait_for(lambda:Path('/tmp/reboot-actions').exists(),90)
-            assert 'quarantined it for now (the next stock boot tells whether the image or the network failed)' in log(), log()
-            assert image in Path('/tmp/tk/quarantine').read_text() and Path('/tmp/tk/strikes').read_text()=='strikes=2\n'
-            assert verdict().get('pending')=='1', verdict()
-        def confirm_boot():
-            Path('/tmp/tk/strikes').write_text('strikes=1\n')
-            Path('/tmp/tk.result').unlink(missing_ok=True)
-            Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(image,max(0,uptime()-60)))
-            Path('/tmp/ping-ok').write_text('')
+            Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(image,uptime()))
             before=len(log())
             restart()
-            wait_for(lambda:'tk boot confirmed:' in log()[before:],90)
-            Path('/tmp/ping-ok').unlink(missing_ok=True)
-        def stock_boot(answer):
+            return before
+        def stock_boot():
             Path('/tmp/tk.result').unlink(missing_ok=True)
             Path('/tmp/tk.status').write_text('state=stock\nreason=strikes\nloaded_at=%d\nsource=nand\nfirmware=clean\n'%max(0,uptime()-400))
-            if answer: Path('/tmp/ping-ok').write_text('')
             before=len(log())
             restart()
-            wait_for(lambda:'tk boot verdict: stock modem firmware' in log()[before:],90)
-            Path('/tmp/ping-ok').unlink(missing_ok=True)
-            return log()[before:]
-        image_boot()
-        judged=stock_boot(False)
-        assert 'was the network' in judged, judged
-        quarantine=Path('/tmp/tk/quarantine').read_text()
-        assert image not in quarantine and bad in quarantine, quarantine
-        assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
-        assert verdict()=={'gzip':image,'genuine':'0','network':'1','pending':'0'}, verdict()
-        assert not Path('/tmp/reboot-actions').exists(), 'a verdict never reboots'
-        print('PASS: tower down at boot: the rollback was provisional, stock got no answer either, and the image came out of quarantine for a later boot.',flush=True)
+            return before
+        # The tower is down at the moment of upgrade, for longer than every
+        # limit here (the scaled two hours): the image waits while it sees no
+        # cell, makes one comparison after 45 s of searching
+        # (TITAN_TK_SEARCH_SECS), stock firmware finds no network either, and
+        # the unit goes straight back onto the image, which then waits for the
+        # tower with no second cycle and confirms once service returns.
+        fresh_budget();radio(False);core(False);answers()
+        before=image_boot()
+        quiet(30)
+        assert 'time with no cell is waiting, not failure' in log()[before:], log()[before:]
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),60)
+        assert 'no cell in view for 45 s in a row' in log()[before:] and 'quarantined it for now' in log()[before:], log()[before:]
+        assert quarantined() and Path('/tmp/tk/strikes').read_text()==strikes(2) and verdict()['pending']=='1', verdict()
+        before=stock_boot()
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        assert 'was the network' in log()[before:], log()[before:]
+        assert not quarantined() and bad in Path('/tmp/tk/quarantine').read_text()
+        assert Path('/tmp/tk/strikes').read_text()==strikes(0)
+        assert verdict()==record(0,1,0,1), verdict()
+        before=image_boot()
+        quiet(60)
+        assert 'waits for the network' in log()[before:], log()[before:]
+        radio(True);core(True);answers(ping=True)
+        wait_for(lambda:'tk boot confirmed:' in log()[before:],30)
+        answers()
+        assert verdict()==record(0,1,0,0), verdict()
+        assert not quarantined() and Path('/tmp/tk/strikes').read_text()==strikes(0)
+        assert reboots()==['away','back'], reboots()
+        print('PASS: tower down at the upgrade: one comparison, straight back onto the image, no second cycle while the tower stayed down, and confirmed as soon as service returned.',flush=True)
         # Power flapping at boot: two image boots ended before their confirm
         # decided (strikes at 2, no rollback recorded). The stock boot records
-        # them as one rollback and judges it; here stock gets no answer either.
-        Path('/tmp/tk/strikes').write_text('strikes=2\n')
-        judged=stock_boot(False)
-        assert 'ended before their boot confirm decided' in judged and 'was the network' in judged, judged
-        assert image not in Path('/tmp/tk/quarantine').read_text()
-        assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
-        assert verdict()=={'gzip':image,'genuine':'0','network':'2','pending':'0'}, verdict()
-        assert not Path('/tmp/reboot-actions').exists(), 'a verdict never reboots'
-        print('PASS: two image boots cut short before their confirm were judged as one rollback on the stock boot, and the image came back.',flush=True)
-        # Stock answers after the rollback: failure 1 of 2. The network is up,
-        # so the keeper reboots at once to try the image again. Here the tower
-        # was only late (a site power cut that outlasted the image's 300 s), so
-        # that retry confirms and the failure is forgotten.
-        run(ip,'addr','add','10.200.1.2/30','dev','lte0pdn0')
-        image_boot()
-        judged=stock_boot(True)
-        assert 'failure 1 of 2' in judged and 'reboots to try it again now' in judged, judged
-        wait_for(lambda:Path('/tmp/reboot-actions').exists(),30)
-        assert image not in Path('/tmp/tk/quarantine').read_text()
-        assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
-        assert verdict()=={'gzip':image,'genuine':'1','network':'2','pending':'0'}, verdict()
-        confirm_boot()
-        assert verdict()=={'gzip':image,'genuine':'0','network':'2','pending':'0'}, verdict()
-        print('PASS: stock answered after a rollback; the keeper rebooted at once to try the image again, and the confirmed retry cleared the failure.',flush=True)
-        # A genuinely bad image: the retry after failure 1 fails as well, stock
-        # answers again, and the quarantine sticks with no further reboot.
-        for failure in (1,2):
-            image_boot()
-            judged=stock_boot(True)
-            assert 'failure %d of 2'%failure in judged, judged
-        assert 'it stays quarantined until Retry' in judged, judged
-        until=time.monotonic()+3
-        wait_for(lambda:time.monotonic()>=until,5)
-        assert not Path('/tmp/reboot-actions').exists(), 'a quarantine that sticks reboots nothing'
-        assert image in Path('/tmp/tk/quarantine').read_text()
-        assert verdict()=={'gzip':image,'genuine':'2','network':'2','pending':'0'}, verdict()
-        run(ip,'addr','del','10.200.1.2/30','dev','lte0pdn0')
+        # them as one rollback; here stock gets no answer either, so straight
+        # back onto the image.
+        radio(False);core(False);answers()
+        Path('/tmp/tk/strikes').write_text(strikes(2))
+        before=stock_boot()
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        assert 'ended before their boot confirm decided' in log()[before:] and 'was the network' in log()[before:], log()[before:]
+        assert not quarantined() and Path('/tmp/tk/strikes').read_text()==strikes(0)
+        assert verdict()==record(0,2,0,1), verdict()
+        print('PASS: two image boots cut short before their confirm were judged on the stock boot, and the unit went straight back onto the image.',flush=True)
+        # A flapping tower: the cell comes and goes every 3 s and nothing ever
+        # answers. Only the time with the cell counts; one comparison, one
+        # way back, then the image waits without another reboot.
+        fresh_budget();core(True);answers()
+        Path('/tmp/tk/verdict').unlink()
+        flapping=threading.Event();flapping.set()
+        def flap():
+            # Uneven steps, so the probe rounds do not see one phase only.
+            up,step=False,0
+            while flapping.is_set():
+                up=not up;radio(up);time.sleep((2.5,4,3.5,2,3)[step%5]);step+=1
+        flapper=threading.Thread(target=flap,daemon=True);flapper.start()
+        before=image_boot()
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),150)
+        assert 'quarantined it for now' in log()[before:], log()[before:]
+        before=stock_boot()
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        before=image_boot()
+        quiet(90)
+        flapping.clear();flapper.join(timeout=10)
+        assert reboots()==['away','back'], reboots()
+        assert not quarantined() and verdict()['outage']=='1', verdict()
+        radio(True);answers(ping=True)
+        wait_for(lambda:'tk boot confirmed:' in log()[before:],30)
+        answers()
+        print('PASS: a flapping tower cost one comparison and one way back; then the image waited with no further reboot and confirmed once the tower settled.',flush=True)
+        # Core up, ping unanswered: a carrier DNS server that ignores ping
+        # still answers DNS, and that answer confirms the image.
+        fresh_budget();radio(True);core(True);answers(dns=True)
+        before=image_boot()
+        wait_for(lambda:'tk boot confirmed:' in log()[before:],30)
+        answers()
+        quiet(3)
+        assert reboots()==[] and not quarantined()
+        print('PASS: core up with ping unanswered: a DNS answer through the core confirmed the image, with no comparison.',flush=True)
+        # Stock answers where the image did not: failure 1 of 2, and with the
+        # network known to be up, straight back onto the image. A tower that
+        # was only late (a site power cut): the retry confirms and the failure
+        # is forgotten.
+        fresh_budget();radio(True);core(True);answers()
+        Path('/tmp/tk/verdict').unlink(missing_ok=True)
+        before=image_boot()
+        wait_for(lambda:Path('/tmp/reboot-actions').exists(),60)
+        answers(ping=True)
+        before=stock_boot()
+        wait_for(lambda:'rebooting back onto modem firmware' in log()[before:],60)
+        assert 'failure 1 of 2' in log()[before:] and 'tries it again at once' in log()[before:], log()[before:]
+        assert verdict()==record(1,0,0,0), verdict()
+        before=image_boot()
+        wait_for(lambda:'tk boot confirmed:' in log()[before:],30)
+        answers()
+        assert verdict()==record(0,0,0,0), verdict()
+        assert reboots()==['away','back'], reboots()
+        print('PASS: stock answered after a comparison; the unit went straight back onto the image, and the confirmed retry cleared the failure.',flush=True)
+        # A genuinely bad image: its boots never answer and stock's do. Failure
+        # 1 goes straight back onto the image, failure 2 in a row sticks, with
+        # no further reboot.
+        fresh_budget()
+        for failure,expect in ((1,'rebooting back onto modem firmware'),(2,'it stays quarantined until Retry')):
+            answers()
+            before=image_boot()
+            wait_for(lambda:Path('/tmp/reboot-actions').exists(),60)
+            answers(ping=True)
+            before=stock_boot()
+            wait_for(lambda:expect in log()[before:],60)
+            assert 'failure %d of 2'%failure in log()[before:], log()[before:]
+        quiet(5)
+        answers()
+        assert 'it stays quarantined until Retry' in log()[before:], log()[before:]
+        assert quarantined() and verdict()==record(2,0,0,0), verdict()
+        assert reboots()==['away','back','away'], reboots()
+        print('PASS: a genuinely bad image went straight back once after stock answered, and its quarantine stuck at the second failure in a row.',flush=True)
+        # The keeper's daily cap: with three reboots in the last day, a
+        # comparison (which needs a second slot for the way back) waits on the
+        # image and records nothing.
+        Path('/tmp/tk/verdict').unlink()
+        Path('/tmp/tk/quarantine').write_text(bad+'\n')
+        Path('/tmp/pd/keeper-reboots').write_text(''.join('%d deaf\n'%(int(time.time())-60) for _ in range(3)))
+        before=image_boot()
+        wait_for(lambda:'reach its cap of 4' in log()[before:],60)
+        quiet(5)
+        assert not quarantined() and Path('/tmp/tk/strikes').read_text()==strikes(1)
+        print('PASS: at the keeper\'s daily cap a comparison waited on the image and recorded nothing.',flush=True)
+        core(False);answers()
+        with radio_lock:
+            kept=[line for line in Path('/tmp/nvram-cache').read_text().splitlines()
+                  if not line.startswith(('sqns_connection_mediaState=','sqns_radio_RSRP='))]
+            Path('/tmp/nvram-cache.radio').write_text('\n'.join(kept)+'\n')
+            Path('/tmp/nvram-cache.radio').replace('/tmp/nvram-cache')
         assert not Path('/tmp/dm-log').exists(), 'a confirmed boot with no wm= lines started a modem console session'
         # The operator image and its quarantine again, for the sections below.
         Path('/tmp/tk/config').write_text(operator_config)
         Path('/tmp/tk/quarantine').write_text(bad+'\n')
-        Path('/tmp/tk/verdict').unlink()
-        print('PASS: a bad default image was retried once at once after stock answered, and its quarantine stuck at the second failure.',flush=True)
+        fresh_budget()
         # A staged image whose boot answers through the core.
         good='b'*64
         Path('/tmp/tk.result').unlink(missing_ok=True)
@@ -894,7 +1016,7 @@ for line in sys.stdin:
         before_good=len(log())
         restart()
         wait_for(lambda:'tk boot confirmed' in log()[before_good:],45)
-        assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
+        assert Path('/tmp/tk/strikes').read_text()==strikes(0), Path('/tmp/tk/strikes').read_text()
         assert Path('/tmp/tk/confirmed').read_text()=='sha256='+good+'\n'
         assert Path('/tmp/tk.result').read_text()=='confirmed='+good+'\n'
         assert Path('/tmp/tk/quarantine').read_text()==bad+'\n'

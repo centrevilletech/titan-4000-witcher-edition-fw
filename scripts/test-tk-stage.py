@@ -200,6 +200,7 @@ class Unit:
             'module': str(self.module), 'gated': str(self.gated),
             'gated_sha': hashlib.sha256(self.gated.read_bytes()).hexdigest(),
             'keeper': str(keeper or base / 'bin/titan-pd-keeper'),
+            'witcher_release': f'{base}/etc/witcher-release',
             'build_log': f'{base}/var/run/witcher-tk.build',
             'build_limit': str(build_limit),
         }
@@ -339,7 +340,7 @@ class Hook(unittest.TestCase):
         status = unit.status()
         self.assertEqual((status['state'], status['sha256'], status['strikes']), ('staged', digest, '1'))
         self.assertEqual((status['loaded_at'], status['source'], status['firmware']), ('17', 'fs', 'clean'))
-        self.assertEqual(unit.strikes(), 'strikes=1\n')
+        self.assertEqual(unit.strikes(), 'strikes=1\nfirmware=unknown\n')
         # The partition was released before the modem loaded.
         self.assertFalse(any(row.startswith('ubi1:') for row in loaded['pre_mounts']), loaded['pre_mounts'])
         self.assertIn(f'witcher-tk {unit.root}/lib/firmware bind rw', loaded['pre_mounts'])
@@ -357,11 +358,11 @@ class Hook(unittest.TestCase):
         digest = unit.opt_in(good_image())
         self.assertEqual(unit.boot()['firmware'], digest)
         self.assertEqual(unit.boot()['firmware'], digest)
-        self.assertEqual(unit.strikes(), 'strikes=2\n')
+        self.assertEqual(unit.strikes(), 'strikes=2\nfirmware=unknown\n')
         for _ in range(3):
             self.assertEqual(unit.boot()['firmware'], 'nand')
             self.assertEqual(unit.status()['reason'], 'strikes')
-            self.assertEqual(unit.strikes(), 'strikes=2\n')
+            self.assertEqual(unit.strikes(), 'strikes=2\nfirmware=unknown\n')
             unit.assert_stock_after(self)
 
     def test_keeper_confirm_resets_the_count(self):
@@ -559,7 +560,7 @@ class DefaultImage(unittest.TestCase):
         self.assertTrue(status['build_secs'].isdigit())
         # Asked read-only first; only the build ran on a read-write mount.
         self.assertEqual(unit.keeper_calls(), ['read ro', 'write rw'])
-        self.assertEqual(unit.strikes(), 'strikes=1\n')
+        self.assertEqual(unit.strikes(), 'strikes=1\nfirmware=unknown\n')
         self.assertTrue((unit.tk / 'config').read_text().startswith('# witcher-default '))
         unit.assert_stock_after(self)
 
@@ -719,6 +720,7 @@ class RealDefaultImage(unittest.TestCase):
         unit = Unit(base, keeper=str(Path(REAL_KEEPER).resolve()), build_limit=build_limit, env={
             'TITAN_TK_PROC_MTD': str(base / 'proc/mtd'), 'TITAN_TK_MTD_DIR': str(base / 'dev'),
             'TITAN_TK_PROC_CMDLINE': str(base / 'proc/cmdline'),
+            'TITAN_WITCHER_RELEASE': str(base / 'etc/witcher-release'),
             'TITAN_PD_RUNTIME': str(base / 'keeper-run'), 'TITAN_PD_STATE': str(base / 'keeper-state')})
         (base / 'proc/mtd').write_text('dev:    size   erasesize  name\nmtd17: 00800000 00020000 "tk"\n'
                                        'mtd18: 00800000 00020000 "tk2"\nmtd19: 01000000 00020000 "misc"\n'
@@ -775,6 +777,60 @@ class RealDefaultImage(unittest.TestCase):
         self.assertEqual(unit.status()['build'], 'cached')
         self.assertEqual((unit.tk / 'active.gz').stat().st_mtime_ns, before)
         self.assertEqual(self.record()['builds'], '1')
+        unit.assert_stock_after(self)
+
+    def firmware(self, version):
+        """Flash firmware `version`: /etc/witcher-release, and its id as the
+        hook and the keeper compute it."""
+        release = self.unit.root / 'etc/witcher-release'
+        release.parent.mkdir(exist_ok=True)
+        release.write_text(json.dumps({'name': 'Witcher', 'version': version}) + '\n')
+        return hashlib.sha256(release.read_bytes()).hexdigest()[:16]
+
+    def test_a_new_firmware_build_clears_a_quarantine_that_stuck_and_loads_the_image(self):
+        unit = self.unit
+        old = self.firmware('1.0.17')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.strikes(), f'strikes=1\nfirmware={old}\n', 'the hook names the build')
+        # The keeper quarantined the release image for good under this build
+        # (two failures in a row where stock firmware answered). An operator's
+        # line for another image stays as it is.
+        other = 'ab' * 32
+        (unit.tk / 'quarantine').write_text(f'{other}\n{self.release}\n')
+        (unit.tk / 'strikes').write_text(f'strikes=2\nfirmware={old}\n')
+        verdict = f'gzip={self.release}\nfirmware={old}\ngenuine=2\nnetwork=0\npending=0\noutage=0\n'
+        (unit.tk / 'verdict').write_text(verdict)
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual((unit.status()['reason'], unit.status()['build']), ('quarantined', 'quarantined'))
+        self.assertEqual((unit.tk / 'verdict').read_text(), verdict, 'the same build keeps it')
+        unit.assert_stock_after(self)
+        # A firmware update: the image loads again at the first boot.
+        new = self.firmware('1.0.18')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        status = unit.status()
+        self.assertEqual((status['state'], status['build']), ('staged', 'cleared'), status)
+        self.assertEqual((unit.tk / 'quarantine').read_text(), f'{other}\n')
+        self.assertFalse((unit.tk / 'verdict').exists())
+        self.assertEqual(unit.strikes(), f'strikes=1\nfirmware={new}\n')
+        self.assertEqual(self.record()['builds'], '1', 'nothing was rebuilt')
+        self.assertIn('cleared what another firmware build left', (unit.root / 'var/run/witcher-tk.build').read_text())
+        unit.assert_stock_after(self)
+
+    def test_strikes_an_older_firmware_counted_are_cleared_but_this_builds_still_stop_the_image(self):
+        unit = self.unit
+        build = self.firmware('1.0.17')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        # Strikes from before v1.0.17 name no build: a leftover, cleared.
+        (unit.tk / 'strikes').write_text('strikes=2\n')
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.status()['build'], 'cleared')
+        self.assertEqual(unit.strikes(), f'strikes=1\nfirmware={build}\n')
+        # This build's own boots that died before their confirm still stop
+        # the image (the keeper's stock boot then judges them).
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.strikes(), f'strikes=2\nfirmware={build}\n')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'strikes')
         unit.assert_stock_after(self)
 
     def test_a_later_firmware_rewrites_an_earlier_default_config_without_a_rebuild(self):

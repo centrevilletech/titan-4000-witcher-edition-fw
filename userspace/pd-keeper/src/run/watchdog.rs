@@ -1,12 +1,15 @@
 //! The deaf watchdog: reboot a unit that stays attached but hears nothing
 //! through the core, and keep the vendor's own ping watchdog off while it
-//! runs. See `titan_pd_model::deaf`.
+//! runs. See `titan_pd_model::deaf`. Its reboot passes the keeper's reboot
+//! gate (`super::reboot`): never in the SAS CPAS window, never with the
+//! clock unset, and within the keeper's daily cap (v1.0.17).
 
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 
 use titan_pd_model::deaf::{self, Action as DeafAction};
+use titan_pd_model::dns_probe;
 use titan_pd_model::mgmt;
 
 use crate::{log, nvram};
@@ -14,6 +17,7 @@ use crate::files::read_file;
 use crate::paths::{env_or, state_dir};
 
 use super::Keeper;
+use super::reboot::Kind;
 
 /// A plain `reboot` that has not ended this process after this long is forced.
 const REBOOT_FORCE_AFTER: u64 = 45;
@@ -21,28 +25,44 @@ const REBOOT_FORCE_AFTER: u64 = 45;
 const REBOOT_GIVE_UP_AFTER: u64 = 120;
 
 /// One ping to each target, collected on later ticks so the wire loop keeps
-/// running. The deaf watchdog and the tk boot confirm each run one.
+/// running. The deaf watchdog and the tk boot confirm each run one; the boot
+/// confirm's also asks each target a DNS question (`dns_probe`), because a
+/// carrier's DNS servers often ignore ping.
 pub(super) struct PingRound {
     children: Vec<Child>,
+    questions: Vec<(UdpSocket, u16)>,
     started: u64,
 }
 
 impl PingRound {
-    /// Start a round, or `None` when no ping could start.
+    /// Start a round of pings, or `None` when no ping could start.
     pub(super) fn start(targets: &[IpAddr], now: u64) -> Option<Self> {
+        Self::open(targets, now, false)
+    }
+
+    /// Pings and a DNS question to each target, or `None` when neither could
+    /// start.
+    pub(super) fn start_with_dns(targets: &[IpAddr], now: u64) -> Option<Self> {
+        Self::open(targets, now, true)
+    }
+
+    fn open(targets: &[IpAddr], now: u64, dns: bool) -> Option<Self> {
         let children = spawn_pings(targets);
-        (!children.is_empty()).then_some(Self {
+        let questions = if dns { ask_dns(targets, now) } else { Vec::new() };
+        (!children.is_empty() || !questions.is_empty()).then_some(Self {
             children,
+            questions,
             started: now,
         })
     }
 
-    /// Whether a target answered: once one has, once every ping has ended,
-    /// or `timeout` seconds after the start. `None` while the round is open.
-    /// An answered round's pings are stopped and reaped.
+    /// Whether a target answered: once one has, once every ping has ended
+    /// (and no DNS question is open), or `timeout` seconds after the start.
+    /// `None` while the round is open. An answered round's pings are stopped
+    /// and reaped.
     pub(super) fn poll(&mut self, now: u64, timeout: u64) -> Option<bool> {
-        let mut heard = false;
-        let mut running = false;
+        let mut heard = self.questions.iter().any(|(socket, id)| dns_answered(socket, *id));
+        let mut running = !self.questions.is_empty();
         for child in &mut self.children {
             match child.try_wait() {
                 Ok(Some(status)) => heard |= status.success(),
@@ -143,6 +163,10 @@ impl Keeper {
             self.deaf_watch = deaf::Watch::default();
             return;
         }
+        if heard == Some(true) {
+            self.heard_through_core();
+            self.deaf_reboot_held = None;
+        }
         let attached = deaf::attached(&self.nvram_get_cached("sqns_connection_mediaState"));
         let path = state_dir().join("watchdog-strikes.txt");
         let strikes = deaf::parse_strikes(&read_file(&path));
@@ -177,12 +201,25 @@ impl Keeper {
                 }
             }
             DeafAction::Reboot { silent_for } => {
+                // The gate holds it in the CPAS window, without a set clock,
+                // or at the keeper's daily cap; the watch asks again after
+                // the next stretch of silence.
+                if let Some(why) = self.reboot_blocked(Kind::Deaf) {
+                    if self.deaf_reboot_held.as_deref() != Some(why.as_str()) {
+                        self.note(&format!(
+                            "deaf watchdog: attached but nothing heard through the core for {silent_for} s; the reboot waits: {why}"
+                        ));
+                        self.deaf_reboot_held = Some(why);
+                    }
+                    return;
+                }
+                self.deaf_reboot_held = None;
                 store_strikes(&path, strikes.saturating_add(1));
                 self.note(&format!(
                     "deaf watchdog: attached but nothing heard through the core for {silent_for} s; rebooting (reboot {} in a row)",
                     strikes.saturating_add(1)
                 ));
-                self.request_reboot();
+                self.keeper_reboot(Kind::Deaf);
             }
         }
     }
@@ -221,6 +258,37 @@ fn spawn_pings(targets: &[IpAddr]) -> Vec<Child> {
                 .ok()
         })
         .collect()
+}
+
+/// One DNS question to each target (`dns_probe::query`) from its own
+/// connected, non-blocking socket, so only that target's reply arrives on
+/// it. The id changes from round to round. A target that cannot be asked
+/// (no route) is left to its ping.
+fn ask_dns(targets: &[IpAddr], now: u64) -> Vec<(UdpSocket, u16)> {
+    targets
+        .iter()
+        .enumerate()
+        .filter_map(|(i, target)| {
+            let id = (now as u16).wrapping_mul(31).wrapping_add(i as u16) ^ 0x5a5a;
+            let any = if target.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+            let socket = UdpSocket::bind(any).ok()?;
+            socket.set_nonblocking(true).ok()?;
+            socket.connect((*target, 53)).ok()?;
+            socket.send(&dns_probe::query(id)).ok()?;
+            Some((socket, id))
+        })
+        .collect()
+}
+
+/// A reply to question `id` has arrived on `socket`.
+fn dns_answered(socket: &UdpSocket, id: u16) -> bool {
+    let mut reply = [0u8; 512];
+    while let Ok(n) = socket.recv(&mut reply) {
+        if dns_probe::answers(id, &reply[..n]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Write the strike count through a temporary file, so a power cut cannot

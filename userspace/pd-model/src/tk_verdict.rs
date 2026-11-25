@@ -1,37 +1,40 @@
 //! Whether a rollback of the default modem image was the image's fault or
 //! the network's (v1.0.17).
 //!
-//! The boot confirm (`tk_boot::Confirm`) rolls an image back when the modem
-//! gets no answer through the core within `CONFIRM_SECS`. A tower outage or a
-//! site power cut at boot looks the same, so for the default image the
-//! quarantine it records is provisional:
+//! The boot confirm (`tk_boot::Confirm`) compares an image with stock
+//! firmware (a rollback) after a cell was in view for `CONFIRM_SECS` without
+//! an answer through the core, or after `SEARCH_SECS` of no cell at all. A
+//! tower, core or backhaul outage, a missing SAS grant or targets that do not
+//! answer look the same from the image's side, so for the default image the
+//! quarantine a rollback records is provisional, and no network condition
+//! can keep the unit off the image:
 //!
 //! - The rollback writes `pending=1` in `tk/verdict` beside the quarantine
-//!   and `strikes=2`, so the next boot is stock, as before.
+//!   and `strikes=2`, so the next boot is stock.
 //! - That stock boot is watched the same way. When stock firmware gets no
-//!   answer either, the network failed, not the image. The keeper takes the
-//!   image out of quarantine and writes `strikes=0`, and a later boot loads
-//!   it again (`network` counts these).
+//!   answer either, the network failed, not the image: the keeper takes the
+//!   image out of quarantine, writes `strikes=0`, records `outage=1` and
+//!   reboots straight back onto the image, which then waits for the network
+//!   as stock would. While `outage=1` the image is not compared again until
+//!   it confirms (only a recheck after `tk_boot::RECHECK_SECS`), so one
+//!   outage costs at most one image -> stock -> image cycle.
 //! - When stock firmware answers, the image failed where stock did not: one
 //!   genuine failure. Below `GENUINE_LIMIT` the network is known to be up, so
 //!   the keeper takes the image out of quarantine and reboots to try it again
-//!   at once (`Judgement::retests`). A tower that came back between the
-//!   image's watch and stock's (a site power cut: the image's 300 s ran out
-//!   before the tower was up) then confirms, and a confirmed boot clears the
-//!   count. At the limit the quarantine sticks until an operator presses Retry
-//!   (Network → Latency).
+//!   at once. A tower that came back between the image's watch and stock's
+//!   then confirms, and a confirmed boot clears the count. At the limit the
+//!   quarantine sticks until an operator presses Retry (Network → Latency),
+//!   or until the image or the firmware build changes.
 //! - Boots of the image that end before their confirm decides anything (a
 //!   power cut, a crash, a reboot by hand) leave the strikes at the limit and
 //!   no rollback recorded. The next stock boot records them as one rollback
-//!   (`stopped`) and judges it the same way, so a flapping power supply
-//!   cannot keep a good image off either.
+//!   (`stopped`) and judges it the same way.
 //!
-//! A network failure forces no reboot: that retry waits for a boot that
-//! happens anyway. The reboot to retry after stock firmware answered waits
-//! until the clock is set and the SAS CPAS window is over, and comes at most
-//! once between confirmed boots of the image. The strike before every load,
-//! the build cap and the CPAS-aware rollback reboot are unchanged. A record
-//! the keeper cannot read never clears a quarantine.
+//! Every record names the firmware build that wrote it (`firmware`). A
+//! record, quarantine or strike count from another build, or for another
+//! image, no longer applies; the boot hook clears it (`tk_default::plan`).
+//! The keeper's reboots all pass its reboot gate (CPAS window, clock, a cap
+//! per day). A record the keeper cannot read never clears a quarantine.
 //!
 //! The web service builds a copy of this module to show the record; both
 //! copies run these tests.
@@ -45,6 +48,8 @@ pub const GENUINE_LIMIT: u32 = 2;
 pub struct Verdict {
     /// The image the counts are for (its gzip SHA-256).
     pub gzip: String,
+    /// The firmware build that wrote the record (`tk_boot::firmware_id`).
+    pub firmware: String,
     /// Rollbacks after which stock firmware answered, since the image's last
     /// confirmed boot.
     pub genuine: u32,
@@ -52,12 +57,15 @@ pub struct Verdict {
     pub network: u32,
     /// A rollback waits for a stock boot to judge it.
     pub pending: bool,
+    /// The last verdict was the network's: the image waits for the network
+    /// and is not compared again until it confirms.
+    pub outage: bool,
 }
 
 /// What a stock boot made of the pending rollback.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Judgement {
-    /// Stock firmware got no answer either: try the image again later.
+    /// Stock firmware got no answer either: back to the image at once.
     Network,
     /// Stock firmware answered: the image's `count`th failure. At
     /// `GENUINE_LIMIT` the quarantine sticks.
@@ -65,22 +73,16 @@ pub enum Judgement {
 }
 
 impl Judgement {
-    /// The quarantine comes off for a later boot.
-    pub fn retries(self) -> bool {
+    /// The quarantine comes off and the keeper reboots onto the image at
+    /// once: after a network verdict, or a genuine failure below the limit.
+    pub fn back_to_image(self) -> bool {
         !matches!(self, Judgement::Genuine { sticks: true, .. })
-    }
-
-    /// Stock firmware answered, so the network is up now: reboot to try the
-    /// image again at once rather than at some later boot, which could meet
-    /// the next outage.
-    pub fn retests(self) -> bool {
-        matches!(self, Judgement::Genuine { sticks: false, .. })
     }
 }
 
 impl Verdict {
     /// An unreadable count counts as the limit, and an unreadable `pending`
-    /// as no: a damaged record keeps the quarantine.
+    /// or `outage` as no: a damaged record keeps the quarantine.
     pub fn parse(text: &str) -> Self {
         let mut verdict = Self::default();
         for line in text.lines() {
@@ -90,9 +92,11 @@ impl Verdict {
             let value = value.trim();
             match key.trim() {
                 "gzip" => verdict.gzip = value.to_ascii_lowercase(),
+                "firmware" => verdict.firmware = value.to_owned(),
                 "genuine" => verdict.genuine = value.parse().unwrap_or(GENUINE_LIMIT),
                 "network" => verdict.network = value.parse().unwrap_or(0),
                 "pending" => verdict.pending = value == "1",
+                "outage" => verdict.outage = value == "1",
                 _ => {}
             }
         }
@@ -101,27 +105,46 @@ impl Verdict {
 
     pub fn render(&self) -> String {
         format!(
-            "gzip={}\ngenuine={}\nnetwork={}\npending={}\n",
+            "gzip={}\nfirmware={}\ngenuine={}\nnetwork={}\npending={}\noutage={}\n",
             self.gzip,
+            self.firmware,
             self.genuine,
             self.network,
-            u8::from(self.pending)
+            u8::from(self.pending),
+            u8::from(self.outage)
         )
     }
 
-    /// The record after a rollback of `sha`: its counts carry over, and any
-    /// other image's are dropped.
-    pub fn rolled_back(&self, sha: &str) -> Self {
-        let sha = sha.to_ascii_lowercase();
-        let mut next = if self.gzip == sha {
+    /// The record is about `sha` and was written by this firmware build.
+    pub fn applies(&self, sha: &str, firmware: &str) -> bool {
+        self.gzip.eq_ignore_ascii_case(sha) && self.firmware == firmware
+    }
+
+    /// The record keeps `sha` off this boot: a rollback waits for its stock
+    /// verdict, or the quarantine stuck.
+    pub fn holds(&self, sha: &str, firmware: &str) -> bool {
+        self.applies(sha, firmware) && (self.pending || self.sticks())
+    }
+
+    /// `sha` waits for the network: its last verdict was the network's.
+    pub fn waits_for_network(&self, sha: &str, firmware: &str) -> bool {
+        self.applies(sha, firmware) && self.outage
+    }
+
+    /// The record after a rollback of `sha` by this firmware build: its
+    /// counts carry over, and another image's or build's are dropped.
+    pub fn rolled_back(&self, sha: &str, firmware: &str) -> Self {
+        let mut next = if self.applies(sha, firmware) {
             self.clone()
         } else {
             Self {
-                gzip: sha,
+                gzip: sha.to_ascii_lowercase(),
+                firmware: firmware.to_owned(),
                 ..Self::default()
             }
         };
         next.pending = true;
+        next.outage = false;
         next
     }
 
@@ -133,6 +156,7 @@ impl Verdict {
         if next.gzip.eq_ignore_ascii_case(sha) {
             next.pending = false;
             next.genuine = 0;
+            next.outage = false;
         }
         next
     }
@@ -144,18 +168,21 @@ impl Verdict {
         next.pending = false;
         let judgement = if answered {
             next.genuine = next.genuine.saturating_add(1);
+            next.outage = false;
             Judgement::Genuine {
                 count: next.genuine,
                 sticks: next.genuine >= GENUINE_LIMIT,
             }
         } else {
             next.network = next.network.saturating_add(1);
+            next.outage = true;
             Judgement::Network
         };
         (next, judgement)
     }
 
-    /// The image's quarantine sticks until an operator retries it.
+    /// The image's quarantine sticks until an operator retries it, or the
+    /// image or the firmware build changes.
     pub fn sticks(&self) -> bool {
         self.genuine >= GENUINE_LIMIT
     }
@@ -166,9 +193,9 @@ impl Verdict {
     /// rollback, or `None` when there is nothing to judge: the strikes are
     /// below the limit, a rollback already waits, or the image is quarantined
     /// already (an earlier record stands, stuck or not).
-    pub fn stopped(&self, sha: &str, at_limit: bool, quarantined: bool) -> Option<Self> {
-        let stuck = self.gzip.eq_ignore_ascii_case(sha) && self.sticks();
-        (at_limit && !quarantined && !self.pending && !stuck).then(|| self.rolled_back(sha))
+    pub fn stopped(&self, sha: &str, firmware: &str, at_limit: bool, quarantined: bool) -> Option<Self> {
+        let stuck = self.applies(sha, firmware) && self.sticks();
+        (at_limit && !quarantined && !self.pending && !stuck).then(|| self.rolled_back(sha, firmware))
     }
 }
 
@@ -177,28 +204,33 @@ mod tests {
     use super::*;
 
     const IMAGE: &str = "3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb";
+    const BUILD: &str = "0123456789abcdef";
 
     #[test]
     fn a_tower_outage_never_counts_against_the_image() {
         let mut verdict = Verdict::default();
         for outage in 1..=5 {
-            verdict = verdict.rolled_back(IMAGE);
-            assert!(verdict.pending);
+            verdict = verdict.rolled_back(IMAGE, BUILD);
+            assert!(verdict.pending && verdict.holds(IMAGE, BUILD));
             let (next, judgement) = verdict.judge(false);
             assert_eq!(judgement, Judgement::Network);
-            assert!(judgement.retries() && !judgement.retests(), "no reboot");
+            assert!(judgement.back_to_image(), "straight back to the image");
             assert_eq!(
-                (next.genuine, next.network, next.pending),
-                (0, outage, false)
+                (next.genuine, next.network, next.pending, next.outage),
+                (0, outage, false, true)
             );
+            assert!(next.waits_for_network(IMAGE, BUILD) && !next.holds(IMAGE, BUILD));
             verdict = next;
         }
         assert!(!verdict.sticks());
+        // The image answers once the network is back: the wait is over.
+        let back = verdict.confirmed(IMAGE);
+        assert!(!back.outage && !back.waits_for_network(IMAGE, BUILD));
     }
 
     #[test]
     fn a_bad_image_sticks_after_two_failures_where_stock_answered() {
-        let (once, first) = Verdict::default().rolled_back(IMAGE).judge(true);
+        let (once, first) = Verdict::default().rolled_back(IMAGE, BUILD).judge(true);
         assert_eq!(
             first,
             Judgement::Genuine {
@@ -206,11 +238,9 @@ mod tests {
                 sticks: false
             }
         );
-        assert!(
-            first.retries() && first.retests(),
-            "one failure: tried again at once"
-        );
-        let (twice, second) = once.rolled_back(IMAGE).judge(true);
+        assert!(first.back_to_image(), "one failure: tried again at once");
+        assert!(!once.holds(IMAGE, BUILD) && !once.outage);
+        let (twice, second) = once.rolled_back(IMAGE, BUILD).judge(true);
         assert_eq!(
             second,
             Judgement::Genuine {
@@ -218,14 +248,14 @@ mod tests {
                 sticks: true
             }
         );
-        assert!(!second.retries() && !second.retests());
-        assert!(twice.sticks());
+        assert!(!second.back_to_image());
+        assert!(twice.sticks() && twice.holds(IMAGE, BUILD));
         // The tower was back by stock's watch but not by the image's (a site
         // power cut): the retry confirms and the failure is forgotten.
         let retried = once.confirmed(IMAGE);
         assert_eq!((retried.genuine, retried.pending), (0, false));
         assert_eq!(
-            retried.rolled_back(IMAGE).judge(true).1,
+            retried.rolled_back(IMAGE, BUILD).judge(true).1,
             Judgement::Genuine {
                 count: 1,
                 sticks: false
@@ -234,29 +264,45 @@ mod tests {
     }
 
     #[test]
-    fn another_image_starts_its_own_count_and_a_damaged_record_keeps_the_quarantine() {
-        let old = Verdict {
-            gzip: "ab".repeat(32),
-            genuine: 1,
-            network: 3,
-            pending: false,
-        };
-        let new = old.rolled_back(IMAGE);
+    fn another_image_or_firmware_build_starts_its_own_count() {
+        let (stuck, _) = Verdict::default()
+            .rolled_back(IMAGE, BUILD)
+            .judge(true)
+            .0
+            .rolled_back(IMAGE, BUILD)
+            .judge(true);
+        assert!(stuck.holds(IMAGE, BUILD));
+        // A new firmware build, or another image: the record no longer holds
+        // anything back, and a rollback starts afresh.
+        assert!(!stuck.holds(IMAGE, "fedcba9876543210"));
+        assert!(!stuck.holds(&"ab".repeat(32), BUILD));
+        let fresh = stuck.rolled_back(IMAGE, "fedcba9876543210");
         assert_eq!(
-            new,
+            fresh,
             Verdict {
                 gzip: IMAGE.into(),
+                firmware: "fedcba9876543210".into(),
                 genuine: 0,
                 network: 0,
-                pending: true
+                pending: true,
+                outage: false
             }
         );
-        assert_eq!(Verdict::parse(&new.render()), new);
-        let damaged = Verdict::parse(&format!("gzip={IMAGE}\ngenuine=x\npending=1\n"));
-        assert!(damaged.sticks());
-        assert!(!Verdict::parse(&format!("gzip={IMAGE}\npending=yes\n")).pending);
+        assert_eq!(Verdict::parse(&fresh.render()), fresh);
+    }
+
+    #[test]
+    fn a_damaged_record_keeps_the_quarantine() {
+        let damaged = Verdict::parse(&format!("gzip={IMAGE}\nfirmware={BUILD}\ngenuine=x\npending=1\n"));
+        assert!(damaged.sticks() && damaged.holds(IMAGE, BUILD));
+        let unsure = Verdict::parse(&format!("gzip={IMAGE}\nfirmware={BUILD}\npending=yes\noutage=yes\n"));
+        assert!(!unsure.pending && !unsure.outage);
         assert_eq!(Verdict::parse(""), Verdict::default());
+        // A v1.0.17 record from before `firmware=` names no build: it applies
+        // to none, so the hook clears it.
+        assert!(!Verdict::parse(&format!("gzip={IMAGE}\ngenuine=2\n")).holds(IMAGE, BUILD));
         // Confirming another image leaves this one's rollback waiting.
+        let new = Verdict::default().rolled_back(IMAGE, BUILD);
         assert!(new.confirmed(&"cd".repeat(32)).pending);
         assert!(!new.confirmed(&IMAGE.to_uppercase()).pending);
     }
@@ -265,33 +311,37 @@ mod tests {
     fn boots_cut_short_before_their_confirm_are_judged_as_one_rollback() {
         let once = Verdict {
             gzip: IMAGE.into(),
+            firmware: BUILD.into(),
             genuine: 1,
             network: 2,
             pending: false,
+            outage: true,
         };
         // Two boots died after their strikes: one rollback, counts kept.
-        let recorded = once.stopped(IMAGE, true, false).expect("judged");
+        let recorded = once.stopped(IMAGE, BUILD, true, false).expect("judged");
         assert_eq!(
             recorded,
             Verdict {
                 pending: true,
+                outage: false,
                 ..once.clone()
             }
         );
         assert_eq!(recorded.judge(false).1, Judgement::Network);
         // Nothing to judge: below the limit, already waiting, or quarantined
         // already (a record whose verdict could not be written stays put).
-        assert_eq!(once.stopped(IMAGE, false, false), None);
-        assert_eq!(recorded.stopped(IMAGE, true, false), None);
-        assert_eq!(once.stopped(IMAGE, true, true), None);
+        assert_eq!(once.stopped(IMAGE, BUILD, false, false), None);
+        assert_eq!(recorded.stopped(IMAGE, BUILD, true, false), None);
+        assert_eq!(once.stopped(IMAGE, BUILD, true, true), None);
         // A stuck image stays stuck, but another image starts afresh.
         let (stuck, _) = recorded.judge(true);
+        let (stuck, _) = stuck.rolled_back(IMAGE, BUILD).judge(true);
         assert!(stuck.sticks());
-        assert_eq!(stuck.stopped(IMAGE, true, false), None);
+        assert_eq!(stuck.stopped(IMAGE, BUILD, true, false), None);
         let other = "cd".repeat(32);
         assert_eq!(
-            stuck.stopped(&other, true, false),
-            Some(Verdict::default().rolled_back(&other))
+            stuck.stopped(&other, BUILD, true, false),
+            Some(Verdict::default().rolled_back(&other, BUILD))
         );
     }
 }

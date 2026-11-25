@@ -30,9 +30,12 @@
 #               keeper's default config starts with "# witcher-default ".
 #   active.gz   the staged image: the keeper's default, or an operator's
 #   default     the keeper's record of its default builds
-#   strikes     strikes=N: staged boots since the last boot confirm. pre adds
-#               one before every load. The keeper writes 0 on a boot confirm.
-#   quarantine  one hash per line, never staged again (the keeper adds them)
+#   strikes     strikes=N: staged boots since the last boot confirm, and
+#               firmware=<id>, the build that counted them. pre adds one
+#               before every load. The keeper writes 0 on a boot confirm.
+#   quarantine  one hash per line, never staged again (the keeper adds them).
+#               For the default image the keeper's quarantine is provisional
+#               and is cleared when the firmware build changes (tk/verdict).
 #   confirmed   the last hash the keeper confirmed (information only)
 # For the keeper, in RAM: /var/run/witcher-tk.status
 set -u
@@ -54,6 +57,7 @@ module=/lib/modules/3.10.0-uc0/extra/modem.ko
 gated=/usr/lib/titan-api/tk/modem-tkfs.ko
 gated_sha=161ffdd052059a14747041a74b7b7740c705bfd52c9913a9013cbb0a15f55977
 keeper=/usr/lib/titan-api/titan-pd-keeper
+witcher_release=/etc/witcher-release
 build_log=/var/run/witcher-tk.build
 build_limit=120
 limit=2
@@ -105,6 +109,16 @@ detach() {
  tmo 30 ubidetach "$ctrl" -m "$mtd" > /dev/null 2>&1
  ! on_mtd > /dev/null
 }
+# This firmware build's id, as the keeper computes it (tk_boot::firmware_id):
+# the first 16 hex digits of the SHA-256 of /etc/witcher-release, or unknown.
+firmware_id() {
+ id=
+ [ -s "$witcher_release" ] && id=$(sha256sum "$witcher_release" 2> /dev/null | cut -c1-16)
+ case "$id" in
+  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) echo "$id";;
+  *) echo unknown;;
+ esac
+}
 # The last value of key $1 in file $2, with spaces and carriage returns removed.
 # A # starts a comment.
 value() { awk -v k="$1" 'index($0, k "=") == 1 { v = substr($0, length(k) + 2) } END { sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); print v }' "$2" 2> /dev/null; }
@@ -126,7 +140,7 @@ uptime_s() {
 # operator's config, recognised here by its first line, never reaches it.
 # The variable is exported inside the command substitution: a prefix
 # assignment before a shell function need not reach its child.
-# Its stdout is one line: operator, cached, updated, built, build, or
+# Its stdout is one line: operator, cached, updated, cleared, built, build, or
 # reason=<word>.
 # Any other answer, a crash or the time limit keeps stock firmware.
 default_image() {
@@ -149,7 +163,7 @@ default_image() {
  fi
  put build_secs $(($(uptime_s) - began))
  case "$rc:$answer" in
-  0:operator|0:cached|0:updated|0:built) put build "$answer"; return 0;;
+  0:operator|0:cached|0:updated|0:cleared|0:built) put build "$answer"; return 0;;
   1:reason=*)
    why=${answer#reason=}
    case "$why" in ''|*[!a-z-]*) why='build';; esac
@@ -250,7 +264,7 @@ stage() {
  tmo 30 mount -o remount,rw "$state" > /dev/null 2>&1 || { why='strike-write'; return 1; }
  next=$((strikes + 1))
  rm -f "$dir/strikes.tmp"
- { printf 'strikes=%s\n' "$next" > "$dir/strikes.tmp" && sync && mv -f "$dir/strikes.tmp" "$dir/strikes" && sync; } \
+ { printf 'strikes=%s\nfirmware=%s\n' "$next" "$(firmware_id)" > "$dir/strikes.tmp" && sync && mv -f "$dir/strikes.tmp" "$dir/strikes" && sync; } \
   || { why='strike-write'; return 1; }
  [ "$(value strikes "$dir/strikes")" = "$next" ] || { why='strike-write'; return 1; }
  # The vendor attaches this partition again later. Leave it as found.

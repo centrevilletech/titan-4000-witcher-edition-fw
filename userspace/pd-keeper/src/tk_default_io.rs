@@ -13,11 +13,14 @@
 //!
 //! It prints one line for the hook and exits:
 //! - `operator`, 0: an operator owns `tk/`; the hook's usual checks decide.
-//! - `cached`, `updated` or `built`, 0: the release image and its default
-//!   config are in place; the hook's usual checks then load them. `updated`
-//!   means a default config an earlier firmware wrote for this same image
-//!   was rewritten with this firmware's words, without a rebuild.
-//! - `build`, 2 (without `--write`): a build is due.
+//! - `cached`, `updated`, `cleared` or `built`, 0: the release image and its
+//!   default config are in place; the hook's usual checks then load them.
+//!   `updated` means a default config an earlier firmware wrote for this
+//!   same image was rewritten with this firmware's words, without a
+//!   rebuild. `cleared` means a quarantine, strikes or a rollback record that
+//!   another firmware build left for the release image were cleared
+//!   (`tk_default::stale`), so a new firmware always tries the image again.
+//! - `build`, 2 (without `--write`): a build or a clear is due.
 //! - `reason=<word>`, 1: keep stock firmware for that reason.
 //!
 //! Anything else (a crash, the time limit) also keeps stock firmware. The
@@ -29,17 +32,19 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 
 use titan_pd_model::tk_build;
-use titan_pd_model::tk_default::{self, Inputs, Owner, Plan, Record};
+use titan_pd_model::tk_default::{self, Cleared, Inputs, Owner, Plan, Record};
 use witcher_tk_patch::manifest::Manifest;
 use witcher_tk_patch::manifests;
 
 use crate::files::write_durably;
-use crate::paths::{env_path_or, tk_dir};
+use crate::paths::{env_path_or, firmware_id, tk_dir};
 use crate::tk_build_io::{self, TMP_CONFIG, TMP_IMAGE};
 
 /// The build record (`tk_default::Record`) and its temporary file.
 const RECORD: &str = "default";
 const TMP_RECORD: &str = ".default.tk-build";
+/// The default image's rollback record (`titan_pd_model::tk_verdict`).
+const VERDICT: &str = "verdict";
 
 /// What the hook reads on stdout.
 enum Outcome {
@@ -104,22 +109,78 @@ fn boot(write: bool) -> Outcome {
     let cached = default_for.as_deref() == Some(release.as_str()) && is_release_image(&image, &m);
     let cmdline = fs::read_to_string(env_path_or("TITAN_TK_PROC_CMDLINE", "/proc/cmdline")).unwrap_or_default();
     let bank = tk_build::active_bank(&cmdline);
-    let (strikes, quarantine) = (read(&dir, "strikes"), read(&dir, "quarantine"));
-    let inputs = Inputs {
-        strikes: strikes.as_deref(),
-        quarantine: quarantine.as_deref(),
+    let firmware = firmware_id();
+    let base = Inputs {
         record: record.as_deref(),
         release: &release,
+        firmware: &firmware,
         cached,
         bank,
+        ..Inputs::default()
     };
-    match (tk_default::plan(&inputs), bank) {
-        (Plan::Ready, _) => refresh(&dir, &m, &release, config.as_deref(), write),
+    let (mut plan, cleared) = decide(&dir, &base);
+    let mut word = None;
+    if plan == Plan::Clear {
+        if !write {
+            return Outcome::Build;
+        }
+        if let Err(err) = apply_clear(&dir, &cleared) {
+            eprintln!("tk-build boot: clearing what another firmware build left: {err}");
+            return Outcome::Stock("build");
+        }
+        eprintln!(
+            "tk-build boot: cleared what another firmware build left for the release image ({}{}{})",
+            if cleared.quarantine.is_some() { "its quarantine line " } else { "" },
+            if cleared.strikes.is_some() { "strikes " } else { "" },
+            if cleared.drop_verdict { "its rollback record" } else { "" },
+        );
+        word = Some("cleared");
+        plan = decide(&dir, &base).0;
+    }
+    match (plan, bank) {
+        (Plan::Ready, _) => match refresh(&dir, &m, &release, config.as_deref(), write) {
+            Outcome::Go(_) if word.is_some() => Outcome::Go("cleared"),
+            outcome => outcome,
+        },
         (Plan::Stock(reason), _) => Outcome::Stock(reason),
+        (Plan::Clear, _) => {
+            eprintln!("tk-build boot: the records still read as another build's after the clear");
+            Outcome::Stock("build")
+        }
         (Plan::Build, None) => Outcome::Stock("bank-unknown"),
         (Plan::Build, Some(_)) if !write => Outcome::Build,
         (Plan::Build, Some(bank)) => build(&dir, &m, bank, record.as_deref()),
     }
+}
+
+/// The plan from `tk/` as it is now, and what a clear would write.
+fn decide(dir: &Path, base: &Inputs<'_>) -> (Plan, Cleared) {
+    let (strikes, quarantine, verdict) = (read(dir, "strikes"), read(dir, "quarantine"), read(dir, VERDICT));
+    let inputs = Inputs {
+        strikes: strikes.as_deref(),
+        quarantine: quarantine.as_deref(),
+        verdict: verdict.as_deref(),
+        ..*base
+    };
+    (tk_default::plan(&inputs), tk_default::clear(&inputs))
+}
+
+/// Write what `tk_default::clear` says, each file through a synced
+/// temporary one.
+fn apply_clear(dir: &Path, cleared: &Cleared) -> io::Result<()> {
+    if let Some(text) = &cleared.quarantine {
+        write_durably(&dir.join("quarantine"), &dir.join("quarantine.tmp"), text.as_bytes())?;
+    }
+    if let Some(text) = &cleared.strikes {
+        write_durably(&dir.join("strikes"), &dir.join("strikes.tmp"), text.as_bytes())?;
+    }
+    if cleared.drop_verdict {
+        match fs::remove_file(dir.join(VERDICT)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// The image is in place. A default config an earlier firmware wrote for it
