@@ -1,6 +1,8 @@
 //! A staged modem firmware image's boot confirm, or the way back to stock
-//! firmware (see `titan_pd_model::tk_boot`), and after the confirm the
-//! operator's modem feature flags (see `titan_pd_model::tk_flags`).
+//! firmware (see `titan_pd_model::tk_boot`), and after the confirm the modem
+//! feature flags `tk/config` lists (see `titan_pd_model::tk_flags`): the
+//! default image's or an operator's. `modem=off` in the latency switches
+//! rolls them all back to their off values.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -172,7 +174,7 @@ impl Keeper {
         let parsed = tk_flags::parse_writes(&text);
         self.note_tk_flags_refused(&parsed);
         self.tk_flags_config_hands_off = parsed.hands_off;
-        let wanted = tk_flags::wanted(&text, &[]);
+        let wanted = tk_flags::wanted(self.words_config(&text), &[]);
         let mut control = tk_flags::Control::new_with_ack(wanted.clone(), parsed.hold_ack, self.now);
         let hands_off = self.tk_flags_hands_off_reason();
         if let Some(reason) = hands_off.as_deref() {
@@ -182,10 +184,7 @@ impl Keeper {
             }
             let _ = fs::write(tk_flags_status_path(), control.status(self.now));
         } else if wanted.is_empty() {
-            let _ = fs::write(
-                tk_flags_status_path(),
-                tk_flags::idle_status("no wm= lines in tk/config", self.now),
-            );
+            let _ = fs::write(tk_flags_status_path(), tk_flags::idle_status(self.no_words_reason(), self.now));
         } else {
             self.note(&format!(
                 "tk flags: modem firmware {short} confirmed; writing {} once the patch magic shows",
@@ -195,6 +194,20 @@ impl Keeper {
         }
         self.tk_flags = Some(control);
         self.tk_flags_config_at.mark(self.now);
+    }
+
+    /// The config text the words come from: none while `modem=off` is in the
+    /// latency switches, which rolls every managed word back.
+    fn words_config<'a>(&self, text: &'a str) -> &'a str {
+        if self.switches.now.modem { text } else { "" }
+    }
+
+    fn no_words_reason(&self) -> &'static str {
+        if self.switches.now.modem {
+            "no wm= lines in tk/config"
+        } else {
+            "modem=off in latency/config"
+        }
     }
 
     fn tk_flags_hands_off_reason(&self) -> Option<String> {
@@ -273,7 +286,8 @@ impl Keeper {
                 changed = true;
             }
             if let (Some(text), Some(parsed)) = (&config_text, &parsed_config) {
-                let wanted = tk_flags::wanted(text, control.wanted());
+                let words = if self.switches.now.modem { text.as_str() } else { "" };
+                let wanted = tk_flags::wanted(words, control.wanted());
                 if let Some(line) = control.set_wanted_with_ack(wanted, parsed.hold_ack, self.now) {
                     lines.push(line);
                     changed = true;
@@ -295,12 +309,13 @@ impl Keeper {
         if spawned.is_some() {
             self.tk_flags_job = spawned;
         }
+        let idle = self.no_words_reason();
         let status = if changed {
             self.tk_flags.as_ref().map(|control| {
                 if control.state() == tk_flags::State::HandsOff {
                     control.status(self.now)
                 } else if control.wanted().is_empty() {
-                    tk_flags::idle_status("no wm= lines in tk/config", self.now)
+                    tk_flags::idle_status(idle, self.now)
                 } else {
                     control.status(self.now)
                 }

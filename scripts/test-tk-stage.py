@@ -9,17 +9,27 @@ vendor kernel's mount or UBI behaviour.
 
 Set TK_SHELL (default `sh`) to run the hook under another POSIX shell. A
 BusyBox shell that prefers its own applets bypasses the stubs.
+
+The default image (v1.0.17) runs twice: `DefaultImage` against a stand-in
+keeper that answers as each test says, and `RealDefaultImage` against the
+real keeper (`TITAN_PD_KEEPER`) building from stand-in NAND banks made from
+the stock .prg (`WITCHER_STOCK_PRG`; skipped without it unless
+`WITCHER_REQUIRE_STOCK=1`).
 """
 import gzip
 import hashlib
 import importlib.util
+import json
 import os
 import re
 import shlex
+import shutil
 import struct
 import subprocess
 import tempfile
+import time
 import unittest
+import zlib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -121,6 +131,31 @@ if 'detach' in fail or busy: sys.exit(1)
 for d in glob.glob(R + '/sys/class/ubi/ubi1*'): shutil.rmtree(d)
 '''
 
+# A stand-in for `titan-pd-keeper tk-build boot [--write]`. It records each
+# call and answers from keeper-plan.json: {"read": step, "write": step}, where
+# a step is {"out": line, "rc": code, "files": {name: text or null}, "sleep": s}.
+# "files" writes (or with null removes) files in the tk directory it was given.
+KEEPER = r'''#!/usr/bin/env python3
+import json, os, sys, time
+R = os.environ['TK_ROOT']; tk = os.environ.get('TITAN_TK_DIR', '')
+write = sys.argv[1:] == ['tk-build', 'boot', '--write']
+assert sys.argv[1:] in (['tk-build', 'boot'], ['tk-build', 'boot', '--write']), sys.argv
+rows = [l.split() for l in open(R + '/proc/mounts').read().splitlines() if l.strip()]
+mode = next((r[3] for r in rows if tk.startswith(r[1] + '/')), 'unmounted')
+open(R + '/keeper-calls', 'a').write(('write' if write else 'read') + ' ' + mode + '\n')
+step = json.load(open(R + '/keeper-plan.json'))['write' if write else 'read']
+time.sleep(step.get('sleep', 0))
+for name, text in step.get('files', {}).items():
+    os.makedirs(tk, exist_ok=True)
+    path = os.path.join(tk, name)
+    if text is None:
+        os.remove(path)
+    else:
+        open(path, 'wb').write(bytes.fromhex(text[4:]) if text.startswith('hex:') else text.encode())
+print(step['out'])
+sys.exit(step['rc'])
+'''
+
 HEXDUMP = r'''#!/usr/bin/env python3
 import sys
 n = int(sys.argv[sys.argv.index('-n') + 1])
@@ -131,7 +166,7 @@ sys.stdout.write(open(sys.argv[-1], 'rb').read(n).hex())
 class Unit:
     """A fake Titan root at boot: the user partition, the Witcher volume and the rootfs paths."""
 
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, keeper=None, build_limit=120, env=None):
         self.root = base
         for d in ('bin', 'proc', 'sys/class/ubi', 'flash/data', 'lib/firmware/mrvl', 'mnt',
                   'lib/modules/3.10.0-uc0/extra', 'usr/lib/titan-api/tk', 'var/run'):
@@ -148,7 +183,7 @@ class Unit:
         self.gated.write_bytes(b'gated modem module\n')
         (base / 'dmesg').write_text('[    9.1] read from fs\n')
         for name, body in (('mount', MOUNT), ('umount', UMOUNT), ('ubiattach', ATTACH),
-                           ('ubidetach', DETACH), ('hexdump', HEXDUMP),
+                           ('ubidetach', DETACH), ('hexdump', HEXDUMP), ('titan-pd-keeper', KEEPER),
                            ('timeout', '#!/bin/sh\n[ "$1" = -t ] && shift 2\nexec "$@"\n'),
                            ('dmesg', '#!/bin/sh\ncat "$TK_ROOT/dmesg"\n'),
                            ('sync', '#!/bin/sh\nexit 0\n')):
@@ -164,13 +199,19 @@ class Unit:
             'status': f'{base}/var/run/witcher-tk.status', 'firmware': f'{base}/lib/firmware',
             'module': str(self.module), 'gated': str(self.gated),
             'gated_sha': hashlib.sha256(self.gated.read_bytes()).hexdigest(),
+            'keeper': str(keeper or base / 'bin/titan-pd-keeper'),
+            'build_log': f'{base}/var/run/witcher-tk.build',
+            'build_limit': str(build_limit),
         }
         for key, value in values.items():
             text, count = re.subn(rf'^{re.escape(key)}=.*$', f'{key}={value}', text, flags=re.M)
             assert count == 1, key
         self.hook = base / 'hook'
         self.hook.write_text(text)
-        self.env = dict(os.environ, TK_ROOT=str(base))
+        self.env = dict(os.environ, TK_ROOT=str(base), **(env or {}))
+        # Asked about an empty tk/, the stand-in keeper hands it to the
+        # hook's usual checks unless a test says otherwise.
+        self.plan({'out': 'operator', 'rc': 0})
 
     @property
     def module(self):
@@ -183,6 +224,13 @@ class Unit:
     @property
     def tk(self):
         return self.root / 'flash/data/tk'
+
+    def plan(self, read, write=None):
+        (self.root / 'keeper-plan.json').write_text(json.dumps({'read': read, 'write': write or {'out': '', 'rc': 9}}))
+
+    def keeper_calls(self):
+        path = self.root / 'keeper-calls'
+        return path.read_text().splitlines() if path.exists() else []
 
     def opt_in(self, image: bytes, allow=True, extra=''):
         self.tk.mkdir(exist_ok=True)
@@ -257,6 +305,8 @@ class Hook(unittest.TestCase):
         self.assertEqual(unit.status()['state'], 'stock')
         self.assertEqual(unit.status()['reason'], 'off')
         self.assertEqual(unit.status()['firmware'], 'clean')
+        # The keeper was asked about the default image on the read-only mount.
+        self.assertEqual(unit.keeper_calls(), ['read ro'])
         actions = unit.actions()
         self.assertIn(f'mount -t ubifs -o ro ubi1:data {unit.root}/var/witcher-tk/state', actions)
         self.assertFalse(any('remount' in a or '--bind' in a or 'tmpfs' in a for a in actions), actions)
@@ -293,6 +343,7 @@ class Hook(unittest.TestCase):
         # The partition was released before the modem loaded.
         self.assertFalse(any(row.startswith('ubi1:') for row in loaded['pre_mounts']), loaded['pre_mounts'])
         self.assertIn(f'witcher-tk {unit.root}/lib/firmware bind rw', loaded['pre_mounts'])
+        self.assertEqual(unit.keeper_calls(), [], 'an operator config never reaches the keeper')
         actions = unit.actions()
         strike = actions.index(f'mount -o remount,rw {unit.root}/var/witcher-tk/state')
         bind = next(i for i, a in enumerate(actions) if a.startswith('mount --bind') and 'lib/firmware' in a)
@@ -472,6 +523,330 @@ class Hook(unittest.TestCase):
         unit.boot(fail='detach')
         self.assertEqual(unit.status()['reason'], 'off')
         self.assertFalse(any('--bind' in a for a in unit.actions()))
+
+def default_config(image_sha, edit=lambda body: body):
+    """A config with the keeper's default marker; `edit` changes its body."""
+    body = edit(f'# Built at boot\nenabled=1\nsha256={image_sha}\nwm=0x847ed604:0x15\n')
+    return f'# witcher-default n6h-r4-r1 {hashlib.sha256(body.encode()).hexdigest()}\n{body}'
+
+
+class DefaultImage(unittest.TestCase):
+    """The hook's side of the default image, against a stand-in keeper."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.unit = Unit(Path(self.tmp.name))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def built(self, image):
+        """The write step of a build that succeeds: the image and its default config."""
+        digest = hashlib.sha256(image).hexdigest()
+        return {'out': 'built', 'rc': 0,
+                'files': {'active.gz': 'hex:' + image.hex(), 'config': default_config(digest)}}, digest
+
+    def test_first_boot_builds_then_loads_the_image_for_the_same_modprobe(self):
+        unit = self.unit
+        write, digest = self.built(good_image())
+        unit.plan({'out': 'build', 'rc': 2}, write)
+        loaded = unit.boot()
+        self.assertEqual(loaded['firmware'], digest)
+        self.assertEqual(loaded['module'], unit.gated.read_bytes())
+        status = unit.status()
+        self.assertEqual((status['state'], status['sha256'], status['strikes']), ('staged', digest, '1'))
+        self.assertEqual(status['build'], 'built')
+        self.assertTrue(status['build_secs'].isdigit())
+        # Asked read-only first; only the build ran on a read-write mount.
+        self.assertEqual(unit.keeper_calls(), ['read ro', 'write rw'])
+        self.assertEqual(unit.strikes(), 'strikes=1\n')
+        self.assertTrue((unit.tk / 'config').read_text().startswith('# witcher-default '))
+        unit.assert_stock_after(self)
+
+    def test_a_later_boot_reuses_the_image_without_building(self):
+        unit = self.unit
+        image = good_image()
+        digest = hashlib.sha256(image).hexdigest()
+        unit.tk.mkdir()
+        (unit.tk / 'active.gz').write_bytes(image)
+        (unit.tk / 'config').write_text(default_config(digest))
+        unit.plan({'out': 'cached', 'rc': 0})
+        self.assertEqual(unit.boot()['firmware'], digest)
+        self.assertEqual(unit.status()['build'], 'cached')
+        self.assertEqual(unit.keeper_calls(), ['read ro'])
+        unit.assert_stock_after(self)
+
+    def test_an_operator_config_never_reaches_the_keeper(self):
+        unit = self.unit
+        digest = unit.opt_in(good_image())
+        unit.plan({'out': 'reason=build', 'rc': 1})
+        self.assertEqual(unit.boot()['firmware'], digest)
+        self.assertNotIn('build', unit.status())
+        (unit.tk / 'config').write_text('enabled=0\n')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'off')
+        # An edited default config is the operator's too: its marker line is
+        # only checked in full by the keeper, but a first line without it is not.
+        (unit.tk / 'config').write_text('# bench\n' + default_config(digest))
+        self.assertEqual(unit.boot()['firmware'], digest)
+        self.assertEqual(unit.keeper_calls(), [])
+        unit.assert_stock_after(self)
+
+    def test_a_keeper_reason_keeps_stock_and_writes_nothing(self):
+        unit = self.unit
+        for reason in ('stock-mismatch', 'quarantined', 'build-limit', 'bank-unknown'):
+            unit.plan({'out': 'reason=' + reason, 'rc': 1})
+            self.assertEqual(unit.boot()['firmware'], 'nand')
+            status = unit.status()
+            self.assertEqual((status['state'], status['reason'], status['build']), ('stock', reason, reason))
+            self.assertFalse(any('remount' in a for a in unit.actions()), unit.actions())
+        self.assertEqual(list((unit.root / 'flash/data').iterdir()), [])
+        unit.assert_stock_after(self)
+
+    def test_a_failed_or_strange_build_keeps_stock_with_the_reason_build(self):
+        unit = self.unit
+        cases = (
+            ({'out': 'build', 'rc': 2}, {'out': 'reason=build', 'rc': 1}),  # the keeper's own failure
+            ({'out': 'build', 'rc': 2}, {'out': '', 'rc': 101}),  # a crash
+            ({'out': 'reason=Not A Word!', 'rc': 1}, None),
+            ({'out': 'reason=' + 'x' * 25, 'rc': 1}, None),
+            ({'out': 'cached\nbuilt', 'rc': 0}, None),
+            ({'out': 'operator', 'rc': 1}, None),
+            ({'out': 'build', 'rc': 0}, None),
+        )
+        for read, write in cases:
+            unit.plan(read, write)
+            self.assertEqual(unit.boot()['firmware'], 'nand', read)
+            self.assertEqual((unit.status()['reason'], unit.status()['build']), ('build', 'build'), read)
+            self.assertIsNone(unit.strikes())
+            unit.assert_stock_after(self)
+
+    def test_the_build_needs_memory_and_a_writable_volume(self):
+        unit = self.unit
+        write, _ = self.built(good_image())
+        unit.plan({'out': 'build', 'rc': 2}, write)
+        (unit.root / 'proc/meminfo').write_text('MemFree: 2000 kB\n')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'memory')
+        self.assertEqual(unit.keeper_calls(), ['read ro'])
+        (unit.root / 'proc/meminfo').write_text('MemFree: 120000 kB\n')
+        self.assertEqual(unit.boot(fail='remount')['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'build')
+        self.assertEqual(unit.keeper_calls(), ['read ro', 'read ro'])
+        unit.assert_stock_after(self)
+
+    def test_the_time_limit_stops_a_build_and_keeps_stock(self):
+        unit = self.unit
+        real = shutil.which('timeout')
+        if real is None:
+            self.skipTest('no timeout program')
+        # A real time limit, called the way newer BusyBox takes it.
+        (unit.root / 'bin/timeout').write_text(f'#!/bin/sh\n[ "$1" = -t ] && exit 1\nexec {real} "$@"\n')
+        unit.hook.write_text(re.sub(r'^build_limit=.*$', 'build_limit=1', unit.hook.read_text(), flags=re.M))
+        write, _ = self.built(good_image())
+        unit.plan({'out': 'build', 'rc': 2}, dict(write, sleep=5))
+        began = time.monotonic()
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertLess(time.monotonic() - began, 4.5)
+        self.assertEqual((unit.status()['reason'], unit.status()['build']), ('build', 'build'))
+        self.assertIsNone(unit.strikes())
+        unit.assert_stock_after(self)
+
+    def test_a_symlinked_tk_directory_is_never_built_into(self):
+        unit = self.unit
+        (unit.root / 'flash/data/elsewhere').mkdir()
+        unit.tk.symlink_to('elsewhere')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'off')
+        self.assertEqual(unit.keeper_calls(), [])
+
+
+STOCK_PRG = os.environ.get('WITCHER_STOCK_PRG')
+REAL_KEEPER = os.environ.get('TITAN_PD_KEEPER')
+if os.environ.get('WITCHER_REQUIRE_STOCK') == '1' and not (STOCK_PRG and REAL_KEEPER):
+    raise SystemExit('WITCHER_REQUIRE_STOCK=1 needs WITCHER_STOCK_PRG and TITAN_PD_KEEPER')
+
+
+@unittest.skipUnless(STOCK_PRG and REAL_KEEPER, 'set WITCHER_STOCK_PRG and TITAN_PD_KEEPER')
+class RealDefaultImage(unittest.TestCase):
+    """The hook and the real keeper build the default image from stand-in banks.
+
+    The banks are the stock tk stream from the vendor .prg padded with 0xff to
+    8 MiB, as dumps of mtd17 and mtd18 show. /proc/cmdline names tk2 active.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        build = load('test-tk-build')
+        cls.release = build.release_gzip_sha()
+        data = Path(STOCK_PRG).read_bytes()
+        kernel, ubi, size = struct.unpack_from('>III', data, 0x24)
+        stock = data[0x54 + kernel + ubi:0x54 + kernel + ubi + size]
+        raw = bytearray(zlib.decompressobj(31).decompress(stock))
+        raw[0x100] ^= 1  # another firmware's tk: the stock image with one byte changed
+        cls.banks = tempfile.TemporaryDirectory()
+        pad = lambda gz: gz + b'\xff' * (8 * 1024 * 1024 - len(gz))
+        cls.good = Path(cls.banks.name) / 'good.bank'
+        cls.good.write_bytes(pad(stock))
+        cls.foreign = Path(cls.banks.name) / 'foreign.bank'
+        cls.foreign.write_bytes(pad(build.gzip_bytes(bytes(raw))))
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.banks.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.unit = self.make(base)
+
+    def make(self, base, build_limit=600):
+        (base / 'dev').mkdir(exist_ok=True)
+        unit = Unit(base, keeper=str(Path(REAL_KEEPER).resolve()), build_limit=build_limit, env={
+            'TITAN_TK_PROC_MTD': str(base / 'proc/mtd'), 'TITAN_TK_MTD_DIR': str(base / 'dev'),
+            'TITAN_TK_PROC_CMDLINE': str(base / 'proc/cmdline'),
+            'TITAN_PD_RUNTIME': str(base / 'keeper-run'), 'TITAN_PD_STATE': str(base / 'keeper-state')})
+        (base / 'proc/mtd').write_text('dev:    size   erasesize  name\nmtd17: 00800000 00020000 "tk"\n'
+                                       'mtd18: 00800000 00020000 "tk2"\nmtd19: 01000000 00020000 "misc"\n'
+                                       'mtd20: 04000000 00020000 "user"\n')
+        (base / 'proc/cmdline').write_text('root=ubi0:rootfs ro rootfstype=ubifs ubi.mtd=16,2048 active=linux2,rootfs2,tk2\n')
+        self.bank(base, 'mtd17', self.good)
+        self.bank(base, 'mtd18', self.good)
+        return unit
+
+    def bank(self, base, name, target):
+        path = base / 'dev' / name
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            path.rmdir()
+        if target is None:
+            path.mkdir()  # reads fail: EISDIR
+        else:
+            path.symlink_to(target)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def files(self):
+        return sorted(p.name for p in self.unit.tk.iterdir()) if self.unit.tk.exists() else []
+
+    def record(self):
+        return dict(line.split('=', 1) for line in (self.unit.tk / 'default').read_text().splitlines())
+
+    def test_the_first_boot_builds_and_loads_and_the_next_one_reuses(self):
+        unit = self.unit
+        loaded = unit.boot()
+        self.assertEqual(loaded['firmware'], self.release, unit.status())
+        status = unit.status()
+        self.assertEqual((status['state'], status['sha256'], status['build']), ('staged', self.release, 'built'))
+        self.assertEqual(self.files(), ['active.gz', 'config', 'default', 'strikes'])
+        self.assertEqual(hashlib.sha256((unit.tk / 'active.gz').read_bytes()).hexdigest(), self.release)
+        config = (unit.tk / 'config').read_text()
+        self.assertTrue(config.startswith('# witcher-default n6h-r4-r1 '), config)
+        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '1', 'result': 'built'})
+        # The words are what stage-latency.sh --profile latency writes for this image.
+        staged = subprocess.run(['bash', str(REPO / 'scripts/stage-latency.sh'), '--dry-run', '--no-clamp',
+                                 '--profile', 'latency', '192.0.2.1', str(unit.tk / 'active.gz')],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(staged.returncode, 0, staged.stderr)
+        wm = lambda text: [line for line in text.splitlines() if line.startswith('wm=')]
+        self.assertEqual(wm(config), wm(staged.stdout))
+        self.assertEqual(len(wm(config)), 11)
+        unit.assert_stock_after(self)
+        # The keeper's boot confirm; the next boot loads the same file.
+        (unit.tk / 'strikes').write_text('strikes=0\n')
+        before = (unit.tk / 'active.gz').stat().st_mtime_ns
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.status()['build'], 'cached')
+        self.assertEqual((unit.tk / 'active.gz').stat().st_mtime_ns, before)
+        self.assertEqual(self.record()['builds'], '1')
+        unit.assert_stock_after(self)
+
+    def test_a_stock_mismatch_keeps_stock_and_builds_nothing(self):
+        unit = self.unit
+        self.bank(unit.root, 'mtd18', self.foreign)
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual((unit.status()['reason'], unit.status()['build']), ('stock-mismatch', 'stock-mismatch'))
+        self.assertEqual(self.files(), ['default'])
+        self.assertEqual(self.record()['result'], 'stock-mismatch')
+        # Later boots decide from the record, on the read-only mount.
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'stock-mismatch')
+        self.assertFalse(any('remount' in a for a in unit.actions()), unit.actions())
+        self.assertEqual(self.record()['builds'], '1')
+        unit.assert_stock_after(self)
+
+    def test_only_the_active_bank_counts(self):
+        unit = self.unit
+        # The inactive bank holds the stock image; the active one does not.
+        self.bank(unit.root, 'mtd17', self.good)
+        self.bank(unit.root, 'mtd18', self.foreign)
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'stock-mismatch')
+        # And with no active= on the command line nothing is built.
+        other = Path(self.tmp.name) / 'no-active'
+        other.mkdir()
+        unit = self.unit = self.make(other)
+        (unit.root / 'proc/cmdline').write_text('root=ubi0:rootfs ro\n')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'bank-unknown')
+        self.assertEqual(self.files(), [])
+
+    def test_an_operator_config_means_no_build(self):
+        unit = self.unit
+        digest = unit.opt_in(good_image())
+        self.assertEqual(unit.boot()['firmware'], digest)
+        self.assertNotIn('default', self.files())
+        (unit.tk / 'config').write_text('enabled=0\n')
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'off')
+        # An image with no config is an operator's too (or one turned off by
+        # deleting the config): nothing is built over it.
+        (unit.tk / 'config').unlink()
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual((unit.status()['reason'], unit.status()['build']), ('off', 'operator'))
+        self.assertNotIn('default', self.files())
+        self.assertEqual(hashlib.sha256((unit.tk / 'active.gz').read_bytes()).hexdigest(), digest)
+        unit.assert_stock_after(self)
+
+    def test_a_failed_build_keeps_stock_with_a_reason_and_stops_after_three(self):
+        unit = self.unit
+        self.bank(unit.root, 'mtd18', None)
+        for n in (1, 2, 3):
+            self.assertEqual(unit.boot()['firmware'], 'nand')
+            self.assertEqual((unit.status()['reason'], unit.status()['build']), ('build', 'build'))
+            self.assertEqual(self.record(), {'gzip': self.release, 'builds': str(n), 'result': 'failed'})
+            self.assertEqual(self.files(), ['default'])
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'build-limit')
+        self.assertFalse(any('remount' in a for a in unit.actions()), unit.actions())
+        log = (unit.root / 'var/run/witcher-tk.build').read_text()
+        self.assertIn('reading the bank', log)
+        # Deleting the record lets it try again.
+        self.bank(unit.root, 'mtd18', self.good)
+        (unit.tk / 'default').unlink()
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        unit.assert_stock_after(self)
+
+    def test_a_build_killed_by_the_time_limit_is_finished_next_boot(self):
+        real = shutil.which('timeout')
+        if real is None:
+            self.skipTest('no timeout program')
+        unit = self.unit
+        (unit.root / 'bin/timeout').write_text(f'#!/bin/sh\n[ "$1" = -t ] && exit 1\nexec {real} "$@"\n')
+        limited = re.sub(r'^build_limit=.*$', 'build_limit=1', unit.hook.read_text(), flags=re.M)
+        normal = unit.hook.read_text()
+        unit.hook.write_text(limited)
+        self.assertEqual(unit.boot()['firmware'], 'nand')
+        self.assertEqual(unit.status()['reason'], 'build')
+        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '1', 'result': 'started'})
+        self.assertNotIn('config', self.files())
+        unit.hook.write_text(normal)
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(self.record(), {'gzip': self.release, 'builds': '2', 'result': 'built'})
+        self.assertFalse([name for name in self.files() if name.startswith('.')], self.files())
+        unit.assert_stock_after(self)
 
 
 class Build(unittest.TestCase):

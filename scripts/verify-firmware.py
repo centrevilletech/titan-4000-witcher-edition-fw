@@ -4,9 +4,10 @@
 Checks: container CRCs/length; kernel and tk byte-identical to stock; all 254
 device nodes present with correct major/minor; every inode owned by uid/gid 500;
 the overlay scripts present; gdmlte.ko carries exactly the one-byte /56
-patch (and nothing else) versus the stock module; and the boot-time tk loader
+patch (and nothing else) versus the stock module; the boot-time tk loader
 keeps the stock modem.ko, adds a copy that differs only in its 4-byte gate, and
-adds no modem firmware bytes.
+adds no modem firmware bytes; and the download clamp and fast path modules are
+exactly their pinned bytes.
 
 Usage: scripts/verify-firmware.py STOCK.prg BUILT.prg
 """
@@ -224,12 +225,20 @@ def main():
           not stray and sorted(p.name for p in firmware.iterdir()) == ['.keep', 'mrvl'])
     for path in stray[:8]:
         print('      modem firmware candidate '+path)
-    # The download clamp module is staged per unit (docs/download-clamp.md).
-    qctrl = [str(path.relative_to(d)) for path in Path(d).rglob('*qctrl*') if path.is_file()]
-    check('no download clamp module in the rootfs (staged per unit)', not qctrl)
-    # The fast path module is staged per unit (docs/fast-path.md).
-    k1fp = [str(path.relative_to(d)) for path in Path(d).rglob('*k1fp*') if path.is_file()]
-    check('no fast path module in the rootfs (staged per unit)', not k1fp)
+    # The download clamp and the fast path ship in the image since v1.0.17
+    # (docs/download-clamp.md, docs/fast-path.md): exactly the pinned bytes,
+    # once each, where the keeper loads them, and not executable.
+    repo = Path(__file__).resolve().parent.parent
+    for kind, module in (('qctrl', 'titan_qctrl.ko'), ('fastpath', 'titan_k1fp.ko')):
+        sums = (repo / 'device' / kind / 'SHA256SUMS').read_text().split()
+        pinned = sums[sums.index(module) - 1] if module in sums else None
+        path = Path(d) / 'usr/lib/titan-api/modules' / module
+        stem = module.split('.')[0]
+        copies = [str(found.relative_to(d)) for found in Path(d).rglob('*' + stem + '*') if found.is_file()]
+        check(f'{module} in the image is the pinned module (device/{kind}/SHA256SUMS)',
+              pinned is not None and path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == pinned
+              and copies == ['usr/lib/titan-api/modules/' + module]
+              and not is_exec('usr/lib/titan-api/modules/' + module))
     if os.environ.get('WITCHER_VERIFY_TLS') == '1':
         result = subprocess.run([sys.executable, str(Path(__file__).with_name('test-tls-compatibility.py')), d])
         check('packed OpenSSL TLS generation compatibility', result.returncode == 0)

@@ -1,10 +1,11 @@
-//! Staging, loading, `/proc/k1fp` control, and SAS grant lease feeding for
+//! Loading, `/proc/k1fp` control, and SAS grant lease feeding for
 //! `titan_pd_model::fastpath`.
 //!
-//! The rootfs has no room for `titan_k1fp.ko`, so an operator stages it in
-//! `/mnt/titan-api/fastpath` with a `config`. Only bytes matching the SHA-256
-//! digest built into the keeper (`device/fastpath/SHA256SUMS`) are copied into
-//! the keeper's private RAM directory and loaded from there.
+//! The firmware image carries `titan_k1fp.ko`; a copy staged in
+//! `/mnt/titan-api/fastpath` overrides it only when it is the same pinned
+//! module. Only bytes matching the SHA-256 digest built into the keeper
+//! (`device/fastpath/SHA256SUMS`) are copied into the keeper's private RAM
+//! directory and loaded from there.
 
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write as _};
@@ -24,7 +25,7 @@ use crate::paths::env_or;
 use crate::staged::{self, Staged};
 use crate::status_file::StatusFile;
 
-/// The staged fast path module.
+/// The fast path module.
 pub const MODULE: Staged = Staged {
     file: fastpath::FILE,
     manifest: include_str!("../../../device/fastpath/SHA256SUMS"),
@@ -99,6 +100,11 @@ pub struct Watch {
 }
 
 impl Watch {
+    /// Check at the next tick: the latency switches changed.
+    pub fn recheck(&mut self) {
+        self.checked_at.reset();
+    }
+
     /// Called from `maintain_cbrs_gate()` immediately after `cbrs_gate::Watch::observe()`,
     /// BEFORE logging or running `ebtables`/`ip6tables`.
     ///
@@ -141,13 +147,15 @@ impl Watch {
         }
     }
 
-    /// Periodic config, staging, load, bridge check, `qctrl_present` tracking,
-    /// and watchdog awareness. Must run AFTER `maintain_qctrl()`.
+    /// Periodic config, load, bridge check, `qctrl_present` tracking, and
+    /// watchdog awareness. `switch_on` is `fastpath=` in the latency switches.
+    /// Must run AFTER `maintain_qctrl()`.
     pub fn maintain(
         &mut self,
         now: u64,
         passthrough: bool,
         qctrl_waiting: bool,
+        switch_on: bool,
         nvram_cache_path: &Path,
         mut note: impl FnMut(&str),
     ) {
@@ -171,7 +179,8 @@ impl Watch {
             return;
         };
 
-        let config = fastpath::parse_config(&read_file(&dir.join("config")));
+        let (config, source) = fastpath::effective(switch_on, staged::operator_config(&dir).as_deref());
+        let from = source.describe("fastpath", "fastpath/config");
         if config.refused != self.refused_logged {
             for line in &config.refused {
                 note(&format!(
@@ -224,7 +233,7 @@ impl Watch {
                 if config.mode == 0 {
                     self.publish(
                         "off",
-                        "mode 0 or no fastpath/config",
+                        &format!("mode 0 ({from})"),
                         &config,
                         None,
                         false,
@@ -289,23 +298,23 @@ impl Watch {
                 if self.failed_for.as_ref() == Some(&config) {
                     return;
                 }
-                if let Err(err) = MODULE.load(&dir) {
-                    self.failed_for = Some(config.clone());
-                    self.publish(
-                        "failed",
-                        &format!("not loaded: {err}"),
-                        &config,
-                        None,
-                        false,
-                        now,
-                        &mut note,
-                    );
-                    return;
-                }
-                note(&format!(
-                    "fast path: loaded {} from the staged copy",
-                    fastpath::VERSION_LINE
-                ));
+                let origin = match MODULE.load_any(&dir) {
+                    Ok(origin) => origin,
+                    Err(err) => {
+                        self.failed_for = Some(config.clone());
+                        self.publish(
+                            "failed",
+                            &format!("not loaded: {err}"),
+                            &config,
+                            None,
+                            false,
+                            now,
+                            &mut note,
+                        );
+                        return;
+                    }
+                };
+                note(&format!("fast path: loaded {} from {origin}", fastpath::VERSION_LINE));
                 self.module_loaded = true;
                 self.managed = true;
                 self.lease_state = LeaseState::Revoked;
@@ -410,11 +419,11 @@ impl Watch {
                     proc = read_proc_until(&|proc| proc.gate_open == Some(true));
                 }
                 let (state, detail) = if config.mode == 0 {
-                    ("off", "mode 0 read back from /proc/k1fp".to_owned())
+                    ("off", format!("mode 0 ({from}) read back from /proc/k1fp"))
                 } else {
                     (
                         "applied",
-                        format!("mode {} read back from /proc/k1fp", config.mode),
+                        format!("mode {} ({from}) read back from /proc/k1fp", config.mode),
                     )
                 };
                 self.publish(
@@ -468,11 +477,11 @@ impl Watch {
                     proc = read_proc_until(&|proc| proc.gate_open == Some(true));
                 }
                 let (state, detail) = if config.mode == 0 {
-                    ("off", "mode 0 read back from /proc/k1fp".to_owned())
+                    ("off", format!("mode 0 ({from}) read back from /proc/k1fp"))
                 } else {
                     (
                         "applied",
-                        format!("mode {} read back from /proc/k1fp", config.mode),
+                        format!("mode {} ({from}) read back from /proc/k1fp", config.mode),
                     )
                 };
                 self.publish(
@@ -529,7 +538,7 @@ impl Watch {
                 }
                 self.publish(
                     "applied",
-                    &format!("mode {} read back from /proc/k1fp", config.mode),
+                    &format!("mode {} ({from}) read back from /proc/k1fp", config.mode),
                     &config,
                     Some(&proc),
                     true,

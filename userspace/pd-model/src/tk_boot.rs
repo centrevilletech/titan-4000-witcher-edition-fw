@@ -64,6 +64,11 @@ pub struct BootStatus {
     pub source: Option<Source>,
     /// The hook took the image back out of `/lib/firmware`.
     pub firmware_clean: Option<bool>,
+    /// What the default image's build did this boot (`tk_default`): `built`,
+    /// `cached`, `operator`, or the reason it kept stock firmware.
+    pub build: Option<String>,
+    /// Seconds the hook spent on that step.
+    pub build_secs: Option<u64>,
 }
 
 pub fn valid_sha(text: &str) -> bool {
@@ -99,6 +104,8 @@ pub fn parse_status(text: &str) -> BootStatus {
                     _ => None,
                 }
             }
+            "build" if !value.is_empty() => status.build = Some(value.to_owned()),
+            "build_secs" => status.build_secs = value.parse().ok(),
             _ => {}
         }
     }
@@ -110,6 +117,17 @@ pub fn parse_status(text: &str) -> BootStatus {
 
 /// One keeper log line for the boot, or `None` when the hook had nothing to do.
 pub fn describe(status: &BootStatus) -> Option<String> {
+    let line = describe_load(status)?;
+    Some(match (status.build.as_deref(), status.build_secs) {
+        (Some("built"), secs) => {
+            let took = secs.map_or_else(String::new, |s| format!(" in {s} s"));
+            format!("{line}; the boot hook built the default modem image{took} from this unit's stock firmware")
+        }
+        _ => line,
+    })
+}
+
+fn describe_load(status: &BootStatus) -> Option<String> {
     if let Some(sha) = &status.staged {
         let source = match status.source {
             Some(Source::Fs) => "the modem read it from /lib/firmware",
@@ -419,6 +437,21 @@ mod tests {
             describe(&parse_status("state=stock\nreason=quarantined\n")).as_deref(),
             Some("tk boot: stock modem firmware (quarantined)")
         );
+    }
+
+    #[test]
+    fn the_log_line_says_when_the_hook_built_the_default_image() {
+        let mut status = staged(40);
+        status.build = Some("built".into());
+        status.build_secs = Some(19);
+        let line = describe(&status).unwrap();
+        assert!(line.ends_with("; the boot hook built the default modem image in 19 s from this unit's stock firmware"), "{line}");
+        let text = format!("state=staged\nsha256={A}\nbuild=cached\nbuild_secs=1\n");
+        assert!(!describe(&parse_status(&text)).unwrap().contains("built"));
+        let mismatch = parse_status("state=stock\nreason=stock-mismatch\nbuild=stock-mismatch\nbuild_secs=2\n");
+        assert_eq!((mismatch.build.as_deref(), mismatch.build_secs), (Some("stock-mismatch"), Some(2)));
+        assert_eq!(describe(&mismatch).as_deref(), Some("tk boot: stock modem firmware (stock-mismatch)"));
+        assert_eq!(parse_status("build=\n").build, None);
     }
 
     #[test]

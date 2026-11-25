@@ -7,7 +7,8 @@
 //! management bearer, to check that the answer no longer reaches the vendor
 //! stack once the keeper has closed the bearer to advertisements.
 //! `tk-build` builds the patched modem image on the unit from its stock
-//! firmware (docs/tk-patch.md); only an operator runs it.
+//! firmware (docs/tk-patch.md): `check` and `stage` for an operator, `boot`
+//! for the boot hook, which builds the default image (docs/tk-boot-loader.md).
 //!
 //! The keeper has no `unsafe` code: its system calls go through the audited
 //! wrappers in `titan-sys`.
@@ -43,6 +44,7 @@ mod run;
 mod staged;
 mod status_file;
 mod tk_build_io;
+mod tk_default_io;
 mod tk_flags_io;
 
 pub(crate) use logging::{log, log_ram};

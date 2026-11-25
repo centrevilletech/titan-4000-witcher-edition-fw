@@ -37,14 +37,26 @@ pub fn find_mtd(proc_mtd: &str, name: &str) -> Option<Mtd> {
     })
 }
 
+/// The bank this boot runs, from `/proc/cmdline`: the boot loader names the
+/// active kernel, rootfs and tk partitions (`active=linux2,rootfs2,tk2`).
+/// `None` when it names no bank in `BANKS`.
+pub fn active_bank(cmdline: &str) -> Option<&'static str> {
+    let list = cmdline.split_whitespace().find_map(|word| word.strip_prefix("active="))?;
+    list.split(',').find_map(|part| BANKS.into_iter().find(|bank| *bank == part))
+}
+
 /// tk/config with the built image staged: `enabled=1` and one `sha256=` line
 /// for it, then every other line of the old config in order (`target=`,
 /// `wm=`, `manage=`, `hold_ack=`, comments). The lines the hook reads as
-/// its switch and allow-list (`enabled=...`, `sha256=...`) are replaced.
+/// its switch and allow-list (`enabled=...`, `sha256=...`) are replaced, and
+/// a default config's marker is dropped: an operator staged this one.
 pub fn staged_config(old: &str, sha: &str) -> String {
     let mut out = format!("enabled=1\nsha256={sha}\n");
     for line in old.lines() {
-        if !line.starts_with("enabled=") && !line.starts_with("sha256=") {
+        if !line.starts_with("enabled=")
+            && !line.starts_with("sha256=")
+            && !line.starts_with(crate::tk_default::MARKER)
+        {
             out.push_str(line);
             out.push('\n');
         }
@@ -100,6 +112,27 @@ mod tests {
         assert_eq!(find_mtd(PROC_MTD, "misc"), None);
         assert_eq!(find_mtd("mtd17: 00800001 00020000 \"tk\"\n", "tk"), None, "not whole erase blocks");
         assert_eq!(find_mtd("mtd17: 00800000 00000000 \"tk\"\n", "tk"), None);
+    }
+
+    #[test]
+    fn the_active_bank_comes_from_the_boot_loaders_command_line() {
+        let line = "root=ubi0:rootfs ro rootfstype=ubifs ubi.mtd=16,2048 console=ttyS0 active=linux2,rootfs2,tk2\n";
+        assert_eq!(active_bank(line), Some("tk2"));
+        assert_eq!(active_bank("ubi.mtd=15 active=linux,rootfs,tk"), Some("tk"));
+        assert_eq!(active_bank("ubi.mtd=15 active=linux,rootfs"), None);
+        assert_eq!(active_bank("ubi.mtd=15 active=linux,rootfs,tk3"), None);
+        assert_eq!(active_bank("inactive=tk2 bank=tk"), None);
+        assert_eq!(active_bank(""), None);
+    }
+
+    #[test]
+    fn staging_over_a_default_config_makes_it_the_operators() {
+        let default = crate::tk_default::config_text("n6h-r4-r1", &"ab".repeat(32));
+        let staged = staged_config(&default, "cccc");
+        assert!(staged.starts_with("enabled=1\nsha256=cccc\n# Built at boot"), "{staged}");
+        assert!(!staged.contains("witcher-default"));
+        assert_eq!(crate::tk_default::default_sha(&staged), None);
+        assert_eq!(staged.lines().filter(|l| l.starts_with("wm=")).count(), crate::tk_default::WORDS.len());
     }
 
     #[test]

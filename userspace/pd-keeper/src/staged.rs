@@ -1,7 +1,8 @@
-//! Kernel modules an operator stages on the persistent volume, because the
-//! rootfs has no room for them. The keeper loads only bytes whose SHA-256
-//! matches the digest built into it, from a copy in its private RAM
-//! directory.
+//! Kernel modules the keeper loads by pinned digest: the firmware image's
+//! copy (`/usr/lib/titan-api/modules`, since v1.0.17), or a copy an operator
+//! staged on the persistent volume, which overrides it only when its bytes
+//! match the same digest. The keeper loads only bytes whose SHA-256 matches
+//! the digest built into it, from a copy in its private RAM directory.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -41,6 +42,27 @@ impl Staged {
         self.stage(dir).and_then(|path| insmod(&path))
     }
 
+    /// Load the module and say where it came from: the copy staged in `dir`
+    /// when there is one and it is the pinned module, else the firmware
+    /// image's copy. Bytes that are not the pinned module never load.
+    pub fn load_any(&self, dir: &Path) -> Result<&'static str, String> {
+        let refused = if dir.join(self.file).exists() {
+            match self.stage(dir) {
+                Ok(path) => return insmod(&path).map(|()| "the staged copy"),
+                Err(why) => Some(why),
+            }
+        } else {
+            None
+        };
+        let image = image_dir();
+        match (self.load(&image), refused) {
+            (Ok(()), None) => Ok("the firmware image"),
+            (Ok(()), Some(_)) => Ok("the firmware image (the staged copy is not the pinned module)"),
+            (Err(err), None) => Err(err),
+            (Err(err), Some(why)) => Err(format!("{why}; {err}")),
+        }
+    }
+
     /// Copy the staged module into RAM once its bytes match the pinned digest,
     /// check the copy again, and return its path.
     fn stage(&self, dir: &Path) -> Result<PathBuf, String> {
@@ -49,7 +71,7 @@ impl Staged {
             .ok_or_else(|| format!("the keeper's {} manifest has no {} line", self.dir, self.file))?;
         let source = dir.join(self.file);
         let bytes =
-            fs::read(&source).map_err(|e| format!("{} is not staged: {e}", source.display()))?;
+            fs::read(&source).map_err(|e| format!("cannot read {}: {e}", source.display()))?;
         let got = sha256::hex(&sha256::digest(&bytes));
         if got != want {
             return Err(format!(
@@ -91,6 +113,22 @@ impl Staged {
         }
         Ok(dest)
     }
+}
+
+/// The operator's `config` in a staging directory, or `None` when there is
+/// none, so the firmware default applies. A file that exists but cannot be
+/// read counts as empty, which turns the feature off.
+pub fn operator_config(dir: &Path) -> Option<String> {
+    match fs::read_to_string(dir.join("config")) {
+        Ok(text) => Some(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(String::new()),
+    }
+}
+
+/// Where the firmware image keeps the modules (`TITAN_MODULES_DIR` in tests).
+pub fn image_dir() -> PathBuf {
+    paths::env_path_or("TITAN_MODULES_DIR", "/usr/lib/titan-api/modules")
 }
 
 /// The kernel's module list (`TITAN_PROC_MODULES` in tests).

@@ -1,4 +1,4 @@
-//! The staged download clamp module. See `titan_pd_model::qctrl`.
+//! The download clamp module, on by default. See `titan_pd_model::qctrl`.
 
 use titan_pd_model::pace::Pace;
 use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
@@ -26,9 +26,17 @@ pub(super) struct QctrlWatch {
     refused_logged: Vec<String>,
 }
 
+impl QctrlWatch {
+    /// Check at the next tick: the latency switches changed.
+    pub(super) fn recheck(&mut self) {
+        self.checked_at.reset();
+    }
+}
+
 impl Keeper {
-    /// Load the staged download clamp once the customer port and LTE are up,
-    /// and keep its mode as `qctrl/config` says. Runs in every mode.
+    /// Load the download clamp once the customer port and LTE are up, and keep
+    /// its mode: the default, the operator's `qctrl/config`, or off by the
+    /// latency switch (`qctrl::effective`). Runs in every mode.
     pub(super) fn maintain_qctrl(&mut self) {
         if !self.qctrl.checked_at.ready(self.now, qctrl::CHECK_EVERY) {
             return;
@@ -37,7 +45,11 @@ impl Keeper {
             self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
             return;
         };
-        let config = qctrl::parse_config(&read_file(dir.join("config")));
+        let modules = read_file(staged::modules_path());
+        let operator = staged::operator_config(&dir);
+        let cake = qctrl::cake_loaded(&modules);
+        let (config, source) = qctrl::effective(self.switches.now.clamp, operator.as_deref(), cake);
+        let from = source.describe("clamp", "qctrl/config");
         if config.refused != self.qctrl.refused_logged {
             for line in &config.refused {
                 self.note(&format!(
@@ -54,7 +66,7 @@ impl Keeper {
         }
         let proc_text = read_file(&qctrl_io::proc_path());
         let mut proc_fresh = true;
-        match qctrl::loaded(&read_file(staged::modules_path()), &proc_text) {
+        match qctrl::loaded(&modules, &proc_text) {
             QctrlLoaded::Other(name) => {
                 let (state, detail) = if config.mode == 0 {
                     ("off", format!("mode 0; another clamp module is loaded ({name})"))
@@ -66,7 +78,7 @@ impl Keeper {
             }
             QctrlLoaded::None => {
                 if config.mode == 0 {
-                    self.qctrl_status("off", "mode 0 or no qctrl/config", &config);
+                    self.qctrl_status("off", &format!("mode 0 ({from})"), &config);
                     return;
                 }
                 if !qctrl::settled(self.qctrl.up_since, self.now) {
@@ -80,12 +92,14 @@ impl Keeper {
                 if self.qctrl.failed_for.as_ref() == Some(&config) {
                     return;
                 }
-                if let Err(err) = qctrl_io::MODULE.load(&dir) {
-                    self.qctrl.failed_for = Some(config.clone());
-                    self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
-                    return;
+                match qctrl_io::MODULE.load_any(&dir) {
+                    Ok(origin) => self.note(&format!("download clamp: loaded {} from {origin}", qctrl::VERSION_LINE)),
+                    Err(err) => {
+                        self.qctrl.failed_for = Some(config.clone());
+                        self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
+                        return;
+                    }
                 }
-                self.note(&format!("download clamp: loaded {} from the staged copy", qctrl::VERSION_LINE));
                 proc_fresh = false;
             }
             QctrlLoaded::Ours => {}
@@ -109,7 +123,7 @@ impl Keeper {
                 self.qctrl_status("failed", &err, &config);
                 return;
             }
-            proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
+            proc = qctrl_io::read_back(&config);
         }
         if !qctrl::matches(&config, &proc) {
             let shown = proc.mode.map_or_else(|| "nothing".to_owned(), |m| m.to_string());
@@ -122,7 +136,7 @@ impl Keeper {
         }
         let state = if config.mode == 0 { "off" } else { "applied" };
         let detail = format!(
-            "mode {} read back from /proc/titan_qctrl{}{}{}{}{}{}{}",
+            "mode {} ({from}) read back from /proc/titan_qctrl{}{}{}{}{}{}{}",
             config.mode,
             config.trough_ms.map_or_else(String::new, |ms| format!(", trough_ms {ms}")),
             config.target_ms.map_or_else(String::new, |ms| format!(", target_ms {ms}")),
@@ -135,8 +149,8 @@ impl Keeper {
         self.qctrl_status(state, &detail, &config);
     }
 
-    /// Write the clamp status file and log the change. A unit that never
-    /// staged a clamp logs nothing.
+    /// Write the clamp status file and log the change. A clamp that is off
+    /// from the start logs nothing.
     fn qctrl_status(&mut self, state: &str, detail: &str, config: &qctrl::Config) {
         self.qctrl.waiting = state == "waiting";
         let quiet = state == "off" && self.qctrl.status.is_blank();

@@ -10,9 +10,10 @@
 //! writes reach flash, the self-revert of a setting change, the drop of
 //! customer IPv6 while the unit holds no SAS grant, carrier watch against held
 //! SAS grants, the boot confirm for a staged modem firmware image, its modem
-//! feature flags, building that image on the unit, the staged download clamp
-//! module, the staged passthrough bridge fast path, the carrier picker, and
-//! the opt-in CPU trims.
+//! feature flags, building that image on the unit and its default build at
+//! boot, the download clamp module, the passthrough bridge fast path, the
+//! off switches for those latency features, the carrier picker, and the
+//! opt-in CPU trims.
 #![forbid(unsafe_code)]
 
 pub mod carrier_pick;
@@ -39,8 +40,10 @@ pub mod qctrl;
 pub mod ra;
 pub mod sas_nat;
 pub mod sha256;
+pub mod switches;
 pub mod tk_boot;
 pub mod tk_build;
+pub mod tk_default;
 pub mod tk_flags;
 pub mod wear;
 

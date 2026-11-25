@@ -201,6 +201,13 @@ jobs:
           TK_PATCH=userspace/target/release/tk-patch python3 scripts/test-tk-patch.py
           cargo build --locked --manifest-path userspace/Cargo.toml -p titan-pd-keeper
           TITAN_PD_KEEPER=userspace/target/debug/titan-pd-keeper python3 scripts/test-tk-build.py
+      - name: The boot hook builds and loads the default image with the real keeper
+        env:
+          WITCHER_REQUIRE_STOCK: '1'
+        run: |
+          set -euo pipefail
+          WITCHER_STOCK_PRG="$RUNNER_TEMP/stock.prg" TITAN_PD_KEEPER=userspace/target/debug/titan-pd-keeper \
+            python3 scripts/test-tk-stage.py -v RealDefaultImage
       - name: Remove the stock download
         if: always()
         run: rm -f "$RUNNER_TEMP/stock.prg"

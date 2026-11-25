@@ -40,6 +40,11 @@ and a fake /proc/k1fp: clamp loads before fast path, mode 2 is read back,
 grant leases renew every second and revoke immediately on gate close, a change
 in qctrl_present is logged, watchdog trips re-arm at most once per boot before
 holding at mode 0 in state=tripped, and mode=0 rolls back live.
+Since v1.0.17 both are on by default: with no config of their own they load
+from a directory standing in for the image's copies, the clamp in mode 3
+(read back from a fake /proc/titan_qctrl) and the fast path in mode 2, and the
+latency switch file turns each off and on live. modem=off there rolls the
+modem words back to 0, and on writes them again.
 """
 import errno
 import os
@@ -313,11 +318,54 @@ for line in sys.stdin:
 
     threading.Thread(target=k1fp_ctl_loop, daemon=True).start()
 
+    # Fake /proc/titan_qctrl control pipe, like k1fp's: the keeper writes knob
+    # and mode lines, and /tmp/qctrl-proc shows them as v0.3-q3 prints them.
+    os.mkfifo('/tmp/qctrl-ctl')
+    q_lock = threading.Lock()
+    q_defaults = {'mode': 0, 'trough_ms': 4, 'target_ms': 40, 'ack_adapt': 0, 'ctrl_v3': 0,
+                  'ack_ms': 6, 'ack_segs': 18, 'ack_min_kbps': 2000}
+    q_state = dict(q_defaults)
+
+    def write_qctrl_proc():
+        s = q_state
+        text = (
+            'titan_qctrl v0.3-q3 (NF_BR_FORWARD prio=+100)\n'
+            f"mode=0x{s['mode']:x} (ack_thin={s['mode'] & 1} rwnd_clamp={(s['mode'] >> 1) & 1} dl_ecn={(s['mode'] >> 2) & 1} udp_drop=0)\n"
+            f"params: target_q_ms={s['target_ms']} hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n"
+            f"        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms={s['trough_ms']} rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n"
+            f"        ack_adapt={s['ack_adapt']} ctrl_v3={s['ctrl_v3']} ack_ms={s['ack_ms']} ack_segs={s['ack_segs']} ack_min_kbps={s['ack_min_kbps']}\n"
+        )
+        Path('/tmp/qctrl-proc.tmp').write_text(text)
+        Path('/tmp/qctrl-proc.tmp').replace('/tmp/qctrl-proc')
+
+    qctrl_fd = os.open('/tmp/qctrl-ctl', os.O_RDWR)
+
+    def qctrl_ctl_loop():
+        buf = b''
+        while True:
+            try:
+                chunk = os.read(qctrl_fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b'\n' in buf:
+                raw, buf = buf.split(b'\n', 1)
+                parts = raw.decode('utf-8', 'replace').split()
+                with q_lock:
+                    if len(parts) == 2 and parts[0] in q_state and parts[1].isdigit() and Path('/tmp/qctrl-proc').exists():
+                        q_state[parts[0]] = int(parts[1])
+                        write_qctrl_proc()
+
+    threading.Thread(target=qctrl_ctl_loop, daemon=True).start()
+
     env=dict(os.environ,PATH='/tmp/bin:'+os.environ['PATH'],TITAN_EBTABLES='/tmp/bin/ebtables',TITAN_IP6TABLES='/tmp/bin/ip6tables',TITAN_PD_STATE='/tmp/pd',TITAN_PD_RUNTIME='/tmp/runtime',TITAN_KMSG='/tmp/kmsg',TITAN_SNMP6='/tmp/snmp6',TITAN_NVRAM='/tmp/bin/titan-nvram',TITAN_NVRAM_CACHE='/tmp/nvram-cache',TITAN_RCINIT_LOG='/tmp/rcinit.log',
              TITAN_TK_STATUS='/tmp/tk.status',TITAN_TK_RESULT='/tmp/tk.result',TITAN_TK_DIR='/tmp/tk',
              TITAN_TK_FLAGS='/tmp/tk.flags',TITAN_TK_HANDS_OFF='/tmp/tk.hands-off',TITAN_TK_M1='/tmp/tk.m1',
              TITAN_LTED_CLI='/tmp/bin/lted_cli',TITAN_DM_STEP_MS='300',
              TITAN_QCTRL_DIR='/tmp/qctrl',TITAN_QCTRL_STATUS='/tmp/qctrl.status',TITAN_QCTRL_PROC='/tmp/qctrl-proc',
+             TITAN_QCTRL_PROC_WRITE='/tmp/qctrl-ctl',TITAN_MODULES_DIR='/tmp/image-modules',TITAN_LATENCY_DIR='/tmp/latency',
              TITAN_FASTPATH_DIR='/tmp/fastpath',TITAN_FASTPATH_STATUS='/tmp/fastpath.status',
              TITAN_FASTPATH_PROC='/tmp/k1fp-proc',TITAN_FASTPATH_PROC_WRITE='/tmp/k1fp-ctl',
              TITAN_PROC_MODULES='/tmp/proc-modules',TITAN_INSMOD='/tmp/bin/insmod',
@@ -663,10 +711,17 @@ for line in sys.stdin:
         print('PASS: no staged modem firmware: the boot confirm never armed.',flush=True)
         assert not Path('/tmp/dm-log').exists(), 'a modem console session ran on a stock boot'
         assert Path('/tmp/tk.flags').read_text().startswith('state=off\n'), Path('/tmp/tk.flags').read_text()
-        assert 'tk flags' not in log() and 'download clamp' not in log() and 'carrier watch' not in log() and 'fast path' not in log(), log()
-        assert Path('/tmp/qctrl.status').read_text().startswith('state=off\n'), Path('/tmp/qctrl.status').read_text()
-        assert Path('/tmp/fastpath.status').read_text().startswith('state=off\n'), Path('/tmp/fastpath.status').read_text()
-        print('PASS: stock boot: no modem console session, flags, clamp and fast path off and silent.',flush=True)
+        assert 'tk flags' not in log() and 'carrier watch' not in log() and 'latency switches' not in log(), log()
+        # On by default since v1.0.17: with no config of their own the clamp
+        # wants mode 3 and the fast path mode 2. The fast path waits for its
+        # bridge. The clamp's links are up, but this fixture has no image
+        # copies yet, so its load fails without running insmod.
+        q_text=Path('/tmp/qctrl.status').read_text()
+        assert q_text.split('\n')[0] in ('state=waiting', 'state=failed') and 'mode=3\n' in q_text, q_text
+        f_text=Path('/tmp/fastpath.status').read_text()
+        assert f_text.startswith('state=waiting\n') and 'mode=2\n' in f_text, f_text
+        assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
+        print('PASS: stock boot: no modem console session or flags; the clamp and the fast path are on by default.',flush=True)
         # A staged modem firmware image whose boot never answers. Nothing has
         # answered since `silent_from`; the deaf watchdog of a new keeper
         # process cannot arm, so any reboot now is the boot confirm's.
@@ -883,6 +938,17 @@ for line in sys.stdin:
         wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x841b5908)) == 0 and 'selector=0\n' in Path('/tmp/tk.m1').read_text(), 60)
         assert dm_ram().get(str(0x847ed604)) == 0x15, dm_ram()
         print('PASS: the M1 selector waited for an accepted build, went out after N4 AQM v2, reported its counters and rolled back to 0.', flush=True)
+        # modem=off in the latency switches rolls every managed word back to its
+        # off value, live; on again writes them back.
+        Path('/tmp/latency').mkdir(exist_ok=True)
+        Path('/tmp/latency/config').write_text('modem=off\n')
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed604)) == 0, 45)
+        assert 'latency switches: modem off, clamp on, fastpath on (latency/config)' in log(), log()
+        Path('/tmp/latency/config').write_text('# back on\nmodem=on\n')
+        wait_for(lambda: 'state=applied\n' in flags() and dm_ram().get(str(0x847ed604)) == 0x15, 45)
+        assert 'latency switches: modem on, clamp on, fastpath on (latency/config)' in log(), log()
+        Path('/tmp/latency/config').unlink()
+        print('PASS: modem=off in the latency switches wrote the modem words to 0 live, and modem=on wrote them back.', flush=True)
         # A modem firmware load in the kernel log starts the flags over.
         with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
         wait_for(lambda:'modem restart seen' in log(),10)
@@ -1044,11 +1110,13 @@ with open('/tmp/insmod-calls', 'a') as f:
     f.write(mod + '\n')
 mods = Path('/tmp/proc-modules').read_text() if Path('/tmp/proc-modules').exists() else ''
 if mod == 'titan_qctrl.ko':
+    # The module loads in mode 0, as v0.3-q3 does.
     Path('/tmp/qctrl-proc').write_text(
-        'titan_qctrl v0.2-o1b (NF_BR_FORWARD prio=+100)\n'
-        'mode=0x2 (ack_thin=0 rwnd_clamp=1 dl_ecn=0 udp_drop=0)\n'
+        'titan_qctrl v0.3-q3 (NF_BR_FORWARD prio=+100)\n'
+        'mode=0x0 (ack_thin=0 rwnd_clamp=0 dl_ecn=0 udp_drop=0)\n'
         'params: target_q_ms=40 hold_us=2500 max_ack_span=8192 phy_cap_kbps=0\n'
         '        qsrc=0 slack_ms=10 floor_pct=30 drain=1 probe=1 trough_ms=4 rtt_target_ms=15 ecn_ms=20 wfix_kb=0 rttlaw=0\n'
+        '        ack_adapt=0 ctrl_v3=0 ack_ms=6 ack_segs=18 ack_min_kbps=2000\n'
     )
     if 'titan_qctrl ' not in mods:
         mods += 'titan_qctrl 47104 0 - Live 0x7f0b4000\n'
@@ -1083,7 +1151,10 @@ else:
         with fp_lock:
             fp_state.update(mode=0, gate='closed', grant_left_ms=0, qctrl_present=1, wd_trips=0, wd_reason='none')
             k1fp_cmds.clear()
+        with q_lock:
+            q_state.update(q_defaults)
         fp_status = lambda: Path('/tmp/fastpath.status').read_text() if Path('/tmp/fastpath.status').exists() else ''
+        q_status = lambda: Path('/tmp/qctrl.status').read_text() if Path('/tmp/qctrl.status').exists() else ''
         restart()
         wait_for(lambda: 'state=applied\n' in fp_status(), 60)
         calls = Path('/tmp/insmod-calls').read_text().splitlines()
@@ -1206,6 +1277,52 @@ else:
         assert 'fast path: adopted a loaded module' not in log()[before_other_log:], log()[before_other_log:]
         assert not Path('/tmp/insmod-calls').exists(), Path('/tmp/insmod-calls').read_text()
         print('PASS: refused wrong version string and other *k1fp* module without adopting.', flush=True)
+        # v1.0.17 defaults: no qctrl/config, no fastpath/config and no staged
+        # copies. Both modules load from the image's copies, the clamp in mode 3
+        # and the fast path in mode 2.
+        for staged in ('/tmp/qctrl', '/tmp/fastpath'):
+            shutil.rmtree(staged, ignore_errors=True)
+        Path('/tmp/image-modules').mkdir()
+        shutil.copy2(REPO/'device/qctrl/payload/titan_qctrl.ko', '/tmp/image-modules/titan_qctrl.ko')
+        shutil.copy2(REPO/'device/fastpath/payload/titan_k1fp.ko', '/tmp/image-modules/titan_k1fp.ko')
+        for stale in ('/tmp/qctrl-proc', '/tmp/k1fp-proc', '/tmp/insmod-calls', '/tmp/qctrl.status', '/tmp/fastpath.status'):
+            Path(stale).unlink(missing_ok=True)
+        Path('/tmp/proc-modules').write_text('')
+        with fp_lock:
+            fp_state.update(mode=0, gate='closed', grant_left_ms=0, qctrl_present=1, wd_trips=0, wd_reason='none')
+            k1fp_cmds.clear()
+        with q_lock:
+            q_state.update(q_defaults)
+        before_defaults = len(log())
+        restart()
+        wait_for(lambda: 'state=applied\n' in fp_status() and 'state=applied\n' in q_status(), 90)
+        assert Path('/tmp/insmod-calls').read_text().splitlines() == ['titan_qctrl.ko', 'titan_k1fp.ko']
+        new_log = log()[before_defaults:]
+        assert 'download clamp: loaded titan_qctrl v0.3-q3 from the firmware image' in new_log, new_log
+        assert 'fast path: loaded titan_k1fp v2.2 from the firmware image' in new_log, new_log
+        assert 'mode=3\n' in q_status() and 'the firmware default' in q_status() and q_state['mode'] == 3, (q_status(), q_state)
+        assert 'mode=2\n' in fp_status() and 'active_mode=2\n' in fp_status() and 'the firmware default' in fp_status(), fp_status()
+        print('PASS: with no config of their own the clamp (mode 3) and the fast path (mode 2) loaded from the image.', flush=True)
+        # The latency switches turn both off live, and on again without a reload.
+        Path('/tmp/latency').mkdir(exist_ok=True)
+        Path('/tmp/latency/config').write_text('clamp=off\nfastpath=off\n')
+        wait_for(lambda: 'state=off\n' in fp_status() and 'state=off\n' in q_status(), 30)
+        assert fp_state['mode'] == 0 and q_state['mode'] == 0, (fp_state, q_state)
+        assert 'clamp=off in latency/config' in q_status() and 'fastpath=off in latency/config' in fp_status(), (q_status(), fp_status())
+        assert 'latency switches: modem on, clamp off, fastpath off (latency/config)' in log(), log()
+        Path('/tmp/latency/config').write_text('clamp=on\nfastpath=on\n')
+        wait_for(lambda: 'state=applied\n' in fp_status() and 'state=applied\n' in q_status(), 30)
+        assert fp_state['mode'] == 2 and q_state['mode'] == 3, (fp_state, q_state)
+        assert Path('/tmp/insmod-calls').read_text().splitlines() == ['titan_qctrl.ko', 'titan_k1fp.ko'], 'no reload'
+        print('PASS: clamp=off and fastpath=off turned both to mode 0 live, and on again put back 3 and 2.', flush=True)
+        # The default clamp stands aside while a radio profile's CAKE is loaded.
+        Path('/tmp/proc-modules').write_text(Path('/tmp/proc-modules').read_text() + 'sch_cake 31676 0 - Live 0x7f0a0000\n')
+        wait_for(lambda: 'state=off\n' in q_status() and 'CAKE' in q_status(), 30)
+        assert q_state['mode'] == 0, q_state
+        Path('/tmp/proc-modules').write_text(Path('/tmp/proc-modules').read_text().replace('sch_cake 31676 0 - Live 0x7f0a0000\n', ''))
+        wait_for(lambda: 'state=applied\n' in q_status() and q_state['mode'] == 3, 30)
+        Path('/tmp/latency/config').unlink()
+        print('PASS: the default clamp stood aside while sch_cake was loaded and came back after.', flush=True)
         # Router swap, last, so no timed step above moves against the deaf
         # watchdog's rounds. The vendor kernel addresses the bearer's IPv4 to the MAC
         # it stored at boot, the router's here, so with the bearer bridged the

@@ -9,17 +9,21 @@
 //! (`ack_adapt`) and low-burst window control (`ctrl_v3`), both off by default
 //! so the default code path matches v0.2-o1b. See docs/download-clamp.md.
 //!
-//! The image has no room for it, so an operator stages the module per unit
-//! in `/mnt/titan-api/qctrl/` with a `config`. The keeper:
-//! - loads it only when `config` asks for a mode other than 0, once the
-//!   customer port and the management bearer have been up for `SETTLE_SECS`;
+//! Since v1.0.17 the module is in the firmware image and on by default, in
+//! `DEFAULT_MODE`. An operator's `/mnt/titan-api/qctrl/config` sets other
+//! modes and knobs, and `clamp=off` in the latency switches turns it off
+//! (`effective`). The keeper:
+//! - loads it only when the effective mode is not 0, once the customer port
+//!   and the management bearer have been up for `SETTLE_SECS`;
 //! - loads only bytes that match the digest built into the keeper
-//!   (`device/qctrl/SHA256SUMS`), from a private copy in RAM;
+//!   (`device/qctrl/SHA256SUMS`): a copy staged in `/mnt/titan-api/qctrl/`
+//!   when there is one, else the image's, from a private copy in RAM;
 //! - never loads it while any other `qctrl` module is loaded;
 //! - writes the knobs, then the mode, to `/proc/titan_qctrl` and reads them back.
 //!
 //! The module starts in mode 0 (observe only). Mode 0 later turns it back to
 //! pass-through without unloading it.
+use crate::switches::Source;
 
 /// The first line of `/proc/titan_qctrl` for the allowed build.
 pub const VERSION_LINE: &str = "titan_qctrl v0.3-q3";
@@ -31,6 +35,11 @@ pub const FILE: &str = "titan_qctrl.ko";
 /// thinning, 6 clamp plus downlink ECN. These are the bench-tested arms. Bit 8
 /// (drop UDP) stays off.
 pub const MODES: [u32; 4] = [0, 2, 3, 6];
+/// The clamp mode of a unit with no `qctrl/config`, and the one line to
+/// change it: 3 is the receive-window clamp plus ACK thinning (Josh, for
+/// v1.0.17), 2 the clamp alone, 0 leaves the clamp off unless an operator
+/// turns it on. It must be one of `MODES`.
+pub const DEFAULT_MODE: u32 = 3;
 /// Seconds the customer port and the management bearer stay up before a load.
 pub const SETTLE_SECS: u64 = 30;
 /// Seconds between config and `/proc` checks.
@@ -133,6 +142,30 @@ pub fn parse_config(text: &str) -> Config {
         }
     }
     config
+}
+
+/// The settings the keeper keeps, and where they came from:
+/// - `clamp=off` in the latency switches: mode 0;
+/// - the operator's `qctrl/config` (`staged`) when there is one;
+/// - else `DEFAULT_MODE` with the module's own knobs, unless CAKE shapes
+///   downloads: only a radio profile's `sqm` action loads `sch_cake`, and
+///   the clamp has not been tested beside it, so the default stands aside.
+pub fn effective(switch_on: bool, staged: Option<&str>, cake: bool) -> (Config, Source) {
+    if !switch_on {
+        return (Config::default(), Source::Off);
+    }
+    if let Some(text) = staged {
+        return (parse_config(text), Source::Operator);
+    }
+    if cake {
+        return (Config::default(), Source::Aside("CAKE shapes downloads (radio profile sqm)"));
+    }
+    (Config { mode: DEFAULT_MODE, ..Config::default() }, Source::Default)
+}
+
+/// `sch_cake` is loaded (`/proc/modules`).
+pub fn cake_loaded(modules: &str) -> bool {
+    modules.lines().any(|line| line.split_whitespace().next() == Some("sch_cake"))
 }
 
 /// What `/proc/titan_qctrl` shows.
@@ -319,6 +352,28 @@ mod tests {
         for mode in MODES {
             assert_eq!(parse_config(&format!("mode={mode}\n")).mode, mode);
         }
+    }
+
+    #[test]
+    fn on_by_default_unless_switched_off_configured_or_beside_cake() {
+        assert!(MODES.contains(&DEFAULT_MODE), "the default must be a bench-tested mode");
+        let (config, source) = effective(true, None, false);
+        assert_eq!((config.mode, source), (DEFAULT_MODE, Source::Default));
+        assert_eq!(config, Config { mode: DEFAULT_MODE, ..Config::default() }, "the module's own knobs");
+        // The switch turns it off, whatever the operator's file says.
+        assert_eq!(effective(false, Some("mode=2\n"), false), (Config::default(), Source::Off));
+        assert_eq!(effective(false, None, false).0.mode, 0);
+        // An operator's file wins over the default, mode=0 included, and CAKE does not matter then.
+        let (config, source) = effective(true, Some("mode=2\ntrough_ms=8\n"), true);
+        assert_eq!((config.mode, config.trough_ms, source), (2, Some(8), Source::Operator));
+        assert_eq!(effective(true, Some("mode=0\n"), false).0.mode, 0);
+        assert_eq!(effective(true, Some(""), false).0.mode, 0, "an empty file is the operator's: off");
+        // The default stands aside while a radio profile's CAKE shapes downloads.
+        let (config, source) = effective(true, None, true);
+        assert_eq!(config.mode, 0);
+        assert!(matches!(source, Source::Aside(_)));
+        assert!(cake_loaded(MODULES));
+        assert!(!cake_loaded("titan_qctrl 47104 0 - Live 0x7f0b4000\nsch_cake_old 1 0 - Live 0x0\n"));
     }
 
     #[test]

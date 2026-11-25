@@ -1,11 +1,14 @@
-//! `titan-pd-keeper tk-build check|stage`: build the patched modem image on
-//! the unit from its own stock firmware and the manifest built into the
-//! keeper (docs/tk-patch.md). Nothing runs it but an operator.
+//! `titan-pd-keeper tk-build check|stage|boot`: build the patched modem image
+//! on the unit from its own stock firmware and the manifest built into the
+//! keeper (docs/tk-patch.md).
 //!
 //! - `check` builds in memory, verifies every hash and writes nothing.
 //! - `stage` also writes `tk/active.gz` and `tk/config` on the Witcher
 //!   volume, each durably (`files`), and touches nothing else. The next
-//!   boot's loader does the rest (docs/tk-boot-loader.md).
+//!   boot's loader does the rest (docs/tk-boot-loader.md). An operator runs
+//!   these two.
+//! - `boot` is the default image at boot, for the boot hook only
+//!   (`crate::tk_default_io`).
 //!
 //! Tests (scripts/test-tk-build.py) point `TITAN_TK_PROC_MTD` at a stand-in
 //! for /proc/mtd and `TITAN_TK_MTD_DIR` at plain files standing in for the
@@ -26,12 +29,15 @@ use crate::files::{replace_durably, write_durably};
 use crate::mtd::GoodBlocks;
 use crate::paths::{env_path_or, tk_dir};
 
-const USAGE: &str = "usage: titan-pd-keeper tk-build check|stage";
+const USAGE: &str = "usage: titan-pd-keeper tk-build check|stage|boot [--write]";
 /// Our temporary files in tk/. A leftover one means a run is going on or died.
-const TMP_IMAGE: &str = ".active.gz.tk-build";
-const TMP_CONFIG: &str = ".config.tk-build";
+pub(crate) const TMP_IMAGE: &str = ".active.gz.tk-build";
+pub(crate) const TMP_CONFIG: &str = ".config.tk-build";
 
 pub fn main(args: &[String]) -> i32 {
+    if args.first().is_some_and(|a| a == "boot") {
+        return crate::tk_default_io::main(&args[1..]);
+    }
     let stage = match args {
         [a] if a == "check" => false,
         [a] if a == "stage" => true,
@@ -79,7 +85,7 @@ fn run(stage: bool) -> Result<(), String> {
             tried.push(format!("{bank}: no such partition"));
             continue;
         };
-        match build(&m, &part, out) {
+        match build(&m, &part, out).map_err(|f| f.text) {
             Ok((built, skipped)) => {
                 println!(
                     "{bank} (mtd{}, {skipped} bad blocks skipped): stock {}; built image {}, gzip {} ({} bytes)",
@@ -142,18 +148,39 @@ fn create(path: &Path) -> io::Result<File> {
     OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)
 }
 
+/// Why a build from one bank stopped.
+pub(crate) struct Failure {
+    /// The bank does not hold the stock image the manifest pins: a property
+    /// of the unit, not of this attempt.
+    pub stock: bool,
+    pub text: String,
+}
+
+impl From<String> for Failure {
+    fn from(text: String) -> Self {
+        Self { stock: false, text }
+    }
+}
+
 /// Build from one bank; with `dir`, into its temporary image file.
-fn build(m: &Manifest, part: &Mtd, dir: Option<&Path>) -> Result<(Built, u32), String> {
+pub(crate) fn build(m: &Manifest, part: &Mtd, dir: Option<&Path>) -> Result<(Built, u32), Failure> {
     // Tests put plain files with no bad block table in another directory.
     let devices = env_path_or("TITAN_TK_MTD_DIR", "/dev");
     let dev = devices.join(format!("mtd{}", part.index));
     let has_bbt = devices == Path::new("/dev");
     let mut src = GoodBlocks::open(&dev, part, has_bbt).map_err(|e| format!("{}: {e}", dev.display()))?;
-    let explain = |err: Error, src: &mut GoodBlocks, sink_error: Option<io::Error>| match err {
-        Error::Read => format!("reading the bank: {}", src.error.take().map_or("?".into(), |e| e.to_string())),
-        Error::Write => format!("writing the image: {}", sink_error.map_or("?".into(), |e| e.to_string())),
-        Error::Site(i) => format!("not the stock image: site {} differs", m.sites[i].name),
-        other => other.to_string(),
+    let explain = |err: Error, src: &mut GoodBlocks, sink_error: Option<io::Error>| {
+        let stock = matches!(
+            err,
+            Error::Site(_) | Error::Stock(_) | Error::Gzip(_) | Error::Inflate(_) | Error::Truncated
+        );
+        let text = match err {
+            Error::Read => format!("reading the bank: {}", src.error.take().map_or("?".into(), |e| e.to_string())),
+            Error::Write => format!("writing the image: {}", sink_error.map_or("?".into(), |e| e.to_string())),
+            Error::Site(i) => format!("not the stock image: site {} differs", m.sites[i].name),
+            other => other.to_string(),
+        };
+        Failure { stock, text }
     };
     let Some(dir) = dir else {
         let built = pipeline::from_gzip(m, &mut src, &mut Discard).map_err(|e| explain(e, &mut src, None))?;
@@ -174,7 +201,7 @@ fn build(m: &Manifest, part: &Mtd, dir: Option<&Path>) -> Result<(Built, u32), S
     Ok((flushed?, src.skipped))
 }
 
-fn sha256_file(path: &Path) -> io::Result<Digest> {
+pub(crate) fn sha256_file(path: &Path) -> io::Result<Digest> {
     let mut file = File::open(path)?;
     let mut sha = Sha256::new();
     let mut buf = vec![0u8; 64 * 1024];
@@ -190,28 +217,37 @@ fn sha256_file(path: &Path) -> io::Result<Digest> {
 /// config. Until the config names the image's hash the loader refuses the
 /// image (not-allowed) and boots stock firmware, so this order is safe.
 fn commit(dir: &Path, built: &Built) -> Result<(), String> {
-    let tmp = dir.join(TMP_IMAGE);
     let config = dir.join("config");
+    let old = match fs::read_to_string(&config) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            let _ = fs::remove_file(dir.join(TMP_IMAGE));
+            return Err(format!("{}: {e}", config.display()));
+        }
+    };
+    place_image(dir, built)?;
+    let new = tk_build::staged_config(&old, &built.gzip.to_string());
+    write_durably(&config, &dir.join(TMP_CONFIG), new.as_bytes()).map_err(|e| {
+        let _ = fs::remove_file(dir.join(TMP_CONFIG));
+        format!("writing {}: {e}", config.display())
+    })
+}
+
+/// Rename the built image over `active.gz` once what reached the flash reads
+/// back as the image that was built. On any failure the temporary file goes.
+pub(crate) fn place_image(dir: &Path, built: &Built) -> Result<(), String> {
+    let tmp = dir.join(TMP_IMAGE);
     let undo = |why: String| {
         let _ = fs::remove_file(&tmp);
-        let _ = fs::remove_file(dir.join(TMP_CONFIG));
         why
     };
-    // What reached the flash, not what was meant to.
     match sha256_file(&tmp) {
         Ok(sha) if sha == built.gzip => {}
         Ok(sha) => return Err(undo(format!("the image read back as {sha}, not {}", built.gzip))),
         Err(e) => return Err(undo(format!("reading the image back: {e}"))),
     }
-    let old = match fs::read_to_string(&config) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(undo(format!("{}: {e}", config.display()))),
-    };
-    replace_durably(&tmp, &dir.join("active.gz")).map_err(|e| undo(format!("placing active.gz: {e}")))?;
-    let new = tk_build::staged_config(&old, &built.gzip.to_string());
-    write_durably(&config, &dir.join(TMP_CONFIG), new.as_bytes())
-        .map_err(|e| undo(format!("writing {}: {e}", config.display())))
+    replace_durably(&tmp, &dir.join("active.gz")).map_err(|e| undo(format!("placing active.gz: {e}")))
 }
 
 /// Why the loader would still boot stock firmware with this image staged.

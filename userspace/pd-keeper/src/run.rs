@@ -23,8 +23,11 @@
 //! modem firmware image it confirms the boot, or puts stock firmware back (see
 //! `titan_pd_model::tk_boot`), and after the confirm writes the operator's
 //! modem feature flags (see `titan_pd_model::tk_flags`). In every mode it
-//! loads a staged download clamp when its config asks for one (see
-//! `titan_pd_model::qctrl`).
+//! loads the download clamp, on by default since v1.0.17 (see
+//! `titan_pd_model::qctrl`), and in passthrough the fast path (see
+//! `titan_pd_model::fastpath`). `/mnt/titan-api/latency/config` turns the
+//! modem words, the clamp and the fast path off (see
+//! `titan_pd_model::switches`).
 //!
 //! This module holds the `Keeper` state and the loop: `tick` runs each part
 //! in turn and `wait_next` sleeps until a control frame, a kernel log line or
@@ -40,6 +43,8 @@
 //! - `watchdog`, `tk`, `clamp`, `mgmt_v6`: the deaf watchdog, the staged
 //!   modem firmware's boot confirm and flags, the download clamp and
 //!   management IPv6
+//! - `latency`: the off switches for the modem words, the clamp and the
+//!   fast path
 
 use std::fs;
 use std::io::ErrorKind;
@@ -76,6 +81,7 @@ use self::carrier::CarrierWatch;
 use self::clamp::QctrlWatch;
 use self::delegation::CORE_MAC;
 use self::kmsg::KernelLog;
+use self::latency::SwitchWatch;
 use self::routes::main_routes;
 use self::sas::FileTail;
 use self::watchdog::PingRound;
@@ -90,6 +96,7 @@ mod gate;
 mod if_inet6;
 mod ipv4_repair;
 mod kmsg;
+mod latency;
 mod mac;
 mod mgmt_v6;
 mod mode;
@@ -241,9 +248,11 @@ struct Keeper {
     tk_flags_config_hands_off: bool,
     /// The kernel log showed a modem firmware load after the keeper started.
     modem_restart_seen: bool,
-    /// The staged download clamp (see `titan_pd_model::qctrl`).
+    /// The latency switches (see `titan_pd_model::switches`).
+    switches: SwitchWatch,
+    /// The download clamp (see `titan_pd_model::qctrl`).
     qctrl: QctrlWatch,
-    /// The staged passthrough bridge fast path (see `titan_pd_model::fastpath`).
+    /// The passthrough bridge fast path (see `titan_pd_model::fastpath`).
     fastpath: fastpath_io::Watch,
     /// The opt-in CPU trims (see `titan_pd_model::cpu_trims`).
     cpu_trims: cpu_trims_io::Watch,
@@ -376,6 +385,7 @@ impl Keeper {
             tk_flags_refused: Vec::new(),
             tk_flags_config_hands_off: false,
             modem_restart_seen: false,
+            switches: SwitchWatch::default(),
             qctrl: QctrlWatch::default(),
             fastpath: fastpath_io::Watch::default(),
             cpu_trims: cpu_trims_io::Watch::default(),
@@ -463,6 +473,7 @@ impl Keeper {
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
+        self.maintain_switches();
         self.maintain_tk_confirm();
         self.maintain_tk_flags();
         self.maintain_qctrl();
@@ -514,16 +525,17 @@ impl Keeper {
         Ok(())
     }
 
-    /// Load and maintain the staged passthrough bridge fast path after the
-    /// download clamp (see `titan_pd_model::fastpath`).
+    /// Load and maintain the passthrough bridge fast path after the download
+    /// clamp (see `titan_pd_model::fastpath`).
     fn maintain_fastpath(&mut self) {
         let now = self.now;
         let passthrough = self.passthrough;
         let qctrl_waiting = self.qctrl.waiting;
+        let switch_on = self.switches.now.fastpath;
         let cache = nvram::cache_path();
         let mut lines = Vec::new();
         self.fastpath
-            .maintain(now, passthrough, qctrl_waiting, &cache, |line| {
+            .maintain(now, passthrough, qctrl_waiting, switch_on, &cache, |line| {
                 lines.push(line.to_owned());
             });
         for line in lines {

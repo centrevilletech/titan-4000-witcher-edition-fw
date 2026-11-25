@@ -6,15 +6,18 @@
 //! handler to `dev_queue_xmit` after proving every flow on the stock path. See
 //! `docs/fast-path.md`.
 //!
-//! Like the download clamp, the image has no room for it, so an operator stages
-//! the module per unit in `/mnt/titan-api/fastpath/` with a `config`. The
-//! keeper:
-//! - loads it only when `config` asks for a mode other than 0, only in IP
+//! Since v1.0.17 the module is in the firmware image and on by default, in
+//! `DEFAULT_MODE`. An operator's `/mnt/titan-api/fastpath/config` sets
+//! another mode, and `fastpath=off` in the latency switches turns it off
+//! (`effective`). The keeper:
+//! - loads it only when the effective mode is not 0, only in IP
 //!   passthrough with the exact bridge shape (`eth0` and `lte0pdn2` in `br0`),
 //!   once both have stayed up for `SETTLE_SECS`, and after the download clamp
 //!   if both are configured;
 //! - loads only bytes that match the digest built into the keeper
-//!   (`device/fastpath/SHA256SUMS`), from a private copy in RAM;
+//!   (`device/fastpath/SHA256SUMS`): a copy staged in
+//!   `/mnt/titan-api/fastpath/` when there is one, else the image's, from a
+//!   private copy in RAM;
 //! - refuses to load beside any other module with `k1fp` in its name or a
 //!   different version string;
 //! - checks `ports_ok=1`, `lan_hooked=1`, and `wan_hooked=1` in `/proc/k1fp`
@@ -32,6 +35,7 @@
 //!   that does not use the re-arm budget.
 
 use crate::cbrs_gate::{Gate, Step as GateStep};
+use crate::switches::Source;
 
 /// The first line of `/proc/k1fp` for the allowed build.
 pub const VERSION_LINE: &str = "titan_k1fp v2.2";
@@ -45,6 +49,9 @@ pub const LAN: &str = "eth0";
 pub const WAN: &str = "lte0pdn2";
 /// Allowed operating modes: 0 off, 1 observe, 2 downlink, 3 both directions.
 pub const MODES: [u32; 4] = [0, 1, 2, 3];
+/// The mode of a unit with no `fastpath/config`: the downlink fast path, which
+/// the bench has run for days. It must be one of `MODES`.
+pub const DEFAULT_MODE: u32 = 2;
 /// Seconds `eth0` and the customer bearer must stay up before a load.
 pub const SETTLE_SECS: u64 = 30;
 /// Seconds between config and `/proc/k1fp` checks.
@@ -106,6 +113,17 @@ pub fn parse_config(text: &str) -> Config {
         }
     }
     config
+}
+
+/// The settings the keeper keeps, and where they came from: mode 0 while
+/// `fastpath=off` is in the latency switches, the operator's
+/// `fastpath/config` (`staged`) when there is one, else `DEFAULT_MODE`.
+pub fn effective(switch_on: bool, staged: Option<&str>) -> (Config, Source) {
+    match (switch_on, staged) {
+        (false, _) => (Config::default(), Source::Off),
+        (true, Some(text)) => (parse_config(text), Source::Operator),
+        (true, None) => (Config { mode: DEFAULT_MODE, refused: Vec::new() }, Source::Default),
+    }
 }
 
 /// What `/proc/k1fp` shows.
@@ -649,6 +667,16 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         let cfg = parse_config("mode=2\ntxirq=1\nnonsense\n");
         assert_eq!(cfg.mode, 2);
         assert_eq!(cfg.refused, vec!["txirq=1", "nonsense"]);
+    }
+
+    #[test]
+    fn on_by_default_in_mode_2_unless_switched_off_or_configured() {
+        assert!(MODES.contains(&DEFAULT_MODE));
+        assert_eq!(effective(true, None), (Config { mode: 2, refused: Vec::new() }, Source::Default));
+        assert_eq!(effective(false, Some("mode=3\n")), (Config::default(), Source::Off));
+        assert_eq!(effective(true, Some("mode=3\n")).0.mode, 3);
+        assert_eq!(effective(true, Some("mode=0\n")), (Config::default(), Source::Operator));
+        assert_eq!(effective(true, Some("")).0.mode, 0, "an empty file is the operator's: off");
     }
 
     #[test]

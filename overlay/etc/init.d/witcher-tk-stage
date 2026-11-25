@@ -1,13 +1,20 @@
 #!/bin/sh
-# Boot-time modem firmware (tk) loader. Off unless an operator opts in.
+# Boot-time modem firmware (tk) loader. On by default since v1.0.17.
 #
 # start_lte.sh runs `witcher-tk-stage pre` right before its one
 # `modprobe modem` and `witcher-tk-stage post` right after it returns (the
 # build adds both lines). See docs/tk-boot-loader.md.
 #
-# Without an opt-in, or after any failed check, nothing is bound. The stock
-# modem.ko then loads the stock firmware from NAND, as on a unit without this
-# hook. The only trace is a read-only look at the Witcher volume.
+# With no operator files in tk/, the keeper builds the release image from
+# this unit's own stock firmware on the first boot that needs it
+# (`titan-pd-keeper tk-build boot`), writes a default config, and the checks
+# below load it like any staged image. An operator's config always wins, and
+# enabled=0 there keeps stock firmware.
+#
+# After any failed check nothing is bound. The stock modem.ko then loads the
+# stock firmware from NAND, as on a unit without this hook. A unit that opted
+# out, or one whose stock firmware the release image cannot be built from, is
+# only read.
 #
 # The gated modem.ko reads /lib/firmware/tk.gz first. It falls back to NAND
 # only when no tk.gz or tk.xz opens there. A file that opens but is bad is NOT
@@ -18,9 +25,11 @@
 # firmware.
 #
 # Files on the Witcher volume (ubi1:data, seen as /mnt/titan-api/tk later):
-#   config      operator: enabled=1, one sha256=<64 hex> line per allowed
-#               image, optional target=<address> lines for the boot confirm
-#   active.gz   operator: the staged image
+#   config      enabled=1, one sha256=<64 hex> line per allowed image,
+#               optional target=<address> lines for the boot confirm. The
+#               keeper's default config starts with "# witcher-default ".
+#   active.gz   the staged image: the keeper's default, or an operator's
+#   default     the keeper's record of its default builds
 #   strikes     strikes=N: staged boots since the last boot confirm. pre adds
 #               one before every load. The keeper writes 0 on a boot confirm.
 #   quarantine  one hash per line, never staged again (the keeper adds them)
@@ -44,6 +53,9 @@ firmware=/lib/firmware
 module=/lib/modules/3.10.0-uc0/extra/modem.ko
 gated=/usr/lib/titan-api/tk/modem-tkfs.ko
 gated_sha=161ffdd052059a14747041a74b7b7740c705bfd52c9913a9013cbb0a15f55977
+keeper=/usr/lib/titan-api/titan-pd-keeper
+build_log=/var/run/witcher-tk.build
+build_limit=120
 limit=2
 max_bytes=7864320
 min_free_kb=32768
@@ -102,6 +114,51 @@ quarantined() {
  awk -v h="$1" '{ v = $0; sub(/#.*/, "", v); gsub(/[ \t\r]/, "", v); if (tolower(v) == h) f = 1 } END { exit !f }' "$dir/quarantine"
 }
 regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+# Whole seconds since boot, or 0.
+uptime_s() {
+ s=$(cut -d. -f1 "$uptime" 2> /dev/null)
+ case "$s" in ''|*[!0-9]*) s=0;; esac
+ echo "$s"
+}
+
+# The default image. The keeper decides whether tk/ is the firmware's (no
+# config at all, or its own default config) and whether to build; an
+# operator's config, recognised here by its first line, never reaches it.
+# The variable is exported inside the command substitution: a prefix
+# assignment before a shell function need not reach its child.
+# Its stdout is one line: operator, cached, built, build, or reason=<word>.
+# Any other answer, a crash or the time limit keeps stock firmware.
+default_image() {
+ if [ -e "$dir/config" ] || [ -L "$dir/config" ]; then
+  regular "$dir/config" || return 0
+  first=
+  IFS= read -r first < "$dir/config"
+  case "$first" in '# witcher-default '*) ;; *) return 0;; esac
+ fi
+ began=$(uptime_s)
+ answer=$(export TITAN_TK_DIR="$dir"; tmo "$build_limit" "$keeper" tk-build boot 2>> "$build_log")
+ rc=$?
+ if [ "$rc" = 2 ] && [ "$answer" = build ]; then
+  free=$(awk '$1 == "MemFree:" { print $2 }' "$meminfo")
+  case "$free" in ''|*[!0-9]*) free=0;; esac
+  [ "$free" -ge "$min_free_kb" ] || { why='memory'; return 1; }
+  tmo 30 mount -o remount,rw "$state" > /dev/null 2>&1 || { why='build'; return 1; }
+  answer=$(export TITAN_TK_DIR="$dir"; tmo "$build_limit" "$keeper" tk-build boot --write 2>> "$build_log")
+  rc=$?
+ fi
+ put build_secs $(($(uptime_s) - began))
+ case "$rc:$answer" in
+  0:operator|0:cached|0:built) put build "$answer"; return 0;;
+  1:reason=*)
+   why=${answer#reason=}
+   case "$why" in ''|*[!a-z-]*) why='build';; esac
+   [ "${#why}" -le 24 ] || why='build'
+   ;;
+  *) why='build';;
+ esac
+ put build "$why"
+ return 1
+}
 
 # TODO(signature): Phase 1 trusts the sha256 allow-list in config, which only
 # root on the unit can write. Phase 2 checks a signature here, before anything
@@ -149,6 +206,7 @@ stage() {
  mounted "$state" || { why='mount'; return 1; }
  state_mounted=1
 
+ [ -L "$dir" ] || default_image || return 1
  [ -d "$dir" ] && [ ! -L "$dir" ] && regular "$dir/config" || { why='off'; return 1; }
  [ "$(value enabled "$dir/config")" = 1 ] || { why='off'; return 1; }
  strikes=0

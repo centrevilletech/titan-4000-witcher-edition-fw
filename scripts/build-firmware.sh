@@ -3,9 +3,10 @@
 #
 # Produces: stock kernel + stock tk (byte-identical) + a rebuilt UBIFS rootfs
 # carrying (a) the passthrough/SSH overlay, (b) the one-byte gdmlte.ko IPv6-PD
-# modem patch and (c) the boot-time tk loader: a gated copy of modem.ko (the
-# stock module stays in place) and a hook around start_lte.sh's modprobe. No
-# modem firmware bytes are added. See README.md for prerequisites.
+# modem patch, (c) the boot-time tk loader: a gated copy of modem.ko (the
+# stock module stays in place) and a hook around start_lte.sh's modprobe, and
+# (d) the pinned download clamp and fast path modules. No modem firmware bytes
+# are added. See README.md for prerequisites.
 #
 # Usage: scripts/build-firmware.sh /path/to/STOCK.prg [-o out.prg]
 set -euo pipefail
@@ -58,6 +59,15 @@ echo ">> building versioned web UI from source"
 "$HERE/scripts/build-keeper.sh" "$WORK/rootfs/usr/lib/titan-api/titan-pd-keeper"
 "$HERE/scripts/build-entropy.sh" "$WORK/rootfs/usr/lib/titan-api/witcher-entropy"
 install -m 644 "$HERE/userspace/entropy/vendor/jitterentropy/LICENSE.bsd" "$WORK/rootfs/usr/lib/titan-api/jitterentropy-LICENSE"
+# The download clamp and the fast path, on by default since v1.0.17. The
+# keeper loads only these pinned bytes (docs/download-clamp.md, docs/fast-path.md).
+echo ">> download clamp and fast path modules (pinned digests)"
+for kind in qctrl fastpath; do
+  ( cd "$HERE/device/$kind/payload" && sha256sum -c --strict --quiet ../SHA256SUMS )
+done
+install -d -m 755 "$WORK/rootfs/usr/lib/titan-api/modules"
+install -m 644 "$HERE/device/qctrl/payload/titan_qctrl.ko" "$HERE/device/fastpath/payload/titan_k1fp.ko" \
+  "$WORK/rootfs/usr/lib/titan-api/modules/"
 python3 "$HERE/scripts/stamp-version.py" "$WORK/rootfs"
 cat "$HERE/overlay/board.conf.append" >> "$WORK/rootfs/etc/sysconfig/board.conf"
 # Keep the desktop recovery UI and updater. No factory shared TLS private key.
