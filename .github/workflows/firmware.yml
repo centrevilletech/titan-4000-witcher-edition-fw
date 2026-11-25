@@ -92,6 +92,8 @@ jobs:
           device/fastpath/test/run.sh
       - name: Keeper and protocol tests
         run: cargo test --locked --workspace --manifest-path userspace/Cargo.toml
+      - name: Modem atlas layout tests
+        run: cargo test --manifest-path device/modem-rust/atlas/Cargo.toml
       - name: Management reachability across network modes
         run: |
           cargo build --locked --manifest-path userspace/Cargo.toml -p witcher-firstboot

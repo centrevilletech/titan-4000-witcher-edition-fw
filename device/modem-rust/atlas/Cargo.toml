@@ -1,0 +1,9 @@
+[package]
+name = "modem-atlas"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Verified #[repr(C)] data-path types, addresses, and FFI signatures for the Titan 4000 GDM7243A LTE modem (tk.bin V1.6.0.P0)"
+
+[lib]
+path = "src/lib.rs"
