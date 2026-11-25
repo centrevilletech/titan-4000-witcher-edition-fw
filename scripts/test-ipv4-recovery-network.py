@@ -1250,9 +1250,11 @@ for line in sys.stdin:
         assert 'latency switches: modem on, clamp on, fastpath on (latency/config)' in log(), log()
         Path('/tmp/latency/config').unlink()
         print('PASS: modem=off in the latency switches wrote the modem words to 0 live, and modem=on wrote them back.', flush=True)
-        # A modem firmware load in the kernel log starts the flags over.
+        # A modem firmware load in the kernel log starts the flags over. Only
+        # this keeper's lines: the boot confirm's crash cases saw restarts too.
+        before_restart=len(log())
         with open('/tmp/kmsg','a') as kmsg: kmsg.write('6,900,1,-;read from nand mtd=tk0\n')
-        wait_for(lambda:'modem restart seen' in log(),10)
+        wait_for(lambda:'modem restart seen' in log()[before_restart:],10)
         assert 'state=pending' in flags(), flags()
         print('PASS: a modem restart in the kernel log starts the flag writes over.',flush=True)
         # The clamp and fast path waited for the links, refused bogus bytes and never ran insmod.
