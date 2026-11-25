@@ -50,7 +50,6 @@ use titan_pd_model::ipv4;
 use titan_pd_model::ipv4_health::{self, Peer, Traffic};
 use titan_pd_model::mgmt::{self, Step};
 use titan_pd_model::prefix::Block;
-use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 use titan_pd_model::ra::{self, Advertisement};
 use titan_pd_model::sas_nat;
 use titan_pd_model::tk_boot::{self, Action as TkAction};
@@ -59,7 +58,7 @@ use titan_pd_model::wear::{self, Route};
 use titan_sys::ifaddrs::InterfaceAddrs;
 use titan_sys::socket::{Socket, SocketExt};
 
-use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, qctrl_io, tk_flags_io};
+use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, tk_flags_io};
 use crate::clock::{monotonic, unix_now};
 use crate::command::{command_stdout, run_status};
 use crate::files::read_file;
@@ -67,6 +66,7 @@ use crate::netdev::{carrier_up, interface_index, interface_mac, read_mac, rx_pac
 use crate::paths::state_dir;
 
 use self::carrier::CarrierWatch;
+use self::clamp::QctrlWatch;
 use self::if_inet6::{link_local, live_prefix, proc_if_inet6_addrs};
 use self::kmsg::{KernelLog, kernel_messages};
 use self::packet::{Class, all_nodes_mac, client_mac_of, ethernet_frame, fe80_1, prefixes_advert, ra_packet, udp_packet};
@@ -76,6 +76,7 @@ use self::watchdog::{DeafProbe, spawn_pings};
 use self::wire::{ControlSockets, send_ipv6, send_marked_frame};
 
 mod carrier;
+mod clamp;
 mod flow;
 mod gate;
 mod if_inet6;
@@ -253,21 +254,6 @@ struct Keeper {
     fastpath: fastpath_io::Watch,
     /// The opt-in CPU trims (see `titan_pd_model::cpu_trims`).
     cpu_trims: cpu_trims_io::Watch,
-}
-
-/// The download clamp's progress this boot.
-#[derive(Default)]
-struct QctrlWatch {
-    checked_at: Option<u64>,
-    /// The customer port and the management bearer were both up since then.
-    up_since: Option<u64>,
-    /// The last status, so the file and the log change only on news.
-    shown: String,
-    /// True while configured with a non-zero mode and still waiting to load.
-    waiting: bool,
-    /// A load failed for this config. It is not retried until the config changes.
-    failed_for: Option<qctrl::Config>,
-    refused_logged: Vec<String>,
 }
 
 pub fn serve() -> Result<(), String> {
@@ -1307,135 +1293,6 @@ impl Keeper {
         }
         if let Some(status) = status {
             let _ = fs::write(tk_flags_status_path(), status);
-        }
-    }
-
-    /// Load the staged download clamp once the customer port and LTE are up,
-    /// and keep its mode as `qctrl/config` says. Runs in every mode.
-    fn maintain_qctrl(&mut self) {
-        if self
-            .qctrl
-            .checked_at
-            .is_some_and(|at| self.now.saturating_sub(at) < qctrl::CHECK_EVERY)
-        {
-            return;
-        }
-        self.qctrl.checked_at = Some(self.now);
-        let Some(dir) = qctrl_io::staged_dir() else {
-            self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
-            return;
-        };
-        let config = qctrl::parse_config(&read_file(dir.join("config")));
-        if config.refused != self.qctrl.refused_logged {
-            for line in &config.refused {
-                self.note(&format!(
-                    "download clamp: ignored {line:?} in qctrl/config (allowed: mode=0|2|3|6, trough_ms=0..40, target_ms=4..80, ack_adapt=0|1, ctrl_v3=0|1, ack_ms=1..10, ack_segs=2..32, ack_min_kbps=0..100000)"
-                ));
-            }
-            self.qctrl.refused_logged = config.refused.clone();
-        }
-        let up = carrier_up(CUSTOMER) && (config.mode == 0 || mgmt_address_up());
-        if !up {
-            self.qctrl.up_since = None;
-        } else if self.qctrl.up_since.is_none() {
-            self.qctrl.up_since = Some(self.now);
-        }
-        let proc_text = read_file(&qctrl_io::proc_path());
-        let mut proc_fresh = true;
-        match qctrl::loaded(&read_file(&qctrl_io::modules_path()), &proc_text) {
-            QctrlLoaded::Other(name) => {
-                let (state, detail) = if config.mode == 0 {
-                    ("off", format!("mode 0; another clamp module is loaded ({name})"))
-                } else {
-                    ("failed", format!("another clamp module is loaded ({name}); not loading {}", qctrl::MODULE))
-                };
-                self.qctrl_status(state, &detail, &config);
-                return;
-            }
-            QctrlLoaded::None => {
-                if config.mode == 0 {
-                    self.qctrl_status("off", "mode 0 or no qctrl/config", &config);
-                    return;
-                }
-                if !qctrl::settled(self.qctrl.up_since, self.now) {
-                    self.qctrl_status(
-                        "waiting",
-                        &format!("for the customer port and LTE to stay up {} s", qctrl::SETTLE_SECS),
-                        &config,
-                    );
-                    return;
-                }
-                if self.qctrl.failed_for.as_ref() == Some(&config) {
-                    return;
-                }
-                if let Err(err) = qctrl_io::stage(&dir).and_then(|path| qctrl_io::insmod(&path)) {
-                    self.qctrl.failed_for = Some(config.clone());
-                    self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
-                    return;
-                }
-                self.note(&format!("download clamp: loaded {} from the staged copy", qctrl::VERSION_LINE));
-                proc_fresh = false;
-            }
-            QctrlLoaded::Ours => {}
-        }
-        let mut proc = if proc_fresh {
-            qctrl::parse_proc(&proc_text)
-        } else {
-            qctrl::parse_proc(&read_file(&qctrl_io::proc_path()))
-        };
-        if !proc.ours {
-            self.qctrl.failed_for = Some(config.clone());
-            self.qctrl_status(
-                "failed",
-                &format!("/proc/titan_qctrl does not show {}", qctrl::VERSION_LINE),
-                &config,
-            );
-            return;
-        }
-        if !qctrl::matches(&config, &proc) {
-            if let Err(err) = qctrl_io::write_proc(&qctrl::proc_writes(&config)) {
-                self.qctrl_status("failed", &err, &config);
-                return;
-            }
-            proc = qctrl::parse_proc(&read_file(&qctrl_io::proc_path()));
-        }
-        if !qctrl::matches(&config, &proc) {
-            let shown = proc.mode.map_or_else(|| "nothing".to_owned(), |m| m.to_string());
-            self.qctrl_status(
-                "failed",
-                &format!("mode {} did not read back (shows {shown})", config.mode),
-                &config,
-            );
-            return;
-        }
-        let state = if config.mode == 0 { "off" } else { "applied" };
-        let detail = format!(
-            "mode {} read back from /proc/titan_qctrl{}{}{}{}{}{}{}",
-            config.mode,
-            config.trough_ms.map_or_else(String::new, |ms| format!(", trough_ms {ms}")),
-            config.target_ms.map_or_else(String::new, |ms| format!(", target_ms {ms}")),
-            config.ack_adapt.map_or_else(String::new, |v| format!(", ack_adapt {v}")),
-            config.ctrl_v3.map_or_else(String::new, |v| format!(", ctrl_v3 {v}")),
-            config.ack_ms.map_or_else(String::new, |ms| format!(", ack_ms {ms}")),
-            config.ack_segs.map_or_else(String::new, |s| format!(", ack_segs {s}")),
-            config.ack_min_kbps.map_or_else(String::new, |k| format!(", ack_min_kbps {k}"))
-        );
-        self.qctrl_status(state, &detail, &config);
-    }
-
-    /// Write the clamp status file and log the change. A unit that never
-    /// staged a clamp logs nothing.
-    fn qctrl_status(&mut self, state: &str, detail: &str, config: &qctrl::Config) {
-        self.qctrl.waiting = state == "waiting";
-        let key = format!("{state}: {detail}");
-        if key == self.qctrl.shown {
-            return;
-        }
-        let quiet = state == "off" && self.qctrl.shown.is_empty();
-        self.qctrl.shown = key;
-        let _ = fs::write(qctrl_io::status_path(), qctrl::status(state, detail, config, self.now));
-        if !quiet {
-            self.note(&format!("download clamp {state}: {detail}"));
         }
     }
 
