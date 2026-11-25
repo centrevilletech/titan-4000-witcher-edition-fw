@@ -1,0 +1,9 @@
+[package]
+name = "modem-power"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+description = "Verified #[repr(C)] uplink power-control types, addresses, and FCC Part 96 / SAS compliance models for the Titan 4000 GDM7243A LTE modem (tk.bin V1.6.0.P0)"
+
+[lib]
+path = "src/lib.rs"
