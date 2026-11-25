@@ -56,9 +56,9 @@ pub fn load_config() -> Config {
 /// Trigger the proven vendor re-grant sequence: `nvram_set 0 sqns_network_cbrs 1`
 /// followed by `SIGUSR1` to `rcinit`.
 pub fn trigger_regrant() -> Result<(), String> {
-    crate::nvram_set("sqns_network_cbrs", "1")
+    crate::nvram::set("sqns_network_cbrs", "1")
         .map_err(|()| "nvram_set sqns_network_cbrs=1 failed".to_owned())?;
-    crate::signal_rcinit().map_err(|()| "SIGUSR1 to rcinit failed".to_owned())
+    crate::nvram::signal_rcinit().map_err(|()| "SIGUSR1 to rcinit failed".to_owned())
 }
 
 /// Incremental reader for `/mnt/cbrslog0.txt`.

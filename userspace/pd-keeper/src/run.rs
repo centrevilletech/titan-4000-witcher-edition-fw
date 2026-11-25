@@ -63,6 +63,8 @@ use titan_sys::socket::{Socket, SocketExt};
 
 use crate::clock::{monotonic, unix_now};
 use crate::files::read_file;
+use crate::nvram;
+use crate::paths::state_dir;
 use crate::netdev::{bridge_ports, carrier_up, interface_index, interface_mac, read_mac, rx_packets};
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
@@ -569,7 +571,7 @@ impl Keeper {
     fn read_nvram_cache(&mut self) -> Option<&[u8]> {
         let refresh = self.nvram_cache.as_ref().is_none_or(|(at, _)| *at != self.now);
         if refresh {
-            self.nvram_cache = fs::read(nvram_cache()).ok().map(|bytes| (self.now, bytes));
+            self.nvram_cache = fs::read(nvram::cache_path()).ok().map(|bytes| (self.now, bytes));
         }
         self.nvram_cache.as_ref().map(|(_, bytes)| bytes.as_slice())
     }
@@ -579,7 +581,7 @@ impl Keeper {
     /// key is absent from the cache file (for example in host tests with stubs).
     fn nvram_get_cached(&mut self, key: &str) -> String {
         if let Some(cache) = self.read_nvram_cache() {
-            if let Some(value) = nvram_get_from_cache(cache, key) {
+            if let Some(value) = nvram::get_from_cache(cache, key) {
                 return value;
             }
         }
@@ -1853,7 +1855,7 @@ impl Keeper {
             self.carrier_watch.config = cfg;
         }
 
-        let cache = fs::read(nvram_cache()).unwrap_or_default();
+        let cache = fs::read(nvram::cache_path()).unwrap_or_default();
         let nvram = carrier_watch::read_nvram(&cache);
         if nvram.cbrs_present && self.carrier_watch.config.mode != carrier_watch::Mode::Off {
             self.carrier_watch.log_tail.poll();
@@ -2153,7 +2155,7 @@ impl Keeper {
             return;
         }
         let was = value.as_deref().unwrap_or("").trim().to_owned();
-        let done = crate::nvram_set("detection_enable", "0").is_ok();
+        let done = crate::nvram::set("detection_enable", "0").is_ok();
         // Something that keeps turning it back on must not fill the flash log.
         let quiet = self
             .vendor_watchdog_logged
@@ -2692,7 +2694,7 @@ impl Keeper {
         let now = self.now;
         let passthrough = self.passthrough;
         let qctrl_waiting = self.qctrl.waiting;
-        let cache = nvram_cache();
+        let cache = nvram::cache_path();
         let mut lines = Vec::new();
         self.fastpath
             .maintain(now, passthrough, qctrl_waiting, &cache, |line| {
@@ -2707,7 +2709,7 @@ impl Keeper {
     /// `cpu-trims/config` says. Runs in every mode, once a second.
     fn maintain_cpu_trims(&mut self) {
         let now = self.now;
-        let cache = nvram_cache();
+        let cache = nvram::cache_path();
         let mut lines = Vec::new();
         self.cpu_trims.maintain(now, &cache, |line| {
             lines.push(line.to_owned());
@@ -2971,7 +2973,7 @@ impl Keeper {
         report.last_action = self.last_action.clone();
         report.last_action_at = self.last_action_at.to_string();
         if self.status_ram.as_ref() != Some(&report) {
-            let _ = config::store_report(&crate::runtime().join("status.json"), &report);
+            let _ = config::store_report(&crate::paths::runtime_dir().join("status.json"), &report);
             self.status_ram = Some(report.clone());
         }
         let differs = self.status_flash.as_ref() != Some(&report);
@@ -3859,20 +3861,6 @@ fn customer_dhcp_running_proc() -> Option<bool> {
     Some(false)
 }
 
-/// Read one key from a NUL- or newline-delimited NVRAM cache snapshot,
-/// formatted the same way as `nvram_get 0 <key>`.
-fn nvram_get_from_cache(cache: &[u8], key: &str) -> Option<String> {
-    let prefix = format!("{key}=");
-    for record in cache.split(|&b| b == 0 || b == b'\n') {
-        let Some(rest) = record.strip_prefix(prefix.as_bytes()) else {
-            continue;
-        };
-        let value = String::from_utf8_lossy(rest);
-        return Some(format!("nvram_get success: {value}\n"));
-    }
-    None
-}
-
 /// Format `dev`'s IPv6 addresses from `/proc/net/if_inet6` in the same
 /// `inet6 <addr>/<prefix> scope <scope>` shape that `mgmt::plan` consumes,
 /// avoiding an `ip -6 addr show` fork.
@@ -4042,21 +4030,12 @@ fn kernel_messages() -> String {
     command_stdout("dmesg", &[])
 }
 
-/// The vendor's RAM configuration cache.
-fn nvram_cache() -> PathBuf {
-    std::env::var_os("TITAN_NVRAM_CACHE").map_or_else(|| PathBuf::from("/tmp/nvram.cfg"), PathBuf::from)
-}
-
 fn command_stdout(program: &str, args: &[&str]) -> String {
     Command::new(program)
         .args(args)
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default()
-}
-
-fn state_dir() -> PathBuf {
-    titan_pd_model::config::default_state_dir()
 }
 
 /// Whether the customer bearer can carry delegated traffic: carrier, and
@@ -4444,26 +4423,6 @@ Bridge chain: FORWARD, entries: 2, policy: ACCEPT
         assert!(flood_rules_present(stub, "lte0pdn1"));
         let missing_68 = "-o lte0pdn1 -p IPv4 --ip-proto 17 --ip-dport 67 -j DROP \n";
         assert!(!flood_rules_present(missing_68, "lte0pdn1"));
-    }
-
-    #[test]
-    fn nvram_cache_lookup_handles_nul_and_newline_formats() {
-        let nul = b"router_disable=1\0pdn_data_ipaddr=172.20.64.152\0wan_get_dns=192.0.2.53\0";
-        assert_eq!(
-            nvram_get_from_cache(nul, "router_disable").as_deref(),
-            Some("nvram_get success: 1\n")
-        );
-        assert_eq!(
-            nvram_get_from_cache(nul, "pdn_data_ipaddr").as_deref(),
-            Some("nvram_get success: 172.20.64.152\n")
-        );
-        assert_eq!(nvram_get_from_cache(nul, "missing"), None);
-
-        let lines = b"detection_enable=1\nsqns_connection_mediaState=ATTACHED\n";
-        assert_eq!(
-            nvram_get_from_cache(lines, "sqns_connection_mediaState").as_deref(),
-            Some("nvram_get success: ATTACHED\n")
-        );
     }
 
     #[test]

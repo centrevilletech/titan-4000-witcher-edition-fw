@@ -596,7 +596,7 @@ fn ready() -> bool {
 // enforcement cycle has its own grant gate.
 fn reachable(p: &Profile) -> bool {
     media() == "ATTACHED"
-        && crate::mgmt_up()
+        && crate::revert::mgmt_up()
         && p.management_probe.is_some_and(|ip| {
             Command::new("ping")
                 .args(["-I", "lte0pdn0", "-c", "1", "-W", "2", &ip.to_string()])
@@ -686,7 +686,7 @@ fn sample(p: &Profile, base: u32) -> io::Result<()> {
     Ok(())
 }
 fn apply(p: &Profile, old: &Profile) -> io::Result<()> {
-    let pd = crate::state();
+    let pd = crate::paths::state_dir();
     let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
     if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
         return Err(fail("keeper recovery already pending"));
@@ -740,7 +740,7 @@ fn apply(p: &Profile, old: &Profile) -> io::Result<()> {
     if rates(&journal).is_some() {
         if rates(p).is_some() {
             let wait = Instant::now();
-            while (!Path::new("/sys/class/net/lte0pdn2").exists() || !crate::mgmt_up())
+            while (!Path::new("/sys/class/net/lte0pdn2").exists() || !crate::revert::mgmt_up())
                 && wait.elapsed() < Duration::from_secs(45)
             {
                 pause(1);
@@ -1114,7 +1114,7 @@ struct PickWatch {
 
 /// Whether the picker may cycle the radio now. Read fresh every time.
 fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(), &'static str> {
-    let pd = crate::state();
+    let pd = crate::paths::state_dir();
     let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
     if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
         return Err("keeper recovery pending");

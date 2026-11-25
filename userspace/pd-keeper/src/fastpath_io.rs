@@ -82,7 +82,7 @@ pub fn stage(dir: &Path) -> Result<PathBuf, String> {
             short(want)
         ));
     }
-    let run = crate::runtime().join("fastpath");
+    let run = crate::paths::runtime_dir().join("fastpath");
     if !run.is_dir() {
         fs::DirBuilder::new()
             .recursive(true)
