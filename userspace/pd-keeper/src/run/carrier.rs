@@ -7,6 +7,7 @@ use titan_pd_model::carrier_watch::{self, Action as CarrierAction};
 
 use crate::{carrier_watch_io, nvram};
 use crate::clock::unix_now;
+use crate::status_file::StatusFile;
 
 use super::Keeper;
 
@@ -17,7 +18,7 @@ pub(super) struct CarrierWatch {
     config: carrier_watch::Config,
     config_at: Option<u64>,
     refused_logged: Vec<String>,
-    status_body: String,
+    status: StatusFile,
 }
 
 impl CarrierWatch {
@@ -28,7 +29,7 @@ impl CarrierWatch {
             config: carrier_watch::Config::default(),
             config_at: None,
             refused_logged: Vec::new(),
-            status_body: String::new(),
+            status: StatusFile::default(),
         }
     }
 }
@@ -91,17 +92,10 @@ impl Keeper {
                 self.note(&line);
             }
         }
-        let body = self
-            .carrier_watch
-            .watch
-            .status_body(&self.carrier_watch.config);
-        if body != self.carrier_watch.status_body {
-            self.carrier_watch.status_body = body;
-            let text = self
-                .carrier_watch
-                .watch
-                .status_text(&self.carrier_watch.config, self.now);
-            let _ = fs::write(carrier_watch_io::status_path(), text);
-        }
+        let now = self.now;
+        let carrier_watch = &mut self.carrier_watch;
+        let body = carrier_watch.watch.status_body(&carrier_watch.config);
+        let render = |_: &str| carrier_watch.watch.status_text(&carrier_watch.config, now);
+        carrier_watch.status.update(carrier_watch_io::status_path(), body, false, render);
     }
 }

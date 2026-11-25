@@ -11,6 +11,7 @@ use titan_pd_model::cpu_trims::{self, Config, LedPacer, LedState, LedStep, Statu
 use titan_sys::process::{self, Signal};
 
 use crate::paths::{env_path_or, volume_config};
+use crate::status_file::StatusFile;
 
 /// Seconds between log lines about the LED loop changing state.
 const LED_LOG_EVERY: u64 = 60;
@@ -107,7 +108,7 @@ pub struct Watch {
     softirq_shown: String,
     pauses: u64,
     lock_backoffs: u64,
-    status_body: String,
+    status: StatusFile,
     status_at: Option<u64>,
 }
 
@@ -329,13 +330,9 @@ impl Watch {
             && self
                 .status_at
                 .is_none_or(|at| now.saturating_sub(at) >= STATUS_EVERY);
-        if body == self.status_body && !stale {
-            return;
+        if self.status.update(status_path(), body, stale, |_| cpu_trims::status(&view, now)) {
+            self.status_at = Some(now);
         }
-        let text = cpu_trims::status(&view, now);
-        self.status_body = body;
-        self.status_at = Some(now);
-        let _ = fs::write(status_path(), text);
     }
 }
 

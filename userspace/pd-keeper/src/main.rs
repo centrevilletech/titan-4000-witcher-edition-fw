@@ -38,6 +38,7 @@ mod radio_sqm;
 mod revert;
 mod run;
 mod staged;
+mod status_file;
 mod tk_flags_io;
 
 pub(crate) use logging::{log, log_ram};

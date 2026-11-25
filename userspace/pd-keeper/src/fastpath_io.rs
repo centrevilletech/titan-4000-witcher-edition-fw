@@ -21,6 +21,7 @@ use crate::files::read_file;
 use crate::netdev::{bridge_ports, carrier_up};
 use crate::paths::env_or;
 use crate::staged::{self, Staged};
+use crate::status_file::StatusFile;
 
 /// The staged fast path module.
 pub const MODULE: Staged = Staged {
@@ -81,7 +82,7 @@ pub struct Watch {
     /// Last rendered status body (without `updated=`), so the status file is
     /// rewritten whenever state, detail, mode, active_mode, gate, qctrl_present,
     /// wd_trips, or wd_reason changes.
-    status_body: String,
+    status: StatusFile,
     /// A load failed for this config; not retried until config changes or reboot.
     failed_for: Option<Config>,
     refused_logged: Vec<String>,
@@ -612,14 +613,12 @@ impl Watch {
         let key = format!("{state}: {detail}");
         let body = fastpath::status_body(&view);
         let log_changed = key != self.shown;
-        let status_changed = body != self.status_body;
-        if !log_changed && !status_changed && !force_status {
+        let quiet = state == "off" && self.shown.is_empty();
+        let render = |body: &str| format!("{body}updated={now}\n");
+        if !self.status.update(status_path(), body, log_changed || force_status, render) {
             return;
         }
-        let quiet = state == "off" && self.shown.is_empty();
         self.shown = key;
-        self.status_body = body;
-        let _ = fs::write(status_path(), format!("{}updated={now}\n", self.status_body));
         if log_changed && !quiet {
             note(&format!("fast path {state}: {detail}"));
         }

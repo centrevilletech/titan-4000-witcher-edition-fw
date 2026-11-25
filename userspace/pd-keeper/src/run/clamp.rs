@@ -1,12 +1,11 @@
 //! The staged download clamp module. See `titan_pd_model::qctrl`.
 
-use std::fs;
-
 use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 
 use crate::{qctrl_io, staged};
 use crate::files::read_file;
 use crate::netdev::carrier_up;
+use crate::status_file::StatusFile;
 
 use super::{CUSTOMER, Keeper};
 use super::mgmt_v6::mgmt_address_up;
@@ -18,7 +17,7 @@ pub(super) struct QctrlWatch {
     /// The customer port and the management bearer were both up since then.
     up_since: Option<u64>,
     /// The last status, so the file and the log change only on news.
-    shown: String,
+    status: StatusFile,
     /// True while configured with a non-zero mode and still waiting to load.
     pub(super) waiting: bool,
     /// A load failed for this config. It is not retried until the config changes.
@@ -144,13 +143,13 @@ impl Keeper {
     /// staged a clamp logs nothing.
     fn qctrl_status(&mut self, state: &str, detail: &str, config: &qctrl::Config) {
         self.qctrl.waiting = state == "waiting";
+        let quiet = state == "off" && self.qctrl.status.is_blank();
+        let now = self.now;
         let key = format!("{state}: {detail}");
-        if key == self.qctrl.shown {
+        let render = |_: &str| qctrl::status(state, detail, config, now);
+        if !self.qctrl.status.update(qctrl_io::status_path(), key, false, render) {
             return;
         }
-        let quiet = state == "off" && self.qctrl.shown.is_empty();
-        self.qctrl.shown = key;
-        let _ = fs::write(qctrl_io::status_path(), qctrl::status(state, detail, config, self.now));
         if !quiet {
             self.note(&format!("download clamp {state}: {detail}"));
         }
