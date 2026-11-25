@@ -53,6 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.99.0'
+          targets: armv7-unknown-linux-musleabi
       - name: Scan tracked source with pinned Gitleaks
         run: |
           set -euo pipefail
@@ -92,8 +93,12 @@ jobs:
           device/fastpath/test/run.sh
       - name: Keeper and protocol tests
         run: cargo test --locked --workspace --manifest-path userspace/Cargo.toml
-      - name: Modem atlas layout tests
-        run: cargo test --manifest-path device/modem-rust/atlas/Cargo.toml
+      - name: Modem Rust AQM and atlas host tests and Thumb-2 build audit
+        run: |
+          cargo test --locked --workspace --manifest-path device/modem-rust/Cargo.toml
+          bash -n device/modem-rust/build-thumb.sh
+          python3 -m py_compile device/modem-rust/make_spec.py
+          device/modem-rust/build-thumb.sh "$(mktemp -d)"
       - name: Management reachability across network modes
         run: |
           cargo build --locked --manifest-path userspace/Cargo.toml -p witcher-firstboot

@@ -1,0 +1,25 @@
+[workspace]
+members = [".", "atlas"]
+resolver = "2"
+
+[package]
+name = "witcher-modem-aqm"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "no_std Rust Thumb-2 uplink PIE AQM patch and reusable toolchain for Titan 4000 modem firmware"
+
+[dependencies]
+modem-atlas = { path = "atlas" }
+
+[lib]
+name = "witcher_modem_aqm"
+crate-type = ["rlib", "staticlib"]
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = false
