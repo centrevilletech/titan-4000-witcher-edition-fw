@@ -89,6 +89,7 @@ read-only mount and writes nothing:
 | `active.gz` with no `config` | `operator`. Either an operator's image, or one an operator turned off by deleting the config. Nothing is built over it. |
 | Anything in `quarantine`, or `strikes` at 2 or unreadable | `reason=quarantined`, `strikes` or `strikes-unreadable`: stock firmware, nothing built. |
 | The default config and `active.gz` holding exactly the release image | `cached`: the usual checks load it. |
+| The same, but with a default config an earlier firmware wrote (other words or comments) | `build`, and with `--write` only the config is rewritten as this firmware writes it (`updated`), with no rebuild. |
 | Nothing, or a default config for another image | `build`, unless the build record stops it (below). |
 
 To build, the hook checks free memory (32 MiB), remounts the volume
@@ -217,7 +218,8 @@ not work, the command does not run and the check after it keeps stock.
    `read from nand`, and whether `/lib/firmware` is clean again.
 
 With the default image, `pre` also records `build=` (`built`, `cached`,
-`operator`, or the reason it kept stock firmware) and `build_secs=`. The
+`updated`, `operator`, or the reason it kept stock firmware) and
+`build_secs=`. The
 keeper's stderr from the build goes to `/var/run/witcher-tk.build`.
 
 ## Boot confirm and rollback

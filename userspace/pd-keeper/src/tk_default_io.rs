@@ -13,8 +13,10 @@
 //!
 //! It prints one line for the hook and exits:
 //! - `operator`, 0: an operator owns `tk/`; the hook's usual checks decide.
-//! - `cached` or `built`, 0: the release image and its default config are in
-//!   place; the hook's usual checks then load them.
+//! - `cached`, `updated` or `built`, 0: the release image and its default
+//!   config are in place; the hook's usual checks then load them. `updated`
+//!   means a default config an earlier firmware wrote for this same image
+//!   was rewritten with this firmware's words, without a rebuild.
 //! - `build`, 2 (without `--write`): a build is due.
 //! - `reason=<word>`, 1: keep stock firmware for that reason.
 //!
@@ -112,11 +114,32 @@ fn boot(write: bool) -> Outcome {
         bank,
     };
     match (tk_default::plan(&inputs), bank) {
-        (Plan::Ready, _) => Outcome::Go("cached"),
+        (Plan::Ready, _) => refresh(&dir, &m, &release, config.as_deref(), write),
         (Plan::Stock(reason), _) => Outcome::Stock(reason),
         (Plan::Build, None) => Outcome::Stock("bank-unknown"),
         (Plan::Build, Some(_)) if !write => Outcome::Build,
         (Plan::Build, Some(bank)) => build(&dir, &m, bank, record.as_deref()),
+    }
+}
+
+/// The image is in place. A default config an earlier firmware wrote for it
+/// (its words or comments differ) is rewritten as this firmware writes it.
+fn refresh(dir: &Path, m: &Manifest, release: &str, config: Option<&str>, write: bool) -> Outcome {
+    let wanted = tk_default::config_text(m.name, release);
+    if config == Some(wanted.as_str()) {
+        return Outcome::Go("cached");
+    }
+    if !write {
+        return Outcome::Build;
+    }
+    match write_durably(&dir.join("config"), &dir.join(TMP_CONFIG), wanted.as_bytes()) {
+        Ok(()) => Outcome::Go("updated"),
+        Err(err) => {
+            // The old default config still allows the same image.
+            eprintln!("tk-build boot: rewriting the default config: {err}");
+            let _ = fs::remove_file(dir.join(TMP_CONFIG));
+            Outcome::Go("cached")
+        }
     }
 }
 

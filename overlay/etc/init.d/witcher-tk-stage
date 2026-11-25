@@ -126,7 +126,8 @@ uptime_s() {
 # operator's config, recognised here by its first line, never reaches it.
 # The variable is exported inside the command substitution: a prefix
 # assignment before a shell function need not reach its child.
-# Its stdout is one line: operator, cached, built, build, or reason=<word>.
+# Its stdout is one line: operator, cached, updated, built, build, or
+# reason=<word>.
 # Any other answer, a crash or the time limit keeps stock firmware.
 default_image() {
  if [ -e "$dir/config" ] || [ -L "$dir/config" ]; then
@@ -148,7 +149,7 @@ default_image() {
  fi
  put build_secs $(($(uptime_s) - began))
  case "$rc:$answer" in
-  0:operator|0:cached|0:built) put build "$answer"; return 0;;
+  0:operator|0:cached|0:updated|0:built) put build "$answer"; return 0;;
   1:reason=*)
    why=${answer#reason=}
    case "$why" in ''|*[!a-z-]*) why='build';; esac

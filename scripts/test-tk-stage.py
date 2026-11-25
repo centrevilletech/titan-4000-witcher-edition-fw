@@ -576,6 +576,20 @@ class DefaultImage(unittest.TestCase):
         self.assertEqual(unit.keeper_calls(), ['read ro'])
         unit.assert_stock_after(self)
 
+    def test_an_updated_default_config_loads_without_a_build(self):
+        unit = self.unit
+        image = good_image()
+        digest = hashlib.sha256(image).hexdigest()
+        unit.tk.mkdir()
+        (unit.tk / 'active.gz').write_bytes(image)
+        (unit.tk / 'config').write_text(default_config(digest, lambda body: body.replace('0x15', '0x5')))
+        unit.plan({'out': 'build', 'rc': 2}, {'out': 'updated', 'rc': 0, 'files': {'config': default_config(digest)}})
+        self.assertEqual(unit.boot()['firmware'], digest)
+        self.assertEqual(unit.status()['build'], 'updated')
+        self.assertEqual(unit.keeper_calls(), ['read ro', 'write rw'])
+        self.assertEqual((unit.tk / 'config').read_text(), default_config(digest))
+        unit.assert_stock_after(self)
+
     def test_an_operator_config_never_reaches_the_keeper(self):
         unit = self.unit
         digest = unit.opt_in(good_image())
@@ -759,6 +773,25 @@ class RealDefaultImage(unittest.TestCase):
         before = (unit.tk / 'active.gz').stat().st_mtime_ns
         self.assertEqual(unit.boot()['firmware'], self.release)
         self.assertEqual(unit.status()['build'], 'cached')
+        self.assertEqual((unit.tk / 'active.gz').stat().st_mtime_ns, before)
+        self.assertEqual(self.record()['builds'], '1')
+        unit.assert_stock_after(self)
+
+    def test_a_later_firmware_rewrites_an_earlier_default_config_without_a_rebuild(self):
+        unit = self.unit
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        current = (unit.tk / 'config').read_text()
+        # What an earlier firmware would have written for the same image:
+        # intact (its checksum holds), with other words.
+        marker, body = current.split('\n', 1)
+        older = body.replace('wm=0x841b5908:0x1\n', '')
+        name = marker.split(' ')[2]
+        (unit.tk / 'config').write_text(f'# witcher-default {name} {hashlib.sha256(older.encode()).hexdigest()}\n{older}')
+        (unit.tk / 'strikes').write_text('strikes=0\n')
+        before = (unit.tk / 'active.gz').stat().st_mtime_ns
+        self.assertEqual(unit.boot()['firmware'], self.release)
+        self.assertEqual(unit.status()['build'], 'updated')
+        self.assertEqual((unit.tk / 'config').read_text(), current)
         self.assertEqual((unit.tk / 'active.gz').stat().st_mtime_ns, before)
         self.assertEqual(self.record()['builds'], '1')
         unit.assert_stock_after(self)
