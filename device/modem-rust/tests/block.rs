@@ -3,14 +3,15 @@
 
 use core::mem::{offset_of, size_of};
 
-use witcher_modem_aqm::block::{M1Block, MAGIC, SELECTOR_N4, VERSION, Word};
+use witcher_modem_aqm::block::{M1Block, MAGIC, SELECTOR_MAX, SELECTOR_N4, SELECTOR_Q1, VERSION, Word};
 use witcher_modem_aqm::pie::Decision;
 
 type Accessor = fn(&M1Block) -> &Word;
 
 /// Every single word: name, offset, boot value, accessor. (The 6 decision counters at
-/// `0x64` and the 21 reserved words at `0xac` are arrays, checked separately.)
-const ABI: [(&str, usize, u32, Accessor); 37] = [
+/// `0x64` are an array, checked separately.) M1's and R1's words keep their offsets and
+/// defaults; lane Q1's fill `0xac..0x100`, which R1 left reserved and zero.
+const ABI: [(&str, usize, u32, Accessor); 58] = [
     ("magic", 0x00, MAGIC, |b| &b.magic),
     ("version", 0x04, VERSION, |b| &b.version),
     ("selector", 0x08, SELECTOR_N4, |b| &b.selector),
@@ -48,6 +49,27 @@ const ABI: [(&str, usize, u32, Accessor); 37] = [
     ("tokens_q24", 0xa0, 64 << 24, |b| &b.tokens_q24),
     ("overloads", 0xa4, 0, |b| &b.overloads),
     ("overload_updates", 0xa8, 0, |b| &b.overload_updates),
+    ("q1_target_ms", 0xac, 8, |b| &b.q1_target_ms),
+    ("q1_interval_ms", 0xb0, 40, |b| &b.q1_interval_ms),
+    ("q1_floor_bytes", 0xb4, 16_000, |b| &b.q1_floor_bytes),
+    ("q1_floor_one_bytes", 0xb8, 32_000, |b| &b.q1_floor_one_bytes),
+    ("q1_two_cc_g_ema", 0xbc, 8000, |b| &b.q1_two_cc_g_ema),
+    ("q1_two_cc_hold_ms", 0xc0, 2000, |b| &b.q1_two_cc_hold_ms),
+    ("q1_backstop_q8", 0xc4, 384, |b| &b.q1_backstop_q8),
+    ("q1_capacity", 0xc8, 0, |b| &b.q1_capacity),
+    ("q1_two_cc_tti", 0xcc, 0, |b| &b.q1_two_cc_tti),
+    ("q1_flow_bits", 0xd0, 0, |b| &b.q1_flow_bits),
+    ("q1_flow_tti", 0xd4, 0, |b| &b.q1_flow_tti),
+    ("q1_flows", 0xd8, 1, |b| &b.q1_flows),
+    ("q1_target_bytes", 0xdc, 0, |b| &b.q1_target_bytes),
+    ("q1_codel_state", 0xe0, 0, |b| &b.q1_codel_state),
+    ("q1_first_above_tti", 0xe4, 0, |b| &b.q1_first_above_tti),
+    ("q1_drop_next_tti", 0xe8, 0, |b| &b.q1_drop_next_tti),
+    ("q1_count", 0xec, 0, |b| &b.q1_count),
+    ("q1_lastcount", 0xf0, 0, |b| &b.q1_lastcount),
+    ("q1_codel_drops", 0xf4, 0, |b| &b.q1_codel_drops),
+    ("q1_codel_marks", 0xf8, 0, |b| &b.q1_codel_marks),
+    ("q1_two_cc", 0xfc, 0, |b| &b.q1_two_cc),
 ];
 
 fn offset(block: &M1Block, word: &Word) -> usize {
@@ -62,8 +84,11 @@ fn every_word_sits_at_its_published_offset() {
         assert_eq!(offset(&block, word(&block)), at, "{name}");
     }
     assert_eq!(offset_of!(M1Block, decisions), 0x64);
-    assert_eq!(offset_of!(M1Block, reserved), 0xac);
-    assert_eq!(size_of::<[Word; 21]>(), 0x100 - 0xac);
+    // Every word is on the list once: 58 named words and the 6 counters fill the block.
+    let mut offsets: Vec<usize> = ABI.iter().map(|w| w.1).collect();
+    offsets.extend((0..6).map(|i| 0x64 + 4 * i));
+    offsets.sort_unstable();
+    assert_eq!(offsets, (0..64).map(|i| 4 * i).collect::<Vec<_>>());
 }
 
 #[test]
@@ -90,12 +115,21 @@ fn boot_image_is_off_with_the_published_defaults() {
         assert_eq!(word(&block).get(), boot, "{name} at {at:#04x}");
     }
     assert!(block.decisions.iter().all(|w| w.get() == 0));
-    assert!(block.reserved.iter().all(|w| w.get() == 0));
     assert_eq!(block.selector.get(), SELECTOR_N4, "must boot to N4 v2");
+    assert_eq!(block.q1_two_cc.get(), 0, "two-carrier mode must boot off");
+}
+
+#[test]
+fn selector_three_is_q1_and_the_largest_the_hook_acts_on() {
+    assert_eq!(SELECTOR_Q1, 3);
+    assert_eq!(SELECTOR_MAX, SELECTOR_Q1);
 }
 
 #[test]
 fn identity_words_are_m1pi_and_a_new_version() {
     assert_eq!(MAGIC.to_be_bytes(), *b"M1PI");
-    assert_ne!(VERSION, 0x2026_1125, "the layout changed, so the version must too");
+    assert_eq!(VERSION, 0x2026_1127);
+    for older in [0x2026_1125, 0x2026_1126] {
+        assert_ne!(VERSION, older, "the layout changed, so the version must too");
+    }
 }

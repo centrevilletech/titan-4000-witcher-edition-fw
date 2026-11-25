@@ -7,9 +7,12 @@ and N6H's hash-pinned manifest `n6h-spec.json`.
 All 68 N6H sites are carried forward unchanged except `n4_ul_engine_cave`
 (`0x847ed000..0x847ed540`), where 6 bytes at `0x847ed414..0x847ed41a`
 (`ldr r0, [r5, #4]; and r0, r0, #5`) become `bl m1_aqm_shim; nop`.
-Two disjoint dead-cave sites are added:
-  1. `m1_rust_pie_code`  (`0x841de8dc..0x841df200`, 2,340 B inside dead `cmd_phy`)
-  2. `m1_rust_pie_block` (`0x841b5900..0x841b5a00`, 256 B inside dead `UMM_DecodeATR`)
+Three disjoint dead-cave sites are added:
+  1. `m1_rust_pie_code`  (`0x841de8dc..0x841df200`, 2,340 B inside dead `cmd_phy`): the
+     per-packet path, `m1_aqm_shim` first;
+  2. `m1_rust_cold_code` (`0x8446e4c8..0x8446e718`, 592 B: dead
+     `CloseUeTestLoopCnf`): PIE's control law and CoDel's drop spacing;
+  3. `m1_rust_pie_block` (`0x841b5900..0x841b5a00`, 256 B inside dead `UMM_DecodeATR`).
 
 Audits every constraint enforced by `tkpatch.py` and checks zero overlap against
 the N6H, C1, N7, U14, IMG4 PRACH-tail and R4 Rust N4 ranges. The block's magic and
@@ -31,6 +34,9 @@ N6H_BIN_SHA = "a2fc899439b938ec4e16ee2c8519587c4e2fffedee52b8a3bb5cdf33daff8168"
 
 CODE_LO = 0x841de8dc
 CODE_HI = 0x841df200  # 2,340 B (dead cmd_phy, Lane M2 cave catalog)
+COLD_LO = 0x8446e4c8
+COLD_HI = 0x8446e718  # 592 B: all of dead CloseUeTestLoopCnf (IMG4's dead-400 list; lane Q1 cave audit)
+CODE_SECTIONS = [(".m1code", CODE_LO, CODE_HI), (".m1cold", COLD_LO, COLD_HI)]
 BLK_LO = 0x841b5900
 BLK_HI = 0x841b5a00   # 256 B (4 x 64 B cache lines in dead UMM_DecodeATR, M2 cave catalog)
 
@@ -135,32 +141,46 @@ def main():
     def stock(va, n):
         return raw[va - BASE : va - BASE + n]
 
-    # 1. Inspect .m1code
-    cvma, code = section(args.elf, ".m1code")
-    assert cvma == CODE_LO and CODE_LO + len(code) <= CODE_HI and len(code) % 2 == 0, (hex(cvma), len(code))
+    # 1. Inspect the two code sections: each decodes in full, uses no PC-relative
+    #    operands, and branches only within the code the two of them hold.
     assert sy["m1_aqm_shim"] == CODE_LO, f"m1_aqm_shim must be at {CODE_LO:#x}, got {sy['m1_aqm_shim']:#x}"
+    texts = {}
+    for name, lo, hi in CODE_SECTIONS:
+        vma, data = section(args.elf, name)
+        assert vma == lo and lo + len(data) <= hi and len(data) % 2 == 0, (name, hex(vma), len(data))
+        texts[name] = (lo, hi, data)
 
-    ins = list(md.disasm(code, cvma))
-    assert sum(i.size for i in ins) == len(code), "m1code partial Capstone decode"
-    for i in ins:
-        assert "pc" not in i.op_str.replace("pc}", ""), (hex(i.address), i.mnemonic, i.op_str)
-        assert i.mnemonic != "blx" or i.op_str.startswith(("r", "ip", "lr")), (hex(i.address), i.op_str)
-        if (
-            i.mnemonic.startswith(("b", "cb"))
-            and i.mnemonic not in ("bic", "bic.w", "bics", "bfi", "bfc", "bx", "blx")
-            and i.operands
-            and i.operands[-1].type == 2
-        ):
-            t = i.operands[-1].imm & 0xFFFFFFFF
-            assert CODE_LO <= t < CODE_LO + len(code), f"unexpected branch outside cave: {i.address:#x} {i.mnemonic} -> {t:#x}"
+    def in_code(t):
+        return any(lo <= t < lo + len(data) for lo, _, data in texts.values())
 
-    # Pad with Thumb NOP (00bf) if needed so stock bytes end on an instruction boundary.
-    while sum(i.size for i in md.disasm(stock(CODE_LO, len(code)), CODE_LO)) != len(code):
-        code += b"\x00\xbf"
-        assert CODE_LO + len(code) <= CODE_HI
-    assert sum(i.size for i in md.disasm(code, CODE_LO)) == len(code)
-    exp_code = stock(CODE_LO, len(code))
-    assert n6h_bin[CODE_LO - BASE : CODE_LO - BASE + len(code)] == exp_code, "code cave modified in N6H"
+    for name, (lo, hi, data) in texts.items():
+        ins = list(md.disasm(data, lo))
+        assert sum(i.size for i in ins) == len(data), f"{name} partial Capstone decode"
+        for i in ins:
+            assert "pc" not in i.op_str.replace("pc}", ""), (hex(i.address), i.mnemonic, i.op_str)
+            assert i.mnemonic != "blx" or i.op_str.startswith(("r", "ip", "lr")), (hex(i.address), i.op_str)
+            if (
+                i.mnemonic.startswith(("b", "cb"))
+                and not i.mnemonic.startswith(("bic", "bfi", "bfc", "bkpt", "bx", "blx"))
+                and i.operands
+                and i.operands[-1].type == 2
+            ):
+                t = i.operands[-1].imm & 0xFFFFFFFF
+                assert in_code(t), f"unexpected branch outside the caves: {i.address:#x} {i.mnemonic} -> {t:#x}"
+
+    def padded(lo, hi, data):
+        """Pad with Thumb NOP (00bf) so the stock bytes the site replaces end on an
+        instruction boundary; return (stock bytes, new bytes)."""
+        while sum(i.size for i in md.disasm(stock(lo, len(data)), lo)) != len(data):
+            data += b"\x00\xbf"
+            assert lo + len(data) <= hi
+        assert sum(i.size for i in md.disasm(data, lo)) == len(data)
+        expected = stock(lo, len(data))
+        assert n6h_bin[lo - BASE : lo - BASE + len(data)] == expected, f"cave at {lo:#x} modified in N6H"
+        return expected, data
+
+    exp_code, code = padded(*texts[".m1code"])
+    exp_cold, cold = padded(*texts[".m1cold"])
 
     # 2. Inspect .m1blk
     bvma, blk = section(args.elf, ".m1blk")
@@ -209,9 +229,23 @@ def main():
             "expected": exp_code.hex(),
             "new": code.hex(),
             "reason": (
-                f"Rust no_std Thumb-2 uplink PIE AQM and hook-4 shim ({len(code)} B of {CODE_HI - CODE_LO} B, "
-                "m1_aqm_shim first at 0x841de8dc, no literal pools, no VFP/NEON, no undefined symbols) "
+                f"Rust no_std Thumb-2 uplink AQM per-packet path and hook-4 shim ({len(code)} B of "
+                f"{CODE_HI - CODE_LO} B, m1_aqm_shim first at 0x841de8dc, no literal pools, no VFP/NEON, "
+                "no undefined symbols) "
                 "inside proven-dead cmd_phy (0x841de8dc..0x841df200, M2 cave catalog)."
+            ),
+        },
+        {
+            "name": "m1_rust_cold_code",
+            "va": hex(COLD_LO),
+            "offset": hex(COLD_LO - BASE),
+            "expected": exp_cold.hex(),
+            "new": cold.hex(),
+            "reason": (
+                f"Rust no_std Thumb-2 code run once per update or per CoDel drop: PIE's control law and "
+                f"CoDel's spacing ({len(cold)} B of {COLD_HI - COLD_LO} B, no literal pools, no VFP/NEON) "
+                "in proven-dead CloseUeTestLoopCnf "
+                "(0x8446e4c8..0x8446e718, IMG4's dead-400 list; lane Q1 cave audit)."
             ),
         },
         {
@@ -229,7 +263,7 @@ def main():
     ]
     sites.extend(new_sites)
 
-    # 4. Strict pairwise non-overlap and preimage checks across all 70 sites.
+    # 4. Strict pairwise non-overlap and preimage checks across all 71 sites.
     spans = sorted((int(s["offset"], 16), int(s["offset"], 16) + len(s["expected"]) // 2, s["name"]) for s in sites)
     for (a0, a1, an), (b0, b1, bn) in zip(spans, spans[1:]):
         assert a1 <= b0, f"overlap {an} ({BASE+a0:#x}..{BASE+a1:#x}) vs {bn} ({BASE+b0:#x}..{BASE+b1:#x})"
@@ -243,7 +277,7 @@ def main():
             assert va1 <= r0 or va0 >= r1, f"{s['name']} overlaps {rname} {r0:#x}..{r1:#x}"
 
     spec = {
-        "name": f"n6h + rust uplink pie aqm at hook4_check_aqm (block version {ver:#010x})",
+        "name": f"n6h + rust uplink aqm (pie, codel) at hook4_check_aqm (block version {ver:#010x})",
         "n6h_spec_sha256": n6h_spec_sha,
         "n6h_bin_sha256": N6H_BIN_SHA,
         "sites": sites,
@@ -254,6 +288,7 @@ def main():
     print(f"N6H spec sha256:  {n6h_spec_sha}")
     print(f"m1_aqm_shim:      {sy['m1_aqm_shim']:#x}")
     print(f"code size:        {len(code)} / {CODE_HI - CODE_LO} B")
+    print(f"cold code size:   {len(cold)} / {COLD_HI - COLD_LO} B")
     print(f"M1_BLK:           {BLK_LO:#x}..{BLK_HI-1:#x} ({len(blk)} B)")
     print(f"total sites:      {len(sites)}")
 

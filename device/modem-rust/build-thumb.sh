@@ -87,6 +87,7 @@ rustc \
 
 # 6. Section images and disassembly for the audit.
 "$OBJCOPY_BIN" -O binary -j .m1code "$OUT/m1_aqm.elf" "$OUT/m1code.bin"
+"$OBJCOPY_BIN" -O binary -j .m1cold "$OUT/m1_aqm.elf" "$OUT/m1cold.bin"
 "$OBJCOPY_BIN" -O binary -j .m1blk  "$OUT/m1_aqm.elf" "$OUT/m1blk.bin"
 "$OBJDUMP_BIN" -d -z "$OUT/m1_aqm.elf" > "$OUT/m1_aqm.dis"
 "$NM_BIN" -n "$OUT/m1_aqm.elf" > "$OUT/m1_aqm.nm"
@@ -98,11 +99,14 @@ import os, re, struct, subprocess, sys
 out_dir, readelf, objdump, block_rs = sys.argv[1:5]
 elf = os.path.join(out_dir, "m1_aqm.elf")
 code = open(os.path.join(out_dir, "m1code.bin"), "rb").read()
+cold = open(os.path.join(out_dir, "m1cold.bin"), "rb").read()
 blk = open(os.path.join(out_dir, "m1blk.bin"), "rb").read()
 dis = open(os.path.join(out_dir, "m1_aqm.dis")).read()
 
 CODE_LO, CODE_HI = 0x841de8dc, 0x841df200
+COLD_LO, COLD_HI = 0x8446e4c8, 0x8446e718
 BLK_LO = 0x841b5900
+in_code = lambda va: CODE_LO <= va < CODE_HI or COLD_LO <= va < COLD_HI
 STACK_BUDGET = 256  # bytes the hook may add to l2_task's stack below N4's frame
 
 
@@ -113,6 +117,7 @@ def rust_const(name):
 
 
 assert len(code) <= CODE_HI - CODE_LO and len(code) % 2 == 0, f".m1code size {len(code)}"
+assert len(cold) <= COLD_HI - COLD_LO and len(cold) % 2 == 0, f".m1cold size {len(cold)}"
 assert len(blk) == 256, f".m1blk size {len(blk)} != 256"
 
 # Symbols: nothing undefined, no ARM-mode code, no data in the code cave, no panic machinery.
@@ -127,13 +132,13 @@ for line in syms.splitlines():
         undef.append(name)
     if name == "$a" or name.startswith("$a."):
         arm_map.append(name)
-    if (name == "$d" or name.startswith("$d.")) and CODE_LO <= val < CODE_HI:
+    if (name == "$d" or name.startswith("$d.")) and in_code(val):
         code_data.append(hex(val))
     if parts[3] == "FUNC":
         names[val & ~1] = (name, size)
 assert not undef, f"undefined symbols: {undef}"
 assert not arm_map, f"ARM-mode code: {arm_map}"
-assert not code_data, f"literal pool or jump table in .m1code at {code_data}"
+assert not code_data, f"literal pool or jump table in a code cave at {code_data}"
 panics = [n for n, _ in names.values() if re.search(r"panic|unwind|fmt", n)]
 assert not panics, f"panic paths survived linking: {panics}"
 assert names.get(CODE_LO, ("", 0))[0] == "m1_aqm_shim", "m1_aqm_shim must be first in .m1code"
@@ -141,7 +146,7 @@ assert names.get(CODE_LO, ("", 0))[0] == "m1_aqm_shim", "m1_aqm_shim must be fir
 # Disassembly: every byte decodes; no PC-relative operands (literal loads, `adr`, branch
 # tables) except `pop {..., pc}`; no VFP/NEON; no traps.
 rows = re.findall(r"^\s*([0-9a-f]+):\s+([0-9a-f]{4}(?:\s+[0-9a-f]{4})?)\s+(.+)$", dis, re.M)
-assert sum(len(b.replace(" ", "")) // 2 for _, b, _ in rows) == len(code), "partial decode"
+assert sum(len(b.replace(" ", "")) // 2 for _, b, _ in rows) == len(code) + len(cold), "partial decode"
 for addr, _, ins in rows:
     mnem = ins.split()[0].lower()
     assert not mnem.startswith("."), f"data directive at 0x{addr}: {ins}"
@@ -198,6 +203,7 @@ assert version == rust_const("VERSION"), hex(version)
 assert selector == 0, f"boot selector must be 0, got {selector}"
 
 print(f"PASS: .m1code {len(code)} / {CODE_HI - CODE_LO} B ({CODE_HI - CODE_LO - len(code)} B free), "
+      f".m1cold {len(cold)} / {COLD_HI - COLD_LO} B ({COLD_HI - COLD_LO - len(cold)} B free), "
       f"m1_aqm_shim @ {CODE_LO:#x}, .m1blk 256 B @ {BLK_LO:#x} (magic {magic:#x}, version {version:#x}, selector 0), "
       f"hook stack {stack} B, 0 undefined symbols, 0 ARM code, 0 data in code, 0 VFP/NEON, 0 panic paths")
 PY

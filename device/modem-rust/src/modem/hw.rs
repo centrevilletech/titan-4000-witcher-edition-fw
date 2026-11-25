@@ -139,10 +139,14 @@ pub fn pdcp_window(rbc: Shared<Rbc>) -> Option<Shared<PdcpUlSduWindow>> {
     Some(unsafe { Shared::new(window) })
 }
 
+/// Bytes of the packet the AQM sees: an IPv6 header and its TCP or UDP ports (the
+/// flow hash), and every IPv4 header field it reads.
+const IP_VIEW: u32 = 44;
+
 /// Hook 4's view of a bulk packet, built from the shim's registers.
 pub struct Packet<'a> {
     pub rbc: Shared<Rbc>,
-    /// The first `min(len, 40)` bytes of the IP header.
+    /// The first `min(len, IP_VIEW)` bytes of the IP packet.
     pub ip: &'a mut [u8],
     pub len: u32,
     pub now: u32,
@@ -161,6 +165,6 @@ pub extern "C" fn m1_decide(rbc: *mut Rbc, len: u32, now: u32, buf: *mut u8) -> 
     // SAFETY: `sl` is the IRB buffer `l2_task` owns until it enqueues or frees this
     // packet: a 2-byte GIPC prefix, then `len` bytes of IP packet. Nothing else touches
     // it before the hook returns, and the slice does not outlive this call.
-    let ip = unsafe { core::slice::from_raw_parts_mut(ip, len.min(40) as usize) };
+    let ip = unsafe { core::slice::from_raw_parts_mut(ip, len.min(IP_VIEW) as usize) };
     super::on_packet(Packet { rbc, ip, len, now }) as u32
 }

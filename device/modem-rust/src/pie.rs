@@ -141,15 +141,15 @@ impl M1Block {
         }
 
         let flags = self.flags.get();
-        let p_packet = if flags & FLAG_SIZE_SCALE != 0 && arrival.len < mtu {
-            ((p >> 8).saturating_mul(arrival.len) / mtu) << 8
-        } else {
-            p
-        };
-        if !self.trigger(p_packet, flags & FLAG_DERANDOMISE != 0) {
+        if !self.trigger(Self::packet_prob(p, arrival.len, mtu, flags), flags & FLAG_DERANDOMISE != 0) {
             return Decision::Enqueue;
         }
+        self.mark_or_drop(p, ip)
+    }
 
+    /// The signal for a packet PIE picked: CE on an ECN-capable packet while `p` is at
+    /// most `ecn_max_prob_q24` (0: at any `p`), otherwise a drop.
+    pub(crate) fn mark_or_drop(&self, p: u32, ip: &mut [u8]) -> Decision {
         let ecn_max = self.ecn_max_prob_q24.get();
         if (ecn_max == 0 || p <= ecn_max) && ecn::mark_ce(ip) {
             Decision::Mark
@@ -158,23 +158,45 @@ impl M1Block {
         }
     }
 
-    /// The control law, every `t_update_ms`.
+    /// The control law, every `t_update_ms`: PIE's step toward `target_ms` under the
+    /// budget, or under no cap during an overload.
     #[inline(never)]
     fn update(&self, qdelay_us: u32, now: u32, dt: u32) {
-        self.updates.bump();
-        if dt > IDLE_RESET_MS {
-            self.reset(qdelay_us, now);
-            return;
-        }
-
         let overload = self.overload.get() != 0;
         let cap = if overload { P_SCALE } else { self.budget() };
+        let Some(p) = self.pi_step(qdelay_us, now, dt, self.target_us(), cap) else {
+            // An idle gap also refills the token bucket and ends any overload.
+            self.overload.set(0);
+            self.tokens_q24.set(self.token_depth());
+            return;
+        };
+        // The overload ends once the budget is enough again.
+        if overload {
+            if p >= self.budget() {
+                self.overload_updates.bump();
+            } else {
+                self.overload.set(0);
+            }
+        }
+    }
+
+    /// One step of the PI law toward `target_us` with `p` capped at `cap`, shared by
+    /// selector 1 and selector 3's backstop. Returns the new `p`, or `None` after an
+    /// idle gap restarted the controller.
+    pub(crate) fn pi_step(&self, qdelay_us: u32, now: u32, dt: u32, target_us: u32, cap: u32) -> Option<u32> {
+        self.updates.bump();
+        if dt > IDLE_RESET_MS {
+            self.restart(qdelay_us, now);
+            return None;
+        }
+
         let p_old = self.prob_q24.get().min(P_SCALE) as i32;
-        let mut p = p_old.saturating_add(self.control_delta(qdelay_us)).clamp(0, cap as i32) as u32;
+        let cap = cap.min(P_SCALE) as i32;
+        let mut p = p_old.saturating_add(self.control_delta(qdelay_us, target_us)).max(0).min(cap) as u32;
 
         // Below half the target for two updates: decay p, and re-arm the burst
         // allowance once p reaches zero.
-        let half_target = self.target_us() / 2;
+        let half_target = target_us / 2;
         if qdelay_us < half_target && self.qdelay_old_us.get() < half_target {
             p -= p >> 3;
             if p < 16 {
@@ -187,38 +209,28 @@ impl M1Block {
             self.burst_ms.set(self.burst_ms.get().saturating_sub(dt));
         }
 
-        // The overload ends once the budget is enough again.
-        if overload {
-            if p >= self.budget() {
-                self.overload_updates.bump();
-            } else {
-                self.overload.set(0);
-            }
-        }
         self.prob_q24.set(p);
         self.max_prob_q24.raise(p);
         self.qdelay_old_us.set(qdelay_us);
         self.last_update_tti.set(now);
+        Some(p)
     }
 
-    /// Start over after an idle gap: no drop probability, a full burst allowance and a
-    /// full token bucket.
-    fn reset(&self, qdelay_us: u32, now: u32) {
+    /// Start over after an idle gap: no drop probability and a full burst allowance.
+    fn restart(&self, qdelay_us: u32, now: u32) {
         self.prob_q24.set(0);
         self.accu_q24.set(0);
         self.qdelay_old_us.set(qdelay_us);
         self.burst_ms.set(self.max_burst_ms.get());
         self.last_update_tti.set(now);
-        self.overload.set(0);
-        self.tokens_q24.set(self.token_depth());
         self.rearms.bump();
     }
 
     /// The PI step `alpha * (qdelay - target) + beta * (qdelay - qdelay_old)` in Q24.
-    fn control_delta(&self, qdelay_us: u32) -> i32 {
+    fn control_delta(&self, qdelay_us: u32, target_us: u32) -> i32 {
         // 64 us ticks clamped to 500 ms keep every product inside i32.
         let ticks = |us: u32| (us.min(500_000) >> 6) as i32;
-        let error = ticks(qdelay_us) - ticks(self.target_us());
+        let error = ticks(qdelay_us) - ticks(target_us);
         let trend = ticks(qdelay_us) - ticks(self.qdelay_old_us.get());
         let alpha = (self.alpha_q10.get() & 0x3fff) as i32;
         let beta = (self.beta_q10.get() & 0x3fff) as i32;
@@ -238,7 +250,7 @@ impl M1Block {
     }
 
     /// Whether to act on this packet at probability `p_q24`.
-    fn trigger(&self, p_q24: u32, derandomise: bool) -> bool {
+    pub(crate) fn trigger(&self, p_q24: u32, derandomise: bool) -> bool {
         if !derandomise {
             return self.random_q24() < p_q24;
         }
@@ -289,6 +301,16 @@ impl M1Block {
 
     fn target_us(&self) -> u32 {
         self.target_ms.get().saturating_mul(1000)
+    }
+
+    /// The packet's share of `p`: smaller packets at proportionally less (RFC 8033
+    /// section 5.2) when `flags` asks for it. `mtu` is at least 1.
+    pub(crate) fn packet_prob(p: u32, len: u32, mtu: u32, flags: u32) -> u32 {
+        if flags & FLAG_SIZE_SCALE != 0 && len < mtu {
+            ((p >> 8).saturating_mul(len) / mtu) << 8
+        } else {
+            p
+        }
     }
 
     /// The cap on `p` outside overload: 0 or above 1.0 means no cap (plain RFC 8033).

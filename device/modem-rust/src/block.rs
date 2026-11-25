@@ -2,9 +2,9 @@
 //! console (`vm`/`wm`), the keeper and the image builder.
 //!
 //! Every field is one little-endian 32-bit word. Readers check `magic` and `version`
-//! before touching anything else. M1's first layout (version `0x2026_1125`) is
-//! extended, not reordered: its words keep their offsets, `+0x24` and `+0x34` keep
-//! their defaults, and the new words use offsets M1 left reserved.
+//! before touching anything else. Layouts are extended, never reordered: M1's words
+//! (version `0x2026_1125`) and R1's (`0x2026_1126`) keep their offsets and defaults,
+//! and lane Q1's selector-3 words (`0x2026_1127`) fill the 21 words R1 left reserved.
 
 #![forbid(unsafe_code)]
 
@@ -15,7 +15,7 @@ use crate::pie::{Decision, FLAG_DERANDOMISE, FLAG_SIZE_SCALE, P_SCALE, RNG_SEED}
 /// `"M1PI"`.
 pub const MAGIC: u32 = 0x4d31_5049;
 /// This layout. Every change of layout or meaning gets a new value.
-pub const VERSION: u32 = 0x2026_1126;
+pub const VERSION: u32 = 0x2026_1127;
 
 /// [`M1Block::selector`]: N4 v2's AQM, the boot default. Unknown values do the same.
 pub const SELECTOR_N4: u32 = 0;
@@ -23,6 +23,11 @@ pub const SELECTOR_N4: u32 = 0;
 pub const SELECTOR_PIE: u32 = 1;
 /// [`M1Block::selector`]: no AQM (N4's backlog report and PDCP limit stay on).
 pub const SELECTOR_NONE: u32 = 2;
+/// [`M1Block::selector`]: lane Q1's controller ([`crate::q1`]): CoDel on the uplink
+/// queue, held at or above the floor the second carrier needs, PIE as the backstop.
+pub const SELECTOR_Q1: u32 = 3;
+/// The largest selector the hook acts on; anything above it is N4 v2.
+pub const SELECTOR_MAX: u32 = SELECTOR_Q1;
 
 /// One 32-bit word that code outside Rust also reads and writes.
 ///
@@ -69,7 +74,8 @@ pub struct M1Block {
     pub magic: Word,
     /// `+0x04` [`VERSION`].
     pub version: Word,
-    /// `+0x08` [`SELECTOR_N4`], [`SELECTOR_PIE`] or [`SELECTOR_NONE`]; boots 0.
+    /// `+0x08` [`SELECTOR_N4`], [`SELECTOR_PIE`], [`SELECTOR_NONE`] or [`SELECTOR_Q1`];
+    /// boots 0.
     pub selector: Word,
 
     // Tunables, read as they are used.
@@ -156,8 +162,56 @@ pub struct M1Block {
     /// `+0xa8` updates spent in overload (x `t_update_ms` = time).
     pub overload_updates: Word,
 
-    /// `+0xac..+0xff` zero.
-    pub reserved: [Word; 21],
+    // Selector 3 (lane Q1, `crate::q1`). Tunables, read as they are used.
+    /// `+0xac` the queue delay CoDel holds at the uplink's capacity.
+    pub q1_target_ms: Word,
+    /// `+0xb0` CoDel's interval: how long the queue must stay above target before
+    /// the first drop, and the spacing of the drops after it (`interval / sqrt(n)`).
+    pub q1_interval_ms: Word,
+    /// `+0xb4` while the second uplink carrier is in use, CoDel holds at least this
+    /// many bytes for many bulk flows ...
+    pub q1_floor_bytes: Word,
+    /// `+0xb8` ... and this many for one. For `n` flows the floor is
+    /// `floor + ((floor_one - floor) >> (n - 1))`.
+    pub q1_floor_one_bytes: Word,
+    /// `+0xbc` N4's grant EWMA at or above this (bytes per uplink TTI) means two carriers.
+    pub q1_two_cc_g_ema: Word,
+    /// `+0xc0` how long two-carrier mode outlasts the last two-carrier grant.
+    pub q1_two_cc_hold_ms: Word,
+    /// `+0xc4` the backstop PIE's target as a multiple of CoDel's, Q8.
+    pub q1_backstop_q8: Word,
+
+    // Selector 3 state and readings.
+    /// `+0xc8` the uplink's capacity: the peak of N4's grant EWMA, decaying 1/64
+    /// per update, bytes per uplink TTI.
+    pub q1_capacity: Word,
+    /// `+0xcc` TTI of the last two-carrier grant.
+    pub q1_two_cc_tti: Word,
+    /// `+0xd0` bulk flows in the current window, one bit per hash bucket.
+    pub q1_flow_bits: Word,
+    /// `+0xd4` TTI the current flow window started.
+    pub q1_flow_tti: Word,
+    /// `+0xd8` bulk flows in the last window (at least 1).
+    pub q1_flows: Word,
+    /// `+0xdc` the queue CoDel holds now: `max(target_ms x capacity rate, floor)`.
+    pub q1_target_bytes: Word,
+    /// `+0xe0` [`crate::codel`] state bits: above target, dropping.
+    pub q1_codel_state: Word,
+    /// `+0xe4` TTI at which a queue above target becomes a standing queue.
+    pub q1_first_above_tti: Word,
+    /// `+0xe8` TTI of the next CoDel drop.
+    pub q1_drop_next_tti: Word,
+    /// `+0xec` drops in this dropping state.
+    pub q1_count: Word,
+    /// `+0xf0` the count the last dropping state started from.
+    pub q1_lastcount: Word,
+    /// `+0xf4` CoDel drops (the rest of `decisions[1]` are the backstop's).
+    pub q1_codel_drops: Word,
+    /// `+0xf8` CoDel CE marks (the rest of `decisions[2]` are the backstop's).
+    pub q1_codel_marks: Word,
+    /// `+0xfc` 1 in two-carrier mode (the floor applies): set by a two-carrier grant,
+    /// cleared by the first update `q1_two_cc_hold_ms` after the last one.
+    pub q1_two_cc: Word,
 }
 
 const _: () = assert!(core::mem::size_of::<M1Block>() == 256);
@@ -213,7 +267,27 @@ impl M1Block {
             tokens_q24: Word::new(BURST_PKTS << 24),
             overloads: Word::new(0),
             overload_updates: Word::new(0),
-            reserved: [const { Word::new(0) }; 21],
+            q1_target_ms: Word::new(8),
+            q1_interval_ms: Word::new(40),
+            q1_floor_bytes: Word::new(16_000),
+            q1_floor_one_bytes: Word::new(32_000),
+            q1_two_cc_g_ema: Word::new(8000),
+            q1_two_cc_hold_ms: Word::new(2000),
+            q1_backstop_q8: Word::new(384),
+            q1_capacity: Word::new(0),
+            q1_two_cc_tti: Word::new(0),
+            q1_flow_bits: Word::new(0),
+            q1_flow_tti: Word::new(0),
+            q1_flows: Word::new(1),
+            q1_target_bytes: Word::new(0),
+            q1_codel_state: Word::new(0),
+            q1_first_above_tti: Word::new(0),
+            q1_drop_next_tti: Word::new(0),
+            q1_count: Word::new(0),
+            q1_lastcount: Word::new(0),
+            q1_codel_drops: Word::new(0),
+            q1_codel_marks: Word::new(0),
+            q1_two_cc: Word::new(0),
         }
     }
 
