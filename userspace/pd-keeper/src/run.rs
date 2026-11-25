@@ -75,7 +75,7 @@ use titan_pd_model::wear::{self, Route};
 use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram};
 use crate::clock::{monotonic, unix_now};
 use crate::command::command_stdout;
-use crate::paths::{env_or, env_path_or, state_dir};
+use crate::paths::{env_or, env_path_or, runtime_dir, state_dir};
 
 use self::carrier::CarrierWatch;
 use self::clamp::QctrlWatch;
@@ -115,6 +115,9 @@ const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
 /// The customer bearer when neither the bridge nor the vendor names one.
 const DEFAULT_BEARER: &str = "lte0pdn1";
+/// Seconds between rewrites of the heartbeat file `alive` in the RAM
+/// directory. The supervisor allows 180 s without a change.
+const ALIVE_EVERY: u64 = 10;
 type FileFingerprint = (u64, u64, i64, i64);
 
 struct Keeper {
@@ -263,6 +266,8 @@ struct Keeper {
     tk_flags: Option<tk_flags::Control>,
     tk_flags_job: Option<(std::thread::JoinHandle<(tk_flags::Outcome, bool)>, tk_flags::Plan)>,
     tk_flags_config_at: Pace,
+    /// The confirmed image whose flags wait for the persistent volume.
+    tk_flags_owed: Option<String>,
     tk_flags_refused: Vec<String>,
     tk_flags_config_hands_off: bool,
     /// The kernel log showed a modem firmware load after the keeper started.
@@ -282,8 +287,14 @@ pub fn serve() -> Result<(), String> {
     let mut keeper = Keeper::new();
     keeper.load_budget();
     keeper.load_delegation();
+    let mut alive = Pace::default();
     loop {
         keeper.now = monotonic();
+        // The heartbeat: the supervisor restarts a keeper whose loop stops
+        // (`/etc/init.d/titan-pd-keeper`).
+        if alive.ready(keeper.now, ALIVE_EVERY) {
+            let _ = fs::write(runtime_dir().join("alive"), format!("{}\n", keeper.now));
+        }
         if let Err(err) = keeper.tick() {
             keeper.note(&format!("tick failed: {err}"));
         }
@@ -294,9 +305,7 @@ pub fn serve() -> Result<(), String> {
 pub fn tc_apply(lines: &[String]) -> Result<(), String> {
     let program = env_or("TITAN_TC", "tc");
     for line in lines {
-        let output = Command::new(&program)
-            .args(line.split_whitespace())
-            .output()
+        let output = crate::command::output(Command::new(&program).args(line.split_whitespace()))
             .map_err(|err| format!("tc {line}: {err}"))?;
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -410,6 +419,7 @@ impl Keeper {
             tk_flags: None,
             tk_flags_job: None,
             tk_flags_config_at: Pace::default(),
+            tk_flags_owed: None,
             tk_flags_refused: Vec::new(),
             tk_flags_config_hands_off: false,
             modem_restart_seen: false,
@@ -484,9 +494,34 @@ impl Keeper {
                 return cached_result.clone();
             }
         }
-        let loaded = config::load_config(&path).map_err(|err| err.to_string());
+        let loaded = match config::load_config(&path) {
+            Ok(loaded) => {
+                if let Some(config) = &loaded {
+                    keep_good_config(&path, config);
+                }
+                Ok(loaded)
+            }
+            Err(err) => self.repair_config(&path, &err.to_string()),
+        };
+        // A repair rewrote the file, so the next tick reads it afresh.
         self.config_cache = Some((fp, loaded.clone()));
         loaded
+    }
+
+    /// `config.json` cannot be read: serve `config::fallback` and write it
+    /// back, so an unreadable file never turns delegation off for good.
+    fn repair_config(&mut self, path: &std::path::Path, err: &str) -> Result<Option<Config>, String> {
+        let ip_proto = self.nvram_get_cached("ip_proto");
+        let ip_proto = ip_proto.rsplit(':').next().unwrap_or("").trim();
+        let Some((config, repaired, source)) = repaired_config(path, ip_proto) else {
+            return Err(err.to_owned());
+        };
+        let what = if config.enabled { "On" } else { "Off" };
+        self.note(&format!(
+            "saved setting was unreadable ({err}); {} it as {what} from {source}",
+            if repaired { "repaired" } else { "serving" }
+        ));
+        Ok(Some(config))
     }
 
     fn tick(&mut self) -> Result<(), String> {
@@ -659,6 +694,31 @@ impl Keeper {
 
 }
 
+/// Keep the last setting read from `path` as `config::GOOD_COPY` beside it,
+/// written only when it changes (a save, or a learned block).
+fn keep_good_config(path: &std::path::Path, config: &Config) {
+    let good = path.with_file_name(config::GOOD_COPY);
+    if config::load_config(&good).ok().flatten().as_ref() != Some(config) {
+        let _ = config::store_config(&good, config);
+    }
+}
+
+/// The setting to serve for an unreadable `config.json` at `path`
+/// (`config::fallback`), whether the file was rewritten with it, and where
+/// it came from. The file is rewritten only while it still cannot be read,
+/// so a save that lands meanwhile wins.
+fn repaired_config(path: &std::path::Path, ip_proto: &str) -> Option<(Config, bool, &'static str)> {
+    let good = config::load_config(&path.with_file_name(config::GOOD_COPY)).ok().flatten();
+    let source = if good.is_some() {
+        "the last copy the keeper read"
+    } else {
+        "the customer bearer's IP family"
+    };
+    let config = config::fallback(good, ip_proto)?;
+    let repaired = config::load_config(path).is_err() && config::store_config(path, &config).is_ok();
+    Some((config, repaired, source))
+}
+
 fn published_detail(existing: &str, argument: &str) -> String {
     if argument.is_empty() {
         existing.to_owned()
@@ -670,6 +730,40 @@ fn published_detail(existing: &str, argument: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The landmine: a `config.json` torn by a power cut kept prefix
+    /// delegation off until someone saved the setting again.
+    #[test]
+    fn a_torn_setting_is_served_and_repaired_from_the_last_good_copy() {
+        let dir = std::env::temp_dir().join(format!("witcher-pd-repair-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let on = Config {
+            enabled: true,
+            pinned: Some("2001:db8:f0:1200::/56".into()),
+            pin_source: "entered".into(),
+        };
+        config::store_config(&path, &on).unwrap();
+        keep_good_config(&path, &on);
+        fs::write(&path, b"{\"enabled\":tr").unwrap();
+        assert!(config::load_config(&path).is_err());
+        // The last copy read wins, pin and all, even over an IPv4 bearer.
+        let (served, repaired, source) = repaired_config(&path, "0").unwrap();
+        assert_eq!(served, on);
+        assert!(repaired && source.contains("last copy"), "{source}");
+        assert_eq!(config::load_config(&path).unwrap(), Some(on));
+        // No copy: the bearer's family tells. IPv4/IPv6 is On, learning the block.
+        fs::remove_file(path.with_file_name(config::GOOD_COPY)).unwrap();
+        fs::write(&path, b"").unwrap();
+        let (served, repaired, _) = repaired_config(&path, "2").unwrap();
+        assert!(served.enabled && served.pinned.is_none() && repaired);
+        assert_eq!(config::load_config(&path).unwrap(), Some(served));
+        // Neither tells: nothing is guessed, and the file is left for a save.
+        fs::write(&path, b"").unwrap();
+        assert!(repaired_config(&path, "").is_none());
+        assert_eq!(fs::read(&path).unwrap(), b"");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_real_status_line_replaces_the_placeholder() {

@@ -10,6 +10,30 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parent.parent
+# A stub sleep for the supervisor tests: each call adds its seconds to the
+# fixture's /proc/uptime and then yields briefly, so the real waits (minutes of
+# backoff, a 180 s heartbeat) run in milliseconds and in a fixed order.
+VIRTUAL_SLEEP = '''until mkdir "$FIXTURE_ROOT/clock.lock" 2>/dev/null; do /bin/sleep 0.001; done
+read -r now _ < "$FIXTURE_ROOT/proc/uptime"
+echo "$((${now%%.*} + ${1%%.*})).00 0.00" > "$FIXTURE_ROOT/proc/uptime.new"
+mv "$FIXTURE_ROOT/proc/uptime.new" "$FIXTURE_ROOT/proc/uptime"
+rmdir "$FIXTURE_ROOT/clock.lock"
+exec /bin/sleep 0.005'''
+
+
+def alive(pid):
+    """A live process. A zombie that its parent has not reaped yet counts as gone."""
+    try:
+        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z'
+    except (OSError, IndexError):
+        return False
+
+
+def dead_pid():
+    """The PID of a process that has just exited."""
+    process = subprocess.Popen(['true'])
+    process.wait()
+    return process.pid
 
 
 class FirstBootTests(unittest.TestCase):
@@ -40,11 +64,14 @@ class FirstBootTests(unittest.TestCase):
         p.write_text(text)
         return p
 
-    def run_script(self, name, *args, **env):
+    def fixture(self, name):
         text = (REPO / 'overlay' / name).read_text()
         text = text.replace('export PATH=/sbin:/usr/sbin:/bin:/usr/bin', '')
         text = re.sub(r'/(?:mnt|sys|proc|tmp)(?=[/\s\"\'])', lambda m: str(self.root) + m.group(), text)
-        script = self.write('fixture.sh', text)
+        return self.write('fixture.sh', text)
+
+    def run_script(self, name, *args, **env):
+        script = self.fixture(name)
         return subprocess.run(['sh', str(script), *args], env=dict(self.env, **env), capture_output=True, text=True, timeout=10)
 
     def state(self, **env):
@@ -290,6 +317,237 @@ FILE *f=fopen(path,"w"); if(!f)return 1;fprintf(f,"%d",getpid());fclose(f);for(;
         self.assertIsNone(process.poll())
 
 
+class StateLockTests(unittest.TestCase):
+    """witcher-state's lock and its wait for the vendor volume."""
+    setUp = FirstBootTests.setUp
+    write = FirstBootTests.write
+    fixture = FirstBootTests.fixture
+    run_script = FirstBootTests.run_script
+    state = FirstBootTests.state
+
+    def test_slow_vendor_volume_does_not_fail_concurrent_callers(self):
+        # The shell, keeper and web service mount together. The vendor /mnt
+        # appears once a caller has waited 50 s; a waiter used to give up at 30.
+        self.write('proc/mounts', '')
+        self.write('bin/sleep', f'''#!/bin/sh
+waited=$(cat "$FIXTURE_ROOT/waited.$PPID" 2>/dev/null || echo 0)
+waited=$((waited + $1)); echo "$waited" > "$FIXTURE_ROOT/waited.$PPID"
+[ "$waited" -lt 50 ] || grep -q " {self.root}/mnt " "$FIXTURE_ROOT/proc/mounts" || echo "ubi1:cbrs {self.root}/mnt ubifs rw 0 0" >> "$FIXTURE_ROOT/proc/mounts"
+exec /bin/sleep 0.0$((2 * $1))
+''').chmod(0o755)
+        script = self.fixture('etc/init.d/witcher-state')
+        callers = [subprocess.Popen(['sh', str(script), 'mount'], env=self.env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        for caller in callers:
+            _, stderr = caller.communicate(timeout=20)
+            self.assertEqual(caller.returncode, 0, stderr)
+        waited = [int(path.read_text()) for path in self.root.glob('waited.*')]
+        self.assertEqual(len(waited), 2)
+        self.assertTrue(all(value > 30 for value in waited), waited)
+        self.assertEqual(len((self.root/'allocations').read_text().splitlines()), 1)
+        self.assertEqual((self.root/'proc/mounts').read_text().count('/mnt/titan-api ubifs'), 1)
+        self.assertFalse((self.root/'tmp/witcher-state.lock').exists())
+
+    def test_stale_lock_is_taken_over_and_a_live_one_kept(self):
+        lock = self.root/'tmp/witcher-state.lock'
+        # A holder killed before or after it wrote its PID.
+        for owner in (str(dead_pid()), None):
+            lock.mkdir()
+            if owner:
+                (lock/'pid').write_text(owner + '\n')
+            result = self.state()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(lock.exists())
+        lock.mkdir()
+        (lock/'pid').write_text(f'{os.getpid()}\n')
+        result = self.state()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('storage is busy', result.stderr)
+        self.assertEqual((lock/'pid').read_text(), f'{os.getpid()}\n')
+
+
+class ManagementAccessTests(unittest.TestCase):
+    write = FirstBootTests.write
+
+    def setUp(self):
+        FirstBootTests.setUp(self)
+        for name, source in {
+            'ip': 'echo "2: lte0pdn2    inet 10.0.0.2/24 brd 10.0.0.255 scope global lte0pdn2"',
+            'iptables': 'echo "iptables $*" >> "$FIXTURE_ROOT/rules"',
+            'iptables-restore': 'cat > /dev/null; echo restore >> "$FIXTURE_ROOT/rules"',
+            'ebtables': 'echo "ebtables $*" >> "$FIXTURE_ROOT/rules"',
+        }.items():
+            self.write('bin/' + name, '#!/bin/sh\n' + source + '\n').chmod(0o755)
+        text = (REPO/'overlay/etc/init.d/witcher-management-access').read_text()
+        text = text.replace('export PATH=/bin:/sbin:/usr/bin:/usr/sbin', '')
+        # The lock moves into the fixture's /tmp, the three firewall tools into its bin.
+        for vendor, fixture in (('/tmp/', '/tmp/'), ('=/bin/', '/bin/'), ('=/usr/bin/', '/bin/')):
+            text = text.replace(vendor, vendor[:vendor.index('/')] + str(self.root) + fixture)
+        self.script = self.write('management-access.sh', text)
+        self.lock = self.root/'tmp/witcher-management-access.lock'
+
+    def apply(self):
+        return subprocess.run(['sh', str(self.script), 'all'], env=self.env, capture_output=True, text=True, timeout=10)
+
+    def test_stale_lock_is_taken_over_and_a_live_one_kept(self):
+        # A holder killed by SIGKILL used to block every later refresh until reboot.
+        self.lock.mkdir()
+        (self.lock/'pid').write_text(f'{dead_pid()}\n')
+        result = self.apply()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('restore', (self.root/'rules').read_text())
+        self.assertFalse(self.lock.exists())
+        (self.root/'rules').unlink()
+        self.lock.mkdir()
+        (self.lock/'pid').write_text(f'{os.getpid()}\n')
+        self.assertEqual(self.apply().returncode, 75)
+        self.assertFalse((self.root/'rules').exists())
+        self.assertTrue(self.lock.exists())
+
+
+class SupervisorTests(unittest.TestCase):
+    """The keeper and shell supervisors on a virtual clock, with stub binaries."""
+    write = FirstBootTests.write
+    exe = ServiceControlTests.exe
+    stop_processes = ServiceControlTests.stop_processes
+
+    def setUp(self):
+        FirstBootTests.setUp(self)
+        self.processes = []
+        self.addCleanup(self.stop_processes)
+        self.write('proc/uptime', '100.00 50.00\n')
+        self.exe('bin/sleep', VIRTUAL_SLEEP)
+        self.exe('bin/killall', 'echo "$*" >> "$FIXTURE_ROOT/killall"')
+        # The Witcher volume mounts only once the test creates ./volume-ready.
+        self.exe('etc/init.d/witcher-state', '''read -r now _ < "$FIXTURE_ROOT/proc/uptime"
+echo "${now%%.*}" >> "$FIXTURE_ROOT/mount-calls"
+[ -f "$FIXTURE_ROOT/volume-ready" ] || exit 1
+mkdir -p "$FIXTURE_ROOT/mnt/titan-api/ssh"
+grep -q " $FIXTURE_ROOT/mnt/titan-api ubifs " "$FIXTURE_ROOT/proc/mounts" || echo "ubi1:data $FIXTURE_ROOT/mnt/titan-api ubifs rw 0 0" >> "$FIXTURE_ROOT/proc/mounts"''')
+        # ./mode picks what each launch does: run (heartbeat), hang or crash.
+        self.exe('usr/lib/titan-api/titan-pd-keeper', '''read -r now _ < "$FIXTURE_ROOT/proc/uptime"
+echo "${now%%.*} $$ ${TITAN_PD_STATE:--}" >> "$FIXTURE_ROOT/launches"
+case "$(cat "$FIXTURE_ROOT/mode")" in
+ crash) exit 3;;
+ hang) echo "${now%%.*}" > "$TITAN_PD_RUNTIME/alive"; while :; do /bin/sleep 1; done;;
+esac
+beat=0; while :; do beat=$((beat + 1)); echo "$beat" > "$TITAN_PD_RUNTIME/alive"; /bin/sleep 0.02; done''')
+        self.exe('usr/lib/titan-api/titan-sshd', '''read -r now _ < "$FIXTURE_ROOT/proc/uptime"
+echo $$ > "$TITAN_SSH_RUNTIME/listener.pid"
+if [ -d "$TITAN_SSH_STATE" ]; then key=persistent; else key=temporary; fi
+echo "${now%%.*} $$ $key" >> "$FIXTURE_ROOT/launches"
+[ "$(cat "$FIXTURE_ROOT/mode")" != crash ] || exit 2
+while :; do /bin/sleep 1; done''')
+        self.write('mode', 'run')
+        for name in ('titan-pd-keeper', 'titan-sshd'):
+            text = (REPO/'overlay/etc/init.d'/name).read_text()
+            text = text.replace('export PATH=/sbin:/usr/sbin:/bin:/usr/bin', '')
+            # /proc/PID/cmdline stays real: the scripts identify their processes by it.
+            text = re.sub(r'/(?:mnt|sys|tmp|etc|usr)(?=[/\s"\'])|/proc/(?:mounts|uptime)', lambda m: str(self.root) + m.group(), text)
+            self.write('etc/init.d/' + name, text)
+
+    def control(self, action, name='titan-pd-keeper', **env):
+        process = subprocess.Popen(['sh', str(self.root/'etc/init.d'/name), action], env=dict(self.env, **env),
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        self.processes.append(process)
+        output, _ = process.communicate(timeout=30)
+        return process.returncode, output
+
+    def launches(self):
+        path = self.root/'launches'
+        return [line.split() for line in path.read_text().splitlines()] if path.exists() else []
+
+    def log(self, name='titan-pd-keeper'):
+        path = self.root/f'tmp/{name}-boot.log'
+        return path.read_text() if path.exists() else ''
+
+    def wait_for(self, predicate, seconds=10):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if predicate(): return
+            time.sleep(0.02)
+        self.fail(f'Supervisor did not reach the expected state; launches {self.launches()}')
+
+    def test_hung_keeper_is_killed_and_restarted(self):
+        # A keeper whose heartbeat stops (a hung child command) used to stay up, frozen.
+        self.write('mode', 'hang')
+        self.control('start')
+        self.wait_for(lambda: len(self.launches()) >= 2)
+        first, second = self.launches()[:2]
+        self.assertRegex(self.log(), r'wrote no heartbeat for 1[89]\d s; killing it')
+        self.assertGreaterEqual(int(second[0]) - int(first[0]), 180)
+        self.assertFalse(alive(first[1]))
+        self.assertIn('-CONT child_gp', (self.root/'killall').read_text())
+
+    def test_keeper_restarts_once_the_volume_mounts_and_never_pins_state(self):
+        # A keeper started before the volume used to keep /tmp state for the boot.
+        self.control('start', TITAN_PD_STATE='/tmp/pinned')
+        self.assertIn('Starting without the persistent volume', self.log())
+        self.wait_for(lambda: len(self.launches()) == 1)
+        self.write('volume-ready', '')
+        self.wait_for(lambda: len(self.launches()) == 2)
+        first, second = self.launches()
+        self.assertEqual([first[2], second[2]], ['-', '-'])
+        self.assertIn('Persistent volume mounted; restarting the prefix keeper to use it.', self.log())
+        self.assertNotIn('starting it again in', self.log())
+        self.wait_for(lambda: not alive(first[1]))
+        tries = [int(line) for line in (self.root/'mount-calls').read_text().splitlines()]
+        self.assertGreaterEqual(tries[1] - tries[0], 60)
+
+    def test_crash_loop_backs_off_to_five_minutes(self):
+        self.write('mode', 'crash')
+        self.control('start')
+        self.wait_for(lambda: len(self.launches()) >= 9)
+        delays = [int(value) for value in re.findall(r'starting it again in (\d+) s', self.log())]
+        self.assertEqual(delays[:8], [5, 10, 20, 40, 80, 160, 300, 300])
+        starts = [int(launch[0]) for launch in self.launches()]
+        gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+        self.assertTrue(all(gap >= delay for gap, delay in zip(gaps, delays)), (gaps, delays))
+        self.assertLessEqual(max(gaps), 300 + 10 + 5)
+
+    def test_ensure_revives_a_dead_supervisor_but_not_a_stopped_one(self):
+        self.control('start')
+        self.wait_for(lambda: len(self.launches()) == 1)
+        pidfile = self.root/'tmp/titan-pd-keeper/supervisor.pid'
+        supervisor, keeper = int(pidfile.read_text()), self.launches()[0][1]
+        os.kill(supervisor, signal.SIGKILL)
+        self.wait_for(lambda: not alive(supervisor))
+        self.assertEqual(self.control('ensure')[0], 0)
+        self.wait_for(lambda: len(self.launches()) == 2)
+        # The keeper the dead supervisor left is stopped, never doubled.
+        self.wait_for(lambda: not alive(keeper))
+        revived = int(pidfile.read_text())
+        self.assertNotEqual(revived, supervisor)
+        self.assertTrue(alive(revived))
+        self.assertEqual(self.control('stop')[0], 0)
+        self.assertEqual(self.control('ensure')[0], 0)
+        self.assertEqual(len(self.launches()), 2)
+        self.assertFalse(alive(revived))
+
+    def test_listener_restarts_with_the_persistent_key_once_the_volume_mounts(self):
+        # A listener started before the volume used to keep its temporary host key.
+        self.control('start', 'titan-sshd')
+        self.assertIn('temporary host key', self.log('titan-sshd'))
+        self.wait_for(lambda: len(self.launches()) == 1)
+        self.write('volume-ready', '')
+        self.wait_for(lambda: len(self.launches()) == 2)
+        self.assertEqual([launch[2] for launch in self.launches()], ['temporary', 'persistent'])
+        self.assertIn('restarting the listener with the persistent host key', self.log('titan-sshd'))
+        self.wait_for(lambda: not alive(self.launches()[0][1]))
+
+    def test_listener_crash_loop_backs_off_and_ensure_respects_stop(self):
+        self.write('mode', 'crash')
+        self.control('start', 'titan-sshd')
+        self.wait_for(lambda: len(self.launches()) >= 8)
+        delays = [int(value) for value in re.findall(r'starting it again in (\d+) s', self.log('titan-sshd'))]
+        self.assertEqual(delays[:7], [5, 10, 20, 40, 80, 160, 300])
+        self.assertEqual(self.control('stop', 'titan-sshd')[0], 0)
+        launched = len(self.launches())
+        self.assertEqual(self.control('ensure', 'titan-sshd')[0], 0)
+        self.assertEqual(len(self.launches()), launched)
+        self.assertFalse((self.root/'tmp/titan-sshd/supervisor.pid').exists())
+
+
 class IndependentBootTests(unittest.TestCase):
     write = FirstBootTests.write
     exe = ServiceControlTests.exe
@@ -314,6 +572,33 @@ class IndependentBootTests(unittest.TestCase):
         self.wait_for(lambda: (self.root/'independent').exists() and all(
             entry in (self.root/'independent').read_text()
             for entry in ('web-failed', 'titan-sshd boot', 'titan-pd-keeper start', 'recovery', 'witcher-management-access all')))
+
+    def test_boot_loops_restart_each_other_and_supervisors(self):
+        # Nothing used to restart a dead management loop, recovery loop or supervisor.
+        FirstBootTests.setUp(self)
+        self.processes = []
+        self.addCleanup(self.stop_processes)
+        self.write('proc/uptime', '100.00 50.00\n')
+        self.exe('bin/sleep', VIRTUAL_SLEEP)
+        for name in ('witcher-management-access', 'titan-sshd', 'titan-pd-keeper'):
+            self.exe('etc/init.d/'+name, 'echo "${0##*/} $*" >> "$FIXTURE_ROOT/calls"')
+        self.exe('etc/init.d/titan-api', 'exec /bin/sleep 600')
+        self.exe('usr/lib/titan-api/witcher-firstboot', 'exec /bin/sleep 600')
+        source = (REPO/'overlay/etc/init.d/witcher-boot').read_text()
+        source = source.replace('export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr:/usr/lte:/usr/gps', '')
+        source = re.sub(r'/(?:tmp|etc|usr)(?=[/\s\"\'])|/proc/uptime', lambda m: str(self.root)+m.group(), source)
+        boot = self.write('etc/init.d/witcher-boot', source)
+        process = subprocess.Popen(['sh', str(boot), 'boot'], env=self.env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.processes.append(process)
+        calls = self.root/'calls'
+        self.wait_for(lambda: calls.exists() and all(entry in calls.read_text() for entry in (
+            'titan-sshd boot', 'titan-pd-keeper start', 'titan-sshd ensure', 'titan-pd-keeper ensure')))
+        for loop in ('recovery', 'management'):
+            pidfile = self.root/f'tmp/witcher-{loop}-loop.pid'
+            old = int(pidfile.read_text())
+            os.kill(old, signal.SIGKILL)
+            self.wait_for(lambda: pidfile.read_text().strip() != str(old) and alive(int(pidfile.read_text())))
 
 
 if __name__ == '__main__':

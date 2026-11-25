@@ -8,7 +8,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use titan_pd_model::sha256;
 
@@ -145,10 +145,7 @@ fn insmod_program() -> String {
 }
 
 fn insmod(path: &Path) -> Result<(), String> {
-    let out = Command::new(insmod_program())
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
+    let out = crate::command::output(Command::new(insmod_program()).arg(path))
         .map_err(|e| format!("insmod did not run: {e}"))?;
     if out.status.success() {
         return Ok(());

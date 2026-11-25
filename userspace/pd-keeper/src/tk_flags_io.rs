@@ -23,6 +23,8 @@ const OUTPUT_CAP: usize = 1 << 20;
 const SESSION_LIMIT: Duration = Duration::from_secs(90);
 /// Set by the radio profile while its own DM session may be open.
 const RADIO_CONSOLE: &str = "/tmp/titan-pd-keeper/radio-console-open";
+/// A console session's name among the children set aside (`command::stop`).
+const STUCK_NAME: &str = "lted_cli";
 
 fn cli_path() -> String {
     crate::paths::env_or("TITAN_LTED_CLI", "/usr/lte/lted_cli")
@@ -88,6 +90,11 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
     if Path::new(RADIO_CONSOLE).exists() {
         return (Outcome::Busy, false);
     }
+    // An earlier console that never exited (stuck in the kernel): no reply,
+    // so the writer looks again later without piling up consoles.
+    if crate::command::still_stuck(STUCK_NAME) {
+        return (Outcome::NoReply, false);
+    }
     let spawned = crate::radio_modem::spawn_console(&cli_path());
     let Ok(mut child) = spawned else {
         return (Outcome::NoReply, false);
@@ -132,11 +139,10 @@ pub fn run(plan: &Plan) -> (Outcome, bool) {
         }
         thread::sleep(Duration::from_millis(100));
     }
-    if !matches!(child.try_wait(), Ok(Some(_))) {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    if let Some(reader) = reader {
+    // A console stuck in the kernel is set aside rather than waited for, so
+    // the session always ends and the next one can be planned.
+    let exited = matches!(child.try_wait(), Ok(Some(_))) || crate::command::stop(child, STUCK_NAME);
+    if let Some(reader) = reader.filter(|_| exited) {
         let _ = reader.join();
     }
     if cli.timed_out {

@@ -209,10 +209,39 @@ pub fn store_pending(path: &Path, pending: &Pending) -> io::Result<()> {
     replace(path, &bytes)
 }
 
+/// Durably (`crate::durable`): a power cut right after a save leaves the old
+/// setting or the new one, never a torn file that reads as no setting.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)
+    crate::durable::write(path, &path.with_extension("json.tmp"), bytes)
+}
+
+/// The keeper's copy of the last setting it read, beside `config.json`
+/// (`fallback`). Its own temporary name, `config.good.json.tmp`, never meets
+/// the one a save of `config.json` uses.
+pub const GOOD_COPY: &str = "config.good.json";
+
+/// The setting to serve, and write back, when `config.json` cannot be read
+/// (torn by a power cut before v1.0.17, or a flash read error), so that an
+/// unreadable file never turns prefix delegation off for good:
+/// - the last copy the keeper read (`GOOD_COPY`);
+/// - else what the customer bearer's IP family says was saved: On sets it to
+///   IPv4/IPv6 (`ip_proto` 2) and learns its block again from the next
+///   attach; Off sets it to IPv4 (0).
+///
+/// `None` when neither tells: nothing is served until a save.
+pub fn fallback(good: Option<Config>, ip_proto: &str) -> Option<Config> {
+    good.or_else(|| {
+        let enabled = match ip_proto.trim() {
+            "2" => true,
+            "0" => false,
+            _ => return None,
+        };
+        Some(Config {
+            enabled,
+            pinned: None,
+            pin_source: String::new(),
+        })
+    })
 }
 
 /// Select value shown on the operating-mode page.
@@ -285,6 +314,39 @@ mod tests {
         assert_eq!(shown_choice(Some(&loaded)), "1");
         fs::write(&path, b"{").unwrap();
         assert!(load_config(&path).is_err());
+    }
+
+    /// The landmine: a save torn by a power cut read as "unreadable" and
+    /// kept delegation off until someone saved again.
+    #[test]
+    fn a_save_cut_short_leaves_a_whole_file_and_an_unreadable_one_has_a_way_back() {
+        let dir = dir();
+        let path = dir.join("config.json");
+        let on = Config {
+            enabled: true,
+            pinned: Some("2001:db8:f0:1200::/56".into()),
+            pin_source: "entered".into(),
+        };
+        store_config(&path, &on).unwrap();
+        // Durable: no temporary left, and the directory holds the new file.
+        assert!(!dir.join("config.json.tmp").exists());
+        assert_eq!(load_config(&path).unwrap(), Some(on.clone()));
+        // A file torn before v1.0.17 (here: empty, as UBIFS leaves it).
+        fs::write(&path, b"").unwrap();
+        assert!(load_config(&path).is_err());
+        // The keeper's last good copy wins over the IP family.
+        assert_eq!(fallback(Some(on.clone()), "0"), Some(on));
+        // Without one, the bearer's family tells what was saved.
+        let learned = fallback(None, " 2\n").unwrap();
+        assert!(learned.enabled && learned.pinned.is_none());
+        assert_eq!(fallback(None, "0").map(|c| c.enabled), Some(false));
+        // Anything else (IPv6 only, an empty cache) is not guessed at.
+        assert_eq!(fallback(None, "1"), None);
+        assert_eq!(fallback(None, ""), None);
+        // The good copy's temporary never meets the one a save uses.
+        assert_eq!(Path::new(GOOD_COPY).with_extension("json.tmp"), Path::new("config.good.json.tmp"));
+        assert_eq!(Path::new("config.json").with_extension("json.tmp"), Path::new("config.json.tmp"));
+        let _ = fs::remove_dir_all(dir);
     }
 
     // Wall times from a bench log: the keeper starts at 2013-06-20 and NTP

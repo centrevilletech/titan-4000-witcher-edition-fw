@@ -22,8 +22,24 @@ use crate::{log, nvram};
 pub fn recover_pending() {
     let first = note_boot();
     let path = state_dir().join("pending.json");
-    let Ok(Some(pending)) = config::load_pending(&path) else {
-        return;
+    let pending = match config::load_pending(&path) {
+        Ok(Some(pending)) => pending,
+        Ok(None) => return,
+        // Unreadable (torn by a power cut before v1.0.17, or a flash read
+        // error): it names no setting to restore, and left in place it would
+        // hold the radio profile and the carrier picker off for good. A guard
+        // that still runs reverts from its own arguments; otherwise it is
+        // moved aside, the current setting stays, and the log says so.
+        Err(err) => {
+            if !guard_running() {
+                let aside = path.with_extension("json.unreadable");
+                match crate::files::replace_durably(&path, &aside) {
+                    Ok(()) => log(&format!("pending setting change was unreadable ({err}); moved it to {} and kept the current setting", aside.display())),
+                    Err(e) => log(&format!("pending setting change was unreadable ({err}) and could not be moved aside: {e}")),
+                }
+            }
+            return;
+        }
     };
     let confirm_file =
         fs::read_to_string(state_dir().join(format!("confirm-{}", pending.token))).unwrap_or_default();
@@ -101,9 +117,10 @@ fn guard_running() -> bool {
 fn finish_revert(pending: &Pending) -> bool {
     if pending.absent {
         let _ = fs::remove_file(state_dir().join("config.json"));
-    } else if let Err(err) =
-        fs::rename(state_dir().join("config.previous"), state_dir().join("config.json"))
-    {
+    } else if let Err(err) = crate::files::replace_durably(
+        &state_dir().join("config.previous"),
+        &state_dir().join("config.json"),
+    ) {
         log(&format!("could not restore the setting file: {err}"));
     }
     if nvram::set("ip_proto", &pending.ip_proto).is_err()
@@ -177,7 +194,8 @@ pub fn confirm(args: &[String]) -> i32 {
             let stable = since.elapsed() >= Duration::from_secs(20);
             if saw_down && stable {
                 let _ = fs::create_dir_all(state_dir());
-                if fs::write(state_dir().join(format!("confirm-{token}")), &token).is_ok() {
+                let path = state_dir().join(format!("confirm-{token}"));
+                if crate::files::write_durably(&path, &path.with_extension("tmp"), token.as_bytes()).is_ok() {
                     log("confirm: management bearer is back");
                     return 0;
                 }

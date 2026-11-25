@@ -4,7 +4,6 @@
 
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -47,33 +46,19 @@ fn tool() -> PathBuf {
 
 /// `titan-nvram set 0 <key>`, with the value on stdin.
 pub fn set(key: &str, value: &str) -> Result<(), ()> {
-    let mut child = Command::new(tool())
-        .args(["set", "0", key])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| ())?;
-    child
-        .stdin
-        .take()
-        .ok_or(())?
-        .write_all(value.as_bytes())
-        .map_err(|_| ())?;
-    child
-        .wait()
+    crate::command::output_with_input(Command::new(tool()).args(["set", "0", key]), value.as_bytes())
         .ok()
-        .filter(|status| status.success())
-        .map(|_| ())
+        .filter(|out| out.status.success())
+        .map(drop)
         .ok_or(())
 }
 
 /// `titan-nvram commit 0`: the RAM settings go to flash.
 pub fn commit() -> Result<(), ()> {
-    Command::new(tool())
-        .args(["commit", "0"])
-        .status()
+    crate::command::output(Command::new(tool()).args(["commit", "0"]))
         .ok()
-        .filter(|status| status.success())
-        .map(|_| ())
+        .filter(|out| out.status.success())
+        .map(drop)
         .ok_or(())
 }
 

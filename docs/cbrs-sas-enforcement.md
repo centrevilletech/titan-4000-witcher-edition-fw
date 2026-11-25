@@ -176,4 +176,7 @@ What this does not change:
   similar short gap during its own rebuild.
 - If the keeper is not running, nothing adds the rules. Rules it already added
   stay until a vendor firewall restart flushes them. The service supervisor
-  restarts the keeper within about 5 s.
+  checks the keeper every 10 s and starts it again 5 s after it finds it gone,
+  so within about 15 s. A keeper that keeps exiting within a minute waits
+  longer, doubling to 5 min. A hung keeper is killed after 180 s without a
+  heartbeat and started again.

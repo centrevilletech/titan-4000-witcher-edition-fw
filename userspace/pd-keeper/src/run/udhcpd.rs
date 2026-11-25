@@ -78,7 +78,7 @@ pub(super) fn customer_dhcp_pids(listing: &str) -> Vec<i32> {
 pub(super) fn stop_customer_udhcpd() {
     let pids = customer_dhcp_pids(&command_stdout("ps", &[]));
     for pid in &pids {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        let _ = crate::command::output(Command::new("kill").arg(pid.to_string()));
     }
     // setsid does not reparent the server, so the keeper must wait for it.
     // An unreaped restart every minute fills the process table with zombies.

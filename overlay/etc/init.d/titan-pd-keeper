@@ -4,6 +4,7 @@
 #
 #   boot       mount the persistent volume, then keep the keeper running
 #   start      the same on a running unit
+#   ensure     start it unless an operator stopped it (the boot watchdog)
 #   stop       stop the keeper
 #   restart | status
 #
@@ -17,7 +18,7 @@ bundle=${TITAN_BUNDLE:-/usr/lib/titan-api}
 runtime=/tmp/titan-pd-keeper
 log=/tmp/titan-pd-keeper-boot.log
 ram_copy=/tmp/titan-pd-keeper-control.sh
-lock=/tmp/titan-data.lock
+lock=/tmp/titan-pd-keeper-start.lock
 # The vendor mounts its own volume of this flash partition at /mnt; the mount
 # point for ours is a directory on that volume.
 vendor_mount=/mnt
@@ -50,6 +51,16 @@ volume_exists() {
  return 1
 }
 mount_state() { /bin/sh /etc/init.d/witcher-state mount; }
+# Whole seconds since boot in $now; the wall clock is not set early in boot.
+clock() { read -r now _ < /proc/uptime; now=${now%%.*}; }
+# While the volume is missing: try 60 s after the supervisor starts, then
+# doubling to 30 min. Never gives up.
+retry_mount() {
+ if mounted || [ "$now" -lt "$retry_at" ]; then return 0; fi
+ retry=$((retry * 2)); [ "$retry" -le 1800 ] || retry=1800
+ mount_state >> "$log" 2>&1 || note "Persistent volume not mounted; trying again in $retry s."
+ clock; retry_at=$((now + retry))
+}
 
 owned() {
  case "$1" in ''|*[!0-9]*) return 1;; esac
@@ -65,14 +76,43 @@ keeper() {
  pid=$(cat "$runtime/keeper.pid" 2> /dev/null)
  owned "$pid" "$runtime/titan-pd-keeper run" && echo "$pid"
 }
+# A process that has exited, reaped or still a zombie. Where sleep is a shell
+# builtin nothing may have reaped our own child yet, and kill -0 still succeeds.
+exited() {
+ stat=; { read -r stat < "/proc/$1/stat"; } 2> /dev/null
+ case "${stat##*) }" in ''|[ZX]*) return 0;; esac
+ return 1
+}
+# TERM, then KILL after 10 s.
+end_process() {
+ kill "$1" 2> /dev/null
+ waited=0
+ while ! exited "$1" && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
+ exited "$1" || kill -9 "$1" 2> /dev/null
+}
+# mkdir is atomic and the holder writes its PID at once. A lock with no live
+# owner at two checks a second apart was left by a killed holder: take it over.
+take_lock() {
+ waited=0 stale=0 seen=
+ until mkdir "$lock" 2> /dev/null; do
+  owner=$(cat "$lock/pid" 2> /dev/null) || owner=0
+  case "$owner" in ''|*[!0-9]*) owner=0;; esac
+  if [ "$owner" -gt 1 ] && kill -0 "$owner" 2> /dev/null; then stale=0
+  elif [ "$owner" = "$seen" ]; then stale=$((stale + 1))
+  else stale=1
+  fi
+  seen=$owner
+  if [ "$stale" -ge 2 ]; then rm -rf "$lock"; stale=0; continue; fi
+  [ "$waited" -lt "$1" ] || return 1
+  sleep 1; waited=$((waited + 1))
+ done
+ echo $$ > "$lock/pid"
+}
 stop() {
  [ -d "$runtime" ] || return 0
  : > "$runtime/stopped"
  pid=$(supervisor) && kill "$pid" 2> /dev/null
- pid=$(keeper) && kill "$pid" 2> /dev/null
- waited=0
- while [ -n "$(keeper)" ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
- pid=$(keeper) && kill -9 "$pid" 2> /dev/null
+ pid=$(keeper) && end_process "$pid"
  rm -f "$runtime/supervisor.pid" "$runtime/keeper.pid"
  # The CPU trims may have the vendor LED and reset-button loop paused.
  killall -CONT child_gp 2> /dev/null
@@ -81,12 +121,15 @@ stop() {
 start() {
  [ -z "$(supervisor)" ] || { echo 'Prefix keeper is already running.'; return 0; }
  [ -f "$bundle/titan-pd-keeper" ] && [ -x "$bundle/titan-pd-keeper" ] || { note 'Prefix keeper binary is missing.'; return 1; }
- if mount_state; then
-  export TITAN_PD_STATE="$state/pd"
- else
-  export TITAN_PD_STATE=/tmp/titan-pd-state
-  note 'Starting without the persistent volume; keeper state stays in /tmp.'
- fi
+ # One start at a time: the boot watchdog can meet a boot start that is still
+ # waiting for the volume.
+ take_lock 2 || { echo 'Prefix keeper is already starting.'; return 0; }
+ trap 'rm -rf "$lock"' EXIT
+ trap 'exit 1' HUP INT TERM
+ [ -z "$(supervisor)" ] || { echo 'Prefix keeper is already running.'; return 0; }
+ # The keeper finds its state itself: on the volume once it is mounted, in
+ # /tmp before. The supervisor keeps trying to mount it.
+ mount_state || note 'Starting without the persistent volume; keeper state stays in /tmp until it mounts.'
  if [ ! -e "$runtime" ]; then mkdir "$runtime" || return 1; fi
  [ -d "$runtime" ] && [ ! -L "$runtime" ] || { note "$runtime is not a directory."; return 1; }
  chmod 700 "$runtime"
@@ -105,6 +148,11 @@ start() {
 
 case "${1:-}" in
  boot|start) [ "$#" = 1 ] || exit 64; start;;
+ ensure)
+  [ "$#" = 1 ] || exit 64
+  # An operator stop stays stopped.
+  [ -e "$runtime/stopped" ] || [ -n "$(supervisor)" ] || start
+  exit 0;;
  stop) [ "$#" = 1 ] || exit 64; stop;;
  restart) [ "$#" = 1 ] || exit 64; stop; start;;
  status)
@@ -116,15 +164,56 @@ case "${1:-}" in
  supervise)
   [ "$#" = 1 ] || exit 64
   export TITAN_PD_RUNTIME="$runtime"
-  if mounted; then export TITAN_PD_STATE="$state/pd"; else export TITAN_PD_STATE=/tmp/titan-pd-state; fi
+  # Never pinned: the keeper uses the volume once it is mounted, /tmp before.
+  unset TITAN_PD_STATE
   echo $$ > "$runtime/supervisor.pid"
+  # One keeper only: stop one that a killed supervisor left running.
+  if pid=$(keeper); then
+   note 'Stopping a prefix keeper left without its supervisor.'
+   end_process "$pid"
+  fi
+  backoff=5
+  clock; retry=60; retry_at=$((now + retry))
   while [ ! -e "$runtime/stopped" ]; do
+   with_volume=0; ! mounted || with_volume=1
    "$runtime/titan-pd-keeper" run > /dev/null 2>&1 < /dev/null &
-   echo $! > "$runtime/keeper.pid"
-   wait "$!" || true
+   pid=$!
+   echo "$pid" > "$runtime/keeper.pid"
+   clock; started=$now; beat_at=$now
+   beat=$(cat "$runtime/alive" 2> /dev/null)
+   planned=0
+   # Every 10 s. The keeper rewrites $runtime/alive at least every 10 s; one
+   # that stops for 180 s is hung and is killed. One started without the
+   # volume starts again once it is mounted, so its start-up checks see it.
+   while sleep 10; ! exited "$pid"; do
+    clock
+    heard=$(cat "$runtime/alive" 2> /dev/null)
+    if [ "$heard" != "$beat" ]; then beat=$heard; beat_at=$now
+    elif [ $((now - beat_at)) -ge 180 ]; then
+     note "Prefix keeper wrote no heartbeat for $((now - beat_at)) s; killing it."
+     kill -9 "$pid" 2> /dev/null
+     break
+    fi
+    retry_mount
+    if [ "$with_volume" = 0 ] && mounted; then
+     note 'Persistent volume mounted; restarting the prefix keeper to use it.'
+     end_process "$pid"
+     planned=1
+     break
+    fi
+   done
+   wait "$pid"
+   result=$?
+   # The CPU trims may have the vendor LED and reset-button loop paused.
+   killall -CONT child_gp 2> /dev/null
    [ ! -e "$runtime/stopped" ] || break
-   note "Prefix keeper exited; starting it again."
-   sleep 5
+   [ "$planned" = 0 ] || continue
+   # Quick exits back off from 5 s to 5 min; a run of a minute or more resets.
+   clock
+   [ $((now - started)) -lt 60 ] || backoff=5
+   note "Prefix keeper exited with status $result after $((now - started)) s; starting it again in $backoff s."
+   sleep "$backoff"
+   backoff=$((backoff * 2)); [ "$backoff" -le 300 ] || backoff=300
   done;;
- *) echo 'Usage: titan-pd-keeper boot|start|stop|restart|status' >&2; exit 64;;
+ *) echo 'Usage: titan-pd-keeper boot|start|ensure|stop|restart|status' >&2; exit 64;;
 esac

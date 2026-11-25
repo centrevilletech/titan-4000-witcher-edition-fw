@@ -556,15 +556,20 @@ impl Keeper {
         }
         let short = tk_boot::short(sha).to_owned();
         let Some(dir) = tk_dir() else {
-            self.note(&format!(
-                "tk flags: modem firmware {short} confirmed, but the persistent volume is not mounted; no flag writes"
-            ));
-            let _ = fs::write(
-                tk_flags_status_path(),
-                tk_flags::idle_status("the persistent volume is not mounted", self.now),
-            );
+            // A slow volume at boot: the flags follow once it is mounted.
+            if self.tk_flags_owed.is_none() {
+                self.note(&format!(
+                    "tk flags: modem firmware {short} confirmed, but the persistent volume is not mounted yet; the flags are written once it is"
+                ));
+                let _ = fs::write(
+                    tk_flags_status_path(),
+                    tk_flags::idle_status("the persistent volume is not mounted yet", self.now),
+                );
+            }
+            self.tk_flags_owed = Some(sha.to_owned());
             return;
         };
+        self.tk_flags_owed = None;
         let text = read_file(dir.join("config"));
         let parsed = tk_flags::parse_writes(&text);
         self.note_tk_flags_refused(&parsed);
@@ -648,7 +653,15 @@ impl Keeper {
         }
         let restarted = std::mem::take(&mut self.modem_restart_seen);
         if self.tk_flags.is_none() {
-            return;
+            // Armed once the persistent volume is there (`arm_tk_flags`).
+            if let Some(sha) = self.tk_flags_owed.clone() {
+                if self.tk_flags_config_at.ready(self.now, TK_FLAGS_CONFIG_EVERY) {
+                    self.arm_tk_flags(&sha);
+                }
+            }
+            if self.tk_flags.is_none() {
+                return;
+            }
         }
         // The operator may change tk/config: read it again now and then. A
         // missing file means off; a read error changes nothing.

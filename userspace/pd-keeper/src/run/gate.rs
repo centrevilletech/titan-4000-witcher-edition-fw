@@ -63,9 +63,7 @@ fn gate_command(tool: GateTool, args: &[&str]) -> Result<String, String> {
             env_or("TITAN_IP6TABLES", "ip6tables")
         }
     };
-    let output = Command::new(program)
-        .args(args)
-        .output()
+    let output = crate::command::output(Command::new(program).args(args))
         .map_err(|err| err.to_string())?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).into_owned());

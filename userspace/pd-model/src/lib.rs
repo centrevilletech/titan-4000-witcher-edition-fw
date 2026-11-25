@@ -25,6 +25,7 @@ pub mod cpu_trims;
 pub mod deaf;
 pub mod dhcpv6;
 pub mod dns_probe;
+pub mod durable;
 pub mod driver_mac;
 pub mod ethernet;
 pub mod extdev;
