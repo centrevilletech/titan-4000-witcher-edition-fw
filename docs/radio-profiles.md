@@ -198,11 +198,10 @@ for no grant and not for the customer, and only for the keeper's own reboot
 window (06:45 to 10:15 UTC, without the 15-minute margin), the clock and the
 daily cap. A visit starts before 06:30 and its grant wait ends before 06:45,
 so the way back is not held for hours. It is skipped when grants cover the
-unit where it is by then.
-Up to v1.0.16 the unit stayed on the ungranted arm, and the grant check kept
-it from ever coming back. If the unit leaves the held arm (a reboot, the
-tower), the picker returns to the arm with one cycle, at most every 6 hours,
-outside the survey window too. A cycle that does not attach within 90 s is
+unit where it is by then. Up to v1.0.16 the unit stayed on the ungranted arm,
+and the grant check kept it from ever coming back. If the unit leaves the held
+arm (a reboot, the tower), the picker returns to the arm with one cycle, at
+most every 6 hours, outside the survey window too. A cycle that does not attach within 90 s is
 not a failure: the nudge is cleared and the radio is on, so the unit attaches
 where the tower lets it, and the grant wait and the way back take it from
 there. A cycle whose nudge does not clear reverts the profile like a failed
@@ -265,8 +264,8 @@ transient condition keeps a profile off once it clears:
   v1.0.16 two pings 3 s apart, about 7 s of loss, reverted it for the rest of
   the boot. RRC reconfiguration failures still roll it back at once: two in
   one sample, or single increases within a minute. A counter that goes down
-  (the modem restarted) or cannot be read gets a fresh baseline, not a
-  failure.
+  (the modem restarted) or a lost baseline gets a fresh baseline, and a check
+  the console returns no counter for is skipped. Neither is a failure.
 - **Only a comparison with stock counts against a profile.** After a
   management failure the guard puts stock settings back and runs the same
   30-in-90 s test on them. Management answering on stock is a strike. When

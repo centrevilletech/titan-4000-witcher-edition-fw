@@ -133,7 +133,9 @@ def modem():
 def set_modem(**values):
     state = modem()
     state.update(values)
-    Path('/tmp/modem.json').write_text(json.dumps(state))
+    # Atomic, as the stub writes it: a torn read would look like stock.
+    Path('/tmp/modem.json.new').write_text(json.dumps(state))
+    Path('/tmp/modem.json.new').replace('/tmp/modem.json')
 
 
 def console_log():

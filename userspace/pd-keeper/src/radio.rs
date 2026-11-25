@@ -204,9 +204,13 @@ fn wait_for_volume() {
 
 pub fn supervise() {
     thread::spawn(|| {
-        wait_for_volume();
-        if let Err(e) = listen() {
-            eprintln!("radio profile API: {e}");
+        // The operator API comes back if it ever stops.
+        loop {
+            wait_for_volume();
+            if let Err(e) = listen() {
+                eprintln!("radio profile API: {e}");
+            }
+            thread::sleep(Duration::from_secs(IDLE_SUPERVISE_SECS));
         }
     });
     thread::spawn(|| {
@@ -308,9 +312,17 @@ fn listen() -> io::Result<()> {
     rm(path.clone())?;
     let listener = UnixListener::bind(path)?;
     for sock in listener.incoming() {
-        let mut sock = sock?;
-        sock.set_read_timeout(Some(Duration::from_secs(3)))?;
-        sock.set_write_timeout(Some(Duration::from_secs(3)))?;
+        // A failed accept (a client gone, too many open files) loses that
+        // one request, not the API for the rest of the boot.
+        let Ok(mut sock) = sock else {
+            pause(1);
+            continue;
+        };
+        if sock.set_read_timeout(Some(Duration::from_secs(3))).is_err()
+            || sock.set_write_timeout(Some(Duration::from_secs(3))).is_err()
+        {
+            continue;
+        }
         let mut bytes = vec![];
         let res = Read::by_ref(&mut sock)
             .take(8193)
