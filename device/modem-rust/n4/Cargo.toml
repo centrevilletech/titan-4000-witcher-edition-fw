@@ -1,0 +1,19 @@
+[package]
+name = "witcher-modem-n4"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "no_std Rust Thumb-2 port of the Titan 4000 N4 v2 uplink engine"
+
+[dependencies]
+modem-atlas = { path = "../atlas" }
+
+[features]
+default = []
+# Enable integration hooks with downstream IMG4 (n4v3_spare), N5 (flow lane + PDCP limit),
+# and M1 (Rust PIE AQM) in the full firmware stack image.
+stack-hooks = []
+
+[lib]
+name = "witcher_modem_n4"
+crate-type = ["rlib", "staticlib"]

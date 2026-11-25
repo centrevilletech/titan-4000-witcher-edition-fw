@@ -99,9 +99,11 @@ jobs:
       - name: Modem Rust AQM and atlas host tests and Thumb-2 build audit
         run: |
           cargo test --locked --workspace --manifest-path device/modem-rust/Cargo.toml
-          bash -n device/modem-rust/build-thumb.sh
-          python3 -m py_compile device/modem-rust/make_spec.py
+          bash -n device/modem-rust/build-thumb.sh device/modem-rust/n4/build-thumb.sh
+          python3 -m py_compile device/modem-rust/make_spec.py device/modem-rust/n4/make_spec.py
           device/modem-rust/build-thumb.sh "$(mktemp -d)"
+          device/modem-rust/n4/build-thumb.sh "$(mktemp -d)" --standalone
+          device/modem-rust/n4/build-thumb.sh "$(mktemp -d)" --stack
       - name: Management reachability across network modes
         run: |
           cargo build --locked --manifest-path userspace/Cargo.toml -p witcher-firstboot
