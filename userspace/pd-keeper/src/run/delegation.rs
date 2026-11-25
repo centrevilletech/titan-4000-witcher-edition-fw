@@ -8,31 +8,32 @@ use std::os::fd::AsFd;
 use std::process::Command;
 use std::time::Duration;
 
-use titan_pd_model::config::{self, Config};
+use titan_pd_model::config::{self, Config, Report};
 use titan_pd_model::dhcpv6;
 use titan_pd_model::filter;
-use titan_pd_model::health::{self, Decision, Phase};
+use titan_pd_model::health::{self, Decision, Phase, View};
 use titan_pd_model::ipv4;
+use titan_pd_model::ipv4_health::Traffic;
 use titan_pd_model::prefix::Block;
 use titan_pd_model::ra::{self, Advertisement};
 
 use crate::log;
 use crate::clock::{monotonic, unix_now};
 use crate::files::read_file;
-use crate::netdev::{interface_index, interface_mac};
+use crate::netdev::{carrier_up, interface_index, interface_mac, rx_packets};
 use crate::paths::state_dir;
 
 use super::{BRIDGE, CUSTOMER, Keeper, tc_apply};
 use super::budget::link_recovery;
-use super::if_inet6::link_local;
+use super::if_inet6::{link_local, live_prefix};
 use super::packet::{Class, all_nodes_mac, client_mac_of, ethernet_frame, fe80_1, prefixes_advert, ra_packet, udp_packet};
 use super::wire::{send_ipv6, send_marked_frame};
 
-pub(super) const RA_INTERVAL: u64 = 45;
+const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
-pub(super) const SERVE_RETRY: u64 = 60;
+const SERVE_RETRY: u64 = 60;
 /// Seconds between two samples of eth0's receive counter for IPv6 health.
-pub(super) const LINK_SAMPLE: u64 = 5;
+const LINK_SAMPLE: u64 = 5;
 /// eth0 down this long may be a router swap: the old router's IPv6 history
 /// and delegation hold no longer apply. Our own renegotiation is shorter.
 const ROUTER_SWAP_SECS: u64 = 10;
@@ -48,7 +49,175 @@ struct Sniff {
 }
 
 impl Keeper {
-    pub(super) fn act(&mut self, decision: Decision, block: Block) {
+    /// Prefix delegation for this tick, once the saved setting is loaded:
+    /// serve the pinned block or stop, advertise, check the router's health
+    /// and publish the report.
+    pub(super) fn maintain_delegation(&mut self, loaded: Result<Option<Config>, String>) {
+        let config = match loaded {
+            Ok(config) => {
+                self.logged_unreadable = false;
+                config
+            }
+            Err(err) => {
+                if self.serving {
+                    self.stop_serving("the saved setting could not be read");
+                }
+                if !self.logged_unreadable {
+                    self.note(&format!("saved setting is unreadable ({err}); not serving and not changing the IP family"));
+                    self.logged_unreadable = true;
+                }
+                self.publish(
+                    &Report::default(),
+                    "The saved setting could not be read. It was not treated as Off.",
+                );
+                return;
+            }
+        };
+        let Some(config) = config else {
+            if self.serving {
+                self.stop_serving("the saved setting is gone");
+            }
+            self.publish(
+                &Report::default(),
+                "IPv6 prefix delegation has not been saved. The IP family is unchanged.",
+            );
+            return;
+        };
+        if !config.enabled {
+            if self.serving {
+                self.stop_serving("prefix delegation is off");
+            }
+            self.publish(
+                &Report::default(),
+                "IPv6 prefix delegation is off. The customer bearer is IPv4.",
+            );
+            return;
+        };
+
+        let bearer = self.bearer.clone();
+        let live = live_prefix(&bearer);
+        let pinned = match ensure_pin(&config, live) {
+            Ok(block) => block,
+            Err(err) => {
+                if self.serving {
+                    self.stop_serving(&err);
+                }
+                self.note(&err);
+                let mut report = self.report(live, None, false, &err);
+                report.mismatch = err;
+                self.publish(&report, &report.mismatch.clone());
+                return;
+            }
+        };
+        let Some(block) = pinned else {
+            if self.serving {
+                self.stop_serving("waiting for the first attach to learn the block");
+            }
+            self.publish(
+                &self.report(
+                    live,
+                    None,
+                    false,
+                    "On, with no pin yet. Waiting for the first attach.",
+                ),
+                "On, with no pin yet. Waiting for the first attach.",
+            );
+            return;
+        };
+        if let Some(live_block) = live {
+            if live_block != block {
+                let message = format!(
+                    "The core handed {live_block} and the pin is {block}. Delegation is stopped and the old block is not being served."
+                );
+                if self.serving {
+                    self.stop_serving(&message);
+                }
+                self.clear_delegation();
+                self.note(&message);
+                let mut report = self.report(live, Some(block), false, &message);
+                report.mismatch = message.clone();
+                self.publish(&report, &message);
+                return;
+            }
+        }
+
+        let carrier = carrier_up(CUSTOMER);
+        self.note_eth0_carrier(carrier);
+        // After 18 h the vendor SDK removes the bridged bearer's own address
+        // for the rest of the session. Bridged with carrier, it still carries
+        // the delegated prefix.
+        let lte = bearer_up(live.is_some(), self.bridged, carrier_up(&bearer));
+        if !self.serving && self.now >= self.serve_retry_at {
+            if let Err(err) = self.start_serving(block) {
+                self.serve_retry_at = self.now + SERVE_RETRY;
+                self.note(&format!("not serving: {err}. Retrying in {SERVE_RETRY}s so a filter failure cannot loop."));
+            }
+        }
+        if self.solicit_pending && self.serving {
+            self.solicit_pending = false;
+            self.send_advertisement(block, "router solicitation");
+        } else if self.serving && carrier && self.now.saturating_sub(self.last_ra) >= RA_INTERVAL {
+            self.send_advertisement(block, "periodic router advertisement");
+        }
+        // A delegated router probes fe80::1 slower than the 45s silence
+        // window. While its prefix is still inside the valid lifetime, that
+        // gap is not a failure and must not drop the Ethernet link.
+        let held = delegation_current(
+            self.delegated_mac.map(|mac| (mac, self.delegated_at)),
+            self.now,
+        );
+        // Frames from the router stand in for the bulk IPv6 the port filter
+        // no longer copies out, and a busy link is never dropped.
+        let rx = rx_packets(CUSTOMER);
+        if self
+            .link_rx_at
+            .is_none_or(|at| self.now.saturating_sub(at) >= LINK_SAMPLE)
+        {
+            self.link_rx.sample(self.now, rx);
+            self.link_rx_at = Some(self.now);
+        }
+        let traffic = self.link_rx.traffic(self.now, rx);
+        let busy = matches!(traffic, Traffic::Busy { .. });
+        let before = self.health.clone();
+        let decision = self.health.tick(&View {
+            now: self.now,
+            carrier_up: carrier,
+            lte_up: lte,
+            prefix_ok: true,
+            serving: self.serving,
+            router_seen: self.router_seen || held || busy,
+            ipv6_router_heard: self.ipv6_router.is_some(),
+            link_quiet: traffic == Traffic::Quiet,
+        });
+        self.router_seen = false;
+        if matches!(decision, Decision::LinkDrop { .. }) && !self.save_budget() {
+            // Spend nothing that could not be recorded.
+            self.health = before;
+            self.note("Ethernet recovery skipped: cannot persist the shared action budget");
+        } else {
+            self.act(decision, block);
+        }
+        if self.saved_budget != Some(self.budget_tuple()) {
+            self.save_budget();
+        }
+        let recent = self.now.saturating_sub(self.last_router) < health::SILENCE_SECS
+            || self.now.saturating_sub(self.health.phase_since) < health::SILENCE_SECS;
+        let healthy = self.serving && carrier && recent;
+        let detail = if !carrier {
+            "Ethernet link is down. The keeper is not treating that as a router failure.".into()
+        } else if !self.serving {
+            "Not answering yet.".into()
+        } else if !lte {
+            "Answering from the pinned block. The LTE bearer is down, so delegated traffic cannot flow yet.".into()
+        } else if healthy {
+            "Router has a current advertisement and the delegated prefix matches the pin.".into()
+        } else {
+            format!("Router looks quiet. {}", health::decision_reason(decision))
+        };
+        self.publish(&self.report(live, Some(block), healthy, &detail), &detail);
+    }
+
+    fn act(&mut self, decision: Decision, block: Block) {
         match decision {
             Decision::Hold | Decision::StopServing => {}
             Decision::Reannounce => {
@@ -83,7 +252,7 @@ impl Keeper {
         }
     }
 
-    pub(super) fn start_serving(&mut self, block: Block) -> Result<(), String> {
+    fn start_serving(&mut self, block: Block) -> Result<(), String> {
         self.ensure_sockets(true)?;
         let sniffed = self.sniff_core_ra()?;
         self.reinstall_filter()?;
@@ -149,7 +318,7 @@ impl Keeper {
         self.health.phase_since = self.now;
     }
 
-    pub(super) fn send_advertisement(&mut self, block: Block, why: &str) {
+    fn send_advertisement(&mut self, block: Block, why: &str) {
         // Source fe80::1 and the core's MAC. The SMF answers neighbour
         // discovery for that address from the bearer side, and the bridge
         // forwards frames addressed to that MAC out lte0pdn1. Sourcing the
@@ -351,7 +520,7 @@ impl Keeper {
 
     /// eth0 down long enough for a router swap: the old router's IPv6 history
     /// and delegation hold no longer apply. Our own renegotiation is shorter.
-    pub(super) fn note_eth0_carrier(&mut self, carrier: bool) {
+    fn note_eth0_carrier(&mut self, carrier: bool) {
         if carrier {
             self.eth0_down_since = None;
             return;
@@ -388,7 +557,7 @@ impl Keeper {
         }
     }
 
-    pub(super) fn clear_delegation(&mut self) {
+    fn clear_delegation(&mut self) {
         self.delegated_mac = None;
         self.delegated_at = 0;
         let path = state_dir().join("router.txt");
@@ -398,7 +567,7 @@ impl Keeper {
     }
 }
 
-pub(super) fn ensure_pin(config: &Config, live: Option<Block>) -> Result<Option<Block>, String> {
+fn ensure_pin(config: &Config, live: Option<Block>) -> Result<Option<Block>, String> {
     match config.pinned_block() {
         Ok(Some(block)) => Ok(Some(block)),
         Ok(None) => {
@@ -457,7 +626,7 @@ fn parse_mac(text: &str) -> Option<[u8; 6]> {
 
 /// A probe for fe80::1 is the router we delegated to, still inside the prefix
 /// lifetime. Any other MAC is a router that has not taken the pin.
-pub(super) fn delegation_current(saved: Option<([u8; 6], u64)>, now: u64) -> bool {
+fn delegation_current(saved: Option<([u8; 6], u64)>, now: u64) -> bool {
     let Some((_, at)) = saved else {
         return false;
     };
@@ -475,7 +644,7 @@ fn probe_keeps_delegation(probe: Option<[u8; 6]>, saved: Option<([u8; 6], u64)>,
 /// either its own global address or a place in the LAN bridge. The vendor
 /// SDK removes a bridged bearer's own address after 18 h and it never comes
 /// back in that session; up to v1.0.12 that turned IPv6 health off.
-pub(super) fn bearer_up(own_prefix: bool, bridged: bool, carrier: bool) -> bool {
+fn bearer_up(own_prefix: bool, bridged: bool, carrier: bool) -> bool {
     carrier && (own_prefix || bridged)
 }
 

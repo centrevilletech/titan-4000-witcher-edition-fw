@@ -41,10 +41,10 @@ use titan_pd_model::deaf;
 use titan_pd_model::driver_mac;
 use titan_pd_model::ethernet;
 use titan_pd_model::extdev;
-use titan_pd_model::health::{self, Decision, Health, View};
+use titan_pd_model::health::Health;
 use titan_pd_model::host_mac;
 use titan_pd_model::ipv4;
-use titan_pd_model::ipv4_health::{self, Peer, Traffic};
+use titan_pd_model::ipv4_health::{self, Peer};
 use titan_pd_model::mgmt;
 use titan_pd_model::prefix::Block;
 use titan_pd_model::sas_nat;
@@ -56,13 +56,11 @@ use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, tk_flags_io};
 use crate::clock::{monotonic, unix_now};
 use crate::command::command_stdout;
 use crate::files::read_file;
-use crate::netdev::{carrier_up, rx_packets};
 use crate::paths::state_dir;
 
 use self::carrier::CarrierWatch;
 use self::clamp::QctrlWatch;
-use self::delegation::{CORE_MAC, LINK_SAMPLE, RA_INTERVAL, SERVE_RETRY, bearer_up, delegation_current, ensure_pin};
-use self::if_inet6::live_prefix;
+use self::delegation::CORE_MAC;
 use self::kmsg::KernelLog;
 use self::mgmt_v6::mgmt_address_up;
 use self::routes::main_routes;
@@ -505,169 +503,7 @@ impl Keeper {
             self.maintain_host_mac();
             self.maintain_sas_nat(&routes);
         }
-
-        let config = match loaded {
-            Ok(config) => {
-                self.logged_unreadable = false;
-                config
-            }
-            Err(err) => {
-                if self.serving {
-                    self.stop_serving("the saved setting could not be read");
-                }
-                if !self.logged_unreadable {
-                    self.note(&format!("saved setting is unreadable ({err}); not serving and not changing the IP family"));
-                    self.logged_unreadable = true;
-                }
-                self.publish(
-                    &Report::default(),
-                    "The saved setting could not be read. It was not treated as Off.",
-                );
-                return Ok(());
-            }
-        };
-        let Some(config) = config else {
-            if self.serving {
-                self.stop_serving("the saved setting is gone");
-            }
-            self.publish(
-                &Report::default(),
-                "IPv6 prefix delegation has not been saved. The IP family is unchanged.",
-            );
-            return Ok(());
-        };
-        if !config.enabled {
-            if self.serving {
-                self.stop_serving("prefix delegation is off");
-            }
-            self.publish(
-                &Report::default(),
-                "IPv6 prefix delegation is off. The customer bearer is IPv4.",
-            );
-            return Ok(());
-        };
-
-        let bearer = self.bearer.clone();
-        let live = live_prefix(&bearer);
-        let pinned = match ensure_pin(&config, live) {
-            Ok(block) => block,
-            Err(err) => {
-                if self.serving {
-                    self.stop_serving(&err);
-                }
-                self.note(&err);
-                let mut report = self.report(live, None, false, &err);
-                report.mismatch = err;
-                self.publish(&report, &report.mismatch.clone());
-                return Ok(());
-            }
-        };
-        let Some(block) = pinned else {
-            if self.serving {
-                self.stop_serving("waiting for the first attach to learn the block");
-            }
-            self.publish(
-                &self.report(
-                    live,
-                    None,
-                    false,
-                    "On, with no pin yet. Waiting for the first attach.",
-                ),
-                "On, with no pin yet. Waiting for the first attach.",
-            );
-            return Ok(());
-        };
-        if let Some(live_block) = live {
-            if live_block != block {
-                let message = format!(
-                    "The core handed {live_block} and the pin is {block}. Delegation is stopped and the old block is not being served."
-                );
-                if self.serving {
-                    self.stop_serving(&message);
-                }
-                self.clear_delegation();
-                self.note(&message);
-                let mut report = self.report(live, Some(block), false, &message);
-                report.mismatch = message.clone();
-                self.publish(&report, &message);
-                return Ok(());
-            }
-        }
-
-        let carrier = carrier_up(CUSTOMER);
-        self.note_eth0_carrier(carrier);
-        // After 18 h the vendor SDK removes the bridged bearer's own address
-        // for the rest of the session. Bridged with carrier, it still carries
-        // the delegated prefix.
-        let lte = bearer_up(live.is_some(), self.bridged, carrier_up(&bearer));
-        if !self.serving && self.now >= self.serve_retry_at {
-            if let Err(err) = self.start_serving(block) {
-                self.serve_retry_at = self.now + SERVE_RETRY;
-                self.note(&format!("not serving: {err}. Retrying in {SERVE_RETRY}s so a filter failure cannot loop."));
-            }
-        }
-        if self.solicit_pending && self.serving {
-            self.solicit_pending = false;
-            self.send_advertisement(block, "router solicitation");
-        } else if self.serving && carrier && self.now.saturating_sub(self.last_ra) >= RA_INTERVAL {
-            self.send_advertisement(block, "periodic router advertisement");
-        }
-        // A delegated router probes fe80::1 slower than the 45s silence
-        // window. While its prefix is still inside the valid lifetime, that
-        // gap is not a failure and must not drop the Ethernet link.
-        let held = delegation_current(
-            self.delegated_mac.map(|mac| (mac, self.delegated_at)),
-            self.now,
-        );
-        // Frames from the router stand in for the bulk IPv6 the port filter
-        // no longer copies out, and a busy link is never dropped.
-        let rx = rx_packets(CUSTOMER);
-        if self
-            .link_rx_at
-            .is_none_or(|at| self.now.saturating_sub(at) >= LINK_SAMPLE)
-        {
-            self.link_rx.sample(self.now, rx);
-            self.link_rx_at = Some(self.now);
-        }
-        let traffic = self.link_rx.traffic(self.now, rx);
-        let busy = matches!(traffic, Traffic::Busy { .. });
-        let before = self.health.clone();
-        let decision = self.health.tick(&View {
-            now: self.now,
-            carrier_up: carrier,
-            lte_up: lte,
-            prefix_ok: true,
-            serving: self.serving,
-            router_seen: self.router_seen || held || busy,
-            ipv6_router_heard: self.ipv6_router.is_some(),
-            link_quiet: traffic == Traffic::Quiet,
-        });
-        self.router_seen = false;
-        if matches!(decision, Decision::LinkDrop { .. }) && !self.save_budget() {
-            // Spend nothing that could not be recorded.
-            self.health = before;
-            self.note("Ethernet recovery skipped: cannot persist the shared action budget");
-        } else {
-            self.act(decision, block);
-        }
-        if self.saved_budget != Some(self.budget_tuple()) {
-            self.save_budget();
-        }
-        let recent = self.now.saturating_sub(self.last_router) < health::SILENCE_SECS
-            || self.now.saturating_sub(self.health.phase_since) < health::SILENCE_SECS;
-        let healthy = self.serving && carrier && recent;
-        let detail = if !carrier {
-            "Ethernet link is down. The keeper is not treating that as a router failure.".into()
-        } else if !self.serving {
-            "Not answering yet.".into()
-        } else if !lte {
-            "Answering from the pinned block. The LTE bearer is down, so delegated traffic cannot flow yet.".into()
-        } else if healthy {
-            "Router has a current advertisement and the delegated prefix matches the pin.".into()
-        } else {
-            format!("Router looks quiet. {}", health::decision_reason(decision))
-        };
-        self.publish(&self.report(live, Some(block), healthy, &detail), &detail);
+        self.maintain_delegation(loaded);
         Ok(())
     }
 

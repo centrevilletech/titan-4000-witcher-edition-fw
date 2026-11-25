@@ -24,7 +24,7 @@ const CONTROL_RCVBUF: libc::c_int = 65_536;
 
 /// Keeps `br0` subscribed to IPv6 link-local control multicast groups so Linux
 /// bridge MLD snooping always delivers RS and DHCPv6 frames to `br0`.
-pub(super) struct Ipv6Socket {
+struct Ipv6Socket {
     pub(super) packet: Socket,
     _mcast_guard: Option<Socket>,
 }
