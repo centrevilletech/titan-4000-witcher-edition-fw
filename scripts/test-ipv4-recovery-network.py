@@ -862,6 +862,7 @@ for line in sys.stdin:
         assert image in Path('/tmp/tk/quarantine').read_text()
         assert verdict()=={'gzip':image,'genuine':'2','network':'2','pending':'0'}, verdict()
         run(ip,'addr','del','10.200.1.2/30','dev','lte0pdn0')
+        assert not Path('/tmp/dm-log').exists(), 'a confirmed boot with no wm= lines started a modem console session'
         # The operator image and its quarantine again, for the sections below.
         Path('/tmp/tk/config').write_text(operator_config)
         Path('/tmp/tk/quarantine').write_text(bad+'\n')
@@ -889,8 +890,10 @@ for line in sys.stdin:
             run(ip,'link','set','lte0pdn2','master','br0')
             run(ip,'link','set','lte0pdn2','up')
         Path('/tmp/tk.status').write_text('state=staged\nsha256=%s\nstrikes=1\nloaded_at=%d\nsource=fs\nfirmware=clean\n'%(good,uptime()))
+        # Only this keeper's lines: the verdict cases above confirmed a boot too.
+        before_good=len(log())
         restart()
-        wait_for(lambda:'tk boot confirmed' in log(),45)
+        wait_for(lambda:'tk boot confirmed' in log()[before_good:],45)
         assert Path('/tmp/tk/strikes').read_text()=='strikes=0\n'
         assert Path('/tmp/tk/confirmed').read_text()=='sha256='+good+'\n'
         assert Path('/tmp/tk.result').read_text()=='confirmed='+good+'\n'

@@ -126,7 +126,7 @@ for f in /var/run/witcher-tk.status /var/run/witcher-tk.result /var/run/witcher-
          /var/run/witcher-qctrl.status /var/run/witcher-fastpath.status \
          /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
          /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed \
-         /mnt/titan-api/tk/default /var/run/witcher-tk.build \
+         /mnt/titan-api/tk/default /mnt/titan-api/tk/verdict /var/run/witcher-tk.build \
          /mnt/titan-api/latency/config \
          /mnt/titan-api/qctrl/config /mnt/titan-api/fastpath/config; do
   show "$f"

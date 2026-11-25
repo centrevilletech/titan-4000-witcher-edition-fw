@@ -244,6 +244,9 @@ staged an image this boot. On any other boot it never reboots for this.
 - `/var/run/witcher-tk.result` records the outcome, so a keeper that restarts
   does not judge the boot again.
 
+This covers the case the deaf watchdog cannot: that watchdog arms only after a
+first answer, so a modem that never attaches never trips it.
+
 ### The default image: a rollback is provisional
 
 A tower outage, or a site power cut that boots the unit before its tower,
@@ -262,12 +265,13 @@ firmware answered.
 
 A confirmed boot of the image sets the failure count back to 0: it works on
 this unit, so the earlier failure was not its own. That matters after a site
-power cut. The unit boots in about a minute, while a CBRS tower can take
-longer than the image's 300 s to boot and get its SAS grant. When the tower
-comes up after the image's 300 s but within the stock boot's, stock firmware
-answers, and that counts as failure 1 even though the image was fine. The retry right after
-it meets a working tower, confirms, and clears the count. Only an image that
-fails again with the tower known to be up gets quarantined for good.
+power cut. The unit loads its modem soon after power returns, while a CBRS
+tower can take longer than the image's 300 s to boot and get its SAS grant.
+When the tower comes up after the image's 300 s but within the stock boot's,
+stock firmware answers, and that counts as failure 1 even though the image
+was fine. The retry right after it meets a working tower, confirms, and
+clears the count. Only an image that fails again with the tower known to be
+up gets quarantined for good.
 
 The retry reboot is careful in the same ways as the rollback reboot, and
 more:
@@ -275,7 +279,7 @@ more:
 - It waits until the clock is set and the SAS CPAS window (06:45 to 10:15
   UTC) is over. A unit that just reached the network may hold grants, and a
   reboot inside the window would lose them until the window ends.
-- It is written only after the record reads back. A keeper that restarts
+- It happens only after the record reads back. A keeper that restarts
   before the reboot leaves the retry to a later boot.
 - It comes at most once between confirmed boots of the image: the next
   failure where stock answers is failure 2, which sticks.
@@ -295,9 +299,6 @@ supply that flaps while the unit boots cannot keep a good image off either.
 `keeper.log` lines start with `tk boot verdict`. Retry clears `quarantine`,
 `verdict` and the build record and writes `strikes=0`, so the next boot
 loads (or builds) the image again.
-
-This covers the case the deaf watchdog cannot: that watchdog arms only after a
-first answer, so a modem that never attaches never trips it.
 
 Neither layer can loop:
 
