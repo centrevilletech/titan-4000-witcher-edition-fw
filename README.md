@@ -165,8 +165,10 @@ cell in view the image simply waits, and when stock firmware finds no
 network either the unit goes straight back onto the image. The image stays
 quarantined only after two failures in a row where stock firmware answered,
 until **Retry** under **Network → Latency** or a new firmware. Every reboot
-the keeper starts waits out the SAS CPAS window, and there are at most four
-a day. See [latency features](docs/latency-switches.md),
+the keeper starts waits out the SAS CPAS window (06:45–10:15 UTC), and there
+are at most four a day. Inside that window the web UI warns before a restart,
+a firmware or SAS action, or a radio change: the SAS issues no new grants
+until it ends. See [latency features](docs/latency-switches.md),
 the [boot-time loader](docs/tk-boot-loader.md), the
 [download clamp](docs/download-clamp.md) and the [fast path](docs/fast-path.md).
 

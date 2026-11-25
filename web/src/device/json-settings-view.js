@@ -3,6 +3,7 @@ import {probeFirmwareReturn,readServedVersion,rememberFirmwareReturn,freshFirmwa
 import {SessionExpired} from './errors.js';
 import {SECTIONS,clone,pathKey,getValue,setValue,fieldAvailable,fieldEnabled,parseSettings,defaultRow,serializeSettings,readbackMatches} from './settings-model.js';
 import {morphHTML} from '../morph.js';
+import {cpasWarning} from './cpas.js';
 
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const text=value=>value===null||value===undefined||value===''?'—':typeof value==='boolean'?(value?'Yes':'No'):String(value);
@@ -238,7 +239,10 @@ export class JsonSettingsView {
    }}
    finally{if(generation===this.serial){this.busy=false;this.host?.removeAttribute('aria-busy');if(!this.restarting){this.render();this.schedule();}}}
   };
-  if(action.confirm)this.h.confirm(typeof action.confirm==='string'?action.confirm:`${action.label} on this Titan? This can interrupt service.`,run);else await run();
+  // Inside the SAS CPAS window, an action that can take the unit off the air
+  // asks first, with a warning, even when it would not otherwise.
+  const warning=cpasWarning(action.id),question=action.confirm?(typeof action.confirm==='string'?action.confirm:`${action.label} on this Titan? This can interrupt service.`):warning&&`${action.label} on this Titan?`;
+  if(question)this.h.confirm(warning?`${warning} ${question}`:question,run);else await run();
  }
  handleError(error,replace=false){if(error instanceof SessionExpired){this.h.expire();return;}this.lastError=error.status===409?'These settings changed on the Titan while you were editing. Reload them before saving.':error.message;
   if(!this.host?.isConnected)return;
