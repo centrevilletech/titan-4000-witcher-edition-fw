@@ -2,9 +2,8 @@
 //! flash so a keeper restart cannot reset it, and the one action it pays for.
 
 use std::fs;
-use std::io;
 
-use crate::files::read_file;
+use crate::files::{read_file, write_durably};
 use crate::paths::state_dir;
 
 use super::{CUSTOMER, Keeper};
@@ -47,18 +46,7 @@ impl Keeper {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
-            let temporary = path.with_extension("new");
-            let saved = (|| -> io::Result<()> {
-                fs::write(&temporary, &text)?;
-                fs::File::open(&temporary)?.sync_all()?;
-                fs::rename(&temporary, &path)?;
-                fs::File::open(
-                    path.parent()
-                        .ok_or_else(|| io::Error::other("no budget directory"))?,
-                )?
-                .sync_all()
-            })();
-            if saved.is_err() {
+            if write_durably(&path, &path.with_extension("new"), text.as_bytes()).is_err() {
                 return false;
             }
         }

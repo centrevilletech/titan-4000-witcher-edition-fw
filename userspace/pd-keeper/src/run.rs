@@ -27,7 +27,7 @@
 //! `titan_pd_model::qctrl`).
 
 use std::fs;
-use std::io::{self, ErrorKind};
+use std::io::ErrorKind;
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -55,7 +55,7 @@ use titan_pd_model::wear::{self, Route};
 use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, tk_flags_io};
 use crate::clock::{monotonic, unix_now};
 use crate::command::command_stdout;
-use crate::files::read_file;
+use crate::files::{read_file, write_durably};
 use crate::paths::{env_or, env_path_or, state_dir};
 
 use self::carrier::CarrierWatch;
@@ -978,19 +978,7 @@ fn tk_dir() -> Option<PathBuf> {
 /// Write through a synced temporary file, then sync the directory, so a power
 /// cut leaves the old record or the new one.
 fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> bool {
-    use std::io::Write;
-    let temp = path.with_extension("tmp");
-    let written = (|| -> io::Result<()> {
-        let mut file = fs::File::create(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        if let Some(parent) = path.parent() {
-            fs::File::open(parent)?.sync_all()?;
-        }
-        Ok(())
-    })();
-    written.is_ok()
+    write_durably(path, &path.with_extension("tmp"), bytes).is_ok()
 }
 
 fn published_detail(existing: &str, argument: &str) -> String {
