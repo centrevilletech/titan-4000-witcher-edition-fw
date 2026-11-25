@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Generate a tkpatch.py JSON manifest for N6H + Lane M1 (Rust uplink PIE AQM).
+"""Generate a tkpatch.py JSON manifest for N6H + the Rust uplink AQM.
 
 Consumes the linked Thumb-2 ELF produced by `build-thumb.sh`, stock `tk.bin`,
 and N6H's hash-pinned manifest `n6h-spec.json`.
 
 All 68 N6H sites are carried forward unchanged except `n4_ul_engine_cave`
 (`0x847ed000..0x847ed540`), where 6 bytes at `0x847ed414..0x847ed41a`
-(`ldr r0, [r5, #4]; and r0, r0, #5`) are redirected to `bl m1_aqm_shim; nop`.
-M1 adds 2 strictly disjoint dead-cave sites:
+(`ldr r0, [r5, #4]; and r0, r0, #5`) become `bl m1_aqm_shim; nop`.
+Two disjoint dead-cave sites are added:
   1. `m1_rust_pie_code`  (`0x841de8dc..0x841df200`, 2,340 B inside dead `cmd_phy`)
   2. `m1_rust_pie_block` (`0x841b5900..0x841b5a00`, 256 B inside dead `UMM_DecodeATR`)
 
 Audits every constraint enforced by `tkpatch.py` and checks zero overlap against
-all N6H, C1, N7, U14, and IMG4 PRACH-tail ranges.
+the N6H, C1, N7, U14, IMG4 PRACH-tail and R4 Rust N4 ranges. The block's magic and
+version must match `src/block.rs`.
 """
 import argparse
 import hashlib
 import json
+import os
+import re
 import shutil
 import struct
 import subprocess
@@ -34,8 +37,9 @@ BLK_HI = 0x841b5a00   # 256 B (4 x 64 B cache lines in dead UMM_DecodeATR, M2 ca
 HOOK4_AQM_VA = 0x847ed414
 HOOK4_EXPECTED_N4 = bytes.fromhex("686800f00500")  # ldr r0, [r5, #4]; and r0, r0, #5
 
-# Disjointness guard against other lanes (IMG4 PRACH tail, U14, N7, C1)
+# Disjointness guard against other lanes (IMG4 PRACH tail, U14, N7, C1, R4)
 FORBIDDEN_RANGES = [
+    ("R4_RUST_N4_OVERFLOW_CAVE", 0x84194654, 0x84194a5c),
     ("IMG4_PRACH_TAIL", 0x847ece64, 0x847ed954),
     ("U14_HOOK_SR_GUARD", 0x842b8924, 0x842b8928),
     ("U14_HOOK_SRMAX_CAP", 0x842d4cd8, 0x842d4cdc),
@@ -48,6 +52,14 @@ FORBIDDEN_RANGES = [
     ("C1_TK2_FLUSH_HOOK", 0x842dcff6, 0x842dcffa),
     ("C1_TK2_CAVE_AND_BLK", 0x843fa060, 0x843fa2c0),
 ]
+
+
+def block_const(name):
+    """MAGIC or VERSION from src/block.rs, the single source of the block's identity."""
+    src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "block.rs")).read()
+    m = re.search(rf"pub const {name}: u32 = (0x[0-9a-f_]+);", src)
+    assert m, f"{name} not found in src/block.rs"
+    return int(m.group(1).replace("_", ""), 16)
 
 
 def enc_bl(site, target, link=True):
@@ -154,8 +166,8 @@ def main():
     bvma, blk = section(args.elf, ".m1blk")
     assert bvma == BLK_LO and len(blk) == BLK_HI - BLK_LO == 256, (hex(bvma), len(blk))
     magic, ver, sel = struct.unpack_from("<III", blk, 0)
-    assert magic == 0x4D315049, hex(magic)
-    assert ver == 0x20261125, hex(ver)
+    assert magic == block_const("MAGIC"), hex(magic)
+    assert ver == block_const("VERSION"), hex(ver)
     assert sel == 0, f"boot selector must be 0, got {sel}"
     exp_blk = stock(BLK_LO, len(blk))
     assert n6h_bin[BLK_LO - BASE : BLK_HI - BASE] == exp_blk, "blk cave modified in N6H"
@@ -197,9 +209,9 @@ def main():
             "expected": exp_code.hex(),
             "new": code.hex(),
             "reason": (
-                f"M1 Rust no_std Thumb-2 PIE AQM + AAPCS shim ({len(code)} B of {CODE_HI - CODE_LO} B, "
-                "zero literal pools, zero VFP/NEON, zero undef syms) inside proven-dead "
-                "cmd_phy (0x841de8dc..0x841df200, M2 cave catalog)."
+                f"Rust no_std Thumb-2 uplink PIE AQM and hook-4 shim ({len(code)} B of {CODE_HI - CODE_LO} B, "
+                "m1_aqm_shim first at 0x841de8dc, no literal pools, no VFP/NEON, no undefined symbols) "
+                "inside proven-dead cmd_phy (0x841de8dc..0x841df200, M2 cave catalog)."
             ),
         },
         {
@@ -209,9 +221,9 @@ def main():
             "expected": exp_blk.hex(),
             "new": blk.hex(),
             "reason": (
-                "M1 Rust PIE 256 B (4 x 64 B cache-line-aligned) control/parameter/state/counter RAM block "
-                "(magic M1PI, version 0x20261125, boot selector=0 = old N4 v2) inside proven-dead "
-                "UMM_DecodeATR (0x841b5900..0x841b5a00, M2 cave catalog)."
+                f"256 B AQM control block (magic M1PI, version {ver:#010x}, boot selector 0 = N4 v2; "
+                "tunables, PIE state, counters) inside proven-dead UMM_DecodeATR "
+                "(0x841b5900..0x841b5a00, M2 cave catalog)."
             ),
         },
     ]
@@ -231,7 +243,7 @@ def main():
             assert va1 <= r0 or va0 >= r1, f"{s['name']} overlaps {rname} {r0:#x}..{r1:#x}"
 
     spec = {
-        "name": "m1 (n6h + rust no_std thumb-2 burst-tolerant pie uplink aqm at hook4_check_aqm)",
+        "name": f"n6h + rust uplink pie aqm at hook4_check_aqm (block version {ver:#010x})",
         "n6h_spec_sha256": n6h_spec_sha,
         "n6h_bin_sha256": N6H_BIN_SHA,
         "sites": sites,
@@ -241,7 +253,6 @@ def main():
 
     print(f"N6H spec sha256:  {n6h_spec_sha}")
     print(f"m1_aqm_shim:      {sy['m1_aqm_shim']:#x}")
-    print(f"m1_pie_decide:    {sy['m1_pie_decide']:#x}")
     print(f"code size:        {len(code)} / {CODE_HI - CODE_LO} B")
     print(f"M1_BLK:           {BLK_LO:#x}..{BLK_HI-1:#x} ({len(blk)} B)")
     print(f"total sites:      {len(sites)}")

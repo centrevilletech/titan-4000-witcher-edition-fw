@@ -1,213 +1,154 @@
-//! Bare-metal Cortex-A7 Thumb-2 integration for Titan 4000 `tk.bin` (N4 hook 4 site).
+//! Hook 4 in the Thumb-2 build: the control block, the naked shim N4 calls, and the
+//! safe per-packet glue. All modem-memory access goes through [`hw`].
 //!
-//! Uses verified `#[repr(C)]` types and VAs from Lane M2's `modem-atlas` crate:
-//! `Rbc`, `PdcpUlSduWindow`, `N4State`, `N4ExtCounters`, `N4_STATE_VA`, `N4_EXT_CNT_VA`.
+//! N4 replaces `ldr r0, [r5, #4]; and r0, r0, #5` at `0x847e_d414` with
+//! `bl m1_aqm_shim; nop`, in asm N4 (N6H) and in R4's Rust N4 alike. At the shim:
 //!
-//! Hook site: `0x847ed414` (`hook4_check_aqm` inside N4's `hook_gipc_rx` cave).
-//! Displaced 6 bytes: `ldr r0, [r5, #4]; and r0, r0, #5` (`6868 00f00500`).
-//! Replaced with:     `bl m1_aqm_shim; nop` (jumping into dead `cmd_phy` at `0x841de8dc`).
-//!
-//! Register contract at `0x847ed414`:
-//! - Stack top: `{r0, r1, r3, r5, r6, lr}` (pushed by `hook_gipc_rx` at `0x847ed2f6`).
-//! - Live inputs: `r4 = pkt_len`, `r5 = N4_STATE_VA (0x847ed600)`, `r6 = now_tti`,
-//!   `r9 = *const Rbc`, `r10 (sl) = pkt_buf` (IP header at `sl + 2`).
-//! - Dead on entry: `r0, r1, r3, ip, APSR`.
-//! - Preserved on all exits: `r4, r5, r6, r7, r8, r9, sl, fp, sp` (plus `r2` on Exit B;
-//!   Exit D loads `r2 = [r9, #4]` at `0x847ed51c`).
+//! - `lr` returns to the `nop` at `0x847e_d418`, before N4's `cmp r0, #5`;
+//! - the stack top is N4's `{r0, r1, r3, r5, r6, lr}`, which both exits pop;
+//! - `r4` is the IP length, `r5` N4's state block, `r6` the TTI clock, `r9` the bearer
+//!   and `sl` the IRB buffer (IP header at `sl + 2`);
+//! - `r0`, `r1`, `r3`, `ip` and the flags are free; `r2` must reach Exit B intact
+//!   (Exit D reloads it), as must `r4`-`fp` and `sp`.
+
+mod hw;
 
 use core::arch::naked_asm;
-use core::cell::UnsafeCell;
 use core::panic::PanicInfo;
-use core::ptr::{addr_of, addr_of_mut, read_volatile, write_volatile};
 
-use modem_atlas::addr::{N4_EXT_CNT_VA, N4_STATE_VA};
-use modem_atlas::l2::Rbc;
+use modem_atlas::l2::{PdcpUlSduEntry, PdcpUlSduWindow, Rbc};
 use modem_atlas::patches::{N4ExtCounters, N4State};
 
-use crate::pie::{Decision, M1Block};
+use crate::block::{M1Block, SELECTOR_NONE};
+use crate::pie::{Arrival, Decision};
+use hw::{Packet, Shared, field};
 
-/// Wrapper allowing a static mutable RAM block in `.m1blk` on single-threaded CPU1 L2 task.
-#[repr(transparent)]
-pub struct SyncM1Block(UnsafeCell<M1Block>);
+/// Exit B: N4 pops its frame and enqueues to Ring 1 (stock `0x842d_a22c`).
+const EXIT_ENQUEUE: u32 = 0x847e_d52e | 1;
+/// Exit D: N4 loads `r2` = Ring 1, pops its frame and drops (stock `0x842d_a3e0`).
+const EXIT_DROP: u32 = 0x847e_d51c | 1;
 
-unsafe impl Sync for SyncM1Block {}
+/// N4's AQM slot runs only with its PDCP limit (bit 0) and AQM (bit 2) on.
+const N4_AQM_ON: u32 = 0b101;
 
-/// Static RAM control/parameter/state/counter block linked at `0x841b5900` (256 B).
-#[unsafe(no_mangle)]
+// SAFETY (attribute): `.m1blk` is the dead `UMM_DecodeATR` range `0x841b_5900..0x841b_5a00`
+// that `link-m1.ld` reserves for this block alone.
 #[unsafe(link_section = ".m1blk")]
-pub static M1_BLK: SyncM1Block = SyncM1Block(UnsafeCell::new(M1Block::new_boot_default()));
+static M1_BLK: M1Block = M1Block::new();
 
-#[inline(always)]
-unsafe fn bump(p: *mut u32) {
-    unsafe { write_volatile(p, read_volatile(p).wrapping_add(1)) };
-}
-
-/// Sample live PDCP-to-ACK head-of-line age from stock `rbc->pdcp_ul_win[oldest_sn]`
-/// (discovered by Lane M2; written at `0x842dcad0` in `proc_pdcp_ul`).
+/// The hook-4 shim, first in `.m1code` at `0x841d_e8dc` (R4's Rust N4 calls that
+/// address directly).
 ///
-/// Exposed as telemetry only: this age starts after Ring-1 dequeue and includes air HARQ
-/// + eNB RLC AM STATUS ACK RTT (~20-40 ms), so it is not Ring-1 queuing delay.
-#[inline(always)]
-unsafe fn sample_pdcp_hol_age_ms(rbc: *const Rbc, now_tti: u32) -> u32 {
-    if rbc.is_null() {
-        return 0;
-    }
-    let win_ptr = unsafe { read_volatile(addr_of!((*rbc).pdcp_ul_win)) };
-    if win_ptr.is_null() {
-        return 0;
-    }
-    let win = win_ptr.as_ptr();
-    let active = unsafe { read_volatile(addr_of!((*win).active_count)) };
-    if active == 0 {
-        return 0;
-    }
-    let sn_max = unsafe { read_volatile(addr_of!((*rbc).pdcp_sn_max)) };
-    let mask = if sn_max == 0 { 0x0fff } else { sn_max.wrapping_sub(1) & 0x0fff } as usize;
-    let oldest = (unsafe { read_volatile(addr_of!((*rbc).pdcp_ul_oldest_sn)) } as usize) & mask;
-    let entry_ptr = unsafe { addr_of!((*win).entries).cast::<modem_atlas::l2::PdcpUlSduEntry>().add(oldest) };
-    let tti_and_flags = unsafe { read_volatile(addr_of!((*entry_ptr).enqueue_tti_and_flags)) };
-    let enq_tti = tti_and_flags & !1;
-    if enq_tti == 0 {
-        return 0;
-    }
-    now_tti.wrapping_sub(enq_tti)
-}
-
-/// AAPCS `extern "C"` decision routine called from `m1_aqm_shim` when `selector == 1`
-/// and N4 flags `(bit0 | bit2)` are both set.
-///
-/// Returns `0` for Exit B (enqueue Ring 1) or `1` for Exit D (clean Ring 1 AQM drop).
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".text.m1_pie_decide")]
-pub extern "C" fn m1_pie_decide(
-    rbc: *const Rbc,
-    pkt_len: u32,
-    now_tti: u32,
-    pkt_buf: *mut u8,
-) -> u32 {
-    unsafe {
-        let blk = &mut *M1_BLK.0.get();
-        let n4 = N4_STATE_VA as *mut N4State;
-        let n4_ext = N4_EXT_CNT_VA as *mut N4ExtCounters;
-
-        let ring_b = read_volatile(addr_of!((*rbc).ring_pending_bytes));
-        let pdcp_b = read_volatile(addr_of!((*rbc).pdcp_rlc_tx_bo));
-        let q_total = ring_b.wrapping_add(pdcp_b);
-
-        let g_ema = read_volatile(addr_of!((*n4).g_ema));
-        let min_len = read_volatile(addr_of!((*n4).aqm_minlen));
-
-        // Telemetry: record PDCP-to-ACK HoL age from M2's verified PdcpUlSduWindow layout.
-        let hol_age = sample_pdcp_hol_age_ms(rbc, now_tti);
-        blk.pdcp_hol_age_ms = hol_age;
-        if hol_age > blk.pdcp_max_hol_age_ms {
-            blk.pdcp_max_hol_age_ms = hol_age;
-        }
-
-        // IP header starts at pkt_buf + 2; cap to 40 B (max bytes inspected for IPv4/IPv6 ECN).
-        let ip_hdr = if pkt_buf.is_null() {
-            &mut [][..]
-        } else {
-            core::slice::from_raw_parts_mut(pkt_buf.add(2), pkt_len.min(40) as usize)
-        };
-
-        match blk.evaluate_packet(q_total, g_ema, min_len, pkt_len, now_tti, ip_hdr) {
-            Decision::Enqueue => 0,
-            Decision::SparedSmall => {
-                bump(addr_of_mut!((*n4).cnt_spared));
-                0
-            }
-            Decision::EcnMark => {
-                bump(addr_of_mut!((*n4).cnt_aqm_mark));
-                0
-            }
-            Decision::Drop => {
-                bump(addr_of_mut!((*n4).cnt_aqm_drop));
-                1
-            }
-            Decision::HardDrop => {
-                bump(addr_of_mut!((*n4_ext).cnt_drop_hard));
-                bump(addr_of_mut!((*n4).cnt_aqm_drop));
-                1
-            }
-        }
-    }
-}
-
-/// Naked Thumb-2 AAPCS shim entered via `bl m1_aqm_shim` from `0x847ed414`.
-///
-/// - `selector == 0` (boot default & live rollback): runs the two displaced N4 instructions
-///   (`ldr r0, [r5, #4]; and r0, r0, #5`) and returns to `0x847ed41a` with zero stack usage.
-/// - N4 `(flags & 5) != 5` (stock kill switch / bit0 off): exits to `0x847ed52e` (Exit B).
-/// - `selector == 2` (no AQM): bumps `c_bypass_pkts` and exits to `0x847ed52e` (Exit B).
-/// - `selector == 1` (Rust PIE): aligns `sp` to 8 bytes, preserves `r2` (and `r4..r11` per AAPCS),
-///   calls `m1_pie_decide(rbc, pkt_len, now_tti, pkt_buf)`, restores `sp` and `r2`, and
-///   branches to `0x847ed52e` (Exit B) or `0x847ed51c` (Exit D).
-/// - Any other `selector` value: falls back safely to `selector == 0` (old N4 v2).
+/// - Selector 0, or any value above 2: N4 v2. Runs the two displaced instructions and
+///   returns, using no stack.
+/// - Selector 1 or 2: calls `hw::m1_decide` on an 8-byte-aligned stack, keeping `r2`,
+///   then takes Exit B or Exit D.
+// SAFETY (attributes): exported once under this name so the image builder can find it;
+// placed by `link-m1.ld`; naked because hook 4's register contract is not AAPCS.
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 #[unsafe(link_section = ".text.m1_aqm_shim")]
-pub unsafe extern "C" fn m1_aqm_shim() {
+extern "C" fn m1_aqm_shim() {
     naked_asm!(
-        // Load M1_BLK base (0x841b5900) with pure movw/movt (zero literal pools).
-        "movw r0, #0x5900",
-        "movt r0, #0x841b",
-        "ldr r1, [r0, #8]",        // r1 = M1_BLK.selector
-        "cbz r1, 1f",              // selector == 0 -> fast path: old N4 v2
-        "cmp r1, #2",
-        "bhi 1f",                  // unknown selector -> safe fallback to old N4 v2
-
-        // Respect N4 invariant D3: AQM only runs when bit0 (PDCP limit) + bit2 (AQM) are both set.
-        "ldr r3, [r5, #4]",
-        "and r3, r3, #5",
-        "cmp r3, #5",
-        "bne 4f",                  // AQM off -> Exit B (0x847ed52e)
-
-        // selector == 2: no AQM (bypass), count and jump to Exit B.
-        "cmp r1, #2",
-        "bne 2f",
-        "ldr.w r3, [r0, #0x88]",   // c_bypass_pkts
-        "adds r3, #1",
-        "str.w r3, [r0, #0x88]",
-        "b 4f",
-
-        // selector == 1: Rust PIE AQM.
-        // Align SP to 8 bytes for AAPCS while saving r2 and original SP.
-        "2:",
+        "movw r0, #:lower16:{block}",
+        "movt r0, #:upper16:{block}",
+        "ldr r1, [r0, #{selector}]",
+        "cbz r1, 2f",
+        "cmp r1, #{none}",
+        "bhi 2f",
         "mov r3, sp",
         "bic r1, r3, #7",
         "mov sp, r1",
-        "push {{r2, r3}}",         // 8 bytes -> SP remains 8-byte aligned
-
-        "mov r0, r9",              // arg0: rbc (*const Rbc)
-        "mov r1, r4",              // arg1: pkt_len
-        "mov r2, r6",              // arg2: now_tti
-        "mov r3, sl",              // arg3: pkt_buf
-        "bl m1_pie_decide",
-
+        "push {{r2, r3}}",
+        "mov r0, r9",
+        "mov r1, r4",
+        "mov r2, r6",
+        "mov r3, sl",
+        "bl {decide}",
         "pop {{r2, r3}}",
-        "mov sp, r3",              // restore exact original SP
-        "cbnz r0, 3f",
-
-        // Exit B: enqueue Ring 1 (0x847ed52e | 1 = 0x847ed52f).
-        "4:",
-        "movw ip, #0xd52f",
-        "movt ip, #0x847e",
+        "mov sp, r3",
+        "cbnz r0, 1f",
+        "movw ip, #{enqueue_lo}",
+        "movt ip, #{enqueue_hi}",
         "bx ip",
-
-        // Exit D: clean Ring 1 AQM drop (0x847ed51c | 1 = 0x847ed51d).
-        // 0x847ed51c executes: ldr.w r2, [r9, #4]; pop {r0,r1,r3,r5,r6,lr}; bx 0x842da3e1
-        "3:",
-        "movw ip, #0xd51d",
-        "movt ip, #0x847e",
-        "bx ip",
-
-        // Selector == 0 fast path: execute displaced N4 instructions and return to 0x847ed41a.
         "1:",
+        "movw ip, #{drop_lo}",
+        "movt ip, #{drop_hi}",
+        "bx ip",
+        "2:",
         "ldr r0, [r5, #4]",
         "and r0, r0, #5",
         "bx lr",
+        block = sym M1_BLK,
+        selector = const core::mem::offset_of!(M1Block, selector),
+        none = const SELECTOR_NONE,
+        decide = sym hw::m1_decide,
+        enqueue_lo = const EXIT_ENQUEUE & 0xffff,
+        enqueue_hi = const EXIT_ENQUEUE >> 16,
+        drop_lo = const EXIT_DROP & 0xffff,
+        drop_hi = const EXIT_DROP >> 16,
     );
+}
+
+/// One bulk packet under selector 1 or 2. Returns true to drop it.
+fn on_packet(packet: Packet<'_>) -> bool {
+    if hw::N4.get(field!(N4State, flags)) & N4_AQM_ON != N4_AQM_ON {
+        return false;
+    }
+    if M1_BLK.selector.get() == SELECTOR_NONE {
+        M1_BLK.record_bypass();
+        return false;
+    }
+    let rbc = packet.rbc;
+    let ring = rbc.get(field!(Rbc, ring_pending_bytes));
+    let staged = rbc.get(field!(Rbc, pdcp_rlc_tx_bo));
+    let arrival = Arrival {
+        len: packet.len,
+        now: packet.now,
+        queue_bytes: ring.saturating_add(staged),
+        g_ema: hw::N4.get(field!(N4State, g_ema)),
+        min_len: hw::N4.get(field!(N4State, aqm_minlen)),
+    };
+    M1_BLK.record_pdcp_hol(pdcp_hol_age_ms(rbc, packet.now));
+    let decision = M1_BLK.decide(arrival, packet.ip);
+    mirror_in_n4(decision);
+    decision.is_drop()
+}
+
+/// N4's AQM counters stay meaningful whichever AQM runs; the keeper and the bench
+/// tools read them. (Comparisons, not a `match`: a match this dense becomes a branch
+/// table, which is PC-relative code the cave audit rejects.)
+fn mirror_in_n4(decision: Decision) {
+    if decision.is_drop() {
+        hw::N4.bump(field!(N4State, cnt_aqm_drop));
+        if decision == Decision::Ceiling {
+            hw::N4_EXT.bump(field!(N4ExtCounters, cnt_drop_hard));
+        }
+    } else if decision == Decision::Mark {
+        hw::N4.bump(field!(N4State, cnt_aqm_mark));
+    } else if decision == Decision::SparedSmall {
+        hw::N4.bump(field!(N4State, cnt_spared));
+    }
+}
+
+/// Age of the bearer's oldest unacknowledged PDCP SDU, for the bench. Not an AQM
+/// input: it counts from Ring-1 dequeue and includes HARQ and the RLC status trip.
+fn pdcp_hol_age_ms(rbc: Shared<Rbc>, now: u32) -> u32 {
+    let Some(window) = hw::pdcp_window(rbc) else {
+        return 0;
+    };
+    if window.get(field!(PdcpUlSduWindow, active_count)) == 0 {
+        return 0;
+    }
+    let sn_max = rbc.get(field!(Rbc, pdcp_sn_max));
+    let mask = if sn_max == 0 { 0x0fff } else { sn_max.wrapping_sub(1) & 0x0fff };
+    let oldest = usize::from(rbc.get(field!(Rbc, pdcp_ul_oldest_sn)) & mask);
+    let entries = field!(PdcpUlSduWindow, entries);
+    let enqueued = field!(PdcpUlSduEntry, enqueue_tti_and_flags);
+    match window.get_element(entries, oldest, enqueued).unwrap_or(0) & !1 {
+        0 => 0,
+        tti => now.wrapping_sub(tti),
+    }
 }
 
 #[panic_handler]

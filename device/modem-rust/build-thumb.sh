@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Reproducible bare-metal Thumb-2 Cortex-A7 build + static audit for witcher-modem-aqm.
+# Bare-metal Thumb-2 (Cortex-A7) build and static audit of the uplink AQM patch.
 #
-# Usage:
-#   device/modem-rust/build-thumb.sh [out_dir]
+# Usage: device/modem-rust/build-thumb.sh [out_dir]
 #
-# Target choice: armv7-unknown-linux-musleabi with -C target-cpu=cortex-a7 and
-# +thumb-mode,+thumb2,+execute-only,-neon,-vfp2,-vfp3,-vfp4,-d32, linked with
-# link-m1.ld (-nostdlib --gc-sections).
+# Target: armv7-unknown-linux-musleabi with target-cpu=cortex-a7 and
+# +thumb-mode,+thumb2,+execute-only,-neon,-vfp2,-vfp3,-vfp4,-d32, linked with link-m1.ld
+# (-nostdlib --gc-sections). Plain rustc, no cargo.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -38,7 +37,7 @@ echo "rustc:   $(rustc --version)"
 echo "linker:  $LD_BIN"
 echo "objdump: $OBJDUMP_BIN"
 
-# 1. Compile Lane M2's modem-atlas crate as a Thumb-2 rlib.
+# 1. Lane M2's modem-atlas crate as a Thumb-2 rlib.
 rustc \
   --edition=2021 \
   --crate-name modem_atlas \
@@ -47,7 +46,24 @@ rustc \
   -o "$OUT/libmodem_atlas.rlib" \
   "$SCRIPT_DIR/atlas/src/lib.rs"
 
-# 2. Compile witcher-modem-aqm against modem-atlas into a single Thumb-2 object file.
+# 2. Lint the AQM for the Thumb-2 target. Only this pass sees the `modem` module (the
+#    hook and the crate's only unsafe code), which host builds leave out. The crate root
+#    denies undocumented unsafe blocks and more than one unsafe operation per block.
+if [ "${SKIP_CLIPPY:-0}" != 1 ]; then
+  clippy-driver \
+    --edition=2024 \
+    --crate-name witcher_modem_aqm \
+    --crate-type=lib \
+    --emit=metadata \
+    -o "$OUT/clippy.rmeta" \
+    --extern modem_atlas="$OUT/libmodem_atlas.rlib" \
+    "${COMMON_FLAGS[@]}" \
+    -D warnings \
+    "$SCRIPT_DIR/src/lib.rs"
+  echo "clippy:  clean for armv7 Thumb-2 (-D warnings)"
+fi
+
+# 3. The AQM as one Thumb-2 object.
 rustc \
   --edition=2024 \
   --crate-name witcher_modem_aqm \
@@ -55,13 +71,13 @@ rustc \
   --emit=obj="$OUT/m1_aqm.o" \
   --extern modem_atlas="$OUT/libmodem_atlas.rlib" \
   "${COMMON_FLAGS[@]}" \
+  -D warnings \
   "$SCRIPT_DIR/src/lib.rs"
 
-# 3. Strip unused .ARM.exidx unwind metadata from the object before bare-metal link
-#    (prevents GNU ld from keeping an unreferenced __aeabi_unwind_cpp_pr0 symbol).
+# 4. Drop unwind tables (unreferenced, but GNU ld would keep __aeabi_unwind_cpp_pr0).
 "$OBJCOPY_BIN" -R '.ARM.exidx*' "$OUT/m1_aqm.o"
 
-# 4. Link at fixed modem VAs using link-m1.ld (no libc, no compiler_builtins, no CRT).
+# 5. Link at the fixed modem addresses: no libc, no compiler_builtins, no CRT.
 "$LD_BIN" \
   -nostdlib \
   --gc-sections \
@@ -69,17 +85,17 @@ rustc \
   -o "$OUT/m1_aqm.elf" \
   "$OUT/m1_aqm.o"
 
-# 4. Extract raw section binaries and disassembly for audit.
+# 6. Section images and disassembly for the audit.
 "$OBJCOPY_BIN" -O binary -j .m1code "$OUT/m1_aqm.elf" "$OUT/m1code.bin"
 "$OBJCOPY_BIN" -O binary -j .m1blk  "$OUT/m1_aqm.elf" "$OUT/m1blk.bin"
 "$OBJDUMP_BIN" -d -z "$OUT/m1_aqm.elf" > "$OUT/m1_aqm.dis"
 "$NM_BIN" -n "$OUT/m1_aqm.elf" > "$OUT/m1_aqm.nm"
 
-# 5. Strict bare-metal Thumb-2 audits.
-python3 - "$OUT" "$READELF_BIN" "$OBJDUMP_BIN" <<'PY'
+# 7. Audit.
+python3 - "$OUT" "$READELF_BIN" "$OBJDUMP_BIN" "$SCRIPT_DIR/src/block.rs" <<'PY'
 import os, re, struct, subprocess, sys
 
-out_dir, readelf, objdump = sys.argv[1:4]
+out_dir, readelf, objdump, block_rs = sys.argv[1:5]
 elf = os.path.join(out_dir, "m1_aqm.elf")
 code = open(os.path.join(out_dir, "m1code.bin"), "rb").read()
 blk = open(os.path.join(out_dir, "m1blk.bin"), "rb").read()
@@ -87,60 +103,101 @@ dis = open(os.path.join(out_dir, "m1_aqm.dis")).read()
 
 CODE_LO, CODE_HI = 0x841de8dc, 0x841df200
 BLK_LO = 0x841b5900
+STACK_BUDGET = 256  # bytes the hook may add to l2_task's stack below N4's frame
 
-assert len(code) <= (CODE_HI - CODE_LO) and len(code) % 2 == 0, f".m1code size {len(code)} > {CODE_HI - CODE_LO} or odd"
+
+def rust_const(name):
+    m = re.search(rf"pub const {name}: u32 = (0x[0-9a-f_]+);", open(block_rs).read())
+    assert m, f"{name} not found in block.rs"
+    return int(m.group(1).replace("_", ""), 16)
+
+
+assert len(code) <= CODE_HI - CODE_LO and len(code) % 2 == 0, f".m1code size {len(code)}"
 assert len(blk) == 256, f".m1blk size {len(blk)} != 256"
 
-# Check zero undefined symbols and zero ARM-mode ($a) or code-section data ($d) mapping symbols.
+# Symbols: nothing undefined, no ARM-mode code, no data in the code cave, no panic machinery.
 syms = subprocess.check_output([readelf, "-sW", elf], text=True)
-undef = []
-arm_map = []
-code_data_map = []
+undef, arm_map, code_data, names = [], [], [], {}
 for line in syms.splitlines():
     parts = line.split()
-    if len(parts) < 8 or not parts[0].endswith(":"):
+    if len(parts) < 8 or not parts[0].endswith(":") or not re.fullmatch(r"[0-9a-f]{8}", parts[1]):
         continue
-    val_hex, ndx, name = parts[1], parts[6], parts[7]
-    if ndx == "UND" and name != "":
+    val, size, ndx, name = int(parts[1], 16), int(parts[2], 0), parts[6], parts[7]
+    if ndx == "UND" and name:
         undef.append(name)
     if name == "$a" or name.startswith("$a."):
-        arm_map.append((val_hex, name))
-    if (name == "$d" or name.startswith("$d.")) and CODE_LO <= int(val_hex, 16) < CODE_HI:
-        code_data_map.append((val_hex, name))
+        arm_map.append(name)
+    if (name == "$d" or name.startswith("$d.")) and CODE_LO <= val < CODE_HI:
+        code_data.append(hex(val))
+    if parts[3] == "FUNC":
+        names[val & ~1] = (name, size)
+assert not undef, f"undefined symbols: {undef}"
+assert not arm_map, f"ARM-mode code: {arm_map}"
+assert not code_data, f"literal pool or jump table in .m1code at {code_data}"
+panics = [n for n, _ in names.values() if re.search(r"panic|unwind|fmt", n)]
+assert not panics, f"panic paths survived linking: {panics}"
+assert names.get(CODE_LO, ("", 0))[0] == "m1_aqm_shim", "m1_aqm_shim must be first in .m1code"
 
-assert not undef, f"Undefined symbols in ELF: {undef}"
-assert not arm_map, f"ARM-mode mapping symbols found (must be pure Thumb-2): {arm_map}"
-assert not code_data_map, f"Literal pool ($d) inside .m1code: {code_data_map}"
-
-# Check disassembly: every byte decoded, zero PC-relative loads, zero VFP/NEON, zero blx imm.
-rows = re.findall(r'^\s*([0-9a-f]+):\s+([0-9a-f]{4}(?:\s+[0-9a-f]{4})?)\s+(.+)$', dis, re.M)
-dec_bytes = sum(len(b.replace(" ", "")) // 2 for _, b, _ in rows)
-assert dec_bytes == len(code), f"objdump decoded {dec_bytes} B != {len(code)} B"
+# Disassembly: every byte decodes; no PC-relative operands (literal loads, `adr`, branch
+# tables) except `pop {..., pc}`; no VFP/NEON; no traps.
+rows = re.findall(r"^\s*([0-9a-f]+):\s+([0-9a-f]{4}(?:\s+[0-9a-f]{4})?)\s+(.+)$", dis, re.M)
+assert sum(len(b.replace(" ", "")) // 2 for _, b, _ in rows) == len(code), "partial decode"
 for addr, _, ins in rows:
     mnem = ins.split()[0].lower()
-    assert not mnem.startswith("."), f"Data directive in .m1code at 0x{addr}: {ins}"
-    assert "undefined" not in ins.lower(), f"Undefined insn at 0x{addr}: {ins}"
-    assert not mnem.startswith("v"), f"VFP/NEON insn in .m1code at 0x{addr}: {ins}"
-    assert "[pc" not in ins.lower(), f"PC-relative literal load at 0x{addr}: {ins}"
+    assert not mnem.startswith("."), f"data directive at 0x{addr}: {ins}"
+    assert "undefined" not in ins.lower(), f"undefined instruction at 0x{addr}: {ins}"
+    assert not mnem.startswith("v"), f"VFP/NEON at 0x{addr}: {ins}"
+    ops = ins[len(mnem):].lower()
+    reglist_pop = mnem.startswith(("pop", "ldm")) and re.search(r"\{[^}]*\bpc\b", ops)
+    assert not re.search(r"\bpc\b", ops) or reglist_pop, f"PC-relative operand at 0x{addr}: {ins}"
+    assert mnem not in ("udf", "bkpt"), f"trap at 0x{addr}: {ins}"
     if mnem == "blx":
-        assert ins.split()[1].startswith(("r", "ip", "lr")), f"blx imm at 0x{addr}: {ins}"
+        assert ins.split()[1].startswith(("r", "ip", "lr")), f"blx immediate at 0x{addr}: {ins}"
 
-# Check Thumb-2 decode of .m1blk via objdump (matching tkpatch.py's check).
-raw_blk_dis = subprocess.check_output(
+# Stack: the deepest frame chain below the shim. Each function's frame is its pushes
+# plus any `sub sp`; calls follow `bl`. The shim's own push of {r2, r3} counts too.
+funcs = sorted(names)
+def owner(a):
+    best = None
+    for f in funcs:
+        if f <= a:
+            best = f
+    return best
+frame, calls = {f: 0 for f in funcs}, {f: set() for f in funcs}
+for addr, _, ins in rows:
+    a = int(addr, 16)
+    f = owner(a)
+    if f is None:
+        continue
+    m = re.match(r"(push|stmdb)(?:\.w)?\s+(?:sp!,\s*)?\{([^}]*)\}", ins)
+    if m:
+        frame[f] += 4 * len(m.group(2).split(","))
+    m = re.match(r"sub(?:\.w)?\s+sp,\s*(?:sp,\s*)?#(\d+)", ins)
+    if m:
+        frame[f] += int(m.group(1))
+    m = re.match(r"bl\s+([0-9a-f]+)", ins)
+    if m:
+        calls[f].add(int(m.group(1), 16) & ~1)
+def depth(f, seen=()):
+    assert f not in seen, f"recursion through {names[f][0]}"
+    return frame[f] + max((depth(c, seen + (f,)) for c in calls[f] if c in frame), default=0)
+stack = depth(CODE_LO)
+assert stack <= STACK_BUDGET, f"hook stack {stack} B > budget {STACK_BUDGET} B"
+
+# The block decodes as Thumb-2 (tkpatch.py audits every patched range that way).
+raw = subprocess.check_output(
     [objdump, "-D", "-z", "-b", "binary", "-m", "arm", "-M", "force-thumb",
-     f"--adjust-vma={BLK_LO:#x}", os.path.join(out_dir, "m1blk.bin")],
-    text=True,
-)
-blk_rows = re.findall(r'^\s*([0-9a-f]+):\s+([0-9a-f]{4}(?: [0-9a-f]{4})?)\s+(.+)$', raw_blk_dis, re.M)
-blk_dec = sum(len(b.replace(" ", "")) // 2 for _, b, _ in blk_rows)
-assert blk_dec == len(blk), f"objdump decoded {blk_dec} B != {len(blk)} B for .m1blk"
+     f"--adjust-vma={BLK_LO:#x}", os.path.join(out_dir, "m1blk.bin")], text=True)
+blk_rows = re.findall(r"^\s*([0-9a-f]+):\s+([0-9a-f]{4}(?: [0-9a-f]{4})?)\s+(.+)$", raw, re.M)
+assert sum(len(b.replace(" ", "")) // 2 for _, b, _ in blk_rows) == len(blk), "partial .m1blk decode"
 assert not any("undefined" in s.lower() or s.lstrip().startswith(".") for _, _, s in blk_rows), "invalid Thumb-2 in .m1blk"
 
-magic, ver, sel = struct.unpack_from("<III", blk, 0)
-assert magic == 0x4d315049, hex(magic)
-assert ver == 0x20261125, hex(ver)
-assert sel == 0, f"boot selector must be 0, got {sel}"
+magic, version, selector = struct.unpack_from("<III", blk, 0)
+assert magic == rust_const("MAGIC"), hex(magic)
+assert version == rust_const("VERSION"), hex(version)
+assert selector == 0, f"boot selector must be 0, got {selector}"
 
-print(f"PASS: .m1code = {len(code)} / {CODE_HI - CODE_LO} B ({CODE_HI - CODE_LO - len(code)} B free), "
-      f".m1blk = {len(blk)} B @ {BLK_LO:#x}, 0 undef syms, 0 ARM insns, 0 literal pools, 0 VFP/NEON")
+print(f"PASS: .m1code {len(code)} / {CODE_HI - CODE_LO} B ({CODE_HI - CODE_LO - len(code)} B free), "
+      f"m1_aqm_shim @ {CODE_LO:#x}, .m1blk 256 B @ {BLK_LO:#x} (magic {magic:#x}, version {version:#x}, selector 0), "
+      f"hook stack {stack} B, 0 undefined symbols, 0 ARM code, 0 data in code, 0 VFP/NEON, 0 panic paths")
 PY

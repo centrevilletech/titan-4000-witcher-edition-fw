@@ -1,93 +1,101 @@
-//! ECN (RFC 3168) CE marking for IPv4 (with RFC 1624 incremental checksum update) and IPv6.
+//! ECN (RFC 3168) on raw IPv4 and IPv6 headers: read the codepoint, mark CE.
 //!
-//! Operates on a raw IP packet slice starting at byte 0 of the IP header.
-//! In Titan 4000 `gipc_rx_loop`, the IP header begins at `pkt_buf + 2`.
+//! The slice starts at byte 0 of the IP header (`pkt_buf + 2` at hook 4). Both
+//! families keep the two ECN bits in byte 1: bits 1..0 of the IPv4 TOS byte, bits
+//! 5..4 of IPv6's traffic class.
 
-/// Attempt to mark an ECT(0) or ECT(1) packet with CE in place.
-///
-/// Returns `true` if the packet was ECT(0) or ECT(1) and has now been marked CE.
-/// Returns `false` for non-ECT (`00`), already-CE (`11`), unknown IP versions,
-/// or truncated packets (leaving the buffer untouched).
-#[inline]
-pub fn try_mark_ce(ip: &mut [u8]) -> bool {
-    if ip.len() < 20 {
-        return false;
+#![forbid(unsafe_code)]
+
+/// The ECN codepoint of a packet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Ecn {
+    NotEct,
+    Ect1,
+    Ect0,
+    Ce,
+}
+
+impl Ecn {
+    const fn from_bits(bits: u8) -> Self {
+        match bits & 3 {
+            0 => Self::NotEct,
+            1 => Self::Ect1,
+            2 => Self::Ect0,
+            _ => Self::Ce,
+        }
     }
-    let ver = ip[0] & 0xf0;
-    if ver == 0x40 {
-        // IPv4: TOS/DSCP+ECN is byte 1, ECN bits are [1:0].
-        // Checksum is big-endian u16 at bytes 10..12.
-        let tos = ip[1];
-        let ecn = tos & 0x03;
-        if ecn != 0x01 && ecn != 0x02 {
-            return false;
-        }
-        let delta = (0x03 - ecn) as u32;
-        ip[1] = tos | 0x03;
 
-        let c_old = ((ip[10] as u32) << 8) | (ip[11] as u32);
-        // RFC 1624 one's-complement subtraction: c_new = ~(~c_old + delta) = c_old - delta - borrow.
-        let (mut c_new, borrow) = c_old.overflowing_sub(delta);
-        if borrow {
-            c_new = c_new.wrapping_sub(1);
-        }
-        let c16 = (c_new & 0xffff) as u16;
-        let c16 = if c16 == 0xffff { 0x0000 } else { c16 };
-        ip[10] = (c16 >> 8) as u8;
-        ip[11] = (c16 & 0xff) as u8;
-        true
-    } else if ver == 0x60 {
-        // IPv6: minimum header is 40 bytes; Traffic Class low nibble is byte 1 bits [7:4],
-        // ECN bits are byte 1 bits [5:4] (0x10 = ECT(1), 0x20 = ECT(0), 0x30 = CE).
-        if ip.len() < 40 {
-            return false;
-        }
-        let b1 = ip[1];
-        let ecn = b1 & 0x30;
-        if ecn != 0x10 && ecn != 0x20 {
-            return false;
-        }
-        ip[1] = b1 | 0x30;
-        true
-    } else {
-        false
+    /// ECT(0) or ECT(1): the sender accepts CE in place of a drop.
+    pub const fn is_capable(self) -> bool {
+        matches!(self, Self::Ect0 | Self::Ect1)
     }
 }
 
-/// Inspect whether an IP packet carries ECT(0) or ECT(1) without modifying it.
-#[inline]
+/// Where a header keeps its ECN bits in byte 1.
+#[derive(Copy, Clone)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    /// The family of `ip`, if its version nibble is 4 or 6 and its fixed header
+    /// (20 or 40 bytes) is all there.
+    fn of(ip: &[u8]) -> Option<Self> {
+        match ip.first()? >> 4 {
+            4 if ip.len() >= 20 => Some(Self::V4),
+            6 if ip.len() >= 40 => Some(Self::V6),
+            _ => None,
+        }
+    }
+
+    const fn shift(self) -> u32 {
+        match self {
+            Self::V4 => 0,
+            Self::V6 => 4,
+        }
+    }
+}
+
+/// The ECN codepoint of the header at the start of `ip`.
+pub fn ecn(ip: &[u8]) -> Option<Ecn> {
+    let family = Family::of(ip)?;
+    Some(Ecn::from_bits(ip.get(1)? >> family.shift()))
+}
+
+/// Whether the header at the start of `ip` is ECT(0) or ECT(1).
 pub fn is_ect(ip: &[u8]) -> bool {
-    if ip.len() < 20 {
-        return false;
-    }
-    match ip[0] & 0xf0 {
-        0x40 => {
-            let ecn = ip[1] & 0x03;
-            ecn == 0x01 || ecn == 0x02
-        }
-        0x60 => {
-            if ip.len() < 40 {
-                return false;
-            }
-            let ecn = ip[1] & 0x30;
-            ecn == 0x10 || ecn == 0x20
-        }
-        _ => false,
-    }
+    ecn(ip).is_some_and(Ecn::is_capable)
 }
 
-/// Compute a standard RFC 1071 IPv4 header checksum (used by host tests).
-#[cfg(test)]
-pub fn ipv4_header_checksum(hdr: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < hdr.len() {
-        let w = ((hdr[i] as u32) << 8) | (hdr[i + 1] as u32);
-        sum += w;
-        i += 2;
+/// Mark an ECT(0) or ECT(1) packet CE in place and return `true`.
+///
+/// Anything else (not ECT, already CE, not IPv4 or IPv6, truncated) is left
+/// untouched and returns `false`. IPv4's header checksum is updated
+/// incrementally (RFC 1624, eqn. 3).
+pub fn mark_ce(ip: &mut [u8]) -> bool {
+    let Some(family) = Family::of(ip) else {
+        return false;
+    };
+    let Some(hdr) = ip.first_chunk_mut::<20>() else {
+        return false;
+    };
+    let bits = (hdr[1] >> family.shift()) & 3;
+    if !Ecn::from_bits(bits).is_capable() {
+        return false;
     }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
+    hdr[1] |= 3 << family.shift();
+    if let Family::V4 = family {
+        // The 16-bit word holding TOS grew by `3 - bits`: HC' = ~(~HC + delta).
+        let checksum = u16::from_be_bytes([hdr[10], hdr[11]]);
+        let checksum = !ones_complement_add(!checksum, u16::from(3 - bits));
+        [hdr[10], hdr[11]] = checksum.to_be_bytes();
     }
-    !(sum as u16)
+    true
+}
+
+/// 16-bit one's-complement addition (end-around carry).
+const fn ones_complement_add(a: u16, b: u16) -> u16 {
+    let (sum, carry) = a.overflowing_add(b);
+    sum.wrapping_add(carry as u16)
 }
