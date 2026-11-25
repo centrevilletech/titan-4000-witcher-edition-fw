@@ -95,7 +95,7 @@ pub const M1_MAGIC_ADDR: u32 = 0x841b_5900;
 /// M1 builds whose selector and counters sit where `TABLE` and `STATUS` say
 /// (`device/modem-rust/src/pie.rs`, `M1Block`). A build not on this list
 /// writes nothing.
-pub const M1_VERSIONS: [u32; 1] = [0x2026_1125];
+pub const M1_VERSIONS: [u32; 2] = [0x2026_1125, 0x2026_1126];
 
 pub const MAGICS: [MagicSpec; 5] = [
     MagicSpec {
@@ -3504,13 +3504,13 @@ wm=0x8418ff08:0x1
         );
         // An M1 build this keeper does not know: nothing is written.
         let mut newer = Fake::all_magics();
-        newer.version = 0x2026_1126;
+        newer.version = 0x2026_1199;
         let (outcome, sent) = run_session(&mut newer, &m1_profile(), Session::Apply);
         assert_eq!(
             outcome,
             Outcome::WrongVersion {
                 group: MagicGroup::M1,
-                got: Some(0x2026_1126)
+                got: Some(0x2026_1199)
             }
         );
         assert!(!sent);
@@ -3663,11 +3663,11 @@ wm=0x8418ff08:0x1
     fn the_control_waits_for_an_accepted_m1_build_and_says_which() {
         let mut control = Control::new(m1_profile(), 0);
         let mut fake = Fake::all_magics();
-        fake.version = 0x2026_1126;
+        fake.version = 0x2026_1199;
         let line = drive(&mut control, &mut fake, 0).unwrap();
         assert!(
             line.contains(
-                "the M1 patch at 0x841b5900 shows version 0x20261126; this keeper accepts 0x20261125; nothing written"
+                "the M1 patch at 0x841b5900 shows version 0x20261199; this keeper accepts 0x20261125, 0x20261126; nothing written"
             ),
             "{line}"
         );

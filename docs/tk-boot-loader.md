@@ -291,7 +291,7 @@ logged with the reason.
    line reads the magic and the version together: `vm 0x841b5900 8`.
 3. It writes only if every required magic reads back in the same session (N4
    through `tk_boot::flag_writes_allowed`), and for M1 only if the version is
-   one this keeper accepts (`tk_flags::M1_VERSIONS`, today `0x20261125`). The
+   one this keeper accepts (`tk_flags::M1_VERSIONS`, today `0x20261125` and `0x20261126`). The
    N4 magic appears only after the first uplink transport block. Until then
    the keeper writes nothing and asks again after 15 s, then 30 s, doubling up
    to 10 minutes. An unaccepted M1 build waits the same way: nothing is
@@ -401,7 +401,7 @@ session as the read-back:
 
 | Line | Values |
 | --- | --- |
-| `version` | The M1 build, `0x20261125` |
+| `version` | The M1 build, `0x20261125` (lane M1) or `0x20261126` (lane R1: overload latch, time-based ceiling) |
 | `selector` | `0` N4 AQM v2, `1` Rust PIE, `2` no AQM |
 | `seen` | Packets the PIE evaluated (`+0x60`) |
 | `pie_drops` | Probabilistic PIE drops (`+0x68`) |

@@ -863,12 +863,12 @@ for line in sys.stdin:
         # an accepted one gets N4 AQM v2 first and the selector last, with its
         # counters in tk.m1; dropping the line writes the selector 0 first.
         assert not Path('/tmp/tk.m1').exists()
-        Path('/tmp/dm-magic-m1').write_text('20261126\n')
+        Path('/tmp/dm-magic-m1').write_text('20261199\n')
         dm_m1_before = len(Path('/tmp/dm-log').read_text().splitlines())
         Path('/tmp/tk/config').write_text('enabled=1\nsha256=' + good + '\nwm=0x847ed604:0x15\nwm=0x841b5908:0x1\n')
-        wait_for(lambda: 'shows version 0x20261126' in flags(), 45)
+        wait_for(lambda: 'shows version 0x20261199' in flags(), 45)
         assert 'state=waiting-magic\n' in flags(), flags()
-        assert 'tk flags: the M1 patch at 0x841b5900 shows version 0x20261126; this keeper accepts 0x20261125' in log(), log()
+        assert 'tk flags: the M1 patch at 0x841b5900 shows version 0x20261199; this keeper accepts 0x20261125, 0x20261126' in log(), log()
         dm_m1 = Path('/tmp/dm-log').read_text().splitlines()[dm_m1_before:]
         assert 'vm 0x841b5900 8' in dm_m1, dm_m1
         assert not any(l.startswith('wm ') for l in dm_m1), dm_m1
