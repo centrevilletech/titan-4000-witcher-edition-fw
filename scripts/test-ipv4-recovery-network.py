@@ -837,8 +837,9 @@ for line in sys.stdin:
         def verdict():
             p=Path('/tmp/tk/verdict')
             return dict(l.split('=',1) for l in p.read_text().splitlines()) if p.exists() else {}
-        def record(genuine,network,pending,outage):
-            return {'gzip':image,'firmware':'unknown','genuine':str(genuine),'network':str(network),'pending':str(pending),'outage':str(outage)}
+        def record(genuine,network,pending,outage,crashes=0,crash=0):
+            return {'gzip':image,'firmware':'unknown','genuine':str(genuine),'network':str(network),'pending':str(pending),
+                    'outage':str(outage),'crashes':str(crashes),'crash':str(crash)}
         def quarantined():
             p=Path('/tmp/tk/quarantine')
             return p.exists() and image in p.read_text()
