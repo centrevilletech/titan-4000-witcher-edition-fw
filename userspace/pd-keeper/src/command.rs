@@ -8,8 +8,9 @@
 //! kernel) is set aside and reaped later, and its program is not started
 //! again until then, so a wedged driver cannot pile up processes.
 
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -80,8 +81,9 @@ fn output_within(command: &mut Command, input: Option<&[u8]>, limit: Duration) -
 
 /// The child's stdout and stderr, read until both end or `deadline`.
 fn read_both(child: &mut Child, deadline: Instant) -> (Vec<u8>, Vec<u8>) {
-    let mut out = child.stdout.take();
-    let mut err = child.stderr.take();
+    // As plain files, so one reader serves both.
+    let mut out = child.stdout.take().map(|pipe| File::from(OwnedFd::from(pipe)));
+    let mut err = child.stderr.take().map(|pipe| File::from(OwnedFd::from(pipe)));
     let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
     while out.is_some() || err.is_some() {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -103,7 +105,7 @@ fn read_both(child: &mut Child, deadline: Instant) -> (Vec<u8>, Vec<u8>) {
 
 /// One read from `pipe` when it is ready now (so the read cannot block);
 /// the pipe is dropped at its end.
-fn read_ready<R: Read + AsFd>(pipe: &mut Option<R>, into: &mut Vec<u8>) {
+fn read_ready(pipe: &mut Option<File>, into: &mut Vec<u8>) {
     let Some(reader) = pipe.as_mut() else {
         return;
     };
