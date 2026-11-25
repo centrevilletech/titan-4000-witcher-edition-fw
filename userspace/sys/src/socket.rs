@@ -77,9 +77,9 @@ impl Socket {
         Self::open(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0)
     }
 
-    /// A raw ICMPv6 socket.
+    /// A raw ICMPv6 socket, closed across `exec` like the others.
     pub fn icmpv6_raw() -> io::Result<Self> {
-        Self::open(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6)
+        Self::open(libc::AF_INET6, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_ICMPV6)
     }
 
     /// Receive only EtherType `protocol` from interface `ifindex`.
