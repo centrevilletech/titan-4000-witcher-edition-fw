@@ -4,7 +4,6 @@
 //! `titan_pd_model::health`, `titan_pd_model::ra` and `titan_pd_model::dhcpv6`.
 
 use std::fs;
-use std::os::fd::AsFd;
 use std::process::Command;
 use std::time::Duration;
 
@@ -27,7 +26,7 @@ use super::{BRIDGE, CUSTOMER, Keeper, tc_apply};
 use super::budget::link_recovery;
 use super::if_inet6::{link_local, live_prefix};
 use super::packet::{Class, all_nodes_mac, client_mac_of, ethernet_frame, fe80_1, prefixes_advert, ra_packet, udp_packet};
-use super::wire::{send_ipv6, send_marked_frame};
+use super::wire::{ControlSockets, send_marked_frame};
 
 const RA_INTERVAL: u64 = 45;
 const SNIFF_SECS: u64 = 3;
@@ -346,7 +345,7 @@ impl Keeper {
             return;
         };
         let ifindex = interface_index(CUSTOMER).unwrap_or(0);
-        match send_ipv6(&sockets.tx_ipv6, ifindex, dest_mac, packet) {
+        match sockets.send_ipv6(ifindex, dest_mac, packet) {
             Ok(()) => self.note(why),
             Err(err) => self.note(&format!("send failed ({why}): {err}")),
         }
@@ -354,14 +353,12 @@ impl Keeper {
 
     fn sniff_core_ra(&mut self) -> Result<Sniff, String> {
         self.ensure_sockets(true)?;
-        {
-            let ipv6 = self
-                .sockets
-                .as_ref()
-                .and_then(|sockets| sockets.ipv6.as_ref())
-                .ok_or("IPv6 control socket is not open")?;
-            crate::capture::install_ipv6(ipv6.packet.as_fd(), true)?;
-        }
+        let ipv6 = self
+            .sockets
+            .as_ref()
+            .and_then(ControlSockets::ipv6_fd)
+            .ok_or("IPv6 control socket is not open")?;
+        crate::capture::install_ipv6(ipv6, true)?;
         let mut found = Sniff::default();
         let deadline = monotonic() + SNIFF_SECS;
         while monotonic() < deadline {
@@ -379,11 +376,7 @@ impl Keeper {
                     }
                 }
             }
-            let ipv6 = self
-                .sockets
-                .as_ref()
-                .and_then(|sockets| sockets.ipv6.as_ref())
-                .map(|ipv6| ipv6.packet.as_fd());
+            let ipv6 = self.sockets.as_ref().and_then(ControlSockets::ipv6_fd);
             let _ = titan_sys::poll::wait_readable(&[ipv6], Duration::from_millis(200));
         }
         if found.prefixes.is_empty() {
@@ -394,8 +387,8 @@ impl Keeper {
                 found.prefixes[0]
             ));
         }
-        let restore = if let Some(ipv6) = self.sockets.as_ref().and_then(|s| s.ipv6.as_ref()) {
-            crate::capture::install_ipv6(ipv6.packet.as_fd(), false)
+        let restore = if let Some(ipv6) = self.sockets.as_ref().and_then(ControlSockets::ipv6_fd) {
+            crate::capture::install_ipv6(ipv6, false)
         } else {
             Ok(())
         };

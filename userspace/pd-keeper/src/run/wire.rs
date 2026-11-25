@@ -25,7 +25,7 @@ const CONTROL_RCVBUF: libc::c_int = 65_536;
 /// Keeps `br0` subscribed to IPv6 link-local control multicast groups so Linux
 /// bridge MLD snooping always delivers RS and DHCPv6 frames to `br0`.
 struct Ipv6Socket {
-    pub(super) packet: Socket,
+    packet: Socket,
     _mcast_guard: Option<Socket>,
 }
 
@@ -35,10 +35,31 @@ struct Ipv6Socket {
 /// and bridge-forwarded customer traffic never enters `ptype_base`.
 pub(super) struct ControlSockets {
     bridge_ifindex: i32,
-    pub(super) arp: Socket,
-    pub(super) dhcp: Socket,
-    pub(super) ipv6: Option<Ipv6Socket>,
-    pub(super) tx_ipv6: Socket,
+    arp: Socket,
+    dhcp: Socket,
+    ipv6: Option<Ipv6Socket>,
+    tx_ipv6: Socket,
+}
+
+impl ControlSockets {
+    /// What the wire loop waits on: the ARP and DHCP sockets, and the IPv6
+    /// one while prefix delegation is on.
+    pub(super) fn receivers(&self) -> [Option<BorrowedFd<'_>>; 3] {
+        [Some(self.arp.as_fd()), Some(self.dhcp.as_fd()), self.ipv6_fd()]
+    }
+
+    /// The IPv6 control socket, while prefix delegation is on.
+    pub(super) fn ipv6_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.ipv6.as_ref().map(|ipv6| ipv6.packet.as_fd())
+    }
+
+    /// Send an IPv6 packet out `ifindex` to `dest_mac` from the marked sender.
+    pub(super) fn send_ipv6(&self, ifindex: i32, dest_mac: [u8; 6], packet: &[u8]) -> Result<(), String> {
+        let sent = self
+            .tx_ipv6
+            .send_link(packet, ifindex, libc::ETH_P_IPV6 as u16, dest_mac);
+        sent_whole(sent, packet.len())
+    }
 }
 
 impl Keeper {
@@ -225,11 +246,6 @@ fn join_ipv6_control_multicast(ifindex: i32) -> Option<Socket> {
         let _ = socket.join_ipv6_multicast(group, ifindex as u32);
     }
     Some(socket)
-}
-
-pub(super) fn send_ipv6(socket: &Socket, ifindex: i32, dest_mac: [u8; 6], packet: &[u8]) -> Result<(), String> {
-    let sent = socket.send_link(packet, ifindex, libc::ETH_P_IPV6 as u16, dest_mac);
-    sent_whole(sent, packet.len())
 }
 
 /// A datagram goes out whole or not at all. A short count, which a packet

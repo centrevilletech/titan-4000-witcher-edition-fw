@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::io::{self, ErrorKind};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
@@ -381,18 +381,16 @@ impl Keeper {
             || self.tk_probe.is_some()
             || (self.kernel_log.is_some() && !self.kmsg_drained);
         let timeout = Duration::from_millis(if fast { 200 } else { 1000 });
-        let sockets = self.sockets.as_ref();
-        let fds: [Option<BorrowedFd<'_>>; 4] = [
-            sockets.map(|sockets| sockets.arp.as_fd()),
-            sockets.map(|sockets| sockets.dhcp.as_fd()),
-            sockets
-                .and_then(|sockets| sockets.ipv6.as_ref())
-                .map(|ipv6| ipv6.packet.as_fd()),
-            self.kernel_log
-                .as_ref()
-                .filter(|klog| klog.is_pollable())
-                .map(|klog| klog.as_fd()),
-        ];
+        let [arp, dhcp, ipv6] = self
+            .sockets
+            .as_ref()
+            .map_or([None; 3], ControlSockets::receivers);
+        let kernel_log = self
+            .kernel_log
+            .as_ref()
+            .filter(|klog| klog.is_pollable())
+            .map(|klog| klog.as_fd());
+        let fds = [arp, dhcp, ipv6, kernel_log];
         if fds.iter().all(Option::is_none) {
             thread::sleep(timeout);
             return;
