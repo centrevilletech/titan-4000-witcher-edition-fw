@@ -57,7 +57,6 @@ use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 use titan_sys::ifaddrs::InterfaceAddrs;
-use titan_sys::process::SpawnExt;
 use titan_sys::socket::{Socket, SocketExt};
 
 use crate::{cpu_trims_io, fastpath_io, log, log_ram, nvram, qctrl_io, tk_flags_io};
@@ -72,6 +71,7 @@ use self::if_inet6::{link_local, live_prefix, proc_if_inet6_addrs};
 use self::kmsg::{KernelLog, kernel_messages};
 use self::packet::{Class, all_nodes_mac, client_mac_of, ethernet_frame, fe80_1, prefixes_advert, ra_packet, udp_packet};
 use self::routes::main_routes;
+use self::udhcpd::{customer_dhcp_pids, spawn_udhcpd, stop_customer_udhcpd};
 use self::wire::{ControlSockets, send_ipv6, send_marked_frame};
 
 mod carrier;
@@ -82,6 +82,7 @@ mod kmsg;
 mod mode;
 mod packet;
 mod routes;
+mod udhcpd;
 mod wire;
 
 const CUSTOMER: &str = "eth0";
@@ -1040,16 +1041,6 @@ impl Keeper {
         });
         self.assigned_at = Some((self.now, self.bearer.clone(), addr));
         addr
-    }
-
-    fn customer_dhcp_running(&self) -> bool {
-        if self.dhcp_child.is_some() {
-            return true;
-        }
-        if let Some(running) = customer_dhcp_running_proc() {
-            return running;
-        }
-        !customer_dhcp_pids(&command_stdout("ps", &[])).is_empty()
     }
 
     fn maintain_ipv4(&mut self, routes: &str) {
@@ -2859,85 +2850,6 @@ fn ebtables(args: &str) -> Result<(), String> {
     }
 }
 
-fn cmdline_is_customer_dhcp(bytes: &[u8]) -> bool {
-    let args: Vec<&[u8]> = bytes
-        .split(|&b| b == 0)
-        .filter(|part| !part.is_empty())
-        .collect();
-    let Some(first) = args.first() else {
-        return false;
-    };
-    let prog = first.rsplit(|&b| b == b'/').next().unwrap_or(first);
-    if prog != b"udhcpd" {
-        return false;
-    }
-    args.windows(2)
-        .any(|pair| pair[0] == b"-f" && pair[1] == b"/tmp/udhcpd.conf")
-}
-
-/// Scan `/proc/<pid>/cmdline` without forking `ps`. Returns `None` if `/proc`
-/// cannot be read so the caller can fall back to `ps`.
-fn customer_dhcp_running_proc() -> Option<bool> {
-    let entries = fs::read_dir("/proc").ok()?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        if let Ok(cmdline) = fs::read(entry.path().join("cmdline")) {
-            if cmdline_is_customer_dhcp(&cmdline) {
-                return Some(true);
-            }
-        }
-    }
-    Some(false)
-}
-
-/// PIDs of the customer DHCP server. The wifi server is also named udhcpd, and
-/// `killall udhcpd` would stop that one too.
-fn customer_dhcp_pids(listing: &str) -> Vec<i32> {
-    listing
-        .lines()
-        .filter_map(|line| {
-            if !line.contains("udhcpd -f /tmp/udhcpd.conf") {
-                return None;
-            }
-            line.split_whitespace().next()?.parse().ok()
-        })
-        .collect()
-}
-
-fn stop_customer_udhcpd() {
-    let pids = customer_dhcp_pids(&command_stdout("ps", &[]));
-    for pid in &pids {
-        let _ = Command::new("kill").arg(pid.to_string()).status();
-    }
-    // setsid does not reparent the server, so the keeper must wait for it.
-    // An unreaped restart every minute fills the process table with zombies.
-    let deadline = std::time::Instant::now() + Duration::from_millis(200);
-    let mut left = pids;
-    while !left.is_empty() && std::time::Instant::now() < deadline {
-        left.retain(|pid| matches!(titan_sys::process::try_reap(*pid), Ok(false)));
-        if !left.is_empty() {
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-fn spawn_udhcpd() -> Result<std::process::Child, String> {
-    Command::new("/usr/sbin/udhcpd")
-        .args(["-f", "/tmp/udhcpd.conf"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .new_session()
-        .spawn()
-        .map_err(|err| err.to_string())
-}
-
 fn cached_mgmt_iid() -> Option<mgmt::Iid> {
     let text = fs::read_to_string(state_dir().join("mgmt-iid.txt")).unwrap_or_default();
     mgmt::parse_iid(text.trim())
@@ -3104,16 +3016,6 @@ mod tests {
     }
 
     #[test]
-    fn the_wifi_dhcp_server_is_not_the_customer_one() {
-        let listing = "\
-  5721 root      1928 S    udhcpd -f /tmp/udhcpd.conf
-  5723 root      1928 S    udhcpd -f /tmp/udhcpd_wifi.conf
-  388 root      2672 S    /bin/sh -c grep udhcpd.conf
-";
-        assert_eq!(customer_dhcp_pids(listing), vec![5721]);
-    }
-
-    #[test]
     fn delegated_traffic_and_a_solicit_are_the_router_and_a_foreign_neighbour_is_not() {
         let block = parse_pinned("2001:db8:ff:d300::/64").unwrap();
         let mut traffic = vec![0u8; 40];
@@ -3269,17 +3171,4 @@ Bridge chain: FORWARD, entries: 2, policy: ACCEPT
         assert!(!flood_rules_present(missing_68, "lte0pdn1"));
     }
 
-    #[test]
-    fn proc_cmdline_identifies_only_the_customer_udhcpd() {
-        assert!(cmdline_is_customer_dhcp(
-            b"/usr/sbin/udhcpd\0-f\0/tmp/udhcpd.conf\0"
-        ));
-        assert!(cmdline_is_customer_dhcp(b"udhcpd\0-f\0/tmp/udhcpd.conf\0"));
-        assert!(!cmdline_is_customer_dhcp(
-            b"/usr/sbin/udhcpd\0-f\0/tmp/udhcpd_wifi.conf\0"
-        ));
-        assert!(!cmdline_is_customer_dhcp(
-            b"/bin/sh\0-c\0grep udhcpd.conf\0"
-        ));
-    }
 }
