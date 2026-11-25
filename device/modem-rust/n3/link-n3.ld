@@ -1,46 +1,55 @@
 /*
- * Linker script for Lane N3 MAC UL hot-path optimizer (`witcher-modem-mac-opt`).
+ * Linker script for the combined MAC/PDCP UL hot-path optimizer (`witcher-modem-mac-opt`).
  *
- * Uses two dead-function caves audited with full-image cavecheck + rdcheck against
- * stock tk.bin and verified 0-overlap against N6H, C1, N7, U14, IMG4, M1, and R4/N4:
+ * Uses three proven-dead caves audited with full-image cavecheck + rdcheck against
+ * stock tk.bin and verified 0-overlap against v1.0.16, IMG4, R4/N4, N1/N5, R1, N6H,
+ * C1, N7, U14, UL-B, and M1:
  *
- *   N3_CODE: grf_cancellation_rpll_mutual_interference_sd_init
- *            0x8418_67e4 .. 0x8418_6b38 (852 B, executable Thumb-2 code)
- *   N3_BLK:  ATM_decodePCO (128-byte aligned sub-range)
- *            0x8449_a2a0 .. 0x8449_a320 (128 B, boot-off control block)
+ *   OPT_CODE1: grf_cancellation_rpll_mutual_interference_sd_init
+ *              0x8418_67e4 .. 0x8418_6b38 (852 B, executable Thumb-2 MAC hooks)
+ *   OPT_CODE2: restore_valid_check
+ *              0x8417_ffd8 .. 0x8418_024c (628 B, executable Thumb-2 PDCP hooks)
+ *   OPT_BLK:   UMM_DisplayUSIMPINInfo + 2 (4-byte aligned sub-range)
+ *              0x841b_b5c0 .. 0x841b_b640 (128 B, boot-off MacPdcpOptBlock)
  *
- * Code and mutable control block live on completely separate regions/cache lines.
+ * Code caves and mutable control block live on completely separate regions/cache lines.
  */
-
-/* Resume addresses are defined as Thumb function symbols via .thumb_set in modem.rs
- * so GNU ld emits pure Thumb-2 b.w with zero ARM veneers. */
 
 MEMORY
 {
-    N3_CODE (rx) : ORIGIN = 0x841867e4, LENGTH = 852
-    N3_BLK  (rw) : ORIGIN = 0x8449a2a0, LENGTH = 128
+    OPT_CODE1 (rx) : ORIGIN = 0x841867e4, LENGTH = 852
+    OPT_CODE2 (rx) : ORIGIN = 0x8417ffd8, LENGTH = 628
+    OPT_BLK   (rw) : ORIGIN = 0x841bb5c0, LENGTH = 128
 }
 
-ENTRY(n3_search_bo_idx_shim)
+ENTRY(opt_search_bo_idx_shim)
 
 SECTIONS
 {
-    .n3code : ALIGN(2)
+    .optcode1 : ALIGN(2)
     {
-        KEEP(*(.text.n3_search_bo_idx_shim))
-        KEEP(*(.text.n3_check_long_bsr_shim))
-        KEEP(*(.text.n3_mac_bsr_pre_work_shim))
+        KEEP(*(.optcode1.entry.search_bo_idx))
+        KEEP(*(.optcode1.entry.check_long_bsr))
+        KEEP(*(.optcode1.entry.mac_bsr_pre_work))
+        *(.optcode1 .optcode1.*)
         *(.text .text.*)
-    } > N3_CODE
+    } > OPT_CODE1
 
-    .n3blk : ALIGN(4)
+    .optcode2 : ALIGN(2)
     {
-        KEEP(*(.n3blk))
-    } > N3_BLK
+        KEEP(*(.optcode2.entry.pdcp_div))
+        KEEP(*(.optcode2.entry.do_tc_cap))
+        *(.optcode2 .optcode2.*)
+    } > OPT_CODE2
 
-    .rodata : { *(.rodata .rodata.*) } > N3_CODE
-    .data   : { *(.data .data.*) } > N3_BLK
-    .bss    : { *(.bss .bss.*) *(COMMON) } > N3_BLK
+    .optblk : ALIGN(4)
+    {
+        KEEP(*(.optblk))
+    } > OPT_BLK
+
+    .rodata : { *(.rodata .rodata.*) } > OPT_CODE1
+    .data   : { *(.data .data.*) } > OPT_BLK
+    .bss    : { *(.bss .bss.*) *(COMMON) } > OPT_BLK
 
     /DISCARD/ :
     {
@@ -49,9 +58,10 @@ SECTIONS
     }
 }
 
-ASSERT((n3_search_bo_idx_shim & ~1) == 0x841867e4, "n3_search_bo_idx_shim must start at 0x841867e4")
-ASSERT(ADDR(.n3blk) == 0x8449a2a0, ".n3blk must start at 0x8449a2a0")
-ASSERT(SIZEOF(.n3blk) == 128, ".n3blk must be exactly 128 bytes")
-ASSERT(SIZEOF(.rodata) == 0, "unexpected .rodata in N3 code cave")
-ASSERT(SIZEOF(.data) == 0, "unexpected .data outside .n3blk")
+ASSERT((opt_search_bo_idx_shim & ~1) == 0x841867e4, "opt_search_bo_idx_shim must start at 0x841867e4")
+ASSERT((opt_pdcp_div_shim & ~1) == 0x8417ffd8, "opt_pdcp_div_shim must start at 0x8417ffd8")
+ASSERT(ADDR(.optblk) == 0x841bb5c0, ".optblk must start at 0x841bb5c0")
+ASSERT(SIZEOF(.optblk) == 128, ".optblk must be exactly 128 bytes")
+ASSERT(SIZEOF(.rodata) == 0, "unexpected .rodata in optimizer code caves")
+ASSERT(SIZEOF(.data) == 0, "unexpected .data outside .optblk")
 ASSERT(SIZEOF(.bss) == 0, "unexpected .bss (modem patch has no CRT zero-init)")

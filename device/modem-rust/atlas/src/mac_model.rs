@@ -106,9 +106,9 @@ pub struct BearerQueue {
     pub ring_pending_bytes: u32,
     /// True when Ring 0, Ring 1, or LLCE0 actually holds at least one packet/batch.
     pub rings_or_cipher_nonempty: bool,
-    /// Ciphered RLC AM new-TX payload bytes (`Rbc::rlc_newtx_bo`, `+0x158`).
+    /// Ciphered RLC AM new-TX payload bytes (`Rbc::rlc_am_newtx_bo`, `+0x154`).
     pub rlc_newtx_bo: u32,
-    /// RLC AM retransmission payload bytes (`Rbc::rlc_retx_bo`, `+0x154`).
+    /// RLC AM retransmission payload bytes (`Rbc::rlc_am_retx_bo`, `+0x158`).
     pub rlc_retx_bo: u32,
     /// RLC AM STATUS PDU bytes (`Rbc::rlc_status_bo`, `+0x144`).
     pub rlc_status_bo: u16,

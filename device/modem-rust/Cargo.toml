@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "atlas", "n3", "n4"]
+members = [".", "atlas", "n3", "n4", "ul-model"]
 resolver = "2"
 
 [package]

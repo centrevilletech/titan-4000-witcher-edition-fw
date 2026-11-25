@@ -3,7 +3,7 @@ name = "witcher-modem-mac-opt"
 version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
-description = "no_std Rust Thumb-2 MAC uplink hot-path optimizer and BSR guard for Titan 4000"
+description = "no_std Rust Thumb-2 combined MAC/PDCP uplink hot-path optimizer and BSR guard for Titan 4000"
 
 [dependencies]
 modem-atlas = { path = "../atlas" }
