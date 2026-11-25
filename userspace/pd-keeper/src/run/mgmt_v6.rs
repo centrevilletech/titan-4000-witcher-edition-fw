@@ -14,7 +14,7 @@ use crate::netdev::{carrier_up, interface_index, read_mac};
 use crate::paths::state_dir;
 
 use super::{BRIDGE, Keeper};
-use super::if_inet6::{link_local, proc_if_inet6_addrs};
+use super::if_inet6::proc_if_inet6_addrs;
 use super::kmsg::kernel_messages;
 
 /// Seconds between safety re-checks of `ip -6 route` once management IPv6 has settled.

@@ -17,7 +17,6 @@ use titan_pd_model::mgmt;
 use titan_pd_model::sas_nat;
 use titan_pd_model::tk_flags;
 
-use crate::log;
 use crate::command::{command_stdout, run_status};
 use crate::netdev::interface_mac;
 
