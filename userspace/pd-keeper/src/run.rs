@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::io::{self, ErrorKind, Read};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -58,6 +58,7 @@ use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
+use titan_sys::ifaddrs::InterfaceAddrs;
 use titan_sys::socket::{Socket, SocketExt};
 
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
@@ -2229,7 +2230,7 @@ impl Keeper {
     /// A watchdog reboot. `maintain_deaf_watchdog` forces it if it does not
     /// happen.
     fn request_reboot(&mut self) {
-        unsafe { libc::sync() };
+        titan_sys::kernel::sync();
         self.reboot_asked_at = Some(self.now);
         self.reboot_forced = false;
         let _ = Command::new(reboot_program())
@@ -3138,34 +3139,18 @@ impl Keeper {
 // customer's bearer or the EPC gateway's address/MAC.
 fn bridge_probe_address(bearer: std::net::Ipv4Addr) -> Option<std::net::Ipv4Addr> {
     // getifaddrs dumps addresses over rtnetlink and includes labeled aliases.
-    let mut head = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
-        return None;
-    }
-    let mut entry = head;
-    let mut result = None;
-    while !entry.is_null() {
-        let interface = unsafe { &*entry };
-        entry = interface.ifa_next;
-        if interface.ifa_addr.is_null()
-            || interface.ifa_name.is_null()
-            || unsafe { (*interface.ifa_addr).sa_family as i32 } != libc::AF_INET
-        {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(interface.ifa_name) }.to_bytes();
-        if name.split(|&c| c == b':').next() != Some(BRIDGE.as_bytes()) {
-            continue;
-        }
-        let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in>() };
-        let ip = std::net::Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
-        if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback() && ip != bearer {
-            result = Some(ip);
-            break;
-        }
-    }
-    unsafe { libc::freeifaddrs(head) };
-    result
+    let addrs = InterfaceAddrs::read().ok()?;
+    addrs
+        .iter()
+        .filter(|addr| addr.is_on(BRIDGE))
+        .find_map(|addr| match addr.addr {
+            IpAddr::V4(ip)
+                if !ip.is_unspecified() && !ip.is_multicast() && !ip.is_loopback() && ip != bearer =>
+            {
+                Some(ip)
+            }
+            _ => None,
+        })
 }
 
 // The main table, without spawning ip on every tick.
@@ -3755,8 +3740,7 @@ fn mgmt_address_up() -> bool {
     if !carrier_up(mgmt::MGMT_DEV) {
         return false;
     }
-    let mut head = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+    let Ok(addrs) = InterfaceAddrs::read() else {
         return command_stdout("ip", &["addr", "show", "dev", mgmt::MGMT_DEV])
             .lines()
             .map(str::trim)
@@ -3764,37 +3748,18 @@ fn mgmt_address_up() -> bool {
                 line.starts_with("inet ")
                     || (line.starts_with("inet6 ") && line.contains("scope global"))
             });
-    }
-    let mut entry = head;
-    let mut found = false;
-    while !entry.is_null() {
-        let interface = unsafe { &*entry };
-        entry = interface.ifa_next;
-        if interface.ifa_addr.is_null() || interface.ifa_name.is_null() {
-            continue;
-        }
-        let name = unsafe { std::ffi::CStr::from_ptr(interface.ifa_name) }.to_bytes();
-        if name.split(|&c| c == b':').next() != Some(mgmt::MGMT_DEV.as_bytes()) {
-            continue;
-        }
-        let family = unsafe { (*interface.ifa_addr).sa_family as i32 };
-        if family == libc::AF_INET {
-            found = true;
-            break;
-        }
-        if family == libc::AF_INET6 {
-            let addr = unsafe { &*interface.ifa_addr.cast::<libc::sockaddr_in6>() };
-            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-            let o = ip.octets();
-            let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
-            if !link_local && !ip.is_loopback() && !ip.is_unspecified() {
-                found = true;
-                break;
+    };
+    addrs
+        .iter()
+        .filter(|addr| addr.is_on(mgmt::MGMT_DEV))
+        .any(|addr| match addr.addr {
+            IpAddr::V4(_) => true,
+            IpAddr::V6(ip) => {
+                let o = ip.octets();
+                let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
+                !link_local && !ip.is_loopback() && !ip.is_unspecified()
             }
-        }
-    }
-    unsafe { libc::freeifaddrs(head) };
-    found
+        })
 }
 
 /// Write through a synced temporary file, then sync the directory, so a power
@@ -4136,12 +4101,12 @@ fn solicit_mgmt(src: Ipv6Addr) -> Result<(), String> {
 
 // SYSLOG_ACTION_SIZE_BUFFER and READ_ALL leave the ring and other readers alone.
 fn kernel_messages() -> String {
-    let size = unsafe { libc::klogctl(10, std::ptr::null_mut(), 0) };
-    if (1..=4 * 1024 * 1024).contains(&size) {
-        let mut buffer = vec![0; size as usize];
-        let n = unsafe { libc::klogctl(3, buffer.as_mut_ptr().cast(), size) };
-        if n >= 0 {
-            return String::from_utf8_lossy(&buffer[..n as usize]).into_owned();
+    if let Ok(size) = titan_sys::kernel::log_buffer_size() {
+        if (1..=4 * 1024 * 1024).contains(&size) {
+            let mut buffer = vec![0; size];
+            if let Ok(read) = titan_sys::kernel::read_log_buffer(&mut buffer) {
+                return String::from_utf8_lossy(&buffer[..read]).into_owned();
+            }
         }
     }
     command_stdout("dmesg", &[])
@@ -4165,12 +4130,7 @@ fn read_file(path: &str) -> String {
 }
 
 pub(super) fn monotonic() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64
+    titan_sys::kernel::monotonic_secs()
 }
 
 fn state_dir() -> PathBuf {
