@@ -7,7 +7,8 @@
 //! - A re-attach that changes the carrier set makes the vendor SAS client
 //!   give back every grant. Applying or removing a profile never cycles the
 //!   radio. Only an opt-in enforcement cycle may, at most once per
-//!   `cycle_hours`, and only while the grant is held.
+//!   `cycle_hours`, only while the grant is held, and never inside the CPAS
+//!   window or with the clock unset (`radio_guard::cycle_hold`).
 //! - A PCell lock is only a nudge for that one cycle. It is always cleared
 //!   with `AT%GLOCKPCELL=1,0,0` (`AT%GLOCKPCELL=0` returns ERROR).
 use crate::carrier_pick::{self, Arm};
@@ -283,6 +284,9 @@ pub struct Gate<'a> {
     pub now: u64,
     pub mode_grant: &'a str,
     pub grant_state: &'a str,
+    /// Why a radio cycle must wait now (`radio_guard::cycle_hold`): the SAS
+    /// CPAS window, with its margin, or an unset clock.
+    pub hold: Option<&'static str>,
 }
 
 /// Whether one enforcement re-attach may run now, or why not.
@@ -307,6 +311,11 @@ pub fn cycle_gate(g: Gate) -> Result<(), &'static str> {
     }
     if g.now.saturating_sub(g.last_cycle) < u64::from(hours.max(MIN_CYCLE_HOURS)) * 3600 {
         return Err("rate limit");
+    }
+    // Before v1.0.17 nothing here looked at the time of day: a cycle inside
+    // the CPAS window left the unit without grants until it closed.
+    if let Some(why) = g.hold {
+        return Err(why);
     }
     // A cycle that changes the carrier set gives back every grant. Never
     // start one unless the grant is fully held.
@@ -544,6 +553,7 @@ mod tests {
             now: 6 * 3600 + 1000,
             mode_grant: "1",
             grant_state: "2",
+            hold: None,
         };
         assert_eq!(cycle_gate(ok), Ok(()));
         let no = |g: Gate| cycle_gate(g).unwrap_err();
@@ -560,5 +570,35 @@ mod tests {
         assert_eq!(no(Gate { now: 6 * 3600 - 1, over_since: Some(0), ..ok }), "rate limit");
         assert_eq!(no(Gate { mode_grant: "0", ..ok }), "SAS grant not held");
         assert_eq!(no(Gate { grant_state: "1", ..ok }), "SAS grant not held");
+    }
+
+    #[test]
+    fn enforcement_waits_out_the_cpas_window_and_an_unset_clock() {
+        use crate::radio_guard::cycle_hold;
+        use crate::tk_boot::{CLOCK_SET_AFTER, CPAS_QUIET};
+        let day = 1_795_305_600; // 2026-11-22 00:00 UTC
+        let gate = |wall: u64| Gate {
+            cap: 2,
+            cycle_hours: Some(6),
+            carriers: Some(3),
+            attached: true,
+            over_since: Some(1000),
+            last_cycle: 0,
+            now: 6 * 3600 + 1000,
+            mode_grant: "1",
+            grant_state: "2",
+            hold: cycle_hold(Some(CPAS_QUIET), wall),
+        };
+        // Everything else holds: only the time of day decides.
+        assert_eq!(cycle_gate(gate(day + 6 * 3600 + 29 * 60)), Ok(()));
+        for minute in [6 * 60 + 30, 6 * 60 + 45, 8 * 60, 10 * 60 + 14, 10 * 60 + 29] {
+            assert_eq!(
+                cycle_gate(gate(day + minute * 60)),
+                Err("the SAS CPAS window is open"),
+                "{minute}"
+            );
+        }
+        assert_eq!(cycle_gate(gate(day + 10 * 3600 + 30 * 60)), Ok(()));
+        assert_eq!(cycle_gate(gate(CLOCK_SET_AFTER - 1)), Err("the clock is not set yet"));
     }
 }

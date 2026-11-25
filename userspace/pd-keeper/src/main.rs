@@ -26,6 +26,7 @@ mod carrier_pick_io;
 mod carrier_watch_io;
 mod clock;
 mod command;
+mod console_lock;
 mod cpu_trims_io;
 mod fastpath_io;
 mod files;

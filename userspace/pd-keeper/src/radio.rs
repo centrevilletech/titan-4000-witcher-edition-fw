@@ -3,10 +3,23 @@
 //! whole worker process group, including vendor programs that stop responding.
 //!
 //! Applying or removing a profile never cycles the radio. A carrier cap
-//! written while attached waits for the next attach. The only radio cycle is
-//! the opt-in enforcement re-attach, gated by `titan_pd_model::radio::cycle_gate`.
+//! written while attached waits for the next attach. The only radio cycles
+//! are the opt-in enforcement re-attach (`titan_pd_model::radio::cycle_gate`)
+//! and the carrier picker's visits. Every one waits out the CPAS window and
+//! for a set clock, and fits a daily cap (`titan_pd_model::radio_guard`).
+//!
+//! When the guard tries, judges and retries a profile is decided in
+//! `titan_pd_model::radio_guard` (v1.0.17): no transient condition (a tower
+//! outage, a boot in the CPAS window, a power cut, a busy console, a lost
+//! ping) keeps a profile off for longer than its backoff, and only a
+//! comparison with stock settings counts against it. Every worker that drives
+//! the modem console holds it (`console_lock`) for its whole run.
 use crate::{
-    carrier_pick_io, nvram,
+    carrier_pick_io,
+    clock::{monotonic, unix_now},
+    console_lock,
+    files::read_file,
+    nvram,
     radio_modem::{cfun, console, media},
     radio_sqm,
 };
@@ -27,9 +40,11 @@ use std::{
     time::{Duration, Instant},
 };
 use titan_pd_model::{
-    carrier_pick::{self as pick, Measure, Record},
+    carrier_pick::{self as pick, Arm, Measure, Record},
     config::persistent_volume_mounted,
     radio::{self as model, Action, Cell, PCELL_CLEAR, PCELL_QUERY, Picker, Profile, failures},
+    radio_guard::{self as guard_model, Health, Restore, Retry, Verdict},
+    reboots,
 };
 use titan_sys::process::{Signal, SpawnExt, effective_uid, kill_group};
 
@@ -39,6 +54,28 @@ const CHECK_EVERY: u64 = 30;
 const AFTER_ATTACH: u64 = 20;
 /// Fallback poll period when no radio profile is configured.
 const IDLE_SUPERVISE_SECS: u64 = 60;
+/// A worker that drives the modem console may first wait this long for it.
+const CONSOLE_WAIT: u64 = console_lock::RADIO_WAIT.as_secs();
+/// Worker deadlines, with the console wait where the worker waits for it.
+const PREFLIGHT_SECS: u64 = 60;
+const APPLY_SECS: u64 = 180 + CONSOLE_WAIT;
+const CHECK_SECS: u64 = 35 + console_lock::CHECK_WAIT.as_secs();
+const JUDGE_SECS: u64 = guard_model::JUDGE_SECS + 30;
+const ROLLBACK_SECS: u64 = 120 + CONSOLE_WAIT;
+const ENFORCE_SECS: u64 = 170 + CONSOLE_WAIT;
+const PICK_CYCLE_SECS: u64 = 175 + CONSOLE_WAIT;
+const RESTORE_LOG_SECS: u64 = 15 + CONSOLE_WAIT;
+/// A worker's management failures, which the guard compares with stock: the
+/// confirm never settled, or a check found management not answering.
+const NOT_SETTLED: &str = "management failed to settle";
+const UNREACHABLE: &str = "management unreachable";
+/// The RRC counter would not read: not judged.
+const MISSING_COUNTER: &str = "missing RRC counter";
+/// A worker found a condition gone right before acting, and did nothing.
+const NOT_NOW: &str = "not now: ";
+/// Left in the keeper's RAM directory when a stock restore keeps failing: the
+/// keeper restarts the unit through its reboot gate (`run/radio_reboot.rs`).
+pub const REBOOT_REQUEST: &str = "radio-reboot";
 
 fn profile_signal() -> &'static (Mutex<u64>, Condvar) {
     static SIGNAL: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
@@ -54,22 +91,33 @@ fn wake_supervisor() {
 }
 
 const DISK: &str = "/mnt/titan-api/radio";
-const RAM: &str = "/tmp/titan-pd-keeper";
-fn disk(name: &str) -> PathBuf {
-    Path::new(DISK).join(name)
+/// The radio files on the persistent volume (`TITAN_RADIO_DIR` in tests).
+fn disk_dir() -> PathBuf {
+    crate::paths::env_path_or("TITAN_RADIO_DIR", DISK)
 }
+fn disk(name: &str) -> PathBuf {
+    disk_dir().join(name)
+}
+/// The keeper's private RAM directory (`TITAN_PD_RUNTIME` in tests).
 fn ram(name: &str) -> PathBuf {
-    Path::new(RAM).join(name)
+    crate::paths::runtime_dir().join(name)
+}
+/// The persistent volume holds the radio files (tests name a directory).
+fn volume_ready() -> bool {
+    std::env::var_os("TITAN_RADIO_DIR").is_some() || persistent_volume_mounted()
 }
 fn fail(s: &str) -> io::Error {
     io::Error::other(s.to_owned())
+}
+fn not_now(why: &str) -> io::Error {
+    fail(&format!("{NOT_NOW}{why}"))
 }
 fn pause(n: u64) {
     thread::sleep(Duration::from_secs(n));
 }
 
 fn atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if path.starts_with(DISK) {
+    if path.starts_with(disk_dir()) {
         root()?;
     }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
@@ -95,12 +143,42 @@ fn profile(path: &Path) -> io::Result<Profile> {
         Err(e) => Err(e),
     }
 }
-fn strikes() -> io::Result<u8> {
-    match fs::read_to_string(disk("strikes")) {
-        Ok(v) => v.trim().parse().map_err(|_| fail("invalid boot guard")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
-    }
+/// The stamp of the strike record: the profile's id and this firmware's.
+fn stamp(p: &Profile) -> io::Result<(String, String)> {
+    static FIRMWARE: OnceLock<String> = OnceLock::new();
+    Ok((
+        guard_model::profile_id(&serde_json::to_vec(p)?),
+        FIRMWARE.get_or_init(crate::paths::firmware_id).clone(),
+    ))
+}
+/// The strike record as it applies to `p` (`radio_guard::parse_record`). A
+/// missing, older or unreadable file reads as none; the next trial rewrites it.
+fn strikes(p: &Profile) -> io::Result<guard_model::Record> {
+    let (id, firmware) = stamp(p)?;
+    Ok(guard_model::parse_record(
+        &read_file(disk("strikes")),
+        &id,
+        &firmware,
+    ))
+}
+fn store_strikes(p: &Profile, record: guard_model::Record) -> io::Result<()> {
+    let (id, firmware) = stamp(p)?;
+    atomic(
+        &disk("strikes"),
+        guard_model::render_record(record, &id, &firmware).as_bytes(),
+    )
+}
+/// When `p` may be tried next on this boot (RAM, so a restarted guard keeps
+/// it). A boot starts from the record's trials that were never judged.
+fn retry(p: &Profile) -> io::Result<Retry> {
+    let (id, _) = stamp(p)?;
+    let tries = strikes(p)?.tries;
+    Ok(Retry::parse(&read_file(ram("radio-retry")))
+        .filter(|r| r.profile == id)
+        .unwrap_or_else(|| Retry::new(&id, tries)))
+}
+fn store_retry(r: &Retry) -> io::Result<()> {
+    atomic(&ram("radio-retry"), r.render().as_bytes())
 }
 fn status(phase: &str, detail: &str) -> io::Result<()> {
     atomic(
@@ -116,22 +194,29 @@ fn json_file(name: &str) -> Value {
         .and_then(|v| serde_json::from_slice(&v).ok())
         .unwrap_or(Value::Null)
 }
-pub fn supervise() {
-    if !persistent_volume_mounted() {
-        return;
+/// Wait for the persistent volume: it may mount after the keeper starts.
+/// Before v1.0.17 a late mount kept every radio profile off for the boot.
+fn wait_for_volume() {
+    while !volume_ready() {
+        thread::sleep(Duration::from_secs(IDLE_SUPERVISE_SECS));
     }
+}
+
+pub fn supervise() {
     thread::spawn(|| {
+        wait_for_volume();
         if let Err(e) = listen() {
             eprintln!("radio profile API: {e}");
         }
     });
     thread::spawn(|| {
+        wait_for_volume();
         let mut seen = 0u64;
         loop {
             // No profile on a stock installation. Only inspect the filesystem.
             let active = disk("profile.json").exists() || ram("radio-journal").exists();
             if active {
-                let _ = Command::new("/tmp/titan-pd-keeper/titan-pd-keeper")
+                let _ = Command::new(ram("titan-pd-keeper"))
                     .arg("opt-guard")
                     .stdin(Stdio::null())
                     .status();
@@ -159,14 +244,14 @@ fn root() -> io::Result<()> {
     if effective_uid() != 0 {
         return Err(fail("operator access required"));
     }
-    if !persistent_volume_mounted() {
+    if !volume_ready() {
         return Err(fail("persistent volume unavailable"));
     }
     Ok(())
 }
 
 fn private_runtime() -> io::Result<()> {
-    let md = fs::symlink_metadata(RAM)?;
+    let md = fs::symlink_metadata(crate::paths::runtime_dir())?;
     if !md.is_dir() || md.uid() != 0 || md.mode() & 0o077 != 0 {
         return Err(fail("untrusted keeper runtime directory"));
     }
@@ -179,8 +264,12 @@ fn request(input: &[u8]) -> io::Result<Value> {
         Some("get") => Ok(serde_json::to_value(profile(&disk("profile.json"))?)?),
         Some("set") => {
             let p = Profile::parse(&serde_json::to_vec(&message["profile"])?).map_err(fail)?;
-            fs::create_dir_all(DISK)?;
+            fs::create_dir_all(disk_dir())?;
             store(&disk("profile.json"), &p)?;
+            // A saved profile, even the same one again, starts with fresh
+            // trials: the visible way to clear a lock.
+            rm(disk("strikes"))?;
+            rm(ram("radio-retry"))?;
             wake_supervisor();
             Ok(json!({"accepted":true}))
         }
@@ -189,9 +278,11 @@ fn request(input: &[u8]) -> io::Result<Value> {
             if guard.is_null() {
                 guard = json!({"phase":"off","detail":"no trial this boot"});
             }
+            let record = strikes(&profile(&disk("profile.json")).unwrap_or_default()).ok();
             Ok(json!({
                 "guard":guard,
-                "strikes":strikes().ok(),
+                "strikes":record.map(|r| r.strikes),
+                "unjudged_trials":record.map(|r| r.tries),
                 "counters":json_file("radio-counters"),
                 "carriers":json_file("radio-carriers"),
                 "pick":json_file("radio-pick"),
@@ -271,7 +362,7 @@ fn run_worker(op: &str, seconds: u64) -> io::Result<()> {
     } else {
         None
     };
-    let mut cmd = Command::new("/tmp/titan-pd-keeper/titan-pd-keeper");
+    let mut cmd = Command::new(ram("titan-pd-keeper"));
     cmd.args(["radio-worker", op])
         .stdin(Stdio::null())
         .process_group(0)
@@ -324,32 +415,71 @@ fn transition(seconds: u64) -> io::Result<()> {
     atomic(&ram("radio-transition"), until.to_string().as_bytes())
 }
 
-fn rollback() -> io::Result<()> {
-    if ram("radio-console-open").exists() && !ram("radio-journal").exists() {
-        run_worker("restore-log", 15)?;
-    }
-    if ram("radio-journal").exists() {
-        transition(125)?;
-        status("reverting", "restoring stock settings")?;
-        if run_worker("rollback", 120).is_err() {
-            // A cold start restores all modem RAM and kernel qdiscs. Disarm
-            // the saved profile durably before requesting that last resort.
-            atomic(&disk("strikes"), b"3")?;
-            store(&disk("profile.json"), &Profile::default())?;
-            status(
-                "recovery",
-                "stock restore failed; restarting with profile off",
-            )?;
-            if !Command::new("reboot").status()?.success() {
-                return Err(fail("restart failed"));
-            }
-            pause(120);
-            return Err(fail("stock restart still pending"));
-        }
-        rm(ram("radio-journal"))?;
-    }
+/// Put stock settings back wherever a profile's are in place. False while
+/// the restore still fails: it is tried again after its backoff
+/// (`radio_guard::Restore`), and once it has failed for
+/// `RESTORE_RESTART_SECS` the keeper is asked for a restart, which its
+/// reboot gate times (never in the CPAS window). The saved profile is never
+/// touched. Before v1.0.17 one failed restore overwrote the operator's profile
+/// with an empty one and rebooted at once, at any hour.
+fn to_stock() -> io::Result<bool> {
     rm(ram("radio-active"))?;
-    rm(ram("radio-transition"))
+    if !ram("radio-journal").exists() {
+        // A query cut short may have left the console logging.
+        if ram("radio-console-open").exists() {
+            let _ = run_worker("restore-log", RESTORE_LOG_SECS);
+        }
+        rm(ram("radio-transition"))?;
+        restored()?;
+        return Ok(true);
+    }
+    let now = monotonic();
+    let mut restore = Restore::parse(&read_file(ram("radio-restore")));
+    if !restore.due(now) {
+        return Ok(false);
+    }
+    status("reverting", "restoring stock settings")?;
+    let error = match run_worker("rollback", ROLLBACK_SECS) {
+        Ok(()) => {
+            rm(ram("radio-journal"))?;
+            rm(ram("radio-transition"))?;
+            restored()?;
+            return Ok(true);
+        }
+        Err(e) => e,
+    };
+    let wait = restore.failed(now);
+    atomic(&ram("radio-restore"), restore.render().as_bytes())?;
+    let mut detail = format!(
+        "stock restore failed {} times in a row ({error}); trying again in {wait} s",
+        restore.failures
+    );
+    if restore.restart_due(now) {
+        if !ram(REBOOT_REQUEST).exists() {
+            // A restart puts modem RAM and the qdiscs back to stock. The
+            // profile counts one more unjudged trial, so after the restart
+            // it waits its backoff before it is tried again.
+            if let Ok(target) = profile(&ram("radio-target")) {
+                if let Ok(record) = strikes(&target) {
+                    let _ = store_strikes(&target, record.started());
+                }
+            }
+            atomic(&ram(REBOOT_REQUEST), b"radio\n")?;
+            crate::log(&format!(
+                "radio profile: {detail}; asking the keeper for a restart, which waits out the SAS CPAS window"
+            ));
+        }
+        detail.push_str("; a restart is asked for, and the keeper's reboot gate decides when");
+    }
+    status("recovery", &detail)?;
+    Ok(false)
+}
+
+/// Stock settings are back: forget a failed restore and the restart it asked
+/// for.
+fn restored() -> io::Result<()> {
+    rm(ram("radio-restore"))?;
+    rm(ram(REBOOT_REQUEST))
 }
 
 fn lock_guard() -> io::Result<File> {
@@ -370,101 +500,284 @@ pub fn guard() -> io::Result<()> {
     root()?;
     private_runtime()?;
     let _lock = lock_guard()?;
-    // A guard restart on this boot inherits the RAM journal. A power cycle
-    // clears the modem and the journal together, but preserves its strike.
-    if ram("radio-journal").exists() {
-        store(&ram("radio-blocked"), &profile(&ram("radio-target"))?)?;
-        rollback()?;
-        status("reverted", "interrupted profile")?;
-    }
+    resume()?;
     let mut watch = CarrierWatch::default();
-    let mut picker = PickWatch::default();
+    let mut picker = PickWatch::new();
+    let mut health = Health::default();
     loop {
         if ram("stopped").exists() {
-            rollback()?;
-            return Ok(());
-        }
-        let desired = profile(&disk("profile.json"));
-        let active = profile(&ram("radio-active"))?;
-        let desired = match desired {
-            Ok(p) => p,
-            Err(_) => {
-                rollback()?;
-                status("blocked", "invalid saved profile")?;
-                pause(10);
-                continue;
-            }
-        };
-        if desired.picker().is_none() {
-            // No stale picker state in the status once the picker is gone.
-            rm(ram("radio-pick"))?;
-        }
-        if desired.actions.is_empty() {
-            rollback()?;
-            rm(ram("radio-blocked"))?;
-            if strikes().unwrap_or(3) != 0 {
-                atomic(&disk("strikes"), b"0")?;
-            }
-            if json_file("radio-status")["phase"] != "off" {
-                status("off", "stock")?;
+            // The keeper is stopping: stock settings first, then exit.
+            if to_stock()? {
+                return Ok(());
             }
             pause(5);
             continue;
         }
-        if desired != active {
-            let Ok(n) = strikes() else {
-                rollback()?;
-                status("locked", "invalid strike record; save Off to reset")?;
-                pause(5);
-                continue;
-            };
-            if n >= 3 || profile(&ram("radio-blocked"))? == desired {
-                rollback()?;
-                if n >= 3 {
-                    status("locked", "three unsuccessful trials")?;
-                }
-                pause(5);
-                continue;
-            }
-            fs::create_dir_all(DISK)?;
-            store(&ram("radio-target"), &desired)?;
-            atomic(&disk("strikes"), (n + 1).to_string().as_bytes())?;
-            store(&ram("radio-blocked"), &desired)?;
-            status("applying", "waiting for profile confirmation")?;
-            match run_worker("apply", 180) {
-                Ok(()) => {
-                    store(&ram("radio-active"), &desired)?;
-                    atomic(&disk("strikes"), b"0")?;
-                    rm(ram("radio-blocked"))?;
-                    status("active", "confirmed")?;
-                    watch = CarrierWatch::default();
-                    picker = PickWatch::default();
-                }
-                Err(e) => {
-                    store(&ram("radio-blocked"), &desired)?;
-                    rollback()?;
-                    status("reverted", &e.to_string())?;
+        let Ok(desired) = profile(&disk("profile.json")) else {
+            to_stock()?;
+            status("blocked", "invalid saved profile")?;
+            pause(10);
+            continue;
+        };
+        if desired.picker().is_none() {
+            // No stale picker state in the status once the picker is gone.
+            rm(ram("radio-pick"))?;
+            rm(ram("radio-pick-back"))?;
+        }
+        if desired.actions.is_empty() {
+            if to_stock()? {
+                rm(disk("strikes"))?;
+                rm(ram("radio-retry"))?;
+                if json_file("radio-status")["phase"] != "off" {
+                    status("off", "stock")?;
                 }
             }
-        } else {
-            let mut checked = Ok(());
-            if watch.due(crate::clock::monotonic(), media() == "ATTACHED") {
-                checked = run_worker("check", 35)
-                    .and_then(|()| watch.carriers(&desired, crate::clock::monotonic()));
+            pause(5);
+            continue;
+        }
+        if desired == profile(&ram("radio-active"))? {
+            if let Err(failure) = steady(&desired, &mut watch, &mut picker, &mut health) {
+                fall_back(&desired, &failure)?;
+                watch = CarrierWatch::default();
+                picker = PickWatch::new();
+                health = Health::default();
             }
-            // A failed picker re-attach is handled like a failed enforcement.
-            if let (Ok(()), Some(p)) = (&checked, desired.picker()) {
-                checked = picker.tick(&p);
-            }
-            if let Err(e) = checked {
-                atomic(&disk("strikes"), b"1")?;
-                store(&ram("radio-blocked"), &desired)?;
-                rollback()?;
-                status("reverted", &e.to_string())?;
-            }
+        } else if trial(&desired)? {
+            watch = CarrierWatch::default();
+            picker = PickWatch::new();
+            health = Health::default();
         }
         pause(5);
     }
+}
+
+/// A guard restarted on the same boot. A profile it confirmed keeps running
+/// and is checked as usual. Anything cut short in the middle (an apply, a
+/// radio cycle, a restore) goes back to stock, and the profile is tried again
+/// after a backoff, so a guard that keeps dying cannot loop. Before v1.0.17
+/// any restart turned the profile off for the rest of the boot.
+fn resume() -> io::Result<()> {
+    rm(ram("radio-blocked"))?;
+    if !ram("radio-journal").exists() {
+        return Ok(());
+    }
+    let journal = profile(&ram("radio-journal")).ok();
+    let kept = journal.as_ref().is_some_and(|j| !j.actions.is_empty())
+        && journal == profile(&ram("radio-active")).ok()
+        && !ram("radio-transition").exists();
+    if kept {
+        crate::log_ram("radio profile: guard restarted; the confirmed profile keeps running");
+        return Ok(());
+    }
+    let target = profile(&ram("radio-target")).unwrap_or_default();
+    if !target.actions.is_empty() {
+        let mut next = retry(&target)?;
+        next.failed(monotonic());
+        store_retry(&next)?;
+    }
+    to_stock()?;
+    status("reverted", "interrupted; trying again after a backoff")
+}
+
+/// Why a running profile, or a trial, failed: the worker's error, and whether
+/// management failed, which is compared with stock settings.
+struct Failure {
+    error: io::Error,
+    management: bool,
+}
+
+/// A worker result that says nothing about the profile: the console was
+/// busy, the RRC counter would not read, or a condition no longer held right
+/// before acting.
+fn no_verdict(e: &io::Error) -> bool {
+    let cause = e.to_string();
+    console_lock::busy(e) || cause == MISSING_COUNTER || cause.starts_with(NOT_NOW)
+}
+
+/// Try the saved profile once its turn has come. True once it is confirmed.
+fn trial(p: &Profile) -> io::Result<bool> {
+    // A profile half put back goes all the way to stock first.
+    if ram("radio-journal").exists() && !ram("radio-active").exists() && !to_stock()? {
+        return Ok(false);
+    }
+    let record = strikes(p)?;
+    if record.locked() {
+        to_stock()?;
+        if json_file("radio-status")["phase"] != "locked" {
+            status(
+                "locked",
+                "management failed under this profile three times in a row while stock settings kept it; saving the profile again, or a new firmware, clears this",
+            )?;
+        }
+        return Ok(false);
+    }
+    let now = monotonic();
+    let mut retry = retry(p)?;
+    if !retry.due(now) {
+        if !ram("radio-status").exists() {
+            status(
+                "waiting",
+                &format!(
+                    "{} earlier trials were cut short; the next starts {} s after boot",
+                    record.tries, retry.next_at
+                ),
+            )?;
+        }
+        return Ok(false);
+    }
+    // Stock settings (or the profile this one replaces) must work first.
+    // Otherwise nothing is tried or counted: a tower or core outage, a boot in
+    // the CPAS window or a slow LTE stack only delays the trial.
+    if let Err(e) = run_worker("preflight", PREFLIGHT_SECS) {
+        retry.not_ready(now);
+        store_retry(&retry)?;
+        let detail = format!("not tried: {e}");
+        if json_file("radio-status")["detail"] != detail.as_str() {
+            status("waiting", &detail)?;
+        }
+        return Ok(false);
+    }
+    fs::create_dir_all(disk_dir())?;
+    store(&ram("radio-target"), p)?;
+    // Counted before the first write, so a trial cut short (a power cut, a
+    // crash) still spaces the next one.
+    store_strikes(p, record.started())?;
+    status("applying", "waiting for profile confirmation")?;
+    let before = profile(&ram("radio-journal")).ok();
+    let applied = run_worker("apply", APPLY_SECS);
+    let now = monotonic();
+    let error = match applied {
+        Ok(()) => {
+            store(&ram("radio-active"), p)?;
+            store_strikes(p, guard_model::Record::default())?;
+            rm(ram("radio-retry"))?;
+            status("active", "confirmed")?;
+            crate::log("radio profile: confirmed");
+            return Ok(true);
+        }
+        Err(e) => e,
+    };
+    // The apply writes its journal right before its first write.
+    if profile(&ram("radio-journal")).ok() == before {
+        // Nothing reached the modem or the qdiscs: no trial, and not counted.
+        store_strikes(p, record)?;
+        let wait = if no_verdict(&error) {
+            retry.not_ready(now);
+            guard_model::NOT_READY_SECS
+        } else {
+            retry.failed(now)
+        };
+        store_retry(&retry)?;
+        status("waiting", &format!("not tried: {error}; trying again in {wait} s"))?;
+        return Ok(false);
+    }
+    let management = error.to_string() == NOT_SETTLED;
+    fall_back(p, &Failure { error, management })?;
+    Ok(false)
+}
+
+/// One look at the running profile. `Err` when it must go: a failure of its
+/// own, or management lost for `SUSTAINED_SECS` while attached.
+fn steady(
+    p: &Profile,
+    watch: &mut CarrierWatch,
+    picker: &mut PickWatch,
+    health: &mut Health,
+) -> Result<(), Failure> {
+    let now = monotonic();
+    let attached = media() == "ATTACHED";
+    if !attached {
+        health.detached();
+    }
+    if watch.due(now, attached) {
+        match run_worker("check", CHECK_SECS) {
+            Ok(()) if attached => {
+                if health.failing_for(now).is_some() {
+                    let _ = status("active", "management answers again");
+                }
+                health.observe(now, Some(true));
+            }
+            Ok(()) => {}
+            Err(e) if e.to_string() == UNREACHABLE => {
+                if health.observe(now, Some(false)) {
+                    let error = fail(&format!(
+                        "{UNREACHABLE} for {} s while attached",
+                        guard_model::SUSTAINED_SECS
+                    ));
+                    return Err(Failure {
+                        error,
+                        management: true,
+                    });
+                }
+                let _ = status(
+                    "active",
+                    &format!(
+                        "management not answering for {} s; stock settings go back only after {} s",
+                        health.failing_for(now).unwrap_or(0),
+                        guard_model::SUSTAINED_SECS
+                    ),
+                );
+                return Ok(());
+            }
+            Err(e) if no_verdict(&e) => {}
+            Err(error) => {
+                return Err(Failure {
+                    error,
+                    management: false,
+                });
+            }
+        }
+        match watch.carriers(p, now) {
+            Err(error) if !no_verdict(&error) => {
+                return Err(Failure {
+                    error,
+                    management: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    if let Some(pk) = p.picker() {
+        match picker.tick(&pk) {
+            Err(error) if !no_verdict(&error) => {
+                return Err(Failure {
+                    error,
+                    management: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The running profile, or a trial, failed. Stock settings go back; a
+/// management failure is then compared with stock settings
+/// (`radio_guard::Verdict`), and the profile is tried again after its backoff.
+fn fall_back(p: &Profile, failure: &Failure) -> io::Result<()> {
+    let restored = to_stock()?;
+    let judged = if !restored {
+        "stock settings are not back yet, so nothing is judged".to_owned()
+    } else {
+        let verdict = if failure.management {
+            Verdict::of(true, run_worker("judge", JUDGE_SECS).is_ok())
+        } else {
+            Verdict::Unjudged
+        };
+        let record = strikes(p)?.judged(verdict);
+        store_strikes(p, record)?;
+        if record.locked() {
+            format!("{}; locked after {} strikes", verdict.describe(), record.strikes)
+        } else {
+            verdict.describe().to_owned()
+        }
+    };
+    let mut next = retry(p)?;
+    let wait = next.failed(monotonic());
+    store_retry(&next)?;
+    let detail = format!("{}; {judged}; trying again in {wait} s", failure.error);
+    crate::log(&format!("radio profile: stock settings back: {detail}"));
+    status("reverted", &detail)
 }
 
 /// When to check, and how long the tower has held more carriers than the cap.
@@ -536,7 +849,13 @@ impl CarrierWatch {
             now,
             mode_grant: &mode_grant,
             grant_state: &grant_state,
+            hold: cycle_hold(),
         });
+        // The daily cap of radio cycles, once everything else holds.
+        let blocked = match verdict {
+            Err(why) => Some(why.to_owned()),
+            Ok(()) => cycle_cap(reboots::SLOTS_AWAY),
+        };
         atomic(
             &ram("radio-carriers"),
             json!({
@@ -544,14 +863,14 @@ impl CarrierWatch {
                 "carriers":carriers,
                 "over_cap_seconds":self.over_since.map(|t| now.saturating_sub(t)),
                 "last_cycle_uptime":last_cycle,
-                "enforcement":verdict.err().unwrap_or("due"),
+                "enforcement":blocked.as_deref().unwrap_or("due"),
             })
             .to_string()
             .as_bytes(),
         )?;
-        if verdict.is_ok() {
+        if blocked.is_none() {
             status("enforcing", "re-attaching once to enforce the carrier cap")?;
-            run_worker("enforce", 170)?;
+            run_worker("enforce", ENFORCE_SECS)?;
             self.over_since = None;
             status("active", "confirmed")?;
         }
@@ -605,9 +924,9 @@ fn set(a: &Action, stock: bool) -> io::Result<()> {
     Ok(())
 }
 fn count() -> io::Result<u32> {
-    // The keeper's modem flag writer shares the console. On the bench a reply
-    // cut short by its session right after a keeper restart reverted a
-    // profile (2026-11-24). Three misses in a row are a missing counter.
+    // The worker holds the console (`console_lock`), so a flag session can no
+    // longer cut a reply short, as one did on the bench (2026-11-24). Three
+    // misses in a row are a missing counter, which the guard does not judge.
     for attempt in 0..3 {
         if let Some(n) = console("rrc dm reest stat ?").ok().and_then(|r| failures(&r)) {
             return Ok(n);
@@ -616,7 +935,7 @@ fn count() -> io::Result<u32> {
             pause(3);
         }
     }
-    Err(fail("missing RRC counter"))
+    Err(fail(MISSING_COUNTER))
 }
 fn rates(p: &Profile) -> Option<(u32, u32)> {
     p.actions.iter().find_map(|a| {
@@ -631,26 +950,38 @@ fn rates(p: &Profile) -> Option<(u32, u32)> {
         }
     })
 }
-fn confirm(p: &Profile, base: u32) -> io::Result<()> {
+/// Management answering for `SETTLE_SECS` in a row within `JUDGE_SECS`:
+/// what confirms a profile and, after a rollback, what shows that stock
+/// settings work (`radio_guard::Verdict`). The same test for both, so a probe
+/// that answers only now and then fails both and strikes nothing.
+fn settles(p: &Profile) -> bool {
     let mut healthy = None;
     let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(90) {
+    while start.elapsed() < Duration::from_secs(guard_model::JUDGE_SECS) {
         if reachable(p) {
-            if healthy.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(30) {
-                return sample(p, base);
+            if healthy.get_or_insert_with(Instant::now).elapsed()
+                >= Duration::from_secs(guard_model::SETTLE_SECS)
+            {
+                return true;
             }
         } else {
             healthy = None;
         }
         pause(2);
     }
-    Err(fail("management failed to settle"))
+    false
+}
+fn confirm(p: &Profile, base: u32) -> io::Result<()> {
+    if !settles(p) {
+        return Err(fail(NOT_SETTLED));
+    }
+    sample(p, base)
 }
 fn sample(p: &Profile, base: u32) -> io::Result<()> {
     let n = count()?;
-    let delta = n
-        .checked_sub(base)
-        .ok_or_else(|| fail("modem counters reset"))?;
+    // A counter below its baseline: the modem restarted. A fresh baseline,
+    // not a failure (the check has already written the cap again).
+    let delta = n.checked_sub(base).unwrap_or(0);
     let now = crate::clock::monotonic();
     let prev = json_file("radio-counters")["last_failure_uptime"].as_u64();
     let storm = titan_pd_model::radio::storm(delta, prev, now);
@@ -673,10 +1004,8 @@ fn sample(p: &Profile, base: u32) -> io::Result<()> {
     Ok(())
 }
 fn apply(p: &Profile, old: &Profile) -> io::Result<()> {
-    let pd = crate::paths::state_dir();
-    let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
-    if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
-        return Err(fail("keeper recovery already pending"));
+    if let Some(why) = recovery_pending() {
+        return Err(fail(why));
     }
     let start = Instant::now();
     while !ready() {
@@ -804,13 +1133,15 @@ fn enforce(p: &Profile) -> io::Result<()> {
         now,
         mode_grant: &mode_grant,
         grant_state: &grant_state,
+        hold: cycle_hold(),
     });
-    if let Err(why) = fresh {
+    if let Some(why) = fresh.err().map(str::to_owned).or_else(|| cycle_cap(reboots::SLOTS_AWAY)) {
         eprintln!("radio-worker: enforcement skipped: {why}");
         return Ok(());
     }
     // Count the cycle before acting, so a crash mid-cycle still spends it.
     atomic(&ram("radio-last-cycle"), now.to_string().as_bytes())?;
+    record_cycle("enforce")?;
     crate::log(&format!(
         "radio profile: re-attaching once to enforce the {cap}-carrier cap ({} carriers, SAS grant held){}; next no sooner than {hours} h",
         before.unwrap_or(0),
@@ -909,40 +1240,92 @@ fn restore(p: &Profile) -> io::Result<()> {
 pub fn worker(op: Option<&str>) -> io::Result<()> {
     root()?;
     let p = profile(&ram("radio-target"))?;
+    // Every op that drives the modem console holds it from its start, so no
+    // flag session slips between a cycle's steps (`console_lock`). A console
+    // still busy past the wait is `console_lock::BUSY`: no verdict.
+    let _console = match op {
+        Some("preflight" | "judge") => None,
+        Some(op) if op.starts_with("pick-measure-") => None,
+        Some("check") => Some(console_lock::hold(console_lock::CHECK_WAIT)?),
+        _ => Some(console_lock::hold(console_lock::RADIO_WAIT)?),
+    };
     match op {
+        Some("preflight") => preflight(&p),
+        Some("judge") => {
+            if settles(&p) {
+                Ok(())
+            } else {
+                Err(fail("management does not answer on stock settings either"))
+            }
+        }
         Some("restore-log") => console("arm1log 1").map(|_| ()),
-        Some("rollback") => restore(&profile(&ram("radio-journal"))?),
+        Some("rollback") => {
+            transition(125)?;
+            restore(&profile(&ram("radio-journal"))?)
+        }
         Some("apply") => apply(&p, &profile(&ram("radio-active"))?),
         Some("enforce") => enforce(&p),
+        Some("pick-back") => pick_back(),
         Some(op) if op.starts_with("pick-cycle-") => pick_cycle(&p, arm_index(op)?),
         Some(op) if op.starts_with("pick-measure-") => pick_measure(&p, arm_index(op)?),
-        Some("check") => {
-            // A detach (tower or SAS outage) is not caused by a profile that
-            // never cycles the radio. Judge again after the next attach.
-            if media() != "ATTACHED" {
-                return Ok(());
-            }
-            if !reachable(&p) {
-                pause(3);
-                if !reachable(&p) {
-                    return Err(fail("management unreachable"));
-                }
-            }
-            // The cap lives in modem RAM. Write it again if something reset it.
-            for a in p.actions.iter().filter(|a| a.query().is_some()) {
-                if !current(a, false)? {
-                    set(a, false)?;
-                    crate::log("radio profile: the carrier cap was reset; written again for the next attach");
-                }
-            }
-            let counters = json_file("radio-counters");
-            let base = counters["reconfig_failures"]
-                .as_u64()
-                .and_then(|v| v.try_into().ok())
-                .ok_or_else(|| fail("counter baseline unavailable"))?;
-            sample(&p, base)
-        }
+        Some("check") => check(&p),
         _ => Err(fail("invalid worker operation")),
+    }
+}
+
+/// What a trial needs first: no keeper recovery pending, the LTE stack up,
+/// and the unit attached with its management probe answering. Anything else
+/// is "not tried": nothing is written or counted.
+fn preflight(p: &Profile) -> io::Result<()> {
+    if let Some(why) = recovery_pending() {
+        return Err(fail(why));
+    }
+    let start = Instant::now();
+    while !ready() {
+        if start.elapsed() > Duration::from_secs(30) {
+            return Err(fail("LTE stack unavailable"));
+        }
+        pause(1);
+    }
+    if media() != "ATTACHED" {
+        return Err(fail("not attached"));
+    }
+    if !reachable(p) {
+        pause(3);
+        if !reachable(p) {
+            return Err(fail("the management probe is not answering"));
+        }
+    }
+    Ok(())
+}
+
+/// One check of the running profile, every 30 s.
+fn check(p: &Profile) -> io::Result<()> {
+    // A detach (tower or SAS outage) is not caused by a profile that never
+    // cycles the radio. Judge again after the next attach.
+    if media() != "ATTACHED" {
+        return Ok(());
+    }
+    if !reachable(p) {
+        pause(3);
+        if !reachable(p) {
+            return Err(fail(UNREACHABLE));
+        }
+    }
+    // The cap lives in modem RAM. Write it again if something reset it.
+    for a in p.actions.iter().filter(|a| a.query().is_some()) {
+        if !current(a, false)? {
+            set(a, false)?;
+            crate::log("radio profile: the carrier cap was reset; written again for the next attach");
+        }
+    }
+    let base = json_file("radio-counters")["reconfig_failures"]
+        .as_u64()
+        .and_then(|v| v.try_into().ok());
+    // A lost baseline (a RAM file) is taken again, not failed.
+    match base {
+        Some(base) => sample(p, base),
+        None => sample(p, count()?),
     }
 }
 
@@ -961,37 +1344,59 @@ fn arm_index(op: &str) -> io::Result<usize> {
         .ok_or_else(|| fail("invalid arm"))
 }
 
-fn minute_utc() -> Option<u16> {
-    let unix = crate::clock::unix_now();
-    // A unit without network time reads 1970 or 2013: no radio cycle then.
-    (unix > 1_704_067_200).then_some(((unix % 86_400) / 60) as u16)
+/// The minute of the UTC day, for the picker's survey window. The clock is
+/// checked with the CPAS window first (`cycle_hold`).
+fn minute_utc() -> u16 {
+    ((unix_now() % 86_400) / 60) as u16
 }
 
-/// The picker's radio cycle: like the enforcement re-attach, with the arm's
-/// cap and primary cell. The nudge is cleared at once, attached or not.
+/// The picker's radio cycle onto an arm. Every condition is read again right
+/// before acting; one that no longer holds is "not now", and nothing is done.
 fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
     let picker = p.picker().ok_or_else(|| fail("no carrier picker"))?;
     let arm = *picker.arms.get(i).ok_or_else(|| fail("no such arm"))?;
-    // Read every condition again right before acting.
-    match minute_utc() {
-        None => return Err(fail("clock not set")),
-        Some(m) if pick::in_window(m, pick::NO_CYCLE) => {
-            eprintln!("radio-worker: picker cycle skipped: SAS coordination window");
-            return Ok(());
-        }
-        Some(_) => {}
+    if let Some(why) = cycle_hold() {
+        return Err(not_now(why));
     }
     if media() != "ATTACHED"
         || nvram::read_value("cbrs_mode_grant") != "1"
         || nvram::read_value("cbrs_grant_state") != "2"
     {
-        eprintln!("radio-worker: picker cycle skipped: not attached with a held SAS grant");
-        return Ok(());
+        return Err(not_now("not attached with a held SAS grant"));
     }
-    let now = crate::clock::monotonic();
+    if let Some(why) = cycle_cap(reboots::SLOTS_AWAY) {
+        return Err(not_now(&why));
+    }
+    cycle_to(arm, &format!("on arm {i}"), "pick")
+}
+
+/// The way back after a visit no covering grant reached (`PickWatch`): to
+/// where the unit was before it, which held its grants then. It has no grant
+/// to protect, so only the CPAS window, the clock and the daily cap hold it.
+fn pick_back() -> io::Result<()> {
+    let back: Arm = serde_json::from_slice(&fs::read(ram("radio-pick-back"))?)
+        .map_err(|_| fail("no way back recorded"))?;
+    if let Some(why) = cycle_hold() {
+        return Err(not_now(why));
+    }
+    if let Some(why) = cycle_cap(reboots::SLOTS_BACK) {
+        return Err(not_now(&why));
+    }
+    cycle_to(back, "back", "back")
+}
+
+/// One picker radio cycle, like the enforcement re-attach, with `arm`'s cap
+/// and primary cell. The nudge is cleared at once, attached or not. With no
+/// attach within 90 s the radio is on and the nudge gone, so the unit
+/// attaches where the tower lets it; the visit's grant wait, and the way
+/// back, take it from there.
+fn cycle_to(arm: Arm, what: &str, why: &str) -> io::Result<()> {
+    let now = monotonic();
+    // Counted before acting, so a cycle cut short still counts.
     atomic(&ram("radio-last-cycle"), now.to_string().as_bytes())?;
+    record_cycle(why)?;
     crate::log(&format!(
-        "carrier picker: re-attaching on arm {i} (EARFCN {} PCI {}, {}-carrier cap)",
+        "carrier picker: re-attaching {what} (EARFCN {} PCI {}, {}-carrier cap)",
         arm.earfcn, arm.pci, arm.carriers
     ));
     transition(175)?;
@@ -1030,9 +1435,6 @@ fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
     ));
     result?;
     cleared?;
-    if !attached {
-        return Err(fail("no attach after the picker re-attach"));
-    }
     // A fresh baseline for the reconfiguration-failure check.
     if let Ok(n) = count() {
         atomic(
@@ -1079,6 +1481,9 @@ struct Visit {
     since: u64,
     granted_at: Option<u64>,
     purpose: Purpose,
+    /// Where the unit was before this cycle, which held its grants then: the
+    /// way back if no grant covers the arm.
+    back: Option<Arm>,
 }
 
 struct Survey {
@@ -1097,28 +1502,101 @@ struct PickWatch {
     visit: Option<Visit>,
     last_hold: Option<u64>,
     shown: String,
+    /// A way back the picker owes (`pick_back`). In RAM, so a restarted
+    /// guard still goes back.
+    back: Option<Arm>,
+}
+
+/// A keeper recovery a radio profile must not cross: an IP family change
+/// waiting for its confirm (`pd/pending.json`, in its first 10 minutes), or a
+/// deaf-watchdog reboot (its strike on flash) in the first hour after boot.
+/// Before v1.0.17 either one held every trial for as long as the file stood,
+/// which a damaged pending file, or a deaf watchdog turned off, made forever.
+fn recovery_pending() -> Option<&'static str> {
+    let pd = crate::paths::state_dir();
+    let fresh = fs::metadata(pd.join("pending.json"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(600));
+    if fresh {
+        return Some("an IP family change is waiting for its confirm");
+    }
+    let strikes = titan_pd_model::deaf::parse_strikes(&read_file(pd.join("watchdog-strikes.txt")));
+    (strikes > 0 && monotonic() < 3600).then_some("the deaf watchdog restarted this unit less than an hour ago")
+}
+
+/// Why a radio cycle must wait (`radio_guard::cycle_hold`): the CPAS window
+/// every keeper reboot waits out, with its margin, or an unset clock.
+fn cycle_hold() -> Option<&'static str> {
+    guard_model::cycle_hold(crate::run::reboot::cpas_window(), unix_now())
+}
+
+/// The radio cycle log (`radio/cycles`), kept like the keeper's reboot log.
+fn cycle_log(wall: u64) -> Vec<reboots::Entry> {
+    let entries = reboots::parse(&read_file(disk("cycles")));
+    reboots::settle(&entries, wall, wall.saturating_sub(monotonic()))
+}
+
+/// Why a radio cycle that needs `slots` free ones must wait for the daily cap.
+fn cycle_cap(slots: usize) -> Option<String> {
+    let wall = unix_now();
+    let entries = cycle_log(wall);
+    (!guard_model::cycles_allow(&entries, wall, slots)).then(|| {
+        format!(
+            "{} radio cycles in the last day reach the cap of {}",
+            reboots::recent(&entries, wall),
+            guard_model::CYCLE_CAP
+        )
+    })
+}
+
+/// Count a radio cycle before it starts.
+fn record_cycle(why: &str) -> io::Result<()> {
+    let wall = unix_now();
+    let entries = cycle_log(wall);
+    atomic(&disk("cycles"), reboots::record(&entries, wall, why).as_bytes())
 }
 
 /// Whether the picker may cycle the radio now. Read fresh every time.
-fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(), &'static str> {
-    let pd = crate::paths::state_dir();
-    let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
-    if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
-        return Err("keeper recovery pending");
+fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(), String> {
+    if let Some(why) = recovery_pending() {
+        return Err(why.into());
     }
-    let minute_utc = minute_utc().ok_or("clock not set")?;
     pick::cycle_gate(pick::Gate {
-        minute_utc,
+        hold: cycle_hold(),
+        minute_utc: minute_utc(),
         window: p.window,
         forced,
         attached,
         mode_grant: nvram::read_value("cbrs_mode_grant") == "1",
         grant_state: nvram::read_value("cbrs_grant_state").parse().unwrap_or(0),
         idle,
-    })
+    })?;
+    cycle_cap(reboots::SLOTS_AWAY).map_or(Ok(()), Err)
 }
 
 impl PickWatch {
+    fn new() -> Self {
+        Self {
+            back: fs::read(ram("radio-pick-back"))
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok()),
+            ..Self::default()
+        }
+    }
+
+    fn owe_back(&mut self, back: Arm) -> io::Result<()> {
+        atomic(&ram("radio-pick-back"), &serde_json::to_vec(&back)?)?;
+        self.back = Some(back);
+        Ok(())
+    }
+
+    fn forget_back(&mut self) -> io::Result<()> {
+        self.back = None;
+        rm(ram("radio-pick-back"))
+    }
+
     fn tick(&mut self, p: &Picker) -> io::Result<()> {
         let now = crate::clock::monotonic();
         if let Some((rx, tx)) = carrier_pick_io::counters(&carrier_pick_io::customer_dev()) {
@@ -1131,6 +1609,7 @@ impl PickWatch {
         self.record = Some(record);
         let (phase, detail) = match &stepped {
             Ok(shown) => shown.clone(),
+            Err(e) if no_verdict(e) => ("paused".to_string(), e.to_string()),
             Err(e) => ("failed".to_string(), e.to_string()),
         };
         self.show(&phase, &detail, p)?;
@@ -1141,6 +1620,34 @@ impl PickWatch {
         let here = carrier_pick_io::attach();
         let current = here.and_then(|(cell, n)| pick::arm_of(&p.arms, cell, n));
         let say = |phase: &str, detail: String| Ok((phase.to_string(), detail));
+        // Where a cycle from here comes back to: this arm, or this primary
+        // cell with the stock cap.
+        let back_here = current.map(|c| p.arms[c]).or_else(|| {
+            here.map(|(cell, _)| Arm {
+                earfcn: cell.earfcn,
+                pci: cell.pci,
+                carriers: 4,
+            })
+        });
+        // A visit no grant reached goes back to where the unit held its
+        // grants, unless grants cover it where it is by now.
+        if let Some(back) = self.back {
+            if carrier_pick_io::granted() {
+                self.forget_back()?;
+                crate::log("carrier picker: grants cover the unit where it is; no way back needed");
+            } else {
+                if let Some(why) = cycle_hold().map(str::to_owned).or_else(|| cycle_cap(reboots::SLOTS_BACK)) {
+                    return say("waiting", format!("back to EARFCN {} PCI {}: {why}", back.earfcn, back.pci));
+                }
+                run_worker("pick-back", PICK_CYCLE_SECS)?;
+                self.forget_back()?;
+                self.visit = None;
+                self.survey = None;
+                // The held arm is tried again no sooner than a hold return.
+                self.last_hold = Some(now);
+                return say("returned", format!("back on EARFCN {} PCI {}", back.earfcn, back.pci));
+            }
+        }
         if self.survey.as_ref().is_some_and(|s| now.saturating_sub(s.started) > SURVEY_STALE) {
             self.survey = None;
             if self.visit.as_ref().is_some_and(|v| v.purpose == Purpose::Survey) {
@@ -1156,14 +1663,27 @@ impl PickWatch {
             }
             match visit.granted_at {
                 None if now.saturating_sub(visit.since) > pick::GRANT_WAIT => {
-                    let arm = visit.arm;
+                    let (arm, back) = (visit.arm, visit.back);
                     self.visit = None;
                     self.survey = None;
+                    let Some(back) = back else {
+                        crate::log(&format!(
+                            "carrier picker: no SAS grant covered arm {arm} within {} s; survey stopped",
+                            pick::GRANT_WAIT
+                        ));
+                        return say("stopped", format!("arm {arm}: no covering SAS grant"));
+                    };
+                    // Before v1.0.17 the unit stayed, and the grant gate kept
+                    // it from ever coming back.
                     crate::log(&format!(
-                        "carrier picker: no SAS grant covered arm {arm} within {} s; survey stopped",
-                        pick::GRANT_WAIT
+                        "carrier picker: no SAS grant covered arm {arm} within {} s; survey stopped; going back to EARFCN {} PCI {}",
+                        pick::GRANT_WAIT, back.earfcn, back.pci
                     ));
-                    return say("stopped", format!("arm {arm}: no covering SAS grant"));
+                    self.owe_back(back)?;
+                    return say(
+                        "returning",
+                        format!("arm {arm}: no covering SAS grant; going back to EARFCN {} PCI {}", back.earfcn, back.pci),
+                    );
                 }
                 None => return say("waiting", format!("arm {}: waiting for SAS grants", visit.arm)),
                 Some(t) if now.saturating_sub(t) < pick::SETTLE => {
@@ -1210,12 +1730,13 @@ impl PickWatch {
                     if let Err(why) = pick_gate(p, forced, here.is_some(), idle) {
                         return say("paused", why.into());
                     }
-                    run_worker(&format!("pick-cycle-{i}"), 175)?;
+                    run_worker(&format!("pick-cycle-{i}"), PICK_CYCLE_SECS)?;
                     self.visit = Some(Visit {
                         arm: i,
-                        since: crate::clock::monotonic(),
+                        since: monotonic(),
                         granted_at: None,
                         purpose: Purpose::Survey,
+                        back: back_here,
                     });
                     return say("surveying", format!("arm {i}: re-attached"));
                 }
@@ -1283,12 +1804,13 @@ impl PickWatch {
             return say("off-arm", format!("left arm {c}: {why}"));
         }
         self.last_hold = Some(now);
-        run_worker(&format!("pick-cycle-{c}"), 175)?;
+        run_worker(&format!("pick-cycle-{c}"), PICK_CYCLE_SECS)?;
         self.visit = Some(Visit {
             arm: c,
-            since: crate::clock::monotonic(),
+            since: monotonic(),
             granted_at: None,
             purpose: Purpose::Hold,
+            back: back_here,
         });
         say("returning", format!("re-attached to arm {c}"))
     }

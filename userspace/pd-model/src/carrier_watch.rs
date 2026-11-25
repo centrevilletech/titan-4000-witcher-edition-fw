@@ -17,11 +17,15 @@
 //! - Acts according to `/mnt/titan-api/carrier-watch/config`:
 //!   - `mode=log` (default with no file): log and update status file only.
 //!   - `mode=off`: do nothing and log nothing.
-//!   - `mode=regrant`: outside the CPAS quiet window (`quiet_utc=06:45-10:00`),
-//!     with a sane wall clock, rate limits (1 per 5 min, 6 per 24 h, backoff
-//!     after failure), `cbrs_mode_grant=1`, and `rc_signal_done=1`, runs the
-//!     same sequence `ucid` uses (`sqns_network_cbrs=1` + SIGUSR1 to `rcinit`)
-//!     and waits up to 180 s for coverage.
+//!   - `mode=regrant`: outside the SAS CPAS window (`tk_boot::CPAS_QUIET`,
+//!     06:45-10:15 UTC, the window every keeper reboot and radio cycle waits
+//!     out) and any extra `quiet_utc` window, with a sane wall clock, rate
+//!     limits (1 per 5 min, 6 per 24 h, backoff after failure), and
+//!     `cbrs_mode_grant=1` and `rc_signal_done=1`, runs the same sequence
+//!     `ucid` uses (`sqns_network_cbrs=1` + SIGUSR1 to `rcinit`) and waits up
+//!     to 180 s for coverage. The day's re-grants and the failure backoff
+//!     outlive the keeper and the boot (`Memory`), so flapping power or a
+//!     crash-looping keeper cannot reset them.
 //! - A unit with no SAS/CBRS mode logs nothing.
 
 use std::collections::BTreeMap;
@@ -54,9 +58,6 @@ pub const QUIET_LOG_EVERY_SECS: u64 = 600;
 /// The Titan boots at 2013-06-20 until NTP sets the clock.
 pub const SANE_EPOCH: u64 = 1_704_067_200;
 
-/// Default CPAS quiet window: 06:45-10:00 UTC.
-pub const DEFAULT_QUIET_START_MIN: u16 = 6 * 60 + 45;
-pub const DEFAULT_QUIET_END_MIN: u16 = 10 * 60;
 
 /// Band 48 (3550-3700 MHz) limits.
 pub const BAND48_EARFCN_MIN: u32 = 55_240;
@@ -490,9 +491,9 @@ impl Mode {
     }
 }
 
-/// Daily UTC quiet window (e.g. `06:45-10:00` for Google SAS CPAS).
-/// `start_min` is inclusive, `end_min` is exclusive. When `start_min > end_min`
-/// the window crosses midnight UTC.
+/// Daily UTC quiet window (`tk_boot::CPAS_QUIET`, 06:45-10:15, for the SAS
+/// CPAS window). `start_min` is inclusive, `end_min` is exclusive. When
+/// `start_min > end_min` the window crosses midnight UTC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct QuietWindow {
     pub start_min: u16,
@@ -501,10 +502,7 @@ pub struct QuietWindow {
 
 impl Default for QuietWindow {
     fn default() -> Self {
-        Self {
-            start_min: DEFAULT_QUIET_START_MIN,
-            end_min: DEFAULT_QUIET_END_MIN,
-        }
+        crate::tk_boot::CPAS_QUIET
     }
 }
 
@@ -562,6 +560,10 @@ pub fn parse_quiet_window(text: &str) -> Option<QuietWindow> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub mode: Mode,
+    /// The SAS CPAS window. Not read from the file: the keeper sets the one
+    /// window every keeper reboot and radio cycle waits out (tests move it).
+    pub cpas_utc: Option<QuietWindow>,
+    /// An operator's extra quiet window, on top of the CPAS window.
     pub quiet_utc: Option<QuietWindow>,
     pub debounce_secs: u64,
     /// Dry-run test option: hides one grant slot from the comparator and
@@ -576,7 +578,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             mode: Mode::Log,
-            quiet_utc: Some(QuietWindow::default()),
+            cpas_utc: Some(QuietWindow::default()),
+            quiet_utc: None,
             debounce_secs: DEFAULT_DEBOUNCE_SECS,
             hide_grant: None,
             refused: Vec::new(),
@@ -584,11 +587,22 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Whether forced re-grants wait at `wall_now`.
+    pub fn quiet(&self, wall_now: u64) -> bool {
+        [self.cpas_utc, self.quiet_utc]
+            .iter()
+            .flatten()
+            .any(|w| w.contains(wall_now))
+    }
+}
+
 /// Parse `/mnt/titan-api/carrier-watch/config`.
 ///
 /// Keys:
 /// - `mode=off|log|regrant` (default `log`; an invalid value resets to `log`).
-/// - `quiet_utc=HH:MM-HH:MM` (default `06:45-10:00`; empty `quiet_utc=` disables).
+/// - `quiet_utc=HH:MM-HH:MM`: an extra window on top of the CPAS window,
+///   which always applies (default none; empty means none).
 /// - `debounce_secs=N` (1..=60, default 3).
 /// - `hide_grant=N` (0..=7, or empty/`none`; dry-run test hook).
 pub fn parse_config(text: &str) -> Config {
@@ -665,6 +679,39 @@ pub fn parse_config(text: &str) -> Config {
     cfg
 }
 
+/// The re-grant rate limits the keeper keeps in `carrier-watch/regrants`:
+/// the forced re-grants of the last day (wall-clock seconds) and the failed
+/// ones in a row.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    pub regrants: Vec<u64>,
+    pub failures: u32,
+}
+
+impl Memory {
+    /// `failures=N` and `regrant=<unix seconds>` lines. Damaged lines are
+    /// dropped.
+    pub fn parse(text: &str) -> Self {
+        let mut memory = Self::default();
+        for line in text.lines() {
+            match line.trim().split_once('=') {
+                Some(("failures", n)) => memory.failures = n.trim().parse().unwrap_or(0),
+                Some(("regrant", wall)) => memory.regrants.extend(wall.trim().parse::<u64>().ok()),
+                _ => {}
+            }
+        }
+        memory
+    }
+
+    pub fn render(&self) -> String {
+        let mut text = format!("failures={}\n", self.failures);
+        for wall in &self.regrants {
+            text.push_str(&format!("regrant={wall}\n"));
+        }
+        text
+    }
+}
+
 /// State machine phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum State {
@@ -712,6 +759,8 @@ pub struct Watch {
     next_tick: u64,
     state: State,
     uncovered_ticks: u64,
+    /// Wall-clock seconds of the forced re-grants in the last day. A forced
+    /// re-grant needs a sane clock, so every entry has one.
     recent_regrants: Vec<u64>,
     next_allowed_at: u64,
     consecutive_failures: u32,
@@ -774,9 +823,42 @@ impl Watch {
         self.state
     }
 
-    fn prune_day(&mut self, now: u64) {
+    fn prune_day(&mut self, wall_now: u64) {
         self.recent_regrants
-            .retain(|ts| now.saturating_sub(*ts) < DAY_SECS);
+            .retain(|ts| wall_now.saturating_sub(*ts) < DAY_SECS);
+    }
+
+    /// The rate limits to keep across keeper restarts and boots.
+    pub fn memory(&self) -> Memory {
+        Memory {
+            regrants: self.recent_regrants.clone(),
+            failures: self.consecutive_failures,
+        }
+    }
+
+    /// Take over rate limits an earlier keeper or boot kept (`memory`), once
+    /// the clock is sane: their re-grants count against the day again, and the
+    /// next one waits out the spacing after the last, or the failure backoff.
+    pub fn remember(&mut self, saved: &Memory, now: u64, wall_now: u64) {
+        if !clock_sane(wall_now) {
+            return;
+        }
+        for wall in &saved.regrants {
+            if wall_now.saturating_sub(*wall) < DAY_SECS && !self.recent_regrants.contains(wall) {
+                self.recent_regrants.push(*wall);
+            }
+        }
+        self.recent_regrants.sort_unstable();
+        self.consecutive_failures = self.consecutive_failures.max(saved.failures);
+        if let Some(last) = self.recent_regrants.last() {
+            let spacing = if self.consecutive_failures == 0 {
+                MIN_REGRANT_INTERVAL_SECS
+            } else {
+                REGRANT_TIMEOUT_SECS + backoff_for_failures(self.consecutive_failures)
+            };
+            let left = (last + spacing).saturating_sub(wall_now);
+            self.next_allowed_at = self.next_allowed_at.max(now + left);
+        }
     }
 
     /// Advance the state machine by one tick.
@@ -790,7 +872,7 @@ impl Watch {
         grants: &[Grant],
     ) -> Outcome {
         self.next_tick = now + INTERVAL;
-        self.prune_day(now);
+        self.prune_day(wall_now);
         self.last_pcell = nvram.pcell;
         self.last_ulscc = nvram.ulscc;
         self.last_grants = grants.iter().map(|g| (g.index, g.span)).collect();
@@ -946,8 +1028,8 @@ impl Watch {
             return out;
         }
 
-        // CPAS quiet window.
-        if config.quiet_utc.is_some_and(|w| w.contains(wall_now)) {
+        // The CPAS window, and any extra quiet window.
+        if config.quiet(wall_now) {
             if entered_uncovered {
                 self.last_quiet_log = Some(now);
                 self.last_action = "quiet window, waiting".to_owned();
@@ -1014,7 +1096,7 @@ impl Watch {
         }
         self.state = State::RegrantPending { since: now };
         self.regrants_triggered += 1;
-        self.recent_regrants.push(now);
+        self.recent_regrants.push(wall_now);
         self.next_allowed_at = now + MIN_REGRANT_INTERVAL_SECS;
         self.last_block_reason = None;
         let today = self.recent_regrants.len();
@@ -1077,9 +1159,16 @@ impl Watch {
 
     /// Stable status body (without `updated=`) for change detection.
     pub fn status_body(&self, config: &Config) -> String {
-        let quiet = config
-            .quiet_utc
-            .map_or_else(|| "off".to_owned(), |w| w.to_string());
+        let windows: Vec<String> = [config.cpas_utc, config.quiet_utc]
+            .iter()
+            .flatten()
+            .map(ToString::to_string)
+            .collect();
+        let quiet = if windows.is_empty() {
+            "off".to_owned()
+        } else {
+            windows.join(",")
+        };
         let mg = match self.last_mode_grant {
             Some(true) => "1",
             Some(false) => "0",
@@ -1320,24 +1409,32 @@ mod tests {
 
     #[test]
     fn config_parsing_and_quiet_window_across_midnight() {
-        // Default with empty file: log mode, 06:45-10:00 UTC quiet window.
+        // Default with empty file: log mode, the shared CPAS window
+        // (06:45-10:15 UTC, as every keeper reboot waits out) and no extra one.
         let def = parse_config("");
         assert_eq!(def.mode, Mode::Log);
+        assert_eq!(def.cpas_utc, Some(crate::tk_boot::CPAS_QUIET));
         assert_eq!(
-            def.quiet_utc,
+            def.cpas_utc,
             Some(QuietWindow {
                 start_min: 6 * 60 + 45,
-                end_min: 10 * 60
+                end_min: 10 * 60 + 15
             })
         );
+        assert_eq!(def.quiet_utc, None);
         assert_eq!(def.debounce_secs, 3);
         assert_eq!(def.hide_grant, None);
         assert!(def.refused.is_empty());
 
-        // Empty quiet_utc disables the quiet window.
+        // An empty quiet_utc means no extra window; the CPAS window stays.
         let cfg = parse_config("# bench test\nmode=regrant\nquiet_utc=\ndebounce_secs=5\n");
         assert_eq!(cfg.mode, Mode::Regrant);
         assert_eq!(cfg.quiet_utc, None);
+        assert_eq!(cfg.cpas_utc, Some(crate::tk_boot::CPAS_QUIET));
+        assert!(cfg.quiet(utc("2026-11-22T10:14:59Z")));
+        let extra = parse_config("quiet_utc=12:00-13:00\n");
+        assert!(extra.quiet(utc("2026-11-22T12:30:00Z")) && extra.quiet(utc("2026-11-22T07:00:00Z")));
+        assert!(!extra.quiet(utc("2026-11-22T11:00:00Z")));
         assert_eq!(cfg.debounce_secs, 5);
         assert!(cfg.refused.is_empty());
 
@@ -1347,12 +1444,14 @@ mod tests {
         assert_eq!(cfg.hide_grant, Some(1));
         assert_eq!(cfg.refused, vec!["mode=bogus", "unknown=1"]);
 
-        // Default quiet window boundaries (06:45-10:00 UTC).
+        // Default quiet window boundaries (06:45-10:15 UTC). Before v1.0.17
+        // it ended at 10:00, while every other keeper path waited to 10:15.
         let w = QuietWindow::default();
         assert!(!w.contains(utc("2026-11-22T06:44:59Z")));
         assert!(w.contains(utc("2026-11-22T06:45:00Z")));
-        assert!(w.contains(utc("2026-11-22T09:59:59Z")));
-        assert!(!w.contains(utc("2026-11-22T10:00:00Z")));
+        assert!(w.contains(utc("2026-11-22T10:00:00Z")));
+        assert!(w.contains(utc("2026-11-22T10:14:59Z")));
+        assert!(!w.contains(utc("2026-11-22T10:15:00Z")));
 
         // Quiet window crossing midnight (23:30-01:15 UTC).
         let night = parse_quiet_window("23:30-01:15").unwrap();
@@ -1464,9 +1563,12 @@ mod tests {
             vec!["carrier watch: uncovered, quiet window, waiting"]
         );
 
-        // At 10:00:00 UTC (window end): fires immediately.
-        let t_end = utc("2026-11-22T10:00:00Z");
-        let out = w.observe(3 + 10_800, t_end, &cfg, &nvram, true, &grants);
+        // At 10:00 UTC the CPAS window is still open (it fired here before
+        // v1.0.17); at 10:15:00 UTC (window end) it fires at once.
+        let out = w.observe(3 + 10_800, utc("2026-11-22T10:00:00Z"), &cfg, &nvram, true, &grants);
+        assert_eq!(out.action, Action::None);
+        let t_end = utc("2026-11-22T10:15:00Z");
+        let out = w.observe(3 + 11_700, t_end, &cfg, &nvram, true, &grants);
         assert_eq!(out.action, Action::ForceRegrant);
     }
 
@@ -1475,6 +1577,7 @@ mod tests {
         let mut w = Watch::default();
         let cfg = Config {
             mode: Mode::Regrant,
+            cpas_utc: Some(QuietWindow::default()),
             quiet_utc: None,
             debounce_secs: 1,
             hide_grant: None,
@@ -1545,6 +1648,70 @@ mod tests {
         t = 12 + DAY_SECS;
         let out = w.observe(t, WALL_OK + 1000 + t, &cfg, &nvram, true, &bad);
         assert_eq!(out.action, Action::ForceRegrant);
+    }
+
+    #[test]
+    fn the_days_regrants_and_backoff_outlive_the_keeper_and_the_boot() {
+        let cfg = Config {
+            mode: Mode::Regrant,
+            debounce_secs: 1,
+            ..Config::default()
+        };
+        let nvram = NvramView {
+            cbrs_present: true,
+            cbrs_mode_grant: Some(true),
+            cbrs_grant_state: Some(2),
+            rc_signal_done: true,
+            pcell: Some(Span::mhz(3680, 3700)),
+            ulscc: Some(Span::mhz(3560, 3580)),
+        };
+        let bad = vec![make_grant(0, 3680, 3700, WALL_OK + 100_000)];
+        let good = vec![
+            make_grant(0, 3560, 3580, WALL_OK + 100_000),
+            make_grant(1, 3680, 3700, WALL_OK + 100_000),
+        ];
+        // Six forced re-grants in one day, each covered again.
+        let mut w = Watch::default();
+        let mut t = 10;
+        for _ in 0..MAX_REGRANTS_PER_DAY {
+            assert_eq!(w.observe(t, WALL_OK + t, &cfg, &nvram, true, &bad).action, Action::ForceRegrant);
+            t += 10;
+            w.observe(t, WALL_OK + t, &cfg, &nvram, true, &good);
+            t += MIN_REGRANT_INTERVAL_SECS;
+        }
+        let kept = Memory::parse(&w.memory().render());
+        assert_eq!(kept, w.memory());
+        assert_eq!(kept.regrants.len(), MAX_REGRANTS_PER_DAY);
+        // The keeper restarts, or the power flaps: a fresh watch at uptime 30
+        // with the kept memory still owes the day's limit. Before v1.0.17 the
+        // limit lived in RAM, so every restart allowed six more.
+        let mut fresh = Watch::default();
+        fresh.remember(&kept, 30, WALL_OK + t);
+        let out = fresh.observe(31, WALL_OK + t + 1, &cfg, &nvram, true, &bad);
+        assert_eq!(out.action, Action::None);
+        assert!(out.logs.iter().any(|l| l.contains("daily re-grant limit")), "{:?}", out.logs);
+        // A day after the first, one slot opens again.
+        let day = WALL_OK + 10 + DAY_SECS;
+        let out = fresh.observe(31 + DAY_SECS, day, &cfg, &nvram, true, &bad);
+        assert_eq!(out.action, Action::ForceRegrant);
+
+        // A failed re-grant's backoff survives too, and nothing is taken over
+        // before the clock is sane.
+        let failed = Memory { regrants: vec![WALL_OK], failures: 2 };
+        let mut early = Watch::default();
+        early.remember(&failed, 5, 1_371_700_000);
+        assert_eq!(early.memory(), Memory::default());
+        let mut w = Watch::default();
+        w.remember(&failed, 5, WALL_OK + 60);
+        assert_eq!(w.memory(), failed);
+        // The backoff after two failures is 1200 s from the timeout, which
+        // came 180 s after the re-grant: blocked now, free once it has run.
+        let out = w.observe(6, WALL_OK + 61, &cfg, &nvram, true, &bad);
+        assert_eq!(out.action, Action::None);
+        let free = 5 + REGRANT_TIMEOUT_SECS + 1200 - 60;
+        assert_eq!(w.observe(free - 1, WALL_OK + free + 54, &cfg, &nvram, true, &bad).action, Action::None);
+        assert_eq!(w.observe(free, WALL_OK + free + 55, &cfg, &nvram, true, &bad).action, Action::ForceRegrant);
+        assert_eq!(Memory::parse("failures=x\nregrant=1\nregrant=bad\njunk\n"), Memory { regrants: vec![1], failures: 0 });
     }
 
     #[test]

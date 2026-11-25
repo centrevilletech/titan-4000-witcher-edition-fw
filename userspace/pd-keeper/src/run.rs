@@ -101,6 +101,7 @@ mod mac;
 mod mgmt_v6;
 mod mode;
 mod packet;
+mod radio_reboot;
 pub(crate) mod reboot;
 mod routes;
 mod sas;
@@ -201,6 +202,8 @@ struct Keeper {
     heard_this_boot: bool,
     /// Why the deaf watchdog's due reboot waits, once noted.
     deaf_reboot_held: Option<String>,
+    /// Why the radio profile guard's restart waits, once noted.
+    radio_reboot_held: Option<String>,
     /// The bearer bridged to the customer port, or the vendor's data bearer.
     bearer: String,
     mode_checked: Pace,
@@ -373,6 +376,7 @@ impl Keeper {
             reboot_forced: false,
             heard_this_boot: false,
             deaf_reboot_held: None,
+            radio_reboot_held: None,
             bearer: DEFAULT_BEARER.to_owned(),
             mode_checked: Pace::default(),
             bridged: false,
@@ -501,6 +505,7 @@ impl Keeper {
         self.maintain_external_dev();
         self.maintain_flow_control();
         self.maintain_deaf_watchdog();
+        self.maintain_radio_reboot();
         self.maintain_switches();
         self.maintain_tk_confirm();
         self.maintain_tk_flags();

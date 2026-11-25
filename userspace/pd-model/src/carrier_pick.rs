@@ -36,13 +36,23 @@
 //! The best arm by `download + ul_weight x upload` is held; the arm the unit
 //! is on keeps its place unless another beats it by `SWITCH_MARGIN_PCT`.
 //!
-//! Guards: no radio cycle in the SAS coordination window (CPAS, 07:00 to 10:00
-//! UTC, with 30 minutes either side), none outside the operator's survey
-//! window, none while the SAS grant is not held, none while the customer moves
-//! traffic, at most one survey per `survey_hours` (24 or more), and a held arm
-//! that the unit left is re-applied at most once per `HOLD_SPACING`.
+//! Guards: no radio cycle in the SAS coordination window (`NO_CYCLE`: the
+//! CPAS window every keeper reboot waits out, 06:45 to 10:15 UTC, with 15
+//! minutes either side) or with the clock unset, none outside the operator's
+//! survey window, none while the SAS grant is not held, none while the
+//! customer moves traffic, at most one survey per `survey_hours` (24 or more),
+//! a held arm that the unit left re-applied at most once per `HOLD_SPACING`,
+//! and at most `radio_guard::CYCLE_CAP` cycles a day.
+//!
+//! A visit that no covering grant reaches within `GRANT_WAIT` goes straight
+//! back to where the unit was before it, which held its grants then. That
+//! way back has no grant to protect, so it waits only for the CPAS window,
+//! the clock and the daily cap, never for a grant (v1.0.17; before, the grant
+//! gate kept a unit on an arm the SAS would not grant).
 
 use crate::radio::Cell;
+use crate::radio_guard::CYCLE_MARGIN_MIN;
+use crate::tk_boot::CPAS_QUIET;
 use serde::{Deserialize, Serialize};
 
 /// One combination the operator lets the picker try: a primary cell held by a
@@ -73,9 +83,15 @@ pub const DEFAULT_UL_WEIGHT: u8 = 4;
 pub const MAX_UL_WEIGHT: u8 = 20;
 /// Default survey window, UTC minutes: early morning in the US after CPAS.
 pub const DEFAULT_WINDOW: (u16, u16) = (10 * 60 + 45, 12 * 60 + 30);
-/// CPAS (07:00 to 10:00 UTC) with 30 minutes either side. New grants are not
-/// issued in it, and a carrier change gives back every grant.
-pub const NO_CYCLE: (u16, u16) = (6 * 60 + 30, 10 * 60 + 30);
+/// The CPAS window every keeper reboot waits out (`tk_boot::CPAS_QUIET`,
+/// 06:45 to 10:15 UTC) with `radio_guard::CYCLE_MARGIN_MIN` either side:
+/// 06:30 to 10:30. New grants are not issued in it, and a carrier change gives
+/// back every grant. A survey window may not touch it, and every radio cycle
+/// waits it out (`radio_guard::cycle_hold`, the same window).
+pub const NO_CYCLE: (u16, u16) = (
+    CPAS_QUIET.start_min - CYCLE_MARGIN_MIN,
+    CPAS_QUIET.end_min + CYCLE_MARGIN_MIN,
+);
 /// A held arm the unit has left is re-applied at most this often.
 pub const HOLD_SPACING: u64 = 6 * 3600;
 /// After an attach on a new arm, wait this long for covering SAS grants.
@@ -374,6 +390,9 @@ pub fn next_arm(arms: &[Arm], done: &[usize], current: Option<usize>) -> Option<
 /// Everything a radio cycle for the picker needs to see, read fresh.
 #[derive(Clone, Copy, Debug)]
 pub struct Gate {
+    /// Why a radio cycle must wait now (`radio_guard::cycle_hold`): the SAS
+    /// CPAS window (`NO_CYCLE`) or an unset clock.
+    pub hold: Option<&'static str>,
     pub minute_utc: u16,
     pub window: (u16, u16),
     /// The operator asked for a survey now: the window does not apply.
@@ -385,10 +404,10 @@ pub struct Gate {
 }
 
 /// Whether the picker may cycle the radio now, or why not. The SAS
-/// coordination window, the grant and the customer always apply.
+/// coordination window, the clock, the grant and the customer always apply.
 pub fn cycle_gate(g: Gate) -> Result<(), &'static str> {
-    if in_window(g.minute_utc, NO_CYCLE) {
-        return Err("SAS coordination window");
+    if let Some(why) = g.hold {
+        return Err(why);
     }
     if !g.forced && !in_window(g.minute_utc, g.window) {
         return Err("outside the survey window");
@@ -669,6 +688,7 @@ noise
     #[test]
     fn a_cycle_needs_the_window_the_grant_and_a_quiet_customer() {
         let ok = Gate {
+            hold: None,
             minute_utc: 11 * 60,
             window: DEFAULT_WINDOW,
             forced: false,
@@ -679,8 +699,23 @@ noise
         };
         assert_eq!(cycle_gate(ok), Ok(()));
         let no = |g: Gate| cycle_gate(g).unwrap_err();
-        assert_eq!(no(Gate { minute_utc: 8 * 60, forced: true, ..ok }), "SAS coordination window");
-        assert_eq!(no(Gate { minute_utc: 6 * 60 + 30, forced: true, ..ok }), "SAS coordination window");
+        // The CPAS window and the clock come from the shared reboot gate.
+        let day = 1_795_305_600; // 2026-11-22 00:00 UTC
+        let held = |minute: u64| crate::radio_guard::cycle_hold(Some(CPAS_QUIET), day + minute * 60);
+        let cpas = "the SAS CPAS window is open";
+        assert_eq!(no(Gate { hold: held(8 * 60), minute_utc: 8 * 60, forced: true, ..ok }), cpas);
+        assert_eq!(no(Gate { hold: held(6 * 60 + 30), minute_utc: 6 * 60 + 30, forced: true, ..ok }), cpas);
+        assert_eq!(held(6 * 60 + 29), None);
+        assert_eq!(held(10 * 60 + 30), None);
+        assert_eq!(no(Gate { hold: crate::radio_guard::cycle_hold(Some(CPAS_QUIET), 1_000), ..ok }), "the clock is not set yet");
+        assert_eq!(
+            crate::radio_guard::cycle_window(Some(CPAS_QUIET)).map(|w| (w.start_min, w.end_min)),
+            Some(NO_CYCLE)
+        );
+        assert_eq!(NO_CYCLE, (6 * 60 + 30, 10 * 60 + 30));
+        // A full survey of the most arms and the return to the chosen one fit
+        // the daily cap of radio cycles.
+        assert!(MAX_ARMS + 1 < crate::radio_guard::CYCLE_CAP);
         assert_eq!(no(Gate { minute_utc: 19 * 60, ..ok }), "outside the survey window");
         assert_eq!(cycle_gate(Gate { minute_utc: 19 * 60, forced: true, ..ok }), Ok(()));
         assert_eq!(no(Gate { attached: false, ..ok }), "not attached");
