@@ -160,7 +160,11 @@ A unit that is only flashed gets all of them; nothing needs SSH or staging.
 Each one turns off live, under **Network → Latency** or with one line in
 `/mnt/titan-api/latency/config`. An operator's own settings still win. An
 image that fails its boot confirm is quarantined, and the unit goes back to
-stock modem firmware by itself. See [latency features](docs/latency-switches.md),
+stock modem firmware by itself. A tower outage at boot does not keep it off:
+the next stock boot checks whether stock firmware does any better, and the
+image stays quarantined only after two failures where stock firmware
+answered (then **Retry** under **Network → Latency**). See
+[latency features](docs/latency-switches.md),
 the [boot-time loader](docs/tk-boot-loader.md), the
 [download clamp](docs/download-clamp.md) and the [fast path](docs/fast-path.md).
 

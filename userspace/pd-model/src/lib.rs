@@ -11,7 +11,8 @@
 //! customer IPv6 while the unit holds no SAS grant, carrier watch against held
 //! SAS grants, the boot confirm for a staged modem firmware image, its modem
 //! feature flags, building that image on the unit and its default build at
-//! boot, the download clamp module, the passthrough bridge fast path, the
+//! boot and whether its rollbacks were the image's or the network's, the
+//! download clamp module, the passthrough bridge fast path, the
 //! off switches for those latency features, the carrier picker, and the
 //! opt-in CPU trims.
 #![forbid(unsafe_code)]
@@ -45,6 +46,7 @@ pub mod tk_boot;
 pub mod tk_build;
 pub mod tk_default;
 pub mod tk_flags;
+pub mod tk_verdict;
 pub mod wear;
 
 pub use config::{Config, Report, load_config, shown_choice, store_config};

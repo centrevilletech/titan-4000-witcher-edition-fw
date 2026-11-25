@@ -96,6 +96,9 @@ says so and leaves the file alone:
 - `strikes` at 2: write `strikes=0` to try again;
 - the image's hash in `quarantine`: remove the line to try again.
 
+**Retry** under **Network → Latency** does both, and also clears the
+default image's rollback record (`verdict`) and build record (`default`).
+
 `stage` makes `tk/config` an operator's config (it drops a default config's
 marker line), so later boots leave it alone. The keeper reads `tk/config` every 15 s, so on a
 running staged boot that was confirmed, `stage` also turns its `wm=` flags back

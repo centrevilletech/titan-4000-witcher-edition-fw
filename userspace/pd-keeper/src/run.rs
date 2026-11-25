@@ -241,6 +241,12 @@ struct Keeper {
     tk_status: tk_boot::BootStatus,
     /// A rollback reboot waits for the SAS CPAS window to end.
     tk_reboot_waits: bool,
+    /// `tk_confirm` watches a stock boot to judge the default image's last
+    /// rollback (see `titan_pd_model::tk_verdict`), not a staged image.
+    tk_judging: bool,
+    /// The reboot to try the default image again after stock firmware
+    /// answered waits for a set clock and the end of the SAS CPAS window.
+    tk_retest_waits: bool,
     /// Modem feature flags after a confirmed staged boot (see
     /// `titan_pd_model::tk_flags`), and the DM session running for them.
     tk_flags: Option<tk_flags::Control>,
@@ -382,6 +388,8 @@ impl Keeper {
             tk_last_round: Pace::default(),
             tk_status: tk_boot::BootStatus::default(),
             tk_reboot_waits: false,
+            tk_judging: false,
+            tk_retest_waits: false,
             tk_flags: None,
             tk_flags_job: None,
             tk_flags_config_at: Pace::default(),

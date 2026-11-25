@@ -66,6 +66,14 @@ pub fn reboot_waits(window: Option<QuietWindow>, wall: u64) -> bool {
     wall >= CLOCK_SET_AFTER && window.is_some_and(|w| w.contains(wall))
 }
 
+/// A reboot to try an image again after stock firmware answered
+/// (`tk_verdict`) also waits while the clock is unset: that unit has just
+/// reached the network, so it may hold grants that a reboot inside the
+/// window would lose until the window ends.
+pub fn retest_waits(window: Option<QuietWindow>, wall: u64) -> bool {
+    wall < CLOCK_SET_AFTER || reboot_waits(window, wall)
+}
+
 /// Where the N4 modem image keeps its patch magic, read with `vm 0x847ed600 4`.
 pub const MAGIC_ADDR: u32 = 0x847e_d600;
 /// `4e 34 56 32`, "N4V2".
@@ -219,6 +227,18 @@ impl Confirm {
         })
     }
 
+    /// The same watch on a stock boot after a rollback of `sha`
+    /// (`tk_verdict`): `Confirmed` means stock firmware answered within
+    /// `CONFIRM_SECS` of its load, `Rollback` that it did not either.
+    pub fn watch(sha: &str, loaded_at: Option<u64>, now: u64) -> Self {
+        let base = loaded_at.filter(|at| *at <= now).unwrap_or(now);
+        Self {
+            sha: sha.to_ascii_lowercase(),
+            deadline: base.saturating_add(CONFIRM_SECS),
+            rounds: 0,
+        }
+    }
+
     /// One finished probe round. `mgmt_up` is an address on the management
     /// bearer. `heard` is `None` when no probe could run (no targets yet,
     /// which is what a modem that never attaches looks like).
@@ -293,6 +313,19 @@ pub fn add_quarantine(existing: &str, sha: &str) -> String {
     }
     text.push_str(&sha);
     text.push('\n');
+    text
+}
+
+/// The quarantine file without `sha`. Other lines stay as they are.
+pub fn remove_quarantine(existing: &str, sha: &str) -> String {
+    let mut text = String::new();
+    for line in existing.lines() {
+        let listed = parse_quarantine(line).first().is_some_and(|q| q.eq_ignore_ascii_case(sha));
+        if !listed {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
     text
 }
 
@@ -466,6 +499,26 @@ mod tests {
             describe(&parse_status("state=stock\nreason=quarantined\n")).as_deref(),
             Some("tk boot: stock modem firmware (quarantined)")
         );
+    }
+
+    #[test]
+    fn a_quarantine_line_comes_off_and_the_others_stay() {
+        let text = format!("# keeper\n{A}\n{} # bench\n", B.to_uppercase());
+        assert_eq!(remove_quarantine(&text, B), format!("# keeper\n{A}\n"));
+        assert_eq!(remove_quarantine(&text, A), format!("# keeper\n{} # bench\n", B.to_uppercase()));
+        assert_eq!(remove_quarantine(&add_quarantine("", A), A), "");
+        assert_eq!(parse_quarantine(&remove_quarantine(&text, "ff")), parse_quarantine(&text));
+        // A stock boot's watch starts from the modem load, like a confirm.
+        let watch = Confirm::watch(&A.to_uppercase(), Some(40), 100);
+        assert_eq!((watch.sha.as_str(), watch.deadline), (A, 40 + CONFIRM_SECS));
+        assert_eq!(Confirm::watch(A, Some(500), 100).deadline, 100 + CONFIRM_SECS);
+        // A retry after stock answered waits for a set clock as well as for
+        // the window's end; a rollback reboot only for the window.
+        let noon = 1_795_305_600 + 12 * 3600;
+        assert!(retest_waits(Some(CPAS_QUIET), 1_000) && !reboot_waits(Some(CPAS_QUIET), 1_000));
+        assert!(retest_waits(None, 1_000));
+        assert!(!retest_waits(Some(CPAS_QUIET), noon));
+        assert!(retest_waits(Some(CPAS_QUIET), noon - 4 * 3600));
     }
 
     #[test]

@@ -37,6 +37,89 @@ Nothing is built, and stock modem firmware loads, when any of these hold:
 `/var/run/witcher-tk.status` says why (`reason=`), and `build=` says what the
 default image did this boot.
 
+A rollback of the default image is provisional: a tower outage or a power
+cut does not keep it off. The next section shows how.
+
+## A tower outage at the moment of upgrade
+
+This is what a unit does when its tower is down as it boots v1.0.17 for the
+first time. Any later boot with the default image goes the same way from
+step 2. Times are from the modem load; `3348aa36` is the release image.
+
+1. **Boot 1, boot hook.** Before the boot's one `modprobe modem`, the keeper
+   builds the release image from the active modem bank (about 20 s). It
+   writes `tk/active.gz`, the default `tk/config` and `tk/default`
+   (`result=built`). The hook records strike 1 of 2 in `tk/strikes` and
+   loads the image. Status: `state=staged`, `build=built`.
+2. **Boot 1, boot confirm.** The keeper pings its targets every 15 s. With
+   the tower down the modem never attaches and nothing answers. The modem
+   words stay off. The clamp and the fast path wait for LTE as always.
+3. **Boot 1, at 300 s: a provisional rollback.** The keeper adds the image's
+   hash to `tk/quarantine` and writes `strikes=2`. Because this is the
+   default image, it also writes `pending=1` in `tk/verdict`. It reads the
+   record back and reboots onto stock modem firmware. `keeper.log`:
+   `tk boot confirm: no management answer within 300 s of loading modem
+   firmware 3348aa36; quarantined it for now (the next stock boot tells
+   whether the image or the network failed), rebooting onto stock modem
+   firmware`.
+   - Between 06:45 and 10:15 UTC (the SAS CPAS window) with the clock set,
+     the reboot waits for the window to end; the record is written at once.
+   - A unit that never reached the network has no set clock, so it reboots
+     at once.
+4. **Boot 2, boot hook.** `strikes=2`, so there is no build and no load: stock
+   modem firmware. Status: `state=stock`, `reason=strikes`.
+5. **Boot 2, the verdict.** The keeper finds `pending=1` and watches the stock
+   boot the same way, for 300 s. `keeper.log`: `tk boot verdict armed: stock
+   modem firmware after a rollback of modem firmware 3348aa36; ...`.
+6. **Boot 2, at 300 s, tower still down: the network failed.** The keeper
+   removes the hash from `tk/quarantine`, writes `strikes=0` and records
+   `network=1`, `pending=0`. Nothing reboots. `keeper.log`: `tk boot
+   verdict: stock modem firmware got no answer through the core either, so
+   the rollback of modem firmware 3348aa36 was the network's (1 so far); it
+   is out of quarantine and a later boot loads it again`.
+   - When the tower comes back, stock modem firmware attaches as it always
+     has, and the clamp and the fast path load about 30 s later.
+   - The unit runs stock modem firmware, without the modem words, until its
+     next boot.
+   - **Network → Latency** shows **Modem image**: "Not held back; it loads
+     at boot." with the counts.
+
+   **If the tower is back before those 300 s are up**, stock firmware
+   answers where the image did not: failure 1 of 2. The keeper takes the
+   image out of quarantine and writes `strikes=0`. The tower is known to be
+   up now, so it reboots at once to try the image again (step 7). That
+   reboot waits until the clock is set and the CPAS window is over.
+7. **Boot 3**: after the reboot to try again, or whenever the unit next
+   boots (a power cut, an upgrade, **System → Restart**). The hook finds the
+   image and the default config intact (`build=cached`), records strike 1
+   and loads the image. Nothing is rebuilt.
+8. **Boot 3, tower up.** The modem attaches, and the first answer through the
+   core confirms the boot, usually within a minute. The keeper writes
+   `strikes=0`, sets the failure count back to 0 and writes the modem words.
+   Every feature is on.
+   - If the tower is down again at this boot, the unit goes back to step 3.
+     Each outage at boot costs one extra reboot. A network failure never
+     forces one, so a long outage cannot make the unit cycle.
+
+Power that comes and goes while the unit boots can end two image boots
+before their confirm decides anything. That leaves `strikes=2` and no
+rollback. The stock boot after them records the two as one rollback and
+judges it as in step 5.
+
+The image stays off only after two failures in a row (with no confirmed boot
+between) where stock firmware answered each time. The second of those comes
+from the retry, with the tower known to be up. **Network → Latency** then
+shows **Modem image**: "Quarantined after 2 failures in a row where stock
+modem firmware answered. Retry tries it again at the next boot."
+
+**Retry the modem image** clears the quarantine, the failure counts and the
+strikes. It does not reboot: restart the unit to load the image now. If the
+image fails its boot confirm again, the unit goes back to stock modem
+firmware by itself.
+
+[Boot-time loader](tk-boot-loader.md#the-default-image-a-rollback-is-provisional)
+has the rules.
+
 ## Turning a feature off
 
 Use the web interface, **Network → Latency**, or edit one file:
@@ -84,9 +167,12 @@ have not been tested together. An operator's `qctrl/config` overrides that.
 | File | Shows |
 | --- | --- |
 | `/var/run/witcher-tk.status` | The modem image this boot: `state`, `reason`, `build`, `build_secs` |
+| `/mnt/titan-api/tk/verdict` | The default image's rollbacks: `genuine` (failures where stock answered, since its last confirmed boot), `network`, `pending` |
 | `/var/run/witcher-tk.flags` | The modem words |
 | `/var/run/witcher-qctrl.status` | The clamp; `detail` says where its mode came from |
 | `/var/run/witcher-fastpath.status` | The fast path; `detail` says where its mode came from |
 
-`keeper.log` lines start with `latency switches`, `tk boot`, `tk flags`,
-`download clamp` or `fast path`.
+`keeper.log` lines start with `latency switches`, `tk boot` (`tk boot verdict`
+for rollbacks of the default image), `tk flags`, `download clamp` or
+`fast path`. **Network → Latency** shows the same: a row for each feature and
+a **Modem image** row with the rollback state.

@@ -2,14 +2,19 @@
 //! firmware (see `titan_pd_model::tk_boot`), and after the confirm the modem
 //! feature flags `tk/config` lists (see `titan_pd_model::tk_flags`): the
 //! default image's or an operator's. `modem=off` in the latency switches
-//! rolls them all back to their off values.
+//! rolls them all back to their off values. A rollback of the default image
+//! is provisional: the next stock boot judges whether the image or the
+//! network failed (see `titan_pd_model::tk_verdict`).
 
 use std::fs;
 use std::io::ErrorKind;
+use std::path::Path;
 
 use titan_pd_model::deaf;
 use titan_pd_model::tk_boot::{self, Action as TkAction};
+use titan_pd_model::tk_default;
 use titan_pd_model::tk_flags;
+use titan_pd_model::tk_verdict::{GENUINE_LIMIT, Judgement, Verdict};
 
 use crate::clock::unix_now;
 use crate::tk_flags_io;
@@ -22,6 +27,8 @@ use super::watchdog::PingRound;
 
 /// Seconds between reads of `tk/config` for flag changes.
 const TK_FLAGS_CONFIG_EVERY: u64 = 15;
+/// The default image's rollback record in `tk/` (`titan_pd_model::tk_verdict`).
+const VERDICT: &str = "verdict";
 
 impl Keeper {
     /// Runs in NAT and in passthrough. See `titan_pd_model::tk_boot`. Nothing
@@ -36,6 +43,18 @@ impl Keeper {
             let result = read_file(tk_result_path());
             let decided = fs::metadata(tk_result_path()).is_ok();
             self.tk_confirm = tk_boot::Confirm::arm(&status, self.now, decided);
+            // A stock boot after a rollback of the default image judges it:
+            // the same watch tells whether stock firmware fares any better.
+            if let (None, Some(dir)) = (&status.staged, tk_dir()) {
+                let mut verdict = Verdict::parse(&read_file(dir.join(VERDICT)));
+                if let Some(recorded) = self.tk_record_stopped(&dir, &verdict) {
+                    verdict = recorded;
+                }
+                if verdict.pending && tk_boot::valid_sha(&verdict.gzip) {
+                    self.tk_confirm = Some(tk_boot::Confirm::watch(&verdict.gzip, status.loaded_at, self.now));
+                    self.tk_judging = true;
+                }
+            }
             // An earlier keeper rolled this boot back and its reboot is still
             // owed (it waited for the CPAS window, or this keeper restarted).
             // It is owed only once the record makes the hook refuse the image.
@@ -60,14 +79,18 @@ impl Keeper {
                     let _ = fs::write(tk_flags_status_path(), tk_flags::idle_status(reason, self.now));
                 }
             }
-            let left = self
+            let armed = self
                 .tk_confirm
                 .as_ref()
-                .map(|confirm| confirm.deadline.saturating_sub(self.now));
-            if let Some(left) = left {
-                self.note(&format!(
+                .map(|confirm| (confirm.deadline.saturating_sub(self.now), tk_boot::short(&confirm.sha).to_owned()));
+            match armed {
+                Some((left, short)) if self.tk_judging => self.note(&format!(
+                    "tk boot verdict armed: stock modem firmware after a rollback of modem firmware {short}; an answer through the core in {left} s says the image failed, none says the network did"
+                )),
+                Some((left, _)) => self.note(&format!(
                     "tk boot confirm armed: without a management answer through the core in {left} s the keeper quarantines this image and reboots onto stock modem firmware"
-                ));
+                )),
+                None => {}
             }
         }
         if self.tk_reboot_waits
@@ -76,6 +99,14 @@ impl Keeper {
         {
             self.tk_reboot_waits = false;
             self.note("tk boot confirm: rebooting onto stock modem firmware, outside the SAS CPAS window");
+            self.request_reboot();
+        }
+        if self.tk_retest_waits
+            && self.reboot_asked_at.is_none()
+            && !tk_boot::retest_waits(cpas_window(), unix_now())
+        {
+            self.tk_retest_waits = false;
+            self.note("tk boot verdict: rebooting to try the modem image again, with the clock set and outside the SAS CPAS window");
             self.request_reboot();
         }
         if self.tk_confirm.is_none() || self.reboot_asked_at.is_some() {
@@ -102,10 +133,99 @@ impl Keeper {
         let Some(mut confirm) = self.tk_confirm.take() else {
             return;
         };
-        match confirm.observe(self.now, mgmt_address_up(), heard) {
-            TkAction::Hold => self.tk_confirm = Some(confirm),
-            TkAction::Confirmed => self.tk_confirmed(&confirm.sha),
-            TkAction::Rollback => self.tk_rollback(&confirm.sha),
+        match (confirm.observe(self.now, mgmt_address_up(), heard), self.tk_judging) {
+            (TkAction::Hold, _) => self.tk_confirm = Some(confirm),
+            (TkAction::Confirmed, false) => self.tk_confirmed(&confirm.sha),
+            (TkAction::Rollback, false) => self.tk_rollback(&confirm.sha),
+            (TkAction::Confirmed, true) => self.tk_judged(&confirm.sha, true),
+            (TkAction::Rollback, true) => self.tk_judged(&confirm.sha, false),
+        }
+    }
+
+    /// Boots of the default image that ended before their confirm decided
+    /// anything left the strikes at the limit and no rollback: record them as
+    /// one rollback for this stock boot to judge (`Verdict::stopped`). The
+    /// verdict goes first, so an interrupted write leaves a rollback to judge,
+    /// never a quarantine nothing judges.
+    fn tk_record_stopped(&mut self, dir: &Path, verdict: &Verdict) -> Option<Verdict> {
+        let sha = tk_default::default_sha(&read_file(dir.join("config")))?;
+        let strikes = tk_boot::parse_strikes(&read_file(dir.join("strikes")));
+        let at_limit = strikes.is_some_and(|n| n >= tk_boot::STRIKE_LIMIT);
+        let path = dir.join("quarantine");
+        let quarantine = read_file(&path);
+        let quarantined = tk_boot::parse_quarantine(&quarantine).contains(&sha);
+        let next = verdict.stopped(&sha, at_limit, quarantined)?;
+        if !write_atomic(&dir.join(VERDICT), next.render().as_bytes()) {
+            return None;
+        }
+        let _ = write_atomic(&path, tk_boot::add_quarantine(&quarantine, &sha).as_bytes());
+        self.note(&format!(
+            "tk boot verdict: {} boots of modem firmware {} ended before their boot confirm decided (a power cut, a crash or a reboot); this stock boot judges them as one rollback",
+            tk_boot::STRIKE_LIMIT,
+            tk_boot::short(&sha)
+        ));
+        Some(next)
+    }
+
+    /// A stock boot's verdict on the default image's last rollback (see
+    /// `titan_pd_model::tk_verdict`). `answered`: stock firmware got an answer
+    /// through the core within the confirm window.
+    fn tk_judged(&mut self, sha: &str, answered: bool) {
+        let Some(dir) = tk_dir() else {
+            return;
+        };
+        let short = tk_boot::short(sha).to_owned();
+        let verdict = Verdict::parse(&read_file(dir.join(VERDICT)));
+        if !verdict.pending || verdict.gzip != sha {
+            // Retried or replaced meanwhile.
+            return;
+        }
+        let (next, judgement) = verdict.judge(answered);
+        if judgement.retries() {
+            // Out of quarantine first: an interrupted write leaves the rollback
+            // pending for the next stock boot, never a good image stuck.
+            let (quarantine, strikes) = (dir.join("quarantine"), dir.join("strikes"));
+            let _ = write_atomic(&quarantine, tk_boot::remove_quarantine(&read_file(&quarantine), sha).as_bytes());
+            let _ = write_atomic(&strikes, tk_boot::format_strikes(0).as_bytes());
+            let blocked = tk_boot::refused(
+                tk_boot::parse_strikes(&read_file(&strikes)),
+                &tk_boot::parse_quarantine(&read_file(&quarantine)),
+                sha,
+            );
+            if blocked {
+                self.note(&format!(
+                    "tk boot verdict: modem firmware {short} could not be taken out of quarantine; the next stock boot judges it again"
+                ));
+                return;
+            }
+        }
+        let recorded = write_atomic(&dir.join(VERDICT), next.render().as_bytes());
+        // A retry reboot only on a record that reads back: an unwritten one
+        // would make the next stock boot judge the same rollback again.
+        let retest = judgement.retests() && recorded && Verdict::parse(&read_file(dir.join(VERDICT))) == next;
+        let waits = retest && tk_boot::retest_waits(cpas_window(), unix_now());
+        self.note(&match judgement {
+            Judgement::Network => format!(
+                "tk boot verdict: stock modem firmware got no answer through the core either, so the rollback of modem firmware {short} was the network's ({} so far); it is out of quarantine and a later boot loads it again",
+                next.network
+            ),
+            Judgement::Genuine { count, sticks: false } if !retest => format!(
+                "tk boot verdict: stock modem firmware answered where modem firmware {short} did not: failure {count} of {GENUINE_LIMIT}; it is out of quarantine, but the record could not be written, so a later boot tries it again"
+            ),
+            Judgement::Genuine { count, sticks: false } if waits => format!(
+                "tk boot verdict: stock modem firmware answered where modem firmware {short} did not: failure {count} of {GENUINE_LIMIT}; it is out of quarantine, and the reboot to try it again waits until the clock is set and the SAS CPAS window is over"
+            ),
+            Judgement::Genuine { count, sticks: false } => format!(
+                "tk boot verdict: stock modem firmware answered where modem firmware {short} did not: failure {count} of {GENUINE_LIMIT}; it is out of quarantine and the network is up, so the keeper reboots to try it again now"
+            ),
+            Judgement::Genuine { count, sticks: true } => format!(
+                "tk boot verdict: stock modem firmware answered where modem firmware {short} did not: failure {count} of {GENUINE_LIMIT}; it stays quarantined until Retry under Network -> Latency"
+            ),
+        });
+        if waits {
+            self.tk_retest_waits = true;
+        } else if retest {
+            self.request_reboot();
         }
     }
 
@@ -128,6 +248,13 @@ impl Keeper {
         };
         let cleared = write_atomic(&dir.join("strikes"), tk_boot::format_strikes(0).as_bytes());
         let _ = write_atomic(&dir.join("confirmed"), format!("sha256={sha}\n").as_bytes());
+        // A confirmed boot ends any wait and clears the image's failure count
+        // (`Verdict::confirmed`); the file is rewritten only when that changes.
+        let verdict = Verdict::parse(&read_file(dir.join(VERDICT)));
+        let next = verdict.confirmed(sha);
+        if next != verdict {
+            let _ = write_atomic(&dir.join(VERDICT), next.render().as_bytes());
+        }
         if cleared {
             self.note(&format!(
                 "tk boot confirmed: modem firmware {short} answered through the core; strikes cleared"
@@ -168,16 +295,30 @@ impl Keeper {
             ));
             return;
         }
+        // The default image's quarantine is provisional: the next stock boot
+        // judges whether the image or the network failed. An operator's
+        // image stays quarantined as before.
+        let default = tk_default::default_sha(&read_file(dir.join("config"))).as_deref() == Some(sha);
+        let provisional = default
+            && write_atomic(
+                &dir.join(VERDICT),
+                Verdict::parse(&read_file(dir.join(VERDICT))).rolled_back(sha).render().as_bytes(),
+            );
+        let quarantined = if provisional {
+            "quarantined it for now (the next stock boot tells whether the image or the network failed)"
+        } else {
+            "quarantined it"
+        };
         if tk_boot::reboot_waits(cpas_window(), unix_now()) {
             // The record already keeps any boot from here on stock.
             self.note(&format!(
-                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; quarantined it. The SAS CPAS window is open, so the reboot onto stock modem firmware waits for it to end"
+                "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; {quarantined}. The SAS CPAS window is open, so the reboot onto stock modem firmware waits for it to end"
             ));
             self.tk_reboot_waits = true;
             return;
         }
         self.note(&format!(
-            "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; quarantined it, rebooting onto stock modem firmware"
+            "tk boot confirm: no management answer within {secs} s of loading modem firmware {short}; {quarantined}, rebooting onto stock modem firmware"
         ));
         self.request_reboot();
     }
@@ -244,7 +385,7 @@ impl Keeper {
             return Some("manage=off in tk/config".into());
         }
         let marker = tk_flags_hands_off_path();
-        if std::path::Path::new(&marker).exists() {
+        if Path::new(&marker).exists() {
             return Some(marker);
         }
         None
@@ -407,6 +548,6 @@ fn tk_flags_hands_off_path() -> String {
 
 /// Write through a synced temporary file, then sync the directory, so a power
 /// cut leaves the old record or the new one.
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> bool {
+fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     write_durably(path, &path.with_extension("tmp"), bytes).is_ok()
 }

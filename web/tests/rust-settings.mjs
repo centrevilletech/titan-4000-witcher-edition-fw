@@ -46,6 +46,12 @@ try{
     fixtures.ssh.fields.find(f=>f.id==='remove').options.push({value:print,label:body.values.name+' ('+print+')'});fixtures.ssh.revision+='x';
     return route.fulfill({json:{operation:{id:'done',state:'succeeded',message:'Key added: '+body.values.name+' ('+print+').'},settings:fixtures.ssh}});
    }
+   if(action==='latency.retry'){
+    assert.deepEqual(body.values,{});const model=fixtures.latency;
+    model.values.image_state='No rollbacks. After 2 failures where stock modem firmware answers, the image stays quarantined until Retry.';
+    model.actions.find(a=>a.id==='latency.retry').enabled=false;model.revision+='x';
+    return route.fulfill({json:{operation:{id:'done',state:'succeeded',message:'Cleared. The next boot loads the modem image again; restart the unit to try it now.'},settings:model}});
+   }
    if(action==='ssh.remove'){
     assert.deepEqual(Object.keys(body.values),['remove']);const options=fixtures.ssh.fields.find(f=>f.id==='remove').options;
     fixtures.ssh.tables[0].rows=fixtures.ssh.tables[0].rows.filter(row=>row.fingerprint!==body.values.remove);options.splice(options.findIndex(o=>o.value===body.values.remove),1);
@@ -148,7 +154,14 @@ try{
  await expect(page.locator('#toast')).toHaveText('Settings saved and read back from the Titan.');
  assert.equal(mutations.at(-1).path,'/api/v1/settings/latency');assert.equal(mutations.at(-1).method,'PUT');assert.deepEqual(mutations.at(-1).body.values,{modem:true,clamp:false,fastpath:true});
  await expect(page.getByLabel('Download clamp',{exact:true})).not.toBeChecked();await expect(page.locator('[data-settings-ready]')).toHaveAttribute('data-dirty','false');
+ await expect(page.getByText('Quarantined after 2 failures in a row where stock modem firmware answered. Retry tries it again at the next boot.',{exact:true})).toBeVisible();
+ await page.getByRole('button',{name:'Retry the modem image',exact:true}).click();await page.getByRole('button',{name:'Cancel',exact:true}).click();const beforeRetry=mutations.length;
+ await page.getByRole('button',{name:'Retry the modem image',exact:true}).click();await page.getByRole('button',{name:'Continue',exact:true}).click();
+ await expect(page.locator('#toast')).toHaveText('Cleared. The next boot loads the modem image again; restart the unit to try it now.');
+ assert.equal(mutations.length,beforeRetry+1,'Cancel sends nothing');assert.equal(mutations.at(-1).path,'/api/v1/actions/latency.retry');assert.equal(mutations.at(-1).body.section,'latency');assert.deepEqual(mutations.at(-1).body.values,{});
+ await expect(page.getByText('No rollbacks. After 2 failures where stock modem firmware answers, the image stays quarantined until Retry.',{exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Retry the modem image',exact:true})).toBeDisabled();
  authenticated=false;await open('access').catch(()=>{});await expect(page.locator('#login-password')).toBeVisible();
  assert.deepEqual(errors,[]);assert.deepEqual(forbidden,[]);await expect(page.locator('iframe')).toHaveCount(0);
- console.log('PASS: all 22 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove, latency switches and auth expiry.');
+ console.log('PASS: all 22 JSON settings, unchanged desktop/phone layout, no vendor requests/iframes, revisions/conflicts, secret-safe saves, readback mismatch, uncertain operations, PCI list, scan confirmation, binary download, multipart upload, SSH key add/remove, latency switches, modem image Retry and auth expiry.');
 }finally{await browser.close();await server.close();}
