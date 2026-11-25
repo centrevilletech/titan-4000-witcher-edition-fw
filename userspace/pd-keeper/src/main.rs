@@ -6,6 +6,10 @@
 //! `solicit-mgmt` is a diagnostic: it sends one router solicitation on the
 //! management bearer, to check that the answer no longer reaches the vendor
 //! stack once the keeper has closed the bearer to advertisements.
+//!
+//! The keeper has no `unsafe` code: its system calls go through the audited
+//! wrappers in `titan-sys`.
+#![forbid(unsafe_code)]
 
 use std::env;
 use std::fs;

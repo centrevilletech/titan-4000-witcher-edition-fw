@@ -1,6 +1,7 @@
 //! Password-authenticated first setup and recovery on LAN and remote IPv4.
 //! Autonomous jitter seed bootstrap normally starts the native HTTPS login.
 //! HTTP browser seeding remains a trusted-network recovery path on failure.
+#![forbid(unsafe_code)]
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
