@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and run the k1fp 2.0 host test suite under AddressSanitizer and UBSan.
+# Build and run the k1fp host test suite under AddressSanitizer and UBSan.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TMP=$(mktemp -d)

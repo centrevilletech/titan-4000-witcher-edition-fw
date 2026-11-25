@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * test_k1fp.c - Userspace unit, integration, and fuzz test suite for
- * k1fp 2.1 (device/fastpath/source/k1fp_core.h).
+ * k1fp 2.2 (device/fastpath/source/k1fp_core.h).
  *
  * Compiled and executed on the host with AddressSanitizer + UBSan via
  * device/fastpath/test/run.sh.
@@ -717,6 +717,196 @@ static void test_sha256_vectors(void)
 	}
 }
 
+/*
+ * Device re-acquire (k1fp 2.2). A small model of the module's device state:
+ * NETDEV_UNREGISTER drops a pointer and sets mode 0; the 1 s housekeeping
+ * pass feeds what it sees to k1_reacq_plan() and adopts what it returns.
+ */
+struct ra_world {
+	int lan_id, wan_id, br_id;   /* registered device generation, 0 = absent */
+	int lan_in, wan_in;          /* bridge generation the port belongs to, 0 = none */
+	int br_is_bridge;
+};
+struct ra_mod {
+	int lan, wan, br;            /* held generation, 0 = NULL */
+	int mode;
+	u32 dev_gone, reacq;
+};
+
+static void ra_unregister(struct ra_world *w, struct ra_mod *m, int which)
+{
+	int id = which == 0 ? w->lan_id : which == 1 ? w->wan_id : w->br_id;
+	int *held = which == 0 ? &m->lan : which == 1 ? &m->wan : &m->br;
+
+	if (which == 0) { w->lan_id = 0; w->lan_in = 0; }
+	if (which == 1) { w->wan_id = 0; w->wan_in = 0; }
+	if (which == 2) { w->br_id = 0; w->lan_in = 0; w->wan_in = 0; }
+	if (id && *held == id) {
+		*held = 0;
+		m->mode = 0;
+		m->dev_gone++;
+	}
+}
+
+static u32 ra_hk(const struct ra_world *w, struct ra_mod *m)
+{
+	struct k1_reacq_in in;
+	int l = m->lan ? m->lan : w->lan_id;
+	int x = m->wan ? m->wan : w->wan_id;
+	u32 plan;
+
+	if (m->lan && m->wan && m->br)
+		return 0;
+	memset(&in, 0, sizeof(in));
+	in.have_lan = m->lan != 0;
+	in.have_wan = m->wan != 0;
+	in.have_br = m->br != 0;
+	in.lan_found = !m->lan && w->lan_id;
+	in.wan_found = !m->wan && w->wan_id;
+	if (l && x) {
+		in.lan_port = w->lan_in != 0;
+		in.wan_port = w->wan_in != 0;
+		if (in.lan_port && in.wan_port) {
+			in.same_br = w->lan_in == w->wan_in;
+			in.br_valid = in.same_br && w->br_is_bridge && w->lan_in == w->br_id;
+			in.br_matches_held = in.br_valid && m->br == w->br_id;
+		}
+	}
+	plan = k1_reacq_plan(&in);
+	if (!plan)
+		return 0;
+	if (plan & K1RA_LAN) m->lan = w->lan_id;
+	if (plan & K1RA_WAN) m->wan = w->wan_id;
+	if (plan & K1RA_BR)  m->br = w->br_id;
+	m->mode = 0;
+	m->reacq++;
+	return plan;
+}
+
+static void test_reacquire(void)
+{
+	struct ra_world w = { 1, 1, 1, 1, 1, 1 };
+	struct ra_mod m = { 1, 1, 1, 2, 0, 0 };
+	struct k1_reacq_in in;
+	u32 bits, plan;
+	int gen = 1, step;
+
+	/* Nothing missing: never a plan, whatever the other inputs say. */
+	for (bits = 0; bits < 128u; bits++) {
+		memset(&in, 0, sizeof(in));
+		in.have_lan = in.have_wan = in.have_br = 1;
+		in.lan_found = bits & 1u; in.wan_found = (bits >> 1) & 1u;
+		in.lan_port = (bits >> 2) & 1u; in.wan_port = (bits >> 3) & 1u;
+		in.same_br = (bits >> 4) & 1u; in.br_valid = (bits >> 5) & 1u;
+		in.br_matches_held = (bits >> 6) & 1u;
+		CHECK(k1_reacq_plan(&in) == 0, "plan with nothing missing (bits %u)", bits);
+	}
+
+	/* Exhaustive: a plan is exactly the missing set, and only for a shape
+	 * init_module would accept that agrees with what is still held. */
+	for (bits = 0; bits < 1024u; bits++) {
+		u32 need = 0;
+		int ok;
+
+		memset(&in, 0, sizeof(in));
+		in.have_lan = bits & 1u; in.have_wan = (bits >> 1) & 1u;
+		in.have_br = (bits >> 2) & 1u;
+		in.lan_found = (bits >> 3) & 1u; in.wan_found = (bits >> 4) & 1u;
+		in.lan_port = (bits >> 5) & 1u; in.wan_port = (bits >> 6) & 1u;
+		in.same_br = (bits >> 7) & 1u; in.br_valid = (bits >> 8) & 1u;
+		in.br_matches_held = (bits >> 9) & 1u;
+		if (!in.have_lan) need |= K1RA_LAN;
+		if (!in.have_wan) need |= K1RA_WAN;
+		if (!in.have_br)  need |= K1RA_BR;
+		ok = need &&
+		     (in.have_lan || in.lan_found) && (in.have_wan || in.wan_found) &&
+		     in.lan_port && in.wan_port && in.same_br && in.br_valid &&
+		     (!in.have_br || in.br_matches_held);
+		plan = k1_reacq_plan(&in);
+		CHECK(plan == (ok ? need : 0u), "plan %u for bits %u, want %u", plan, bits, ok ? need : 0u);
+	}
+
+	/* The bench case: a modem re-attach. The vendor scripts delete br0 (eth0
+	 * stays registered but leaves the bridge), delete lte0pdn2, then create
+	 * both again and add the ports one at a time. */
+	ra_unregister(&w, &m, 2);
+	CHECK(m.br == 0 && m.lan == 1 && m.mode == 0 && m.dev_gone == 1, "bridge gone");
+	CHECK(ra_hk(&w, &m) == 0, "no adopt with no bridge");
+	ra_unregister(&w, &m, 1);
+	CHECK(m.wan == 0 && m.dev_gone == 2, "wan gone");
+	CHECK(ra_hk(&w, &m) == 0, "no adopt with nothing back");
+	w.br_id = 2;
+	CHECK(ra_hk(&w, &m) == 0, "no adopt: empty new bridge");
+	w.lan_in = 2;
+	CHECK(ra_hk(&w, &m) == 0, "no adopt: only eth0 is a port");
+	w.wan_id = 2;
+	CHECK(ra_hk(&w, &m) == 0, "no adopt: lte0pdn2 registered but not a port");
+	CHECK(m.wan == 0, "no reference kept on a half-built shape");
+	w.wan_in = 2;
+	CHECK(ra_hk(&w, &m) == (K1RA_WAN | K1RA_BR), "adopt lte0pdn2 and the bridge together");
+	CHECK(m.lan == 1 && m.wan == 2 && m.br == 2 && m.mode == 0 && m.reacq == 1,
+	      "state after re-acquire: mode stays 0");
+	CHECK(ra_hk(&w, &m) == 0, "second pass is a no-op");
+
+	/* Only the bearer is recreated; br0 stays. Adopt it only as a port of
+	 * the bridge the module still holds. */
+	m.mode = 2;
+	ra_unregister(&w, &m, 1);
+	CHECK(m.mode == 0 && m.wan == 0 && m.br == 2, "bearer gone, bridge held");
+	w.wan_id = 3;
+	CHECK(ra_hk(&w, &m) == 0, "new bearer not yet a port");
+	w.wan_in = 7; /* a port of some other bridge */
+	CHECK(ra_hk(&w, &m) == 0, "new bearer on another bridge");
+	w.wan_in = 2;
+	CHECK(ra_hk(&w, &m) == K1RA_WAN, "adopt the new bearer on the held bridge");
+	CHECK(m.wan == 3 && m.reacq == 2, "bearer adopted");
+
+	/* Both ports sit on something that is not a bridge device: refuse. */
+	ra_unregister(&w, &m, 2);
+	w.br_id = 4; w.lan_in = 4; w.wan_in = 4; w.br_is_bridge = 0;
+	CHECK(ra_hk(&w, &m) == 0, "not a bridge device");
+	w.br_is_bridge = 1;
+	CHECK(ra_hk(&w, &m) == K1RA_BR, "bridge adopted once valid");
+
+	/* Random churn: the module never holds a device that is not registered,
+	 * never holds a mode other than 0 across a loss, and always converges
+	 * within one pass once the full shape is back. */
+	gen = 10;
+	for (step = 0; step < 200000; step++) {
+		u32 r = rnd() % 8u;
+
+		if (r == 0) ra_unregister(&w, &m, 0);
+		else if (r == 1) ra_unregister(&w, &m, 1);
+		else if (r == 2) ra_unregister(&w, &m, 2);
+		else if (r == 3 && !w.lan_id) w.lan_id = ++gen;
+		else if (r == 4 && !w.wan_id) w.wan_id = ++gen;
+		else if (r == 5 && !w.br_id) w.br_id = ++gen;
+		else if (r == 6 && w.br_id && w.lan_id) w.lan_in = w.br_id;
+		else if (r == 7 && w.br_id && w.wan_id) w.wan_in = w.br_id;
+		if (rnd() & 1u) {
+			int full = w.lan_id && w.wan_id && w.br_id &&
+				   w.lan_in == w.br_id && w.wan_in == w.br_id;
+			int missing = !m.lan || !m.wan || !m.br;
+			int stale_br = m.br && m.br != w.br_id;
+
+			plan = ra_hk(&w, &m);
+			if (full && missing && !stale_br)
+				CHECK(plan != 0 && m.lan && m.wan && m.br, "converges at step %d", step);
+			if (plan)
+				CHECK(m.mode == 0, "mode 0 after adopt at step %d", step);
+		} else if (m.lan && m.wan && m.br && (rnd() & 3u) == 0) {
+			m.mode = 2; /* userspace arms it again */
+		}
+		CHECK(!m.lan || m.lan == w.lan_id, "stale lan at step %d", step);
+		CHECK(!m.wan || m.wan == w.wan_id, "stale wan at step %d", step);
+		CHECK(!m.br || m.br == w.br_id, "stale br at step %d", step);
+		CHECK(m.mode == 0 || (m.lan && m.wan && m.br), "mode %d with a device missing at step %d", m.mode, step);
+		if (fails)
+			break;
+	}
+	CHECK(m.dev_gone > 1000u && m.reacq > 100u, "churn exercised (gone %u, reacq %u)", m.dev_gone, m.reacq);
+}
+
 int main(void)
 {
 	test_classifier();
@@ -726,11 +916,12 @@ int main(void)
 	test_diag_ring();
 	test_watchdog();
 	test_tx_ring_model();
+	test_reacquire();
 	test_sha256_vectors();
 	if (fails) {
 		fprintf(stderr, "FAILED: %d check(s) failed\n", fails);
 		return 1;
 	}
-	printf("PASS: all k1fp 2.1 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, SHA-256)\n");
+	printf("PASS: all k1fp 2.2 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, device re-acquire, SHA-256)\n");
 	return 0;
 }

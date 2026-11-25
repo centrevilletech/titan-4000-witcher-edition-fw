@@ -202,7 +202,7 @@ pub struct Watch {
     /// A load failed for this config; not retried until config changes or reboot.
     failed_for: Option<Config>,
     refused_logged: Vec<String>,
-    /// True while our `titan_k1fp v2.1` module is loaded.
+    /// True while our `titan_k1fp v2.2` module is loaded.
     module_loaded: bool,
     /// True once `maintain()` has loaded or adopted the currently loaded module.
     managed: bool,
@@ -507,7 +507,16 @@ impl Watch {
             return;
         }
 
-        match self.trip.evaluate(&config, &proc) {
+        let action = self.trip.evaluate(&config, &proc);
+        if self.trip.take_device_event() {
+            note(&format!(
+                "fast path: a bridge device was recreated (dev_gone={}, reacq={}); the module is at mode 0 and the keeper applies mode {} again",
+                proc.dev_gone.unwrap_or(0),
+                proc.reacq.unwrap_or(0),
+                config.mode
+            ));
+        }
+        match action {
             TripAction::Normal => {
                 self.active_for_lease = config.mode > 0;
                 let mut proc = proc;
