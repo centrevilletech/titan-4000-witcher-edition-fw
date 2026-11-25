@@ -62,6 +62,7 @@ use crate::files::read_file;
 use crate::netdev::{carrier_up, interface_index, interface_mac, rx_packets};
 use crate::paths::state_dir;
 
+use self::budget::link_recovery;
 use self::carrier::CarrierWatch;
 use self::clamp::QctrlWatch;
 use self::if_inet6::{link_local, live_prefix};
@@ -73,6 +74,7 @@ use self::sas::FileTail;
 use self::watchdog::{DeafProbe, spawn_pings};
 use self::wire::{ControlSockets, send_ipv6, send_marked_frame};
 
+mod budget;
 mod carrier;
 mod clamp;
 mod flow;
@@ -418,14 +420,6 @@ impl Keeper {
         {
             thread::sleep(Duration::from_millis(200));
         }
-    }
-
-    fn budget_tuple(&self) -> (u32, u64, u64) {
-        (
-            self.health.link_drops,
-            self.health.window_start,
-            self.health.quiet_until,
-        )
     }
 
     fn read_nvram_cache(&mut self) -> Option<&[u8]> {
@@ -1468,57 +1462,6 @@ impl Keeper {
         }
     }
 
-    fn load_budget(&mut self) {
-        let text = read_file(state_dir().join("budget.txt"));
-        for line in text.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                let Ok(value) = value.trim().parse::<u64>() else {
-                    continue;
-                };
-                match key.trim() {
-                    "link_drops" => {
-                        self.health.link_drops = u32::try_from(value).unwrap_or(u32::MAX)
-                    }
-                    "window_start" => self.health.window_start = value,
-                    "quiet_until" => self.health.quiet_until = value,
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    fn save_budget(&mut self) -> bool {
-        let path = state_dir().join("budget.txt");
-        let text = format!(
-            "link_drops={}\nwindow_start={}\nquiet_until={}\n",
-            self.health.link_drops, self.health.window_start, self.health.quiet_until
-        );
-        if read_file(&path) != text {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let temporary = path.with_extension("new");
-            let saved = (|| -> io::Result<()> {
-                fs::write(&temporary, &text)?;
-                fs::File::open(&temporary)?.sync_all()?;
-                fs::rename(&temporary, &path)?;
-                fs::File::open(
-                    path.parent()
-                        .ok_or_else(|| io::Error::other("no budget directory"))?,
-                )?
-                .sync_all()
-            })();
-            if saved.is_err() {
-                return false;
-            }
-        }
-        let ok = read_file(&path) == text;
-        if ok {
-            self.saved_budget = Some(self.budget_tuple());
-        }
-        ok
-    }
-
     /// The tk config's own targets, else the deaf watchdog's.
     fn tk_targets(&mut self) -> Vec<std::net::IpAddr> {
         let config = tk_dir()
@@ -1615,12 +1558,6 @@ fn probe_keeps_delegation(probe: Option<[u8; 6]>, saved: Option<([u8; 6], u64)>,
         return false;
     };
     probe == mac && now.saturating_sub(at) < u64::from(titan_pd_model::dhcpv6::VALID)
-}
-
-/// What a link-drop budget step runs. One PHY renegotiation. Not a burst,
-/// and not an administrative carrier down, which this router ignores.
-fn link_recovery() -> (&'static str, &'static [&'static str]) {
-    ("mii-tool", &["-r", CUSTOMER])
 }
 
 fn tk_status_path() -> String {
@@ -1778,13 +1715,6 @@ mod tests {
             classify_ipv6(&neighbour, None, Some(ours)),
             Class::NeighbourForUs
         );
-    }
-
-    #[test]
-    fn link_recovery_is_one_renegotiation() {
-        let (program, args) = link_recovery();
-        assert_eq!(program, "mii-tool");
-        assert_eq!(args, ["-r", "eth0"]);
     }
 
     #[test]

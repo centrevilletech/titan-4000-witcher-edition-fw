@@ -16,7 +16,8 @@ use crate::command::command_stdout;
 use crate::files::read_file;
 use crate::netdev::{carrier_up, interface_index, interface_mac, rx_packets};
 
-use super::{BRIDGE, CUSTOMER, Keeper, link_recovery};
+use super::{BRIDGE, CUSTOMER, Keeper};
+use super::budget::link_recovery;
 use super::routes::main_routes;
 use super::udhcpd::{customer_dhcp_pids, spawn_udhcpd, stop_customer_udhcpd};
 use super::wire::send_marked_frame;
