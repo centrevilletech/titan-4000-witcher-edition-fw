@@ -106,7 +106,7 @@ impl Samples {
         if let Ok(bps) = ul.parse() {
             self.ul.push((t, bps));
         }
-        if let Some(db) = pick::hundredths(&sinr) {
+        if let Some(db) = pick::weakest_hundredths(&sinr) {
             self.pcell_sinr.push(db);
         }
         self.scc_sinr.push(pick::scc_sinr_db(&scc));

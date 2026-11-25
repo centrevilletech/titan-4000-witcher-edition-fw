@@ -14,11 +14,15 @@
 //! uplink secondary carrier, the picker scores the arm:
 //!
 //! - download, estimated: every serving carrier's SINR as the modem reports it
-//!   in that arm, through `dl_estimate_kbps`. The Titan cannot measure its own
+//!   in that arm, the weaker receive branch of each (rank 2 runs at its pace),
+//!   through `dl_estimate_kbps`. The Titan cannot measure its own
 //!   download without a sender: its CPU caps a local TCP download near 53 Mbps.
 //!   The estimate matched UDP bursts from the core on the bench: 128 Mbps for
-//!   c5 (11 dB) with c9 (15 dB) against 130.7 measured, and 180 Mbps for c6
-//!   (10 dB) with c9 (15 dB) and c5 (12 dB) against 176.8.
+//!   c5 (11 dB) with c9 (15 dB) against 130.7 measured, 180 Mbps for c6
+//!   (10 dB) with c9 (15 dB) and c5 (12 dB) against 176.8, and 150 Mbps for c6
+//!   (9 dB) with c9 and c12 at their weaker branches (11, 12 dB) against 148
+//!   to 150. The same combination read 202 with the first branch only, and the
+//!   eNB's own counters put c9 at 43 Mbps while its branches read 18 and 11.
 //! - upload, measured: a 20 s UDP burst to the discard port of the profile's
 //!   management probe, the operator's own ping responder. The packets cross the
 //!   radio and the probe drops them. The rate is the modem's own upload report
@@ -228,16 +232,31 @@ pub fn dl_estimate_kbps(sinr_db: &[i32], layers: u8) -> u32 {
 }
 
 /// SINR of each secondary carrier from `sqns_connection_downlinkSccEx`, a
-/// header (`dl_mcs,dl_freq,bw,...,sinr,...:`) and `;`-separated entries.
+/// header (`dl_mcs,dl_freq,bw,...,sinr,...,cinr,...:`) and `;`-separated
+/// entries. Each SCell has two receive branches and `cinr` lists both
+/// (`18.0/11.0`); the `sinr` column repeats the first. Rank 2 needs both
+/// streams, so the weaker branch sets the rate: on the bench (2026-11-24) the
+/// eNB's per-UE MAC peak on c9 was 43 Mbps while it read `18.0/11.0`, close to
+/// the model at 11 dB and far from it at 18. Falls back to `sinr` without
+/// `cinr`.
 pub fn scc_sinr_db(value: &str) -> Vec<i32> {
     let Some((header, data)) = value.split_once(':') else {
         return vec![];
     };
-    let Some(col) = header.split(',').position(|h| h.trim() == "sinr") else {
+    let cols: Vec<&str> = header.split(',').map(str::trim).collect();
+    let cinr = cols.iter().position(|h| *h == "cinr");
+    let sinr = cols.iter().position(|h| *h == "sinr");
+    if cinr.is_none() && sinr.is_none() {
         return vec![];
-    };
+    }
     data.split(';')
-        .filter_map(|entry| entry.split(',').nth(col)?.trim().parse::<f64>().ok())
+        .filter_map(|entry| {
+            let fields: Vec<&str> = entry.split(',').collect();
+            let weakest = cinr.and_then(|c| fields.get(c)).and_then(|v| {
+                v.split('/').filter_map(|x| x.trim().parse::<f64>().ok()).reduce(f64::min)
+            });
+            weakest.or_else(|| sinr.and_then(|c| fields.get(c)?.trim().parse::<f64>().ok()))
+        })
         .map(|v| v.round() as i32)
         .collect()
 }
@@ -431,6 +450,14 @@ pub fn hundredths(value: &str) -> Option<i32> {
     Some((f64::from(v) / 100.0).round() as i32)
 }
 
+/// The weakest comma field of a vendor reading in hundredths, rounded: the
+/// primary cell's SINR lists one value per receive branch (`900,1000` is 9),
+/// and rank 2 runs at the weaker one's pace (see `scc_sinr_db`).
+pub fn weakest_hundredths(value: &str) -> Option<i32> {
+    let v = value.split(',').filter_map(|f| f.trim().parse::<i32>().ok()).min()?;
+    Some((f64::from(v) / 100.0).round() as i32)
+}
+
 /// What the picker keeps on the persistent volume.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Record {
@@ -527,6 +554,10 @@ noise
         // c6 at 10 dB with c9 at 15 and c5 at 12: 176.8 Mbps measured.
         let three = dl_estimate_kbps(&[10, 15, 12], 2);
         assert!((170_000..=190_000).contains(&three), "{three}");
+        // c6 PCell at 9 dB with c9 and c12 at their weaker branches, 11 and 12 dB:
+        // UDP floods from the core got 148 to 150 Mbps (2026-11-24 22:39 UTC).
+        let weak = dl_estimate_kbps(&[9, 11, 12], 2);
+        assert!((140_000..=160_000).contains(&weak), "{weak}");
         // A single carrier at 14 dB: 66 to 75 Mbps on the bench (2026-11-22).
         let one = dl_estimate_kbps(&[14], 2);
         assert!((60_000..=78_000).contains(&one), "{one}");
@@ -568,6 +599,16 @@ noise
 0,3689.0,20,-86.0/-83.0,-112.0/-109.0,-6.0/-6.0,16,14,217,16.0/17.0,-,901,70;\
 0,3570.0,20,-89.0/-85.0,-116.0/-111.0,-6.0/-5.0,11,-,199,11.0/16.0,-,901,70";
         assert_eq!(scc_sinr_db(scc), vec![16, 11]);
+        // The bench at 22:39 UTC: c9 read 18.0/11.0 and c12 12.0/12.0; the weaker branch counts.
+        let split = "dl_mcs,dl_freq,bw,rssi,rsrp,rsrq,sinr,tx_power,pci,cinr,cell_id,mcc,mnc:\
+0,3689.0,20,-83.0/-88.0,-110.0/-116.0,-6.0/-8.0,18,-,217,18.0/11.0,-,901,70;\
+0,3630.0,20,-81.0/-86.0,-107.0/-113.0,-6.0/-6.0,12,-,190,12.0/12.0,-,901,70";
+        assert_eq!(scc_sinr_db(split), vec![11, 12]);
+        // Without a cinr column the sinr column still works.
+        assert_eq!(scc_sinr_db("dl_mcs,sinr:0,14;0,9"), vec![14, 9]);
+        assert_eq!(weakest_hundredths("900,1000"), Some(9));
+        assert_eq!(weakest_hundredths("1300"), Some(13));
+        assert_eq!(weakest_hundredths("-"), None);
         assert_eq!(scc_sinr_db("-"), Vec::<i32>::new());
         assert_eq!(scc_sinr_db("a,b:1,2"), Vec::<i32>::new());
         // The bench burst: one stale report, then 4.7 and 13.8 Mbps.

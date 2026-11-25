@@ -130,12 +130,15 @@ scores the arm. It needs no server:
 - Download, estimated. The Titan cannot measure its own download without a
   sender: its CPU caps a TCP download on the unit near 53 Mbps. Instead the
   picker reads the SINR the modem reports for every serving carrier once a
-  second for 20 s, takes each carrier's median and the median rank, and sums a
+  second for 20 s, using each carrier's weaker receive branch because rank 2
+  runs at its pace. It takes each carrier's median and the median rank, and sums a
   per-carrier capacity: Shannon with a 4.6 dB implementation gap, 256QAM at
   most, over the downlink share of TDD configuration 2. There is no rate cap
   beyond that. On the bench the estimate read 128 Mbps for c5 at 11 dB with c9
   at 15 dB, where a UDP burst from the core measured 130.7, and 180 Mbps for
-  c6 at 10 dB with c9 and c5 at 15 and 12 dB, where the burst measured 176.8.
+  c6 at 10 dB with c9 and c5 at 15 and 12 dB, where the burst measured 176.8,
+  and 150 Mbps for c6 at 9 dB with c9 and c12 at 11 and 12 dB on their weaker
+  branches, where floods from the core measured 148 to 150.
   At 17 dB on three carriers it gives about 270 Mbps. The estimate sees radio
   quality, not how busy each carrier is, so it ranks arms rather than
   promising rates.
