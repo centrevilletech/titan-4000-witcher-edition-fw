@@ -26,14 +26,17 @@ keep() {
 # to $tls/broken, which keeps only the last one, and a new identity is made:
 # browsers then ask once to accept the unit's new certificate.
 broken=
+good=
 if [ -e "$tls/cert.pem" ] || [ -e "$tls/key.pem" ] || [ -L "$tls/cert.pem" ] || [ -L "$tls/key.pem" ]; then
  if usable "$tls"; then keep "$tls"; fi
  broken="cert.pem key.pem"
 fi
 if [ -e "$tls/current" ] || [ -L "$tls/current" ]; then
- if [ -d "$tls/current" ] && [ ! -L "$tls/current" ] && usable "$tls/current"; then keep "$tls/current"; fi
- broken="$broken current"
+ if [ -d "$tls/current" ] && [ ! -L "$tls/current" ] && usable "$tls/current"; then good=$tls/current
+ else broken="$broken current"; fi
 fi
+# A broken legacy pair must go even when current is good: the launcher reads
+# the legacy pair whenever either of its files exists.
 if [ -n "$broken" ]; then
  rm -rf "$tls/broken"
  mkdir "$tls/broken"
@@ -41,8 +44,9 @@ if [ -n "$broken" ]; then
   if [ -e "$tls/$name" ] || [ -L "$tls/$name" ]; then mv "$tls/$name" "$tls/broken/"; fi
  done
  sync
- echo "The TLS identity failed its checks; it is kept in $tls/broken and a new one is made." >&2
+ echo "A TLS identity failed its checks; it is kept in $tls/broken." >&2
 fi
+[ -z "$good" ] || keep "$good"
 # Stock BusyBox has no mktemp applet. The kernel is already seeded here.
 temporary=$tls/.new-$(openssl rand -hex 16)
 mkdir "$temporary"

@@ -170,6 +170,18 @@ class FirstBootTests(unittest.TestCase):
         self.assertEqual((self.root/'tls-calls').read_text(), 'generate\ngenerate\n')
         self.assertEqual((tls/'current/key.pem').read_text(), 'private\n')
 
+    def test_a_broken_legacy_pair_never_hides_a_good_current_identity(self):
+        # The launcher reads the legacy pair whenever either file exists.
+        tls = self.root/'mnt/titan-api/tls'
+        self.write('mnt/titan-api/tls/cert.pem', 'damaged\n')
+        self.write('mnt/titan-api/tls/current/cert.pem', 'certificate\n')
+        self.write('mnt/titan-api/tls/current/key.pem', 'private\n')
+        self.assertEqual(self.tls().returncode, 0)
+        self.assertFalse((tls/'cert.pem').exists())
+        self.assertEqual((tls/'broken/cert.pem').read_text(), 'damaged\n')
+        self.assertEqual((tls/'current/key.pem').read_text(), 'private\n')
+        self.assertFalse((self.root/'tls-calls').exists(), 'the good identity is kept')
+
     def test_a_good_identity_is_kept_and_its_modes_put_right(self):
         tls = self.root/'mnt/titan-api/tls'
         self.write('mnt/titan-api/tls/current/cert.pem', 'certificate\n')
