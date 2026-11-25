@@ -62,6 +62,8 @@ use titan_sys::process::SpawnExt;
 use titan_sys::socket::{Socket, SocketExt};
 
 use crate::clock::{monotonic, unix_now};
+use crate::files::read_file;
+use crate::netdev::{bridge_ports, carrier_up, interface_index, interface_mac, read_mac, rx_packets};
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
@@ -1901,14 +1903,7 @@ impl Keeper {
     /// LAN port. The bridge answers both without a fork. Only when it has no
     /// LTE port is the vendor asked, and then at most every `MODE_EVERY` s.
     fn refresh_mode(&mut self) {
-        let ports: Vec<String> = fs::read_dir("/sys/class/net/br0/brif")
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let ports = bridge_ports();
         if let Some(port) = extdev::bridged_bearer(ports.iter().map(String::as_str)) {
             self.bearer = port;
             self.passthrough = true;
@@ -2022,7 +2017,7 @@ impl Keeper {
         if !self.flow_watch.tick(carrier_up(CUSTOMER)) {
             return;
         }
-        if ethernet::stock_requested(&read_file(&state_dir().join("ethernet.conf").to_string_lossy())) {
+        if ethernet::stock_requested(&read_file(state_dir().join("ethernet.conf"))) {
             if !self.flow_stock_logged {
                 self.note("ethernet.conf asks for flow_control=stock; leaving the vendor's 802.3x setting on eth0");
                 self.flow_stock_logged = true;
@@ -2119,9 +2114,7 @@ impl Keeper {
             return;
         }
         self.last_deaf_round = Some(self.now);
-        let settings = deaf::parse_settings(&read_file(
-            &state_dir().join("watchdog.conf").to_string_lossy(),
-        ));
+        let settings = deaf::parse_settings(&read_file(state_dir().join("watchdog.conf")));
         self.deaf_secs = settings.deaf_secs;
         self.maintain_vendor_watchdog(&settings);
         if !settings.enabled {
@@ -2186,7 +2179,7 @@ impl Keeper {
         }
         let attached = deaf::attached(&self.nvram_get_cached("sqns_connection_mediaState"));
         let path = state_dir().join("watchdog-strikes.txt");
-        let strikes = deaf::parse_strikes(&read_file(&path.to_string_lossy()));
+        let strikes = deaf::parse_strikes(&read_file(&path));
         match self
             .deaf_watch
             .observe(self.now, attached, heard, self.deaf_secs, strikes)
@@ -2375,12 +2368,12 @@ impl Keeper {
         };
         let quarantine = dir.join("quarantine");
         let strikes = dir.join("strikes");
-        let listed = tk_boot::add_quarantine(&read_file(&quarantine.to_string_lossy()), sha);
+        let listed = tk_boot::add_quarantine(&read_file(&quarantine), sha);
         let _ = write_atomic(&quarantine, listed.as_bytes());
         let _ = write_atomic(&strikes, tk_boot::format_strikes(tk_boot::STRIKE_LIMIT).as_bytes());
         let recorded = tk_boot::refused(
-            tk_boot::parse_strikes(&read_file(&strikes.to_string_lossy())),
-            &tk_boot::parse_quarantine(&read_file(&quarantine.to_string_lossy())),
+            tk_boot::parse_strikes(&read_file(&strikes)),
+            &tk_boot::parse_quarantine(&read_file(&quarantine)),
             sha,
         );
         if !recorded {
@@ -2412,7 +2405,7 @@ impl Keeper {
             );
             return;
         };
-        let text = read_file(&dir.join("config").to_string_lossy());
+        let text = read_file(dir.join("config"));
         let parsed = tk_flags::parse_writes(&text);
         self.note_tk_flags_refused(&parsed);
         self.tk_flags_config_hands_off = parsed.hands_off;
@@ -2579,7 +2572,7 @@ impl Keeper {
             self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
             return;
         };
-        let config = qctrl::parse_config(&read_file(&dir.join("config").to_string_lossy()));
+        let config = qctrl::parse_config(&read_file(dir.join("config")));
         if config.refused != self.qctrl.refused_logged {
             for line in &config.refused {
                 self.note(&format!(
@@ -3032,9 +3025,7 @@ impl Keeper {
     /// wall-clock and says nothing this boot's monotonic clock can use, so no
     /// delegation hold comes back: the router's next DHCPv6 makes a new one.
     fn load_delegation(&mut self) {
-        let Some((mac, _at)) = parse_delegation(&read_file(
-            &state_dir().join("router.txt").to_string_lossy(),
-        )) else {
+        let Some((mac, _at)) = parse_delegation(&read_file(state_dir().join("router.txt"))) else {
             return;
         };
         self.router_mac = ipv4::mac_text(mac);
@@ -3047,7 +3038,7 @@ impl Keeper {
         let path = state_dir().join("router.txt");
         // The wall-clock time, for a person reading the file.
         let text = format_delegation(mac, unix_now());
-        if read_file(&path.to_string_lossy()) != text {
+        if read_file(&path) != text {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -3065,7 +3056,7 @@ impl Keeper {
     }
 
     fn load_budget(&mut self) {
-        let text = read_file(&state_dir().join("budget.txt").to_string_lossy());
+        let text = read_file(state_dir().join("budget.txt"));
         for line in text.lines() {
             if let Some((key, value)) = line.split_once('=') {
                 let Ok(value) = value.trim().parse::<u64>() else {
@@ -3089,7 +3080,7 @@ impl Keeper {
             "link_drops={}\nwindow_start={}\nquiet_until={}\n",
             self.health.link_drops, self.health.window_start, self.health.quiet_until
         );
-        if read_file(&path.to_string_lossy()) != text {
+        if read_file(&path) != text {
             if let Some(parent) = path.parent() {
                 let _ = fs::create_dir_all(parent);
             }
@@ -3108,7 +3099,7 @@ impl Keeper {
                 return false;
             }
         }
-        let ok = read_file(&path.to_string_lossy()) == text;
+        let ok = read_file(&path) == text;
         if ok {
             self.saved_budget = Some(self.budget_tuple());
         }
@@ -3118,15 +3109,13 @@ impl Keeper {
     /// The tk config's own targets, else the deaf watchdog's.
     fn tk_targets(&mut self) -> Vec<std::net::IpAddr> {
         let config = tk_dir()
-            .map(|dir| read_file(&dir.join("config").to_string_lossy()))
+            .map(|dir| read_file(dir.join("config")))
             .unwrap_or_default();
         let own = tk_boot::parse_targets(&config);
         if !own.is_empty() {
             return own;
         }
-        let settings = deaf::parse_settings(&read_file(
-            &state_dir().join("watchdog.conf").to_string_lossy(),
-        ));
+        let settings = deaf::parse_settings(&read_file(state_dir().join("watchdog.conf")));
         let bearer_dns = if settings.targets.is_empty() {
             self.nvram_get_cached("wan_get_dns")
         } else {
@@ -3646,38 +3635,6 @@ fn parse_hex_addr(text: &str) -> Option<[u8; 16]> {
     Some(addr)
 }
 
-fn interface_mac(dev: &str) -> Option<[u8; 6]> {
-    let text = read_file(&format!("/sys/class/net/{dev}/address"));
-    let mut mac = [0u8; 6];
-    let parts: Vec<_> = text.trim().split(':').collect();
-    if parts.len() != 6 {
-        return None;
-    }
-    for (index, part) in parts.iter().enumerate() {
-        mac[index] = u8::from_str_radix(part, 16).ok()?;
-    }
-    Some(mac)
-}
-
-fn interface_index(dev: &str) -> Option<i32> {
-    read_file(&format!("/sys/class/net/{dev}/ifindex"))
-        .trim()
-        .parse()
-        .ok()
-}
-
-/// Frames received on `dev` since boot. `None` when the counter is unreadable.
-fn rx_packets(dev: &str) -> Option<u64> {
-    read_file(&format!("/sys/class/net/{dev}/statistics/rx_packets"))
-        .trim()
-        .parse()
-        .ok()
-}
-
-fn carrier_up(dev: &str) -> bool {
-    read_file(&format!("/sys/class/net/{dev}/carrier")).trim() == "1"
-}
-
 fn reboot_program() -> String {
     std::env::var("TITAN_REBOOT").unwrap_or_else(|_| "reboot".into())
 }
@@ -4034,20 +3991,6 @@ fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn read_mac(dev: &str) -> Result<[u8; 6], String> {
-    let text = fs::read_to_string(format!("/sys/class/net/{dev}/address"))
-        .map_err(|err| err.to_string())?;
-    let mut mac = [0u8; 6];
-    let parts: Vec<&str> = text.trim().split(':').collect();
-    if parts.len() != 6 {
-        return Err(format!("bad mac on {dev}"));
-    }
-    for (index, part) in parts.iter().enumerate() {
-        mac[index] = u8::from_str_radix(part, 16).map_err(|err| err.to_string())?;
-    }
-    Ok(mac)
-}
-
 /// Diagnostic: one router solicitation on the management bearer, from the
 /// core-assigned link-local. Changes no setting.
 pub fn solicit_once() -> Result<Ipv6Addr, String> {
@@ -4110,10 +4053,6 @@ fn command_stdout(program: &str, args: &[&str]) -> String {
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default()
-}
-
-fn read_file(path: &str) -> String {
-    fs::read_to_string(path).unwrap_or_default()
 }
 
 fn state_dir() -> PathBuf {

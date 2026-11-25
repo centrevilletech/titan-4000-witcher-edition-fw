@@ -30,6 +30,8 @@ mod carrier_watch_io;
 mod clock;
 mod cpu_trims_io;
 mod fastpath_io;
+mod files;
+mod netdev;
 mod radio;
 mod radio_modem;
 mod qctrl_io;

@@ -21,6 +21,9 @@ use titan_pd_model::fastpath::{
 };
 use titan_pd_model::sha256;
 
+use crate::files::read_file;
+use crate::netdev::{bridge_ports, carrier_up};
+
 const MANIFEST: &str = include_str!("../../../device/fastpath/SHA256SUMS");
 
 /// The staged module and its config, only while the volume is mounted.
@@ -139,52 +142,33 @@ fn write_proc_cmd(cmd: &str) -> std::io::Result<()> {
         .and_then(|mut file| file.write_all(cmd.as_bytes()))
 }
 
-fn read_text(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
-}
-
-fn carrier_up(dev: &str) -> bool {
-    read_text(Path::new(&format!("/sys/class/net/{dev}/carrier"))).trim() == "1"
-}
-
-fn bridge_ports() -> Vec<String> {
-    fs::read_dir("/sys/class/net/br0/brif")
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn read_proc_after_mode_write(want: u32) -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+    let proc = fastpath::parse_proc(&read_file(Path::new(&proc_path())));
     if proc.ours && proc.mode == Some(want) {
         return proc;
     }
     // On a real kernel `/proc/k1fp` updates synchronously on the first read.
     // A brief retry covers a test control pipe updating a stand-in file.
     thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
+    fastpath::parse_proc(&read_file(Path::new(&proc_path())))
 }
 
 fn read_proc_after_grant_open() -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+    let proc = fastpath::parse_proc(&read_file(Path::new(&proc_path())));
     if proc.ours && proc.gate_open == Some(true) {
         return proc;
     }
     thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
+    fastpath::parse_proc(&read_file(Path::new(&proc_path())))
 }
 
 fn read_proc_after_grant_close() -> Proc {
-    let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+    let proc = fastpath::parse_proc(&read_file(Path::new(&proc_path())));
     if proc.ours && proc.gate_open == Some(false) {
         return proc;
     }
     thread::sleep(Duration::from_millis(50));
-    fastpath::parse_proc(&read_text(Path::new(&proc_path())))
+    fastpath::parse_proc(&read_file(Path::new(&proc_path())))
 }
 
 /// Fast path lifecycle and grant-lease state for one keeper process.
@@ -223,7 +207,7 @@ impl Watch {
         if !loaded && self.lease_state == LeaseState::Unknown && step == GateStep::Close {
             // Handle a keeper restart or hand-loaded module before the first
             // `maintain()` tick runs without suppressing the adoption log.
-            let text = read_text(Path::new(&proc_path()));
+            let text = read_file(Path::new(&proc_path()));
             if fastpath::parse_proc(&text).ours {
                 loaded = true;
             }
@@ -291,7 +275,7 @@ impl Watch {
             return;
         };
 
-        let config = fastpath::parse_config(&read_text(&dir.join("config")));
+        let config = fastpath::parse_config(&read_file(&dir.join("config")));
         if config.refused != self.refused_logged {
             for line in &config.refused {
                 note(&format!(
@@ -311,8 +295,8 @@ impl Watch {
             self.up_since = Some(now);
         }
 
-        let proc_text = read_text(Path::new(&proc_path()));
-        let modules_text = read_text(Path::new(&modules_path()));
+        let proc_text = read_file(Path::new(&proc_path()));
+        let modules_text = read_file(Path::new(&modules_path()));
         let adopted = match fastpath::loaded(&modules_text, &proc_text) {
             Loaded::Other(name) => {
                 self.module_loaded = false;
@@ -443,7 +427,7 @@ impl Watch {
             }
         };
 
-        let proc = fastpath::parse_proc(&read_text(Path::new(&proc_path())));
+        let proc = fastpath::parse_proc(&read_file(Path::new(&proc_path())));
         if !proc.ours {
             self.module_loaded = false;
             self.managed = false;
