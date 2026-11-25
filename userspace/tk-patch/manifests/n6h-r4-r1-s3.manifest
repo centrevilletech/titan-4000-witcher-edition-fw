@@ -1,7 +1,5 @@
 # Witcher tk patch manifest: Witcher bytes and hashes only (docs/tk-patch.md).
-# From spec: n6h + rust n4 v2 uplink engine (r4) + rust uplink pie aqm (r1, block version 0x20261126)
-# v1.0.17 uplink AQM defaults, bench step S3 (lanes-20261125/AB3): PIE drop budget 5% (0x841b5934 =
-# 0xccccd, was 0x51eb8) and ceiling 35 ms (0x841b5938 = 0x23, was 0x32). Every other byte is n6h-r4-r1.
+# From spec: n6h + rust n4 v2 uplink engine (r4) + rust uplink pie aqm (r1, block version 0x20261126) + s3 uplink aqm defaults (pie drop budget 5% at 0x841b5934, ceiling 35 ms at 0x841b5938)
 witcher-tk-manifest 1
 name n6h-r4-r1-s3
 base 0x84100000
