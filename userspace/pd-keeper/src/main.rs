@@ -17,6 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use titan_pd_model::config::{self, Pending, Recovery};
 use titan_pd_model::wear;
+use titan_sys::process::{Signal, SpawnExt};
 
 mod bench;
 mod capture;
@@ -376,9 +377,7 @@ pub(crate) fn signal_rcinit() -> Result<(), ()> {
             continue;
         };
         if fs::read_to_string(entry.path().join("comm")).is_ok_and(|name| name.trim() == "rcinit") {
-            return (unsafe { libc::kill(pid, libc::SIGUSR1) } == 0)
-                .then_some(())
-                .ok_or(());
+            return titan_sys::process::kill(pid, Signal::User1).map_err(drop);
         }
     }
     Err(())
@@ -420,25 +419,18 @@ fn filter_undo(args: &[String]) -> i32 {
 }
 
 fn spawn_undo(dev: &str) -> Result<(), ()> {
-    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
     let exe = env::current_exe().map_err(|_| ())?;
-    let mut child = Command::new(exe);
-    child
+    Command::new(exe)
         .arg("filter-undo")
         .arg(dev)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        child.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    child.spawn().map(|_| ()).map_err(|_| ())?;
+        .stderr(Stdio::null())
+        .new_session()
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| ())?;
     let dev = dev.to_owned();
     thread::spawn(move || {
         thread::sleep(Duration::from_secs(30));

@@ -16,12 +16,9 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     mem::discriminant,
-    os::{
-        fd::AsRawFd,
-        unix::{
-            fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-            process::CommandExt,
-        },
+    os::unix::{
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
+        process::CommandExt,
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -34,6 +31,7 @@ use titan_pd_model::{
     config::persistent_volume_mounted,
     radio::{self as model, Action, Cell, PCELL_CLEAR, PCELL_QUERY, Picker, Profile, failures},
 };
+use titan_sys::process::{Signal, SpawnExt, effective_uid, kill_group};
 
 /// Seconds between health and carrier checks while a profile is active.
 const CHECK_EVERY: u64 = 30;
@@ -158,7 +156,7 @@ pub fn supervise() {
 }
 
 fn root() -> io::Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if effective_uid() != 0 {
         return Err(fail("operator access required"));
     }
     if !persistent_volume_mounted() {
@@ -276,18 +274,9 @@ fn run_worker(op: &str, seconds: u64) -> io::Result<()> {
     let mut cmd = Command::new("/tmp/titan-pd-keeper/titan-pd-keeper");
     cmd.args(["radio-worker", op])
         .stdin(Stdio::null())
-        .process_group(0);
-    let ppid = std::process::id();
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0
-                || libc::getppid() != ppid as i32
-            {
-                return Err(fail("guard gone"));
-            }
-            Ok(())
-        });
-    }
+        .process_group(0)
+        // The worker dies with the guard, and does not start once it is gone.
+        .die_with_parent(std::process::id());
     let reason = ram("radio-worker-error");
     cmd.stderr(Stdio::from(File::create(&reason)?));
     let mut child = cmd.spawn()?;
@@ -314,9 +303,7 @@ fn run_worker(op: &str, seconds: u64) -> io::Result<()> {
         }
         pause(1);
     }
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
-    }
+    let _ = kill_group(child.id() as i32, Signal::Kill);
     child.wait()?;
     Err(fail("worker deadline expired"))
 }
@@ -372,7 +359,8 @@ fn lock_guard() -> io::Result<File> {
         .truncate(false)
         .mode(0o600)
         .open(ram("radio.lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    // flock(LOCK_EX | LOCK_NB), held until the file is closed.
+    if file.try_lock().is_err() {
         return Err(fail("guard already running"));
     }
     Ok(file)

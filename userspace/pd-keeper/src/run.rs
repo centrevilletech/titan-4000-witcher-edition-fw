@@ -36,7 +36,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use std::os::unix::process::CommandExt;
 use titan_pd_model::carrier_watch::{self, Action as CarrierAction};
 use titan_pd_model::cbrs_gate::{self, Step as GateStep, Tool as GateTool};
 use titan_pd_model::config::{self, Config, Report};
@@ -59,6 +58,7 @@ use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 use titan_sys::ifaddrs::InterfaceAddrs;
+use titan_sys::process::SpawnExt;
 use titan_sys::socket::{Socket, SocketExt};
 
 use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
@@ -3990,7 +3990,7 @@ fn stop_customer_udhcpd() {
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
     let mut left = pids;
     while !left.is_empty() && std::time::Instant::now() < deadline {
-        left.retain(|pid| unsafe { libc::waitpid(*pid, std::ptr::null_mut(), libc::WNOHANG) } == 0);
+        left.retain(|pid| matches!(titan_sys::process::try_reap(*pid), Ok(false)));
         if !left.is_empty() {
             thread::sleep(Duration::from_millis(20));
         }
@@ -3998,21 +3998,14 @@ fn stop_customer_udhcpd() {
 }
 
 fn spawn_udhcpd() -> Result<std::process::Child, String> {
-    let mut child = Command::new("/usr/sbin/udhcpd");
-    child
+    Command::new("/usr/sbin/udhcpd")
         .args(["-f", "/tmp/udhcpd.conf"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        child.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    child.spawn().map_err(|err| err.to_string())
+        .stderr(Stdio::null())
+        .new_session()
+        .spawn()
+        .map_err(|err| err.to_string())
 }
 
 fn cached_mgmt_iid() -> Option<mgmt::Iid> {

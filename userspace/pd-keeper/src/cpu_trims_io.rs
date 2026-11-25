@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use titan_pd_model::config;
 use titan_pd_model::cpu_trims::{self, Config, LedPacer, LedState, LedStep, StatusView};
+use titan_sys::process::{self, Signal};
 
 /// Seconds between log lines about the LED loop changing state.
 const LED_LOG_EVERY: u64 = 60;
@@ -90,14 +91,13 @@ fn find_ksoftirqd(root: &Path) -> Option<i32> {
         .find(|pid| ksoftirqd_nice(root, *pid).is_some())
 }
 
-fn signal(pid: i32, sig: libc::c_int) -> bool {
-    pid > 1 && unsafe { libc::kill(pid as libc::pid_t, sig) } == 0
+/// Never init, nor a pid `kill(2)` reads as a group.
+fn signal(pid: i32, signal: Signal) -> bool {
+    pid > 1 && process::kill(pid, signal).is_ok()
 }
 
 fn set_nice(pid: i32, nice: i32) -> bool {
-    pid > 1
-        && unsafe { libc::setpriority(libc::PRIO_PROCESS as _, pid as libc::id_t, nice as libc::c_int) }
-            == 0
+    pid > 1 && process::set_nice(pid, nice).is_ok()
 }
 
 #[derive(Default)]
@@ -165,7 +165,7 @@ impl Watch {
             // A keeper that died may have left the loop paused.
             if let Some(pid) = find_led_loop(&root) {
                 self.led_pid = Some(pid);
-                signal(pid, libc::SIGCONT);
+                signal(pid, Signal::Continue);
             }
             self.led_scan_at = Some(now);
             self.pacer.resumed_at(now);
@@ -222,7 +222,7 @@ impl Watch {
             LedStep::Leave => {}
             LedStep::Resume => {
                 if let Some(pid) = self.led_target(now, root) {
-                    signal(pid, libc::SIGCONT);
+                    signal(pid, Signal::Continue);
                 }
                 self.pacer.resumed_at(now);
             }
@@ -244,7 +244,7 @@ impl Watch {
             note("cpu trims: cannot read /proc/locks, so the LED loop is never paused");
             return;
         }
-        if !signal(pid, libc::SIGSTOP) {
+        if !signal(pid, Signal::Stop) {
             self.led_pid = None;
             self.pacer.resumed_at(now);
             return;
@@ -256,7 +256,7 @@ impl Watch {
             self.pauses += 1;
             self.pacer.paused_at(now);
         } else {
-            signal(pid, libc::SIGCONT);
+            signal(pid, Signal::Continue);
             self.lock_backoffs += 1;
             self.pacer.resumed_at(now);
         }
@@ -420,9 +420,9 @@ mod tests {
 
     #[test]
     fn signals_never_reach_init_or_a_bad_pid() {
-        assert!(!signal(1, libc::SIGCONT));
-        assert!(!signal(0, libc::SIGCONT));
-        assert!(!signal(-1, libc::SIGCONT));
+        assert!(!signal(1, Signal::Continue));
+        assert!(!signal(0, Signal::Continue));
+        assert!(!signal(-1, Signal::Continue));
         assert!(!set_nice(1, 0));
         assert!(!set_nice(0, 0));
     }
