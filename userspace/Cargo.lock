@@ -110,6 +110,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "titan-sys"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"

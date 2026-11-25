@@ -139,6 +139,9 @@ jobs:
         with:
           toolchain: '1.99.0'
           targets: armv7-unknown-linux-musleabi
+          components: clippy
+      - name: Unsafe audit (every unsafe block in titan-sys has a SAFETY comment)
+        run: cargo clippy --locked --manifest-path userspace/Cargo.toml -p titan-sys --all-targets -- -D warnings
       - name: Build the release binaries and report their sizes
         run: |
           set -euo pipefail
