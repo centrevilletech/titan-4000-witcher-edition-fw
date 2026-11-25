@@ -2,7 +2,7 @@
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
  * k1fp_core.h - Portable decision, classification, lease, watchdog, TX-ring,
- * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.2.
+ * diagnostic ring, and SHA-256 fingerprint logic for titan_k1fp 2.3.
  *
  * No kernel headers here. The includer must provide u8/u16/u32/u64/s32 and
  * memcmp/memcpy/memset. The same header compiles into the ARMv7 kernel module
@@ -415,6 +415,7 @@ struct k1_pend {
 	u8  had_lease;
 	u8  active;
 	u8  cancelled; /* cancelled via NF_BR_LOCAL_IN or NF_BR_LOCAL_OUT */
+	u8  qctrl;     /* 2.3: titan_qctrl's hook was live when the proof began */
 };
 
 enum k1_stage_res {
@@ -437,6 +438,7 @@ static inline void k1_pend_begin(struct k1_pend *pd, const void *skb, u32 outidx
 	pd->had_lease = (u8)!!had_lease;
 	pd->active = 1;
 	pd->cancelled = 0;
+	pd->qctrl = 0;
 }
 
 /*
@@ -455,36 +457,81 @@ static inline int k1_pend_cancel(struct k1_pend *pd, const void *skb)
 	return 1;
 }
 
+/* IPv4 or IPv6 header unchanged, or only ECT(0)/ECT(1) -> CE (titan_qctrl mode 4) with a
+ * valid IPv4 checksum; never a DSCP, TTL, length, address or protocol change. */
+static inline int k1_l3_same(u8 family, const u8 *o, const u8 *n)
+{
+	u8 oecn, necn;
+
+	if (family == 4u) {
+		if (memcmp(o, n, 20) == 0)
+			return 1;
+		oecn = o[1] & 0x03u;
+		necn = n[1] & 0x03u;
+		return (oecn == 1u || oecn == 2u) && necn == 3u &&
+		       o[0] == n[0] && (o[1] & 0xfcu) == (n[1] & 0xfcu) &&
+		       memcmp(o + 2, n + 2, 8) == 0 && memcmp(o + 12, n + 12, 8) == 0 &&
+		       k1_v4csum_ok(n);
+	}
+	if (memcmp(o, n, 40) == 0)
+		return 1;
+	oecn = (o[1] >> 4) & 0x03u;
+	necn = (n[1] >> 4) & 0x03u;
+	return (oecn == 1u || oecn == 2u) && necn == 3u &&
+	       o[0] == n[0] && (o[1] & 0xcfu) == (n[1] & 0xcfu) && memcmp(o + 2, n + 2, 38) == 0;
+}
+
+/*
+ * 2.3: titan_qctrl's upload clamp lowered the receive window (bytes 14-15 of the base TCP
+ * header) and fixed the checksum (16-17) incrementally; every other byte is the same. The
+ * one's complement sum of window and checksum is unchanged (mod 0xffff), so the checksum
+ * is still right.
+ */
+/* x mod 0xffff without a division (the kernel exports none to this module). */
+static inline u32 k1_ones_fold(u32 x)
+{
+	x = (x & 0xffffu) + (x >> 16);
+	x = (x & 0xffffu) + (x >> 16);
+	return x == 0xffffu ? 0u : x;
+}
+
+static inline int k1_tcp_window_lowered(const u8 *o, const u8 *n)
+{
+	u32 ow = k1_be16(o + 14), nw = k1_be16(n + 14);
+	u32 oc = k1_be16(o + 16), nc = k1_be16(n + 16);
+
+	if (memcmp(o, n, 14) != 0 || memcmp(o + 18, n + 18, 2) != 0 || nw >= ow)
+		return 0;
+	return k1_ones_fold(ow + oc) == k1_ones_fold(nw + nc);
+}
+
+/*
+ * Did the stock path forward the proof packet unchanged? Downlink packets may carry what
+ * titan_qctrl writes there, which the fast path reproduces by calling its hook: an ECN CE
+ * mark (mode 4) and, while titan_qctrl's hook was live when the proof began, a lowered TCP
+ * receive window (2.3, upload clamp). Nothing else: no MAC, address, port, DSCP, TTL, flag,
+ * sequence or other TCP change, and nothing at all on uplink.
+ */
 static inline int k1_pend_same(const struct k1_pend *pd, const u8 *eth, u32 lin,
 			       u32 prio, u32 mark)
 {
+	const u8 *o = pd->hdr + K1_ETH_HLEN, *n = eth + K1_ETH_HLEN;
+	u32 l3 = pd->pkt.family == 4u ? 20u : 40u, l4;
+
 	if (lin < pd->pkt.hdrlen || prio != pd->pkt.prio || mark != pd->pkt.mark)
 		return 0;
 	if (memcmp(eth, pd->hdr, pd->pkt.hdrlen) == 0)
 		return 1;
-	/* Allow valid ECT(0)/ECT(1) -> CE ECN marking on downlink (e.g. titan_qctrl mode 4)
-	 * while still rejecting any DSCP, TTL, MAC, IP, port, or TCP change. */
-	if (pd->outidx == 1u && memcmp(eth, pd->hdr, K1_ETH_HLEN) == 0) {
-		const u8 *o = pd->hdr + K1_ETH_HLEN;
-		const u8 *n = eth + K1_ETH_HLEN;
-
-		if (pd->pkt.family == 4u && pd->pkt.hdrlen >= K1_ETH_HLEN + 20u) {
-			u8 oecn = o[1] & 0x03u, necn = n[1] & 0x03u;
-			if ((oecn == 1u || oecn == 2u) && necn == 3u &&
-			    o[0] == n[0] && (o[1] & 0xfcu) == (n[1] & 0xfcu) &&
-			    memcmp(o + 2, n + 2, 8) == 0 &&
-			    memcmp(o + 12, n + 12, pd->pkt.hdrlen - (K1_ETH_HLEN + 12u)) == 0 &&
-			    k1_v4csum_ok(n))
-				return 1;
-		} else if (pd->pkt.family == 6u && pd->pkt.hdrlen >= K1_ETH_HLEN + 40u) {
-			u8 oecn = (o[1] >> 4) & 0x03u, necn = (n[1] >> 4) & 0x03u;
-			if ((oecn == 1u || oecn == 2u) && necn == 3u &&
-			    o[0] == n[0] && (o[1] & 0xcfu) == (n[1] & 0xcfu) &&
-			    memcmp(o + 2, n + 2, pd->pkt.hdrlen - (K1_ETH_HLEN + 2u)) == 0)
-				return 1;
-		}
-	}
-	return 0;
+	if (pd->outidx != 1u || memcmp(eth, pd->hdr, K1_ETH_HLEN) != 0 ||
+	    pd->pkt.hdrlen < K1_ETH_HLEN + l3)
+		return 0;
+	if (!k1_l3_same(pd->pkt.family, o, n))
+		return 0;
+	l4 = pd->pkt.hdrlen - (K1_ETH_HLEN + l3);
+	if (memcmp(o + l3, n + l3, l4) == 0)
+		return 1;
+	return pd->qctrl && pd->pkt.proto == 6u && l4 >= 20u &&
+	       k1_tcp_window_lowered(o + l3, n + l3);
 }
 
 static inline int k1_stage_br(struct k1_pend *pd, struct k1_tbl *t, const void *skb,

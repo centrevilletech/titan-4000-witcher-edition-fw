@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
- * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.2) for the Global
+ * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.3) for the Global
  * Telecom Titan 4000 (GDM7243AP, Linux 3.10.0-uc0, UP ARMv7, PREEMPT_NONE).
  *
  * Built standalone against titan_k310_abi.h (no 3.10 kernel tree required).
@@ -48,6 +48,13 @@
  *   ports of one bridge again (the test init_module applies), counts reacq
  *   and bumps the epoch. The mode stays 0 until userspace writes it again.
  *
+ * titan_qctrl's upload clamp (2.3): titan_qctrl v0.4 lowers the receive window
+ *   of downlink TCP ACKs. The fast path reproduces that by calling its hook, so a
+ *   proof sample whose only change is a lowered window with an incrementally
+ *   fixed checksum, on downlink, while titan_qctrl's hook was live when the proof
+ *   began, still proves the flow (k1_pend_same). 2.2 counted it as modified and
+ *   tripped its watchdog within a second of an upload.
+ *
  * Note: dlbypass (gdmlte live text patch) is intentionally absent so
  * the vendor netif_enqueue router-MAC rewrite is always preserved.
  */
@@ -56,7 +63,7 @@
 #include "k1fp_core.h"
 #include "k1_fp.h"
 
-#define K1_VERSION "titan_k1fp v2.2"
+#define K1_VERSION "titan_k1fp v2.3"
 
 /* ---------- Module metadata matching stock 3.10.0-uc0 ELF ABI ---------- */
 int init_module(void);
@@ -593,6 +600,7 @@ static rx_handler_result_t k1_rx(struct sk_buff **pskb)
 stock_cand:
 	g.st.cand_stock++;
 	k1_pend_begin(&g.pend, skb, outidx, &pkt, eth, f && r != K1F_NOLEASE && r != K1F_STALE);
+	g.pend.qctrl = (u8)qctrl_active;   /* 2.3: its downlink window rewrite is expected */
 	res = g.orig_rx(pskb);
 	if (!g.pend.granted && !g.pend.cancelled)
 		g.st.noconfirm++;

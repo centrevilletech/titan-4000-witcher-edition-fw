@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
  * test_k1fp.c - Userspace unit, integration, and fuzz test suite for
- * k1fp 2.2 (device/fastpath/source/k1fp_core.h).
+ * k1fp 2.3 (device/fastpath/source/k1fp_core.h).
  *
  * Compiled and executed on the host with AddressSanitizer + UBSan via
  * device/fastpath/test/run.sh.
@@ -91,6 +91,18 @@ static u32 mk_v4(u8 *b, u8 proto, u32 src, u32 dst, u16 sp, u16 dp,
 		wr16(b + 34 + 4, (u16)(8u + payload));
 	}
 	return K1_ETH_HLEN + tot;
+}
+
+/* Lower a TCP window and fix the checksum as titan_qctrl does (RFC 1624 eqn. 3). */
+static void tcp_lower_win(u8 *th, u16 nw)
+{
+	u32 ow = k1_be16(th + 14), hc = k1_be16(th + 16), s;
+
+	s = (~hc & 0xffffu) + (~ow & 0xffffu) + nw;
+	s = (s & 0xffffu) + (s >> 16);
+	s = (s & 0xffffu) + (s >> 16);
+	wr16(th + 16, (u16)~s);
+	wr16(th + 14, nw);
 }
 
 static u32 mk_v6(u8 *b, u8 nh, const u8 src[16], const u8 dst[16],
@@ -420,6 +432,102 @@ static void test_cbrs_and_proof_invariants(void)
 	CHECK(k1_stage_br(&pd, &tbl, b, 2, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
 	      "TCP RWND change rejected");
 	k1_pend_end(&pd, &tbl, now, seed);
+
+	/* 3b. k1fp 2.3: titan_qctrl's upload clamp lowers the receive window of downlink ACKs.
+	 *     Accepted only on downlink, only while titan_qctrl was live when the proof began,
+	 *     only lower, only with a consistent checksum, and nothing else in the header. */
+	now = 4500;
+	n = mk_v4(b, 6, 0xc6336401u, 0xcb007101u, 5299, 51234, 0x10, 0, 0, 64, 0); /* server ACK */
+	wr16(b + 34 + 14, 0x2000u);
+	wr16(b + 34 + 16, 0x5a17u);
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK, "v4 ack parse");
+	memcpy(mod, b, n);
+	tcp_lower_win(mod + 34, 0x0123u);
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_BROK,
+	      "DL v4 window lowered by qctrl accepted");
+	CHECK(k1_stage_ip4(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_GRANTED,
+	      "DL v4 window lowered by qctrl granted");
+	k1_pend_end(&pd, &tbl, now, seed);
+	{
+		u32 c4 = 0, k4;
+		for (k4 = 0; k4 < 20; k4 += 2)   /* the rewrite keeps the TCP one's complement sum */
+			c4 += k1_be16(b + 34 + k4) - k1_be16(mod + 34 + k4) + 0xffffu;
+		CHECK(c4 % 0xffffu == 0, "qctrl rewrite keeps the TCP checksum sum");
+	}
+	k1_pend_begin(&pd, b, 1, &p, b, 0);      /* titan_qctrl not live: 2.2 behaviour */
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "window change without qctrl rejected");
+	k1_pend_end(&pd, &tbl, now, seed);
+	k1_pend_begin(&pd, b, 2, &p, b, 0);      /* uplink: never */
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 2, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "UL window change rejected even with qctrl");
+	k1_pend_end(&pd, &tbl, now, seed);
+	memcpy(mod, b, n);
+	tcp_lower_win(mod + 34, 0x2001u);         /* raised */
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "window raised rejected");
+	k1_pend_end(&pd, &tbl, now, seed);
+	memcpy(mod, b, n);
+	wr16(mod + 34 + 14, 0x0123u);             /* lowered, checksum not fixed */
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "window lowered with a stale checksum rejected");
+	k1_pend_end(&pd, &tbl, now, seed);
+	memcpy(mod, b, n);
+	tcp_lower_win(mod + 34, 0x0123u);
+	mod[34 + 11] ^= 0x01u;                    /* and the ACK number */
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "window plus another TCP change rejected");
+	k1_pend_end(&pd, &tbl, now, seed);
+	memcpy(mod, b, n);
+	tcp_lower_win(mod + 34, 0x0123u);
+	mod[22] = 63;                             /* and the TTL */
+	ip4_fix_csum(mod + 14);
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_MODIFIED,
+	      "window plus TTL change rejected");
+	k1_pend_end(&pd, &tbl, now, seed);
+	/* ECN CE and a lowered window together (a bidirectional flow's downlink data) */
+	n = mk_v4(b, 6, 0xc6336401u, 0xcb007101u, 5299, 51234, 0x10, 0x02, 0, 64, 40);
+	wr16(b + 34 + 14, 0x4000u);
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK, "v4 ect data parse");
+	memcpy(mod, b, n);
+	mod[15] |= 0x03u;
+	ip4_fix_csum(mod + 14);
+	tcp_lower_win(mod + 34, 0x0400u);
+	k1_pend_begin(&pd, b, 1, &p, b, 0);
+	pd.qctrl = 1;
+	CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_BROK,
+	      "CE mark plus lowered window accepted");
+	k1_pend_end(&pd, &tbl, now, seed);
+	/* IPv6 downlink ACK */
+	{
+		static const u8 s6[16] = { 0x20, 0x01, 0x0d, 0xb8, 1, [15] = 1 };
+		static const u8 d6[16] = { 0x20, 0x01, 0x0d, 0xb8, 2, [15] = 2 };
+		n = mk_v6(b, 6, s6, d6, 5299, 51234, 0x10, 0, 64, 0);
+		wr16(b + 54 + 14, 0x2000u);
+		CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK, "v6 ack parse");
+		memcpy(mod, b, n);
+		tcp_lower_win(mod + 54, 0x0042u);
+		k1_pend_begin(&pd, b, 1, &p, b, 0);
+		pd.qctrl = 1;
+		CHECK(k1_stage_br(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_BROK,
+		      "DL v6 window lowered by qctrl accepted");
+		CHECK(k1_stage_br_last(&pd, &tbl, b, 1, mod, n, 0, 0, now, 1, 60, 20, seed) == K1S_GRANTED,
+		      "DL v6 window lowered by qctrl granted");
+		k1_pend_end(&pd, &tbl, now, seed);
+	}
+	n = mk_v4(b, 6, 0xc6336401u, 0xcb007101u, 443, 51234, 0x10, 0x22, 0, 64, 50);
+	CHECK(k1_parse(b, n, n - 14, 1, &p) == K1W_OK, "v4 parse again");
 
 	/* Wrong port -> WRONGPORT */
 	k1_pend_begin(&pd, b, 1, &p, b, 0);
@@ -922,6 +1030,6 @@ int main(void)
 		fprintf(stderr, "FAILED: %d check(s) failed\n", fails);
 		return 1;
 	}
-	printf("PASS: all k1fp 2.2 host tests passed (classifier, 2M fuzz, modes/qctrl, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, device re-acquire, SHA-256)\n");
+	printf("PASS: all k1fp 2.3 host tests passed (classifier, 2M fuzz, modes/qctrl, qctrl upload window, CBRS v4+v6, local-alias, diag-ring, windowed watchdog, txring, device re-acquire, SHA-256)\n");
 	return 0;
 }

@@ -18,8 +18,9 @@
  *
  * Default on insmod: mode=0 (OBSERVE-ONLY; zero packet modification or delay).
  * Runtime control & telemetry: /proc/titan_qctrl
- *   echo "mode <0..15>"      (1=ACK-thin, 2=RWND-clamp, 4=DL-ECN, 8=UDP-drop)
+ *   echo "mode <0..31>"      (1=ACK-thin, 2=RWND-clamp, 4=DL-ECN, 8=UDP-drop, 16=UL-clamp)
  *   echo "target_ms <ms>"    (target eNB queue delay, default 12 ms)
+ *   echo "ul_target_ms <ms>" (Q2: modem queue the upload clamp allows, 0..40, default 8)
  *   echo "hold_us <us>"      (max ACK coalesce hold, default 2500 us)
  *   echo "ack_span <bytes>"  (max bytes per coalesced ACK, default 8192 B)
  *   echo "phy <kbps>"        (optional PHY DL ceiling; 0 = off, else 4000..1000000)
@@ -53,9 +54,20 @@
  *   - a floor tied to the unclamped rate, a starvation fail-safe (release),
  *     a fail-open when no queue signal exists, upward probes and a short
  *     periodic drain that refreshes the delay baselines.
+ *
+ * Q2 UPLOAD CLAMP (v0.4, 2026-11-25). Mode bit 4 (16) clamps the receive
+ * window in the server's ACKs (lte0pdn2 -> eth0) of every upload flow, so each
+ * customer sender keeps at most about ul_target_ms of data queued in the modem
+ * (Ring 1 and PDCP staging, which Linux cannot see). The law is in
+ * ulclamp_core.h (shared with the host tests); this file feeds it uplink data
+ * and downlink ACKs, rewrites the window, and runs its tick. With bit 4 clear
+ * the download paths below are unchanged; the upload estimates still run so
+ * /proc shows them and they are warm when the bit is set. titan_k1fp calls
+ * this hook for fast-path downlink packets, so the clamp also covers them.
  */
 
 #include "titan_k310_abi.h"
+#include "ulclamp_core.h"
 
 /* ---------- Module metadata matching stock 3.10.0-uc0 ELF ABI ---------- */
 int init_module(void);
@@ -78,7 +90,8 @@ static const char __mod_vermagic[] __attribute__((section(".modinfo"), used)) =
 #define MODE_RWND_CLAMP (1u << 1)
 #define MODE_DL_ECN     (1u << 2)
 #define MODE_UDP_DROP   (1u << 3)
-#define MODE_ALL        0x0fu
+#define MODE_UL_CLAMP   (1u << 4)                   /* Q2: upload window clamp */
+#define MODE_ALL        0x1fu
 
 #define FLOW_BUCKETS    128
 #define FLOW_WAYS       2
@@ -274,6 +287,9 @@ struct flow_entry {
     u16 thin_drop_ticks;       /* consecutive ticks flow dropped under thinning */
     u8  thin_active_flow;      /* flow thinned at least one ACK this tick */
     u8  _pad2;
+
+    /* Q2 (v0.4): upload clamp state (ulclamp_core.h) */
+    struct ulc_flow ul;
 };
 
 /* ---------- Global controller & telemetry state ---------- */
@@ -397,6 +413,8 @@ static struct {
     u32 stat_thin_bypass_recov;    /* ACKs bypassed: SACK / dupACK / recovery cooldown */
     u32 stat_thin_bypass_rate;     /* ACKs bypassed: slow-start / rate floor / backoff */
     u32 stat_thin_bypass_win;      /* ACKs bypassed: clamp window opening */
+
+    struct ulc ul;                 /* Q2 (v0.4): upload clamp knobs, estimates, counters */
 
     struct flow_entry flows[FLOW_SLOTS];
 } g;
@@ -538,6 +556,45 @@ static int flush_timer_cb(struct hrtimer *timer)
     return HRTIMER_NORESTART;
 }
 
+/* ---------- Window rewrite (download clamp on uplink ACKs, upload clamp on downlink ACKs) ---------- */
+
+/*
+ * Write a new raw TCP window into the segment whose TCP header starts at
+ * l4_off and fix the checksum incrementally (RFC 1624, inet_proto_csum_replace4).
+ * Returns 0 when the header cannot be made writable; the original window then
+ * goes out. skb_make_writable may move skb->data: callers reload any pointer
+ * into the packet afterwards.
+ */
+static int tcp_set_window(struct sk_buff *skb, u32 l4_off, u16 old_win, u16 new_win)
+{
+    u8 *th;
+
+    if (!skb_make_writable(skb, l4_off + 20u))
+        return 0;
+    th = skb->data + l4_off;
+    th[14] = (u8)(new_win >> 8);
+    th[15] = (u8)(new_win & 0xffu);
+    inet_proto_csum_replace4((__sum16 *)(th + 16), skb,
+                             (__be32)htons(old_win), (__be32)htons(new_win), 0);
+    return 1;
+}
+
+/* Q2: the upload clamp's tick over every flow (ulclamp_core.h). The uploads'
+ * ACKs wait in the downlink queue too; pass it in only when it comes from the
+ * servers' clocks (q_src 1, one way): the RTT fallback would include the
+ * uploads' own queue. */
+static void ul_tick(u32 now)
+{
+    u32 i;
+
+    g.ul.dl_queue_ms = (g.q_src == 1u) ? g.dq_est_ms : 0u;
+    ulc_tick_begin(&g.ul, now);
+    for (i = 0; i < FLOW_SLOTS; i++)
+        if (g.flows[i].key_hash)
+            ulc_tick_flow(&g.ul, &g.flows[i].ul, now);
+    ulc_tick_end(&g.ul, now);
+}
+
 /* ---------- O1b: 20 ms controller (queue signal, c_hat, window loop) ---------- */
 
 /* Weight of a flow for the RTT-fair split: its mean cycle time in ms. */
@@ -591,6 +648,7 @@ static void controller_tick(u32 now)
         dt_us = 976562u;
     g.last_tick_us = now;
     g.tick_count++;
+    ul_tick(now);
     dt_ms = units_to_ms(dt_us);
     if (dt_ms == 0)
         dt_ms = 1;
@@ -1583,6 +1641,9 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
                 if (f->syn_pending) {
                     f->syn_pending = 0;
                     record_rtt_sample(f, now - f->syn_ts_us, now);
+                    /* Q2: this answers the customer's SYN seen on this flow */
+                    ulc_on_synack(&f->ul, f->syn_ws_seen, opts.has_ws, opts.wscale,
+                                  now - f->syn_ts_us, now);
                 }
             }
 
@@ -1613,6 +1674,20 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
                 seq_gt(seq + tcp_payload_len, f->edge_probe_seq)) {
                 f->edge_probe_active = 0;
                 record_rtt_sample(f, now - f->edge_probe_us, now);
+            }
+
+            /* Q2: this segment carries the server's receive window for the
+             * customer's upload. The estimates run in every mode; the window
+             * is lowered only with MODE_UL_CLAMP. */
+            if ((flags & TCP_ACK) && !(flags & (TCP_SYN | TCP_RST)) &&
+                (f->ul.state & ULC_S_WS)) {
+                u32 target = ulc_on_dl_ack(&g.ul, &f->ul, ack, now, f->mss);
+                u16 sent = (g.mode & MODE_UL_CLAMP) ?
+                           ulc_raw_window(&f->ul, ack, win, target) : win;
+
+                if (sent != win && !tcp_set_window(skb, l4_off, win, sent))
+                    sent = win;
+                ulc_sent(&g.ul, &f->ul, ack, win, sent);
             }
             return NF_ACCEPT;
         }
@@ -1650,8 +1725,13 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
             f->thin_ref_kbps = 0;
             f->thin_drop_ticks = 0;
             f->thin_active_flow = 0;
+            ulc_flow_reset(&f->ul, now);       /* Q2 */
             return NF_ACCEPT;
         }
+
+        /* Q2: the customer's upload data (every mode, so the estimates are warm) */
+        if (tcp_payload_len > 0 && !(flags & TCP_RST))
+            ulc_on_ul_data(&g.ul, &f->ul, seq + tcp_payload_len, now);
 
         /* O1b: arm the passive RTT probe on the FIRST UL packet that carries
          * a new TSval (one probe per RTT). Y6 armed on any packet after a
@@ -1697,15 +1777,9 @@ static unsigned int qctrl_hook_body(struct sk_buff *skb,
                 new_win_raw = win;
 
             if (new_win_raw != win) {
-                if (skb_make_writable(skb, l4_off + 20u)) {
-                    __be16 old_be = htons(win);
-                    __be16 new_be = htons(new_win_raw);
+                if (tcp_set_window(skb, l4_off, win, new_win_raw)) {
                     l3 = skb->data;
                     th = l3 + l4_off;
-                    th[14] = (u8)(new_win_raw >> 8);
-                    th[15] = (u8)(new_win_raw & 0xffu);
-                    inet_proto_csum_replace4((__sum16 *)(th + 16), skb,
-                                             (__be32)old_be, (__be32)new_be, 0);
                     win = new_win_raw;
                     g.stat_rwnd_clamped++;
                 }
@@ -1999,8 +2073,8 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
 {
     (void)v;
     seq_printf(m,
-        "titan_qctrl v0.3-q3 (NF_BR_FORWARD prio=+100)\n"
-        "mode=0x%x (ack_thin=%u rwnd_clamp=%u dl_ecn=%u udp_drop=%u)\n"
+        "titan_qctrl v0.4 (NF_BR_FORWARD prio=+100)\n"
+        "mode=0x%x (ack_thin=%u rwnd_clamp=%u dl_ecn=%u udp_drop=%u ul_clamp=%u)\n"
         "params: target_q_ms=%u hold_us=%u max_ack_span=%u phy_cap_kbps=%u\n"
         "        qsrc=%u slack_ms=%u floor_pct=%u drain=%u probe=%u trough_ms=%u rtt_target_ms=%u ecn_ms=%u wfix_kb=%u rttlaw=%u\n"
         "        ack_adapt=%u ctrl_v3=%u ack_ms=%u ack_segs=%u ack_min_kbps=%u\n"
@@ -2018,6 +2092,7 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
         g.mode,
         !!(g.mode & MODE_ACK_THIN), !!(g.mode & MODE_RWND_CLAMP),
         !!(g.mode & MODE_DL_ECN),   !!(g.mode & MODE_UDP_DROP),
+        !!(g.mode & MODE_UL_CLAMP),
         g.target_q_ms, g.hold_us, g.max_ack_span, g.phy_cap_kbps,
         g.q_force, g.rtt_slack_ms, g.floor_pct, g.drain_enable, g.probe_enable,
         g.trough_ms, g.rtt_target_ms, g.ecn_ms, g.w_fix_bytes >> 10, g.rtt_law,
@@ -2041,6 +2116,14 @@ static int qctrl_proc_show(struct seq_file *m, void *v)
         g.stat_acks_flushed_wd, g.stat_acks_dropped_netdev, g.stat_ctx_skipped,
         g.stat_thin_backoff, g.stat_thin_bypass_recov, g.stat_thin_bypass_rate, g.stat_thin_bypass_win,
         g.stat_rwnd_clamped, g.stat_ecn_marked, g.stat_udp_dropped);
+    /* Q2: upload clamp. bw is bytes per 1024 units (1.048576 ms): x 7.63 = kbps. */
+    seq_printf(m,
+        "upload: ul_target_ms=%u ul_full=%u ul_dlq_ms=%u\n"
+        "        ul_bw_kbps=%u ul_rtt_ms=%u ul_flows=%u ul_w_kb=%u\n"
+        "        ul_acks=%u ul_clamped=%u ul_samples=%u ul_probes=%u ul_startups=%u\n",
+        g.ul.target_ms, g.ul.full, g.ul.dl_queue_ms,
+        (g.ul.bw * 1000u) / 131u, units_to_ms(g.ul.rtt_base), g.ul.n_active, g.ul.w_total >> 10,
+        g.ul.st_acks, g.ul.st_clamped, g.ul.st_samples, g.ul.st_probes, g.ul.st_startups);
     return 0;
 }
 
@@ -2092,7 +2175,9 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
     kbuf[n] = '\0';
 
     local_bh_disable();
-    if (starts_with(kbuf, "mode") && parse_u32(kbuf + 4, &val)) {
+    if (starts_with(kbuf, "ul_target_ms") && parse_u32(kbuf + 12, &val)) {
+        if (val <= ULC_TARGET_MAX_MS) g.ul.target_ms = val;           /* Q2 */
+    } else if (starts_with(kbuf, "mode") && parse_u32(kbuf + 4, &val)) {
         if (val <= MODE_ALL) {              /* Y6: reject, do not mask, >15 */
             g.mode = val;
             /* Flush held ACKs immediately if ACK thinning turned off */
@@ -2200,6 +2285,7 @@ static ssize_t qctrl_proc_write(struct file *file, const char *ubuf,
         g.thin_backoff_ticks = g.thin_armed = g.thin_drop_ticks = 0;
         g.thin_strikes = g.thin_ref_kbps = g.pre_thin_kbps = 0;
         g.thinned_last = 0;
+        g.ul.st_acks = g.ul.st_clamped = g.ul.st_samples = g.ul.st_probes = g.ul.st_startups = 0;  /* Q2 */
         g.ctl_active = 0;
         g.release_left = 0;
         g.starve_ticks = 0;
@@ -2256,6 +2342,7 @@ int init_module(void)
     }
     g.timer_pending = 0;
     g.last_tick_us = now_us();
+    ulc_init(&g.ul, g.last_tick_us);   /* Q2: knobs at their defaults, nothing learned */
 
     tasklet_hrtimer_init(&g_flush_timer, flush_timer_cb,
                          CLOCK_MONOTONIC, HRTIMER_MODE_REL);
@@ -2290,7 +2377,7 @@ int init_module(void)
         return ret;
     }
 
-    printk("titan_qctrl: loaded (v0.3-q3) in observe-only mode (mode=0); control via /proc/titan_qctrl\n");
+    printk("titan_qctrl: loaded (v0.4) in observe-only mode (mode=0); control via /proc/titan_qctrl\n");
     return 0;
 }
 

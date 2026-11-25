@@ -1,4 +1,4 @@
-//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.2).
+//! The passthrough bridge fast path: the `titan_k1fp` kernel module (v2.3).
 //!
 //! At 130+ Mbps in IP passthrough, softirq saturates the CPU and adds queueing
 //! delay. `titan_k1fp` short-circuits steady-state unicast IPv4 and IPv6
@@ -34,7 +34,9 @@
 use crate::cbrs_gate::{Gate, Step as GateStep};
 
 /// The first line of `/proc/k1fp` for the allowed build.
-pub const VERSION_LINE: &str = "titan_k1fp v2.2";
+/// 2.3 accepts the receive window titan_qctrl v0.4's upload clamp lowers on downlink ACKs
+/// in its stock-path proofs (2.2 counted it as modified and tripped its watchdog).
+pub const VERSION_LINE: &str = "titan_k1fp v2.3";
 /// The module's name in `/proc/modules`.
 pub const MODULE: &str = "titan_k1fp";
 /// The file in the staging directory and in the manifest.
@@ -610,7 +612,7 @@ mod tests {
 
     // Real `/proc/k1fp` output captured on the bench unit (mode 2, download running).
     const BENCH_PROC: &str = "\
-titan_k1fp v2.2
+titan_k1fp v2.3
 mode=2 lan=eth0 lan_hooked=1 wan=lte0pdn2 wan_hooked=1 br=br0 br_ports=2 ports_ok=1
 devices: dev_gone=0 reacq=0
 require_grant=1 grant_left_ms=4290 gate=open v4=1 v6=1 lease_ms=60 sample_ms=20
@@ -697,10 +699,10 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert!(unhooked_wan.bridge_issue().contains("wan_hooked=0"));
 
         // Different version string is rejected.
-        let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v1.2"));
+        let v1 = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.3", "titan_k1fp v1.2"));
         assert!(!v1.ours);
         assert!(!matches(&parse_config("mode=2\n"), &v1));
-        let dev = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.2-dev"));
+        let dev = parse_proc(&BENCH_PROC.replace("titan_k1fp v2.3", "titan_k1fp v2.3-dev"));
         assert!(!dev.ours);
         assert!(!parse_proc("").ours);
     }
@@ -711,8 +713,8 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         assert_eq!(loaded("", ""), Loaded::None);
         assert_eq!(loaded(MODULES, BENCH_PROC), Loaded::Ours);
         assert_eq!(
-            loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.2", "titan_k1fp v2.1")),
-            Loaded::Other("titan_k1fp (titan_k1fp v2.1)".into())
+            loaded(MODULES, &BENCH_PROC.replace("titan_k1fp v2.3", "titan_k1fp v2.2")),
+            Loaded::Other("titan_k1fp (titan_k1fp v2.2)".into())
         );
         assert_eq!(
             loaded(MODULES, ""),
