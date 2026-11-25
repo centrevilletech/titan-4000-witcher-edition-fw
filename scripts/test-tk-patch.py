@@ -48,6 +48,9 @@ BENCH = {
     # The release image (lane R1, build-combined): N6H + R4's Rust N4 + R1's PIE.
     'n6h-r4-r1': ('f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42',
                   '3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb'),
+    # Lane N1: n6h-r4-r1 with N5 rewritten in Rust (device/modem-rust/n5).
+    'n6h-r4-n5-r1': ('3d684b500fa8a2cd46229796a45c9b5f3dd71748dd381eabff86bcdeb7df797e',
+                     '46e266815503cbe2559c7e2f6543f4d0867e94e13a52c3315ecd952ecea24d26'),
 }
 failures = []
 

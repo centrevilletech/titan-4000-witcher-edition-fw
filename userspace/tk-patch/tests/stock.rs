@@ -9,7 +9,7 @@ use witcher_tk_patch::{Discard, manifests, pipeline, prg};
 
 /// The Python-built bench images (tkpatch.py), from the lanes' SHA256SUMS:
 /// manifest, tk.bin SHA-256, tk.gz SHA-256.
-const BENCH: [(&str, &str, &str); 5] = [
+const BENCH: [(&str, &str, &str); 6] = [
     (
         manifests::N6H,
         "a2fc899439b938ec4e16ee2c8519587c4e2fffedee52b8a3bb5cdf33daff8168",
@@ -34,6 +34,11 @@ const BENCH: [(&str, &str, &str); 5] = [
         manifests::N6H_R4_R1,
         "f1aa8add6a4e4e00c17c3cfe90f51e8b31d75c39751c48cf6ffa5c9f159d1f42",
         "3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb",
+    ),
+    (
+        manifests::N6H_R4_N5_R1,
+        "3d684b500fa8a2cd46229796a45c9b5f3dd71748dd381eabff86bcdeb7df797e",
+        "46e266815503cbe2559c7e2f6543f4d0867e94e13a52c3315ecd952ecea24d26",
     ),
 ];
 

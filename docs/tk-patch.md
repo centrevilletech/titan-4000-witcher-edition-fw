@@ -109,6 +109,7 @@ opens but does not decompress is not a fallback (see
 | `r1` | `f434277d…` | `186697f3…` (4655738 bytes) |
 | `r4` | `60ab8fe7…` | `4ced9782…` (4655937 bytes) |
 | `n6h-r4-r1` (release) | `f1aa8add…` | `3348aa36…` (4656029 bytes) |
+| `n6h-r4-n5-r1` | `3d684b50…` | `46e26681…` (4656287 bytes) |
 
 ## The manifest
 
