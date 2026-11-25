@@ -31,8 +31,9 @@ trap 'rm -f "$collector_tmp"' EXIT
 trap 'exit 0' HUP INT TERM
 while :; do
   # Open exclusively in the root-owned directory. rename preserves mode.
+  # A failed sample or publish skips this second; it never ends the collector.
   if "$collector_helper" --snapshot > "$collector_tmp"; then
-    mv -f "$collector_tmp" "$collector_dir/telemetry.json"
+    mv -f "$collector_tmp" "$collector_dir/telemetry.json" || rm -f "$collector_tmp"
   else
     rm -f "$collector_tmp"
   fi

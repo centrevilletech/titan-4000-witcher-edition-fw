@@ -28,9 +28,52 @@ needed on the successful path.
 First setup no longer needs a browser seed on the successful path. If the local
 collector fails, no autonomous seed or new TLS key is published. The existing
 password-authenticated HTTP bootstrap is retained for a trusted LAN/protected
-management network. Independent HTTP recovery on 8081 remains available. Failed
-storage, invalid existing seeds or incomplete existing TLS identities are not
-silently overwritten.
+management network. Independent HTTP recovery on 8081 remains available.
+
+## When something fails
+
+Nothing that fails here keeps the Witcher web interface off once the cause is
+gone. Every fallback retries by itself, and nothing an operator saved is deleted.
+
+- **The web service.** If it does not start, or stops later, the factory
+  interface serves while `/etc/init.d/titan-api` tries Witcher again: after a
+  minute, then doubling to half an hour, for as long as it takes. A service
+  that ran for an hour before it stopped starts again at once. One slow health
+  answer is not a failure: three in a row are, and a missing process is.
+  Only an operator's choice ends the retries: the factory interface chosen on
+  the recovery page (or `titan-api vendor`) for this boot, or
+  `/mnt/titan-api/use-vendor-ui` across reboots.
+- **The persistent volume.** A mount that fails is retried with the web
+  service. Anything found in the bare `/mnt/titan-api` while the volume is not
+  mounted moves to `/mnt/titan-api.stray-N` and the volume mounts as usual;
+  before, one such file kept the volume unmounted on every boot. The recovery
+  page writes its marker only while the volume is mounted; otherwise its choice
+  holds for that boot only.
+- **The boot seed.** A seed is published with a rename, so a power cut leaves
+  either no seed or a complete one. A seed that fails its checks (for example,
+  one an older build left with two names after a power cut) is never credited:
+  titan-api moves it to `/mnt/titan-api/.invalid-seed` and a new one is made
+  before the next start. An unused `seed.next` from a power cut is kept in
+  `.interrupted-seed`, one slot.
+- **The browser setup page.** When there is no seed and the collector fails,
+  the setup page takes port 80, and the collector is tried again underneath it
+  (after a minute, doubling to half an hour). When it succeeds, the page
+  closes and the HTTPS login starts; no operator has to come.
+- **The TLS identity.** One that fails a check (a file missing or empty,
+  unreadable, or a key that is not the certificate's) moves to
+  `/mnt/titan-api/tls/broken`, which keeps the last one, and a new identity is
+  made. Browsers then ask once to accept the unit's new certificate. A good
+  identity is kept, with its file modes put right.
+- **Sign-in limits.** Attempts are counted per source address (an IPv6 host by
+  its /64): 10 a minute on the web service and 5 on the recovery page.
+  Addresses on the open Internet also share one budget (30 and 15 a minute),
+  so a crowd guesses no faster than a few. Private, CGNAT, link-local and
+  loopback sources never count against the shared budget, so nothing on the
+  Internet can lock out the LAN or the management APN. Nothing is kept on
+  flash.
+- **Sessions.** At 16 sessions, a new sign-in replaces the least recently used
+  one instead of being refused. With Automatic logout off, sessions never
+  expire, so closed browsers used to fill the table and lock out every sign-in.
 
 ## Source and qualification
 

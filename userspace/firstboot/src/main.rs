@@ -13,6 +13,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
+use titan_pd_model::{config::persistent_volume_mounted, sign_in};
 use titan_sys::process::effective_uid;
 
 const BUNDLE: &str = "/usr/lib/titan-api";
@@ -153,12 +154,20 @@ fn decode_seed(value: &str) -> io::Result<[u8; 64]> {
     }
     Ok(seed)
 }
+const SEED_TEMPORARY: &str = ".seed-bootstrap-";
 fn save_seed(directory: &Path, seed: &[u8; 64]) -> io::Result<()> {
     let meta = fs::symlink_metadata(directory)?;
     if !meta.is_dir() || meta.uid() != effective_uid() || meta.mode() & 0o077 != 0 {
         return Err(invalid());
     }
-    let temporary = directory.join(format!(".seed-bootstrap-{}", std::process::id()));
+    // A power cut before an earlier publish left its temporary file: never
+    // boot input, so remove it.
+    for entry in fs::read_dir(directory)?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with(SEED_TEMPORARY) {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let temporary = directory.join(format!("{SEED_TEMPORARY}{}", std::process::id()));
     let target = directory.join("seed");
     let result = (|| {
         let mut file = OpenOptions::new()
@@ -170,12 +179,47 @@ fn save_seed(directory: &Path, seed: &[u8; 64]) -> io::Result<()> {
         file.write_all(seed)?;
         file.sync_all()?;
         // Never overwrite an existing seed, including a symlink or partial file.
-        fs::hard_link(&temporary, &target)?;
-        fs::remove_file(&temporary)?;
+        if fs::symlink_metadata(&target).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "Existing seed preserved",
+            ));
+        }
+        // A rename publishes with one link: a power cut leaves no seed or this
+        // one. (A link then an unlink could leave a seed with two names, which
+        // the web service refuses.)
+        fs::rename(&temporary, &target)?;
         File::open(directory)?.sync_all()
     })();
     let _ = fs::remove_file(temporary);
     result
+}
+
+/// The recovery page's choice of web interface: the `/etc/init.d/titan-api`
+/// command to run. The factory interface is kept across reboots by a marker
+/// on the Witcher volume, written only while that volume is mounted:
+/// unmounted, `/mnt/titan-api` is a bare directory on the vendor volume, and a
+/// file there would keep the Witcher volume from mounting on later boots. The
+/// choice then holds for this boot only.
+fn choose_interface(vendor: bool, state: &Path, mounted: bool) -> io::Result<&'static str> {
+    let marker = state.join("use-vendor-ui");
+    if !vendor {
+        match fs::remove_file(&marker) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => return Ok("restart"),
+        }
+    }
+    if mounted {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&marker)
+            .and_then(|f| f.sync_all())?;
+    }
+    Ok("vendor")
 }
 // Called before native entropy consumption and TLS. The collector has its own
 // 90-second alarm; no seed or TLS identity is published on a health failure.
@@ -249,7 +293,9 @@ fn main() -> io::Result<()> {
         ));
     }
     let listener = TcpListener::bind(("0.0.0.0", if setup { 80 } else { 8081 }))?;
-    let mut attempts = Vec::<Instant>::new();
+    // Per source (`titan_pd_model::sign_in`): a client that keeps guessing
+    // never locks out another, and the Internet shares one budget.
+    let mut attempts = sign_in::Throttle::new(5, 15, Duration::from_secs(60));
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else {
             continue;
@@ -279,8 +325,8 @@ fn main() -> io::Result<()> {
             );
             continue;
         }
-        attempts.retain(|time| time.elapsed() < Duration::from_secs(60));
-        if attempts.len() >= 5 {
+        let source = stream.peer_addr().ok().map(|peer| peer.ip());
+        if !attempts.admit(source, Instant::now()) {
             let _ = json_reply(
                 &mut stream,
                 429,
@@ -288,7 +334,6 @@ fn main() -> io::Result<()> {
             );
             continue;
         }
-        attempts.push(Instant::now());
         let Ok(mut input) = serde_json::from_slice::<Value>(&r.body) else {
             let _ = json_reply(&mut stream, 400, "Invalid request.");
             continue;
@@ -322,35 +367,20 @@ fn main() -> io::Result<()> {
                 "Setup could not be saved. Open the recovery page; existing state was preserved.",
             );
         } else if !setup && matches!(action.as_str(), "vendor" | "native") {
-            let marker = Path::new(STATE).join("use-vendor-ui");
-            let result = if action == "vendor" {
-                OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&marker)
-                    .and_then(|f| f.sync_all())
-            } else {
-                match fs::remove_file(&marker) {
-                    Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                    _ => Ok(()),
+            let vendor = action == "vendor";
+            let mounted = persistent_volume_mounted();
+            let command = match choose_interface(vendor, Path::new(STATE), mounted) {
+                Ok(command) => command,
+                // Recovery can still select vendor UI for this boot if storage failed.
+                Err(_) if vendor => "vendor",
+                Err(_) => {
+                    let _ = json_reply(
+                        &mut stream,
+                        503,
+                        "Storage is unavailable. Factory desktop recovery remains available.",
+                    );
+                    continue;
                 }
-            };
-            // Recovery can still select vendor UI for this boot if storage failed.
-            if result.is_err() && action != "vendor" {
-                let _ = json_reply(
-                    &mut stream,
-                    503,
-                    "Storage is unavailable. Factory desktop recovery remains available.",
-                );
-                continue;
-            }
-            let command = if action == "vendor" {
-                "vendor"
-            } else {
-                "restart"
             };
             let started = Command::new("/bin/sh")
                 .args(["/etc/init.d/titan-api", command])
@@ -367,7 +397,11 @@ fn main() -> io::Result<()> {
             let _ = json_reply(
                 &mut stream,
                 if success { 200 } else { 503 },
-                "Switch requested. Open the device's normal address in a few seconds.",
+                if vendor && !mounted {
+                    "Switch requested for this boot only: persistent storage is not mounted. Open the device's normal address in a few seconds."
+                } else {
+                    "Switch requested. Open the device's normal address in a few seconds."
+                },
             );
         } else {
             let _ = json_reply(&mut stream, 400, "Unavailable action.");
@@ -450,6 +484,42 @@ mod tests {
         assert_eq!(before.len(), 64);
         assert!(bootstrap(&root, &collector).is_err());
         assert_eq!(before, fs::read(root.join("seed")).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_factory_interface_never_leaves_a_file_in_an_unmounted_state_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("witcher-choose-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // Unmounted: the bare mount point stays empty, so witcher-state can
+        // still mount the volume over it (lane L2 #9, L3 #8).
+        assert_eq!(choose_interface(true, &root, false).unwrap(), "vendor");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        // Mounted: the choice is kept across reboots.
+        assert_eq!(choose_interface(true, &root, true).unwrap(), "vendor");
+        assert!(root.join("use-vendor-ui").is_file());
+        // Native clears it, mounted or not (a stray marker included).
+        assert_eq!(choose_interface(false, &root, false).unwrap(), "restart");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(choose_interface(false, &root, true).unwrap(), "restart");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_publish_cut_short_never_leaves_a_seed_under_two_names() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("witcher-seedcut-test-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        // A temporary file a power cut left behind is cleared, not published.
+        fs::write(root.join(".seed-bootstrap-1"), [9; 64]).unwrap();
+        save_seed(&root, &[7; 64]).unwrap();
+        assert_eq!(fs::read(root.join("seed")).unwrap(), [7; 64]);
+        assert_eq!(fs::metadata(root.join("seed")).unwrap().nlink(), 1);
+        let names: Vec<_> = fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, [std::ffi::OsString::from("seed")]);
         fs::remove_dir_all(root).unwrap();
     }
 

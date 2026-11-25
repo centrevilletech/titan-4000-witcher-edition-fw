@@ -30,8 +30,17 @@ grep -Eq '^mtd20: [0-9a-fA-F]+ [0-9a-fA-F]+ "user"$' /proc/mtd || fail 'partitio
 [ "$(cat "$sys/ubi1_0/name")" = cbrs ] || fail 'vendor volume identity changed'
 [ ! -L "$state" ] || fail 'state path is a symlink'
 if ! mounted; then
- # Do not hide data from an older directory-based installation.
- [ ! -e "$state" ] || { [ -d "$state" ] && [ -z "$(ls -A "$state")" ]; } || fail 'existing unmounted files need recovery'
+ # Anything in the bare mount point (a file written while the volume was not
+ # mounted, or an older directory-based installation) moves next to it, as
+ # state.stray-N: never hidden by the mount, never deleted, and never a reason
+ # to leave the volume unmounted on every later boot.
+ if [ -e "$state" ] && ! { [ -d "$state" ] && [ -z "$(ls -A "$state")" ]; }; then
+  ! awk -v point="$state" '$2==point { found=1 } END { exit !found }' "$mounts" || fail 'another filesystem is mounted on the state path'
+  stray=1
+  while [ -e "$state.stray-$stray" ] || [ -L "$state.stray-$stray" ]; do stray=$((stray+1)); done
+  mv "$state" "$state.stray-$stray" || fail 'existing unmounted files could not be moved aside'
+  echo "Witcher state: moved what was in the unmounted $state to $state.stray-$stray" >&2
+ fi
  found=
  for entry in "$sys"/ubi1_*; do
   [ "$(cat "$entry/name" 2>/dev/null)" != data ] || found=$entry

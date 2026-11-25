@@ -183,7 +183,9 @@ The native SSH service rejects connections arriving over the customer LTE bearer
 Browser recovery is at `http://DEVICE_IP:8081/`, using the administrator
 password. It can open the factory desktop UI or retry Witcher while Linux
 and networking are working. If HTTPS initialization fails, HTTP setup remains
-available. See [first-boot HTTPS](docs/first-boot-https.md).
+available. If the Witcher web service stops, the factory UI serves while it
+is retried by itself, and a damaged seed or TLS identity is replaced. See
+[first-boot HTTPS](docs/first-boot-https.md).
 
 To return to stock, upload a compatible vendor `.prg` through
 **System → Firmware**. Select the older-image option for an intended downgrade.
