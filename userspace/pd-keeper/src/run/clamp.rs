@@ -4,7 +4,7 @@ use std::fs;
 
 use titan_pd_model::qctrl::{self, Loaded as QctrlLoaded};
 
-use crate::qctrl_io;
+use crate::{qctrl_io, staged};
 use crate::files::read_file;
 use crate::netdev::carrier_up;
 
@@ -38,7 +38,7 @@ impl Keeper {
             return;
         }
         self.qctrl.checked_at = Some(self.now);
-        let Some(dir) = qctrl_io::staged_dir() else {
+        let Some(dir) = qctrl_io::MODULE.staged_dir() else {
             self.qctrl_status("off", "the persistent volume is not mounted", &qctrl::Config::default());
             return;
         };
@@ -59,7 +59,7 @@ impl Keeper {
         }
         let proc_text = read_file(&qctrl_io::proc_path());
         let mut proc_fresh = true;
-        match qctrl::loaded(&read_file(&qctrl_io::modules_path()), &proc_text) {
+        match qctrl::loaded(&read_file(staged::modules_path()), &proc_text) {
             QctrlLoaded::Other(name) => {
                 let (state, detail) = if config.mode == 0 {
                     ("off", format!("mode 0; another clamp module is loaded ({name})"))
@@ -85,7 +85,7 @@ impl Keeper {
                 if self.qctrl.failed_for.as_ref() == Some(&config) {
                     return;
                 }
-                if let Err(err) = qctrl_io::stage(&dir).and_then(|path| qctrl_io::insmod(&path)) {
+                if let Err(err) = qctrl_io::MODULE.load(&dir) {
                     self.qctrl.failed_for = Some(config.clone());
                     self.qctrl_status("failed", &format!("not loaded: {err}"), &config);
                     return;
