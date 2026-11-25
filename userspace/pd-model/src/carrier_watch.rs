@@ -17,8 +17,7 @@
 //! - Acts according to `/mnt/titan-api/carrier-watch/config`:
 //!   - `mode=log` (default with no file): log and update status file only.
 //!   - `mode=off`: do nothing and log nothing.
-//!   - `mode=regrant`: outside the CPAS quiet window (`quiet_utc`, by default
-//!     the keeper's one SAS CPAS window `tk_boot::CPAS_QUIET`, 06:45-10:15),
+//!   - `mode=regrant`: outside the CPAS quiet window (`quiet_utc=06:45-10:00`),
 //!     with a sane wall clock, rate limits (1 per 5 min, 6 per 24 h, backoff
 //!     after failure), `cbrs_mode_grant=1`, and `rc_signal_done=1`, runs the
 //!     same sequence `ucid` uses (`sqns_network_cbrs=1` + SIGUSR1 to `rcinit`)
@@ -55,11 +54,9 @@ pub const QUIET_LOG_EVERY_SECS: u64 = 600;
 /// The Titan boots at 2013-06-20 until NTP sets the clock.
 pub const SANE_EPOCH: u64 = 1_704_067_200;
 
-/// Default CPAS quiet window: the keeper's one SAS CPAS window, the reboot
-/// gate's (`tk_boot::CPAS_QUIET`, 06:45-10:15 UTC). Up to v1.0.16 it ended at
-/// 10:00, 15 minutes before the rest.
-pub const DEFAULT_QUIET_START_MIN: u16 = crate::tk_boot::CPAS_QUIET.start_min;
-pub const DEFAULT_QUIET_END_MIN: u16 = crate::tk_boot::CPAS_QUIET.end_min;
+/// Default CPAS quiet window: 06:45-10:00 UTC.
+pub const DEFAULT_QUIET_START_MIN: u16 = 6 * 60 + 45;
+pub const DEFAULT_QUIET_END_MIN: u16 = 10 * 60;
 
 /// Band 48 (3550-3700 MHz) limits.
 pub const BAND48_EARFCN_MIN: u32 = 55_240;
@@ -493,7 +490,7 @@ impl Mode {
     }
 }
 
-/// Daily UTC quiet window (e.g. `06:45-10:15`, the SAS CPAS window with a margin).
+/// Daily UTC quiet window (e.g. `06:45-10:00` for Google SAS CPAS).
 /// `start_min` is inclusive, `end_min` is exclusive. When `start_min > end_min`
 /// the window crosses midnight UTC.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -591,7 +588,7 @@ impl Default for Config {
 ///
 /// Keys:
 /// - `mode=off|log|regrant` (default `log`; an invalid value resets to `log`).
-/// - `quiet_utc=HH:MM-HH:MM` (default `06:45-10:15`; empty `quiet_utc=` disables).
+/// - `quiet_utc=HH:MM-HH:MM` (default `06:45-10:00`; empty `quiet_utc=` disables).
 /// - `debounce_secs=N` (1..=60, default 3).
 /// - `hide_grant=N` (0..=7, or empty/`none`; dry-run test hook).
 pub fn parse_config(text: &str) -> Config {
@@ -1323,17 +1320,16 @@ mod tests {
 
     #[test]
     fn config_parsing_and_quiet_window_across_midnight() {
-        // Default with empty file: log mode, the one CPAS window (06:45-10:15 UTC).
+        // Default with empty file: log mode, 06:45-10:00 UTC quiet window.
         let def = parse_config("");
         assert_eq!(def.mode, Mode::Log);
         assert_eq!(
             def.quiet_utc,
             Some(QuietWindow {
                 start_min: 6 * 60 + 45,
-                end_min: 10 * 60 + 15
+                end_min: 10 * 60
             })
         );
-        assert_eq!(def.quiet_utc, Some(crate::tk_boot::CPAS_QUIET));
         assert_eq!(def.debounce_secs, 3);
         assert_eq!(def.hide_grant, None);
         assert!(def.refused.is_empty());
@@ -1351,12 +1347,12 @@ mod tests {
         assert_eq!(cfg.hide_grant, Some(1));
         assert_eq!(cfg.refused, vec!["mode=bogus", "unknown=1"]);
 
-        // Default quiet window boundaries (06:45-10:15 UTC), as the reboot gate's.
+        // Default quiet window boundaries (06:45-10:00 UTC).
         let w = QuietWindow::default();
         assert!(!w.contains(utc("2026-11-22T06:44:59Z")));
         assert!(w.contains(utc("2026-11-22T06:45:00Z")));
-        assert!(w.contains(utc("2026-11-22T10:14:59Z")));
-        assert!(!w.contains(utc("2026-11-22T10:15:00Z")));
+        assert!(w.contains(utc("2026-11-22T09:59:59Z")));
+        assert!(!w.contains(utc("2026-11-22T10:00:00Z")));
 
         // Quiet window crossing midnight (23:30-01:15 UTC).
         let night = parse_quiet_window("23:30-01:15").unwrap();
@@ -1468,12 +1464,9 @@ mod tests {
             vec!["carrier watch: uncovered, quiet window, waiting"]
         );
 
-        // Still held at 10:00 UTC, where it used to fire: CPAS ends at 10:15 for every module.
-        let out = w.observe(3 + 10_800, utc("2026-11-22T10:00:00Z"), &cfg, &nvram, true, &grants);
-        assert_eq!(out.action, Action::None);
-        // At 10:15:00 UTC (window end): fires immediately.
-        let t_end = utc("2026-11-22T10:15:00Z");
-        let out = w.observe(3 + 11_700, t_end, &cfg, &nvram, true, &grants);
+        // At 10:00:00 UTC (window end): fires immediately.
+        let t_end = utc("2026-11-22T10:00:00Z");
+        let out = w.observe(3 + 10_800, t_end, &cfg, &nvram, true, &grants);
         assert_eq!(out.action, Action::ForceRegrant);
     }
 

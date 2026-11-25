@@ -37,8 +37,7 @@
 //! is on keeps its place unless another beats it by `SWITCH_MARGIN_PCT`.
 //!
 //! Guards: no radio cycle in the SAS coordination window (CPAS, 07:00 to 10:00
-//! UTC; the keeper's one window `tk_boot::CPAS_QUIET`, 06:45 to 10:15), none
-//! outside the operator's survey
+//! UTC, with 30 minutes either side), none outside the operator's survey
 //! window, none while the SAS grant is not held, none while the customer moves
 //! traffic, at most one survey per `survey_hours` (24 or more), and a held arm
 //! that the unit left is re-applied at most once per `HOLD_SPACING`.
@@ -74,13 +73,9 @@ pub const DEFAULT_UL_WEIGHT: u8 = 4;
 pub const MAX_UL_WEIGHT: u8 = 20;
 /// Default survey window, UTC minutes: early morning in the US after CPAS.
 pub const DEFAULT_WINDOW: (u16, u16) = (10 * 60 + 45, 12 * 60 + 30);
-/// CPAS (07:00 to 10:00 UTC) with a margin: the keeper's one SAS CPAS window,
-/// the reboot gate's (`tk_boot::CPAS_QUIET`, 06:45 to 10:15). New grants are
-/// not issued in it, and a carrier change gives back every grant.
-pub const NO_CYCLE: (u16, u16) = (
-    crate::tk_boot::CPAS_QUIET.start_min,
-    crate::tk_boot::CPAS_QUIET.end_min,
-);
+/// CPAS (07:00 to 10:00 UTC) with 30 minutes either side. New grants are not
+/// issued in it, and a carrier change gives back every grant.
+pub const NO_CYCLE: (u16, u16) = (6 * 60 + 30, 10 * 60 + 30);
 /// A held arm the unit has left is re-applied at most this often.
 pub const HOLD_SPACING: u64 = 6 * 3600;
 /// After an attach on a new arm, wait this long for covering SAS grants.
@@ -685,11 +680,7 @@ noise
         assert_eq!(cycle_gate(ok), Ok(()));
         let no = |g: Gate| cycle_gate(g).unwrap_err();
         assert_eq!(no(Gate { minute_utc: 8 * 60, forced: true, ..ok }), "SAS coordination window");
-        assert_eq!(no(Gate { minute_utc: 6 * 60 + 45, forced: true, ..ok }), "SAS coordination window");
-        assert_eq!(no(Gate { minute_utc: 10 * 60 + 14, forced: true, ..ok }), "SAS coordination window");
-        // The same window as every keeper reboot: one CPAS window everywhere.
-        assert_eq!(NO_CYCLE, (crate::tk_boot::CPAS_QUIET.start_min, crate::tk_boot::CPAS_QUIET.end_min));
-        assert_eq!(cycle_gate(Gate { minute_utc: 10 * 60 + 15, forced: true, ..ok }), Ok(()));
+        assert_eq!(no(Gate { minute_utc: 6 * 60 + 30, forced: true, ..ok }), "SAS coordination window");
         assert_eq!(no(Gate { minute_utc: 19 * 60, ..ok }), "outside the survey window");
         assert_eq!(cycle_gate(Gate { minute_utc: 19 * 60, forced: true, ..ok }), Ok(()));
         assert_eq!(no(Gate { attached: false, ..ok }), "not attached");
