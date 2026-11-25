@@ -6,6 +6,7 @@
 //! written while attached waits for the next attach. The only radio cycle is
 //! the opt-in enforcement re-attach, gated by `titan_pd_model::radio::cycle_gate`.
 use crate::{
+    carrier_pick_io,
     radio_modem::{cfun, console},
     radio_sqm,
 };
@@ -29,8 +30,9 @@ use std::{
     time::{Duration, Instant},
 };
 use titan_pd_model::{
+    carrier_pick::{self as pick, Measure, Record},
     config::persistent_volume_mounted,
-    radio::{self as model, Action, Cell, PCELL_CLEAR, PCELL_QUERY, Profile, failures},
+    radio::{self as model, Action, Cell, PCELL_CLEAR, PCELL_QUERY, Picker, Profile, failures},
 };
 
 /// Seconds between health and carrier checks while a profile is active.
@@ -194,7 +196,15 @@ fn request(input: &[u8]) -> io::Result<Value> {
                 "strikes":strikes().ok(),
                 "counters":json_file("radio-counters"),
                 "carriers":json_file("radio-carriers"),
+                "pick":json_file("radio-pick"),
             }))
+        }
+        Some("survey") => {
+            if profile(&disk("profile.json"))?.picker().is_none() {
+                return Err(fail("no carrier picker in the saved profile"));
+            }
+            atomic(&ram("pick-survey-now"), b"1")?;
+            Ok(json!({"survey":"requested"}))
         }
         _ => Err(fail("invalid profile operation")),
     }
@@ -236,14 +246,14 @@ pub fn api(op: Option<&str>) -> io::Result<()> {
     root()?;
     private_runtime()?;
     let message = match op {
-        Some("get" | "status") => json!({"op":op}),
+        Some("get" | "status" | "survey") => json!({"op":op}),
         Some("set") => {
             let mut bytes = vec![];
             io::stdin().take(4097).read_to_end(&mut bytes)?;
             let p = Profile::parse(&bytes).map_err(fail)?;
             json!({"op":"set","profile":p})
         }
-        _ => return Err(fail("usage: radio-profile get|set|status")),
+        _ => return Err(fail("usage: radio-profile get|set|status|survey")),
     };
     let mut s = UnixStream::connect(ram("radio.sock"))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
@@ -380,6 +390,7 @@ pub fn guard() -> io::Result<()> {
         status("reverted", "interrupted profile")?;
     }
     let mut watch = CarrierWatch::default();
+    let mut picker = PickWatch::default();
     loop {
         if ram("stopped").exists() {
             rollback()?;
@@ -396,6 +407,10 @@ pub fn guard() -> io::Result<()> {
                 continue;
             }
         };
+        if desired.picker().is_none() {
+            // No stale picker state in the status once the picker is gone.
+            rm(ram("radio-pick"))?;
+        }
         if desired.actions.is_empty() {
             rollback()?;
             rm(ram("radio-blocked"))?;
@@ -435,6 +450,7 @@ pub fn guard() -> io::Result<()> {
                     rm(ram("radio-blocked"))?;
                     status("active", "confirmed")?;
                     watch = CarrierWatch::default();
+                    picker = PickWatch::default();
                 }
                 Err(e) => {
                     store(&ram("radio-blocked"), &desired)?;
@@ -442,9 +458,16 @@ pub fn guard() -> io::Result<()> {
                     status("reverted", &e.to_string())?;
                 }
             }
-        } else if watch.due(crate::run::monotonic(), media() == "ATTACHED") {
-            let checked = run_worker("check", 35)
-                .and_then(|()| watch.carriers(&desired, crate::run::monotonic()));
+        } else {
+            let mut checked = Ok(());
+            if watch.due(crate::run::monotonic(), media() == "ATTACHED") {
+                checked = run_worker("check", 35)
+                    .and_then(|()| watch.carriers(&desired, crate::run::monotonic()));
+            }
+            // A failed picker re-attach is handled like a failed enforcement.
+            if let (Ok(()), Some(p)) = (&checked, desired.picker()) {
+                checked = picker.tick(&p);
+            }
             if let Err(e) = checked {
                 atomic(&disk("strikes"), b"1")?;
                 store(&ram("radio-blocked"), &desired)?;
@@ -607,7 +630,18 @@ fn set(a: &Action, stock: bool) -> io::Result<()> {
     Ok(())
 }
 fn count() -> io::Result<u32> {
-    failures(&console("rrc dm reest stat ?")?).ok_or_else(|| fail("missing RRC counter"))
+    // The keeper's modem flag writer shares the console. On the bench a reply
+    // cut short by its session right after a keeper restart reverted a
+    // profile (2026-11-24). Three misses in a row are a missing counter.
+    for attempt in 0..3 {
+        if let Some(n) = console("rrc dm reest stat ?").ok().and_then(|r| failures(&r)) {
+            return Ok(n);
+        }
+        if attempt < 2 {
+            pause(3);
+        }
+    }
+    Err(fail("missing RRC counter"))
 }
 fn rates(p: &Profile) -> Option<(u32, u32)> {
     p.actions.iter().find_map(|a| {
@@ -760,8 +794,10 @@ fn clear_pcell() -> io::Result<()> {
     Err(fail("PCell lock not cleared"))
 }
 
+/// An attached unit has its radio on. `AT+CFUN?` cannot tell: it reads 1
+/// while the radio is off (see `radio_modem::cfun`).
 fn radio_on() -> io::Result<()> {
-    if console("AT+CFUN?")?.lines().any(|s| s.trim() == "+CFUN: 1") {
+    if media() == "ATTACHED" {
         return Ok(());
     }
     cfun(true)
@@ -880,6 +916,11 @@ fn restore(p: &Profile) -> io::Result<()> {
     for a in p.actions.iter().filter(|a| a.query().is_some()) {
         ok &= set(a, true).is_ok();
     }
+    if p.picker().is_some() {
+        ok &= radio_on().is_ok();
+        ok &= clear_pcell().is_ok();
+        ok &= set(&stock_cap(), true).is_ok();
+    }
     if rates(p).is_some() {
         radio_sqm::reconcile(None)?;
     }
@@ -898,6 +939,8 @@ pub fn worker(op: Option<&str>) -> io::Result<()> {
         Some("rollback") => restore(&profile(&ram("radio-journal"))?),
         Some("apply") => apply(&p, &profile(&ram("radio-active"))?),
         Some("enforce") => enforce(&p),
+        Some(op) if op.starts_with("pick-cycle-") => pick_cycle(&p, arm_index(op)?),
+        Some(op) if op.starts_with("pick-measure-") => pick_measure(&p, arm_index(op)?),
         Some("check") => {
             // A detach (tower or SAS outage) is not caused by a profile that
             // never cycles the radio. Judge again after the next attach.
@@ -925,5 +968,425 @@ pub fn worker(op: Option<&str>) -> io::Result<()> {
             sample(&p, base)
         }
         _ => Err(fail("invalid worker operation")),
+    }
+}
+
+fn stock_cap() -> Action {
+    Action::CarrierAggregation {
+        carriers: 4,
+        cycle_hours: None,
+        nudge: None,
+    }
+}
+
+fn arm_index(op: &str) -> io::Result<usize> {
+    op.rsplit('-')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| fail("invalid arm"))
+}
+
+fn minute_utc() -> Option<u16> {
+    let unix = carrier_pick_io::unix_now();
+    // A unit without network time reads 1970 or 2013: no radio cycle then.
+    (unix > 1_704_067_200).then_some(((unix % 86_400) / 60) as u16)
+}
+
+/// The picker's radio cycle: like the enforcement re-attach, with the arm's
+/// cap and primary cell. The nudge is cleared at once, attached or not.
+fn pick_cycle(p: &Profile, i: usize) -> io::Result<()> {
+    let picker = p.picker().ok_or_else(|| fail("no carrier picker"))?;
+    let arm = *picker.arms.get(i).ok_or_else(|| fail("no such arm"))?;
+    // Read every condition again right before acting.
+    match minute_utc() {
+        None => return Err(fail("clock not set")),
+        Some(m) if pick::in_window(m, pick::NO_CYCLE) => {
+            eprintln!("radio-worker: picker cycle skipped: SAS coordination window");
+            return Ok(());
+        }
+        Some(_) => {}
+    }
+    if media() != "ATTACHED"
+        || nvram_field(b"cbrs_mode_grant=") != "1"
+        || nvram_field(b"cbrs_grant_state=") != "2"
+    {
+        eprintln!("radio-worker: picker cycle skipped: not attached with a held SAS grant");
+        return Ok(());
+    }
+    let now = crate::run::monotonic();
+    atomic(&ram("radio-last-cycle"), now.to_string().as_bytes())?;
+    crate::log(&format!(
+        "carrier picker: re-attaching on arm {i} (EARFCN {} PCI {}, {}-carrier cap)",
+        arm.earfcn, arm.pci, arm.carriers
+    ));
+    transition(175)?;
+    let cap = Action::CarrierAggregation {
+        carriers: arm.carriers,
+        cycle_hours: None,
+        nudge: None,
+    };
+    cfun(false)?;
+    let mut result = (|| {
+        if !current(&cap, false)? {
+            set(&cap, false)?;
+        }
+        console(&model::pcell_lock(arm.cell()))?;
+        if model::pcell_state(&console(PCELL_QUERY)?) != Some(Some(arm.cell())) {
+            return Err(fail("PCell nudge read-back failed"));
+        }
+        Ok(())
+    })();
+    // The radio always comes back on, and the nudge never outlives the cycle.
+    let on = cfun(true);
+    if result.is_ok() {
+        result = on;
+    }
+    let attached = result.is_ok() && wait_attached(90);
+    let cleared = clear_pcell();
+    let landed = carrier_pick_io::attach();
+    crate::log(&format!(
+        "carrier picker: {}{}",
+        match (attached, landed) {
+            (true, Some((cell, n))) => format!("attached on EARFCN {} PCI {} with {n} carriers", cell.earfcn, cell.pci),
+            (true, None) => "attached".into(),
+            (false, _) => "no attach within 90 s".into(),
+        },
+        if cleared.is_ok() { "; nudge cleared" } else { "; nudge NOT cleared, reverting" }
+    ));
+    result?;
+    cleared?;
+    if !attached {
+        return Err(fail("no attach after the picker re-attach"));
+    }
+    // A fresh baseline for the reconfiguration-failure check.
+    if let Ok(n) = count() {
+        atomic(
+            &ram("radio-counters"),
+            json!({"reconfig_failures":n,"delta":0,"last_failure_uptime":null,"sqm":null})
+                .to_string()
+                .as_bytes(),
+        )?;
+    }
+    rm(ram("radio-transition"))
+}
+
+fn pick_measure(p: &Profile, arm: usize) -> io::Result<()> {
+    let picker = p.picker().ok_or_else(|| fail("no carrier picker"))?;
+    let probe = p.management_probe.ok_or_else(|| fail("no management probe"))?;
+    let m = carrier_pick_io::measure(probe, picker.ul_sink.unwrap_or(probe), arm)?;
+    atomic(&ram("radio-pick-measure"), &serde_json::to_vec(&m)?)
+}
+
+fn load_record(arms: &[pick::Arm]) -> Record {
+    fs::read(disk("pick.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Record>(&b).ok())
+        .filter(|r| r.arms == arms)
+        .unwrap_or_else(|| Record {
+            arms: arms.to_vec(),
+            ..Record::default()
+        })
+}
+
+/// A survey that has not finished in this long is abandoned.
+const SURVEY_STALE: u64 = 6 * 3600;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Survey,
+    Hold,
+}
+
+/// An arm the picker re-attached to: it waits for covering grants and the
+/// settle time before it is measured (survey) or confirmed (hold).
+struct Visit {
+    arm: usize,
+    since: u64,
+    granted_at: Option<u64>,
+    purpose: Purpose,
+}
+
+struct Survey {
+    done: Vec<usize>,
+    results: Vec<Measure>,
+    started: u64,
+    forced: bool,
+}
+
+/// The carrier picker in the guard. See `titan_pd_model::carrier_pick`.
+#[derive(Default)]
+struct PickWatch {
+    traffic: Vec<(u64, u64, u64)>,
+    record: Option<Record>,
+    survey: Option<Survey>,
+    visit: Option<Visit>,
+    last_hold: Option<u64>,
+    shown: String,
+}
+
+/// Whether the picker may cycle the radio now. Read fresh every time.
+fn pick_gate(p: &Picker, forced: bool, attached: bool, idle: bool) -> Result<(), &'static str> {
+    let pd = crate::state();
+    let strikes = fs::read_to_string(pd.join("watchdog-strikes.txt")).unwrap_or_default();
+    if pd.join("pending.json").exists() || titan_pd_model::deaf::parse_strikes(&strikes) > 0 {
+        return Err("keeper recovery pending");
+    }
+    let minute_utc = minute_utc().ok_or("clock not set")?;
+    pick::cycle_gate(pick::Gate {
+        minute_utc,
+        window: p.window,
+        forced,
+        attached,
+        mode_grant: nvram_field(b"cbrs_mode_grant=") == "1",
+        grant_state: nvram_field(b"cbrs_grant_state=").parse().unwrap_or(0),
+        idle,
+    })
+}
+
+impl PickWatch {
+    fn tick(&mut self, p: &Picker) -> io::Result<()> {
+        let now = crate::run::monotonic();
+        if let Some((rx, tx)) = carrier_pick_io::counters(&carrier_pick_io::customer_dev()) {
+            self.traffic.push((now, rx, tx));
+        }
+        self.traffic.retain(|s| now.saturating_sub(s.0) <= pick::IDLE_SECS + 30);
+        let idle = pick::idle(&self.traffic, now);
+        let mut record = self.record.take().unwrap_or_else(|| load_record(&p.arms));
+        let stepped = self.step(&mut record, p, now, idle);
+        self.record = Some(record);
+        let (phase, detail) = match &stepped {
+            Ok(shown) => shown.clone(),
+            Err(e) => ("failed".to_string(), e.to_string()),
+        };
+        self.show(&phase, &detail, p)?;
+        stepped.map(|_| ())
+    }
+
+    fn step(&mut self, record: &mut Record, p: &Picker, now: u64, idle: bool) -> io::Result<(String, String)> {
+        let here = carrier_pick_io::attach();
+        let current = here.and_then(|(cell, n)| pick::arm_of(&p.arms, cell, n));
+        let say = |phase: &str, detail: String| Ok((phase.to_string(), detail));
+        if self.survey.as_ref().is_some_and(|s| now.saturating_sub(s.started) > SURVEY_STALE) {
+            self.survey = None;
+            if self.visit.as_ref().is_some_and(|v| v.purpose == Purpose::Survey) {
+                self.visit = None;
+            }
+            crate::log("carrier picker: survey abandoned unfinished after 6 hours");
+            return say("stopped", "survey abandoned".into());
+        }
+        // An arm just re-attached to: wait for grants and the settle time.
+        if let Some(visit) = self.visit.as_mut() {
+            if visit.granted_at.is_none() && carrier_pick_io::granted() {
+                visit.granted_at = Some(now);
+            }
+            match visit.granted_at {
+                None if now.saturating_sub(visit.since) > pick::GRANT_WAIT => {
+                    let arm = visit.arm;
+                    self.visit = None;
+                    self.survey = None;
+                    crate::log(&format!(
+                        "carrier picker: no SAS grant covered arm {arm} within {} s; survey stopped",
+                        pick::GRANT_WAIT
+                    ));
+                    return say("stopped", format!("arm {arm}: no covering SAS grant"));
+                }
+                None => return say("waiting", format!("arm {}: waiting for SAS grants", visit.arm)),
+                Some(t) if now.saturating_sub(t) < pick::SETTLE => {
+                    return say("waiting", format!("arm {}: settling", visit.arm));
+                }
+                Some(_) => {}
+            }
+            let Some(visit) = self.visit.take() else {
+                return say("idle", String::new());
+            };
+            if visit.purpose == Purpose::Hold {
+                if current == Some(visit.arm) {
+                    crate::log(&format!("carrier picker: back on held arm {} with covering grants", visit.arm));
+                    return say("holding", format!("arm {}", visit.arm));
+                }
+                crate::log(&format!(
+                    "carrier picker: the re-attach for held arm {} landed elsewhere; next try within 6 hours",
+                    visit.arm
+                ));
+                return say("off-arm", format!("re-attach for arm {} landed elsewhere", visit.arm));
+            }
+            // The burst would crowd the customer: measure only while idle,
+            // and again later when the customer interrupts it.
+            let arm = visit.arm;
+            if !idle || !self.measure(arm) {
+                self.visit = Some(visit);
+                return say("paused", format!("arm {arm}: waiting for an idle customer"));
+            }
+            return say("surveying", format!("arm {arm} measured"));
+        }
+        if let Some(survey) = &self.survey {
+            let forced = survey.forced;
+            match pick::next_arm(&p.arms, &survey.done, current) {
+                Some(i) if Some(i) == current => {
+                    if !idle || !carrier_pick_io::granted() {
+                        return say("paused", "waiting for an idle customer and covering grants".into());
+                    }
+                    if !self.measure(i) {
+                        return say("paused", format!("arm {i}: customer traffic during the measurement"));
+                    }
+                    return say("surveying", format!("arm {i} measured in place"));
+                }
+                Some(i) => {
+                    if let Err(why) = pick_gate(p, forced, here.is_some(), idle) {
+                        return say("paused", why.into());
+                    }
+                    run_worker(&format!("pick-cycle-{i}"), 175)?;
+                    self.visit = Some(Visit {
+                        arm: i,
+                        since: crate::run::monotonic(),
+                        granted_at: None,
+                        purpose: Purpose::Survey,
+                    });
+                    return say("surveying", format!("arm {i}: re-attached"));
+                }
+                None => {
+                    let Some(survey) = self.survey.take() else {
+                        return say("idle", String::new());
+                    };
+                    let chosen = pick::choose(&p.arms, &survey.results, current, p.ul_weight);
+                    *record = Record {
+                        arms: p.arms.clone(),
+                        chosen,
+                        surveyed_at: Some(carrier_pick_io::unix_now()),
+                        results: survey.results,
+                    };
+                    atomic(&disk("pick.json"), &serde_json::to_vec(&*record)?)?;
+                    crate::log(&match chosen {
+                        Some(c) => format!(
+                            "carrier picker: survey done; holding arm {c} (EARFCN {} PCI {}, {}-carrier cap)",
+                            p.arms[c].earfcn, p.arms[c].pci, p.arms[c].carriers
+                        ),
+                        None => "carrier picker: survey done; no arm measured, nothing held".into(),
+                    });
+                    self.last_hold = None;
+                    return say("chosen", chosen.map_or("none".into(), |c| format!("arm {c}")));
+                }
+            }
+        }
+        let forced = ram("pick-survey-now").exists();
+        let due = forced
+            || record.surveyed_at.is_none_or(|t| {
+                carrier_pick_io::unix_now().saturating_sub(t) >= u64::from(p.survey_hours) * 3600
+            });
+        if due {
+            match pick_gate(p, forced, here.is_some(), idle) {
+                Ok(()) => {
+                    rm(ram("pick-survey-now"))?;
+                    crate::log(&format!(
+                        "carrier picker: survey of {} arms started{}",
+                        p.arms.len(),
+                        if forced { " (operator request)" } else { "" }
+                    ));
+                    self.survey = Some(Survey {
+                        done: vec![],
+                        results: vec![],
+                        started: now,
+                        forced,
+                    });
+                    return say("surveying", "started".into());
+                }
+                Err(why) if forced => return say("waiting", format!("survey requested: {why}")),
+                Err(_) => {}
+            }
+        }
+        let Some(c) = record.chosen else {
+            return say("idle", "no survey yet".into());
+        };
+        if current == Some(c) {
+            return say("holding", format!("arm {c}"));
+        }
+        if self.last_hold.is_some_and(|t| now.saturating_sub(t) < pick::HOLD_SPACING) {
+            return say("off-arm", format!("left arm {c}; next return within 6 hours"));
+        }
+        // Going back to the held arm ignores the survey window, nothing else.
+        if let Err(why) = pick_gate(p, true, here.is_some(), idle) {
+            return say("off-arm", format!("left arm {c}: {why}"));
+        }
+        self.last_hold = Some(now);
+        run_worker(&format!("pick-cycle-{c}"), 175)?;
+        self.visit = Some(Visit {
+            arm: c,
+            since: crate::run::monotonic(),
+            granted_at: None,
+            purpose: Purpose::Hold,
+        });
+        say("returning", format!("re-attached to arm {c}"))
+    }
+
+    /// One visit's measurement. A failed measurement is logged and the arm
+    /// counts as visited, so a failed measurement cannot stall a survey.
+    /// False when the customer interrupted it: the arm stays to measure again.
+    fn measure(&mut self, arm: usize) -> bool {
+        let _ = rm(ram("radio-pick-measure"));
+        let result = run_worker(&format!("pick-measure-{arm}"), 60).and_then(|()| {
+            serde_json::from_slice::<Measure>(&fs::read(ram("radio-pick-measure"))?)
+                .map_err(|_| fail("unreadable measurement"))
+        });
+        if result.as_ref().is_err_and(|e| e.to_string() == pick::CUSTOMER_BUSY) {
+            crate::log(&format!("carrier picker: arm {arm}: the customer started traffic; burst stopped, measuring later"));
+            return false;
+        }
+        let Some(survey) = self.survey.as_mut() else {
+            return true;
+        };
+        survey.done.push(arm);
+        match result {
+            Ok(m) => {
+                let sinr: Vec<String> = m.sinr_db.iter().chain(&m.scc_sinr_db).map(i32::to_string).collect();
+                crate::log(&format!(
+                    "carrier picker: arm {arm} on EARFCN {} PCI {} with {} carriers (SINR {} dB): \
+                     {}.{} down estimated, {}.{} up Mbps, {} ms",
+                    m.pcell.earfcn,
+                    m.pcell.pci,
+                    m.carriers,
+                    sinr.join("/"),
+                    m.dl_kbps / 1000,
+                    m.dl_kbps % 1000 / 100,
+                    m.ul_kbps / 1000,
+                    m.ul_kbps % 1000 / 100,
+                    m.rtt_ms.map_or("?".into(), |r| r.to_string())
+                ));
+                survey.results.push(m);
+            }
+            Err(e) => crate::log(&format!("carrier picker: arm {arm} not measured: {e}")),
+        }
+        true
+    }
+
+    fn show(&mut self, phase: &str, detail: &str, p: &Picker) -> io::Result<()> {
+        let record = self.record.as_ref();
+        let results: Vec<Value> = record
+            .map(|r| {
+                r.results
+                    .iter()
+                    .map(|m| {
+                        json!({"arm":m.arm,"earfcn":m.pcell.earfcn,"pci":m.pcell.pci,"carriers":m.carriers,
+                            "ul_scc":m.ul_scc,"sinr_db":m.sinr_db,"scc_sinr_db":m.scc_sinr_db,"rsrp_dbm":m.rsrp_dbm,
+                            "down_estimate_kbps":m.dl_kbps,"up_kbps":m.ul_kbps,"rtt_ms":m.rtt_ms,
+                            "modem_max_down_kbps":m.dl_max_kbps,"modem_max_up_kbps":m.ul_max_kbps,
+                            "score":pick::score(m, p.ul_weight),"held":m.held(&p.arms)})
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let text = json!({
+            "phase":phase,
+            "detail":detail,
+            "chosen":record.and_then(|r| r.chosen),
+            "surveyed_at":record.and_then(|r| r.surveyed_at),
+            "survey_visited":self.survey.as_ref().map(|s| s.done.clone()),
+            "results":results,
+        })
+        .to_string();
+        if text != self.shown {
+            atomic(&ram("radio-pick"), text.as_bytes())?;
+            self.shown = text;
+        }
+        Ok(())
     }
 }

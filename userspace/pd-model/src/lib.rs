@@ -10,9 +10,10 @@
 //! writes reach flash, the self-revert of a setting change, the drop of
 //! customer IPv6 while the unit holds no SAS grant, carrier watch against held
 //! SAS grants, the boot confirm for a staged modem firmware image, its modem
-//! feature flags, the staged download clamp module, and the staged passthrough
-//! bridge fast path.
+//! feature flags, the staged download clamp module, the staged passthrough
+//! bridge fast path, and the carrier picker.
 
+pub mod carrier_pick;
 pub mod carrier_watch;
 pub mod cbrs_gate;
 pub mod config;

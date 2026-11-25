@@ -20,6 +20,7 @@ use titan_pd_model::wear;
 
 mod bench;
 mod capture;
+mod carrier_pick_io;
 mod carrier_watch_io;
 mod fastpath_io;
 mod radio;

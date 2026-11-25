@@ -10,8 +10,13 @@
 //!   `cycle_hours`, and only while the grant is held.
 //! - A PCell lock is only a nudge for that one cycle. It is always cleared
 //!   with `AT%GLOCKPCELL=1,0,0` (`AT%GLOCKPCELL=0` returns ERROR).
+use crate::carrier_pick::{self, Arm};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, mem::discriminant, net::Ipv4Addr};
+use std::{
+    collections::HashSet,
+    mem::discriminant,
+    net::Ipv4Addr,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +61,39 @@ pub enum Action {
         upload_kbit: u32,
         download_kbit: u32,
     },
+    /// Survey the listed combinations and hold the best. See
+    /// `titan_pd_model::carrier_pick`. Replaces `carrier_aggregation`.
+    CarrierPick {
+        arms: Vec<Arm>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        survey_hours: Option<u16>,
+        /// `HH:MM-HH:MM` UTC. It may not touch the SAS coordination window.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_utc: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ul_weight: Option<u8>,
+        /// Where the upload burst goes, to UDP port 9 (discard). Defaults to
+        /// the management probe. Set it when the probe is a router whose
+        /// control plane should not take the burst.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ul_sink: Option<Ipv4Addr>,
+    },
+}
+
+/// An address a unit may probe: not unspecified, loopback, multicast,
+/// reserved, broadcast or link-local.
+pub fn unicast(ip: Ipv4Addr) -> bool {
+    !matches!(ip.octets()[0], 0 | 127 | 224..=255) && !ip.is_link_local()
+}
+
+/// The picker's settings with defaults filled in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picker {
+    pub arms: Vec<Arm>,
+    pub survey_hours: u16,
+    pub window: (u16, u16),
+    pub ul_weight: u8,
+    pub ul_sink: Option<Ipv4Addr>,
 }
 
 /// Shortest allowed spacing of enforcement cycles.
@@ -75,14 +113,16 @@ impl Profile {
         if profile.version != 1 {
             return Err("unsupported profile version");
         }
-        if !profile.actions.is_empty()
-            && !profile.management_probe.is_some_and(|ip| {
-                !matches!(ip.octets()[0], 0 | 127 | 224..=255) && !ip.is_link_local()
-            })
-        {
+        if !profile.actions.is_empty() && !profile.management_probe.is_some_and(unicast) {
             return Err("enabled profile needs a unicast management probe");
         }
         let mut kinds = HashSet::new();
+        let has = |want: fn(&Action) -> bool| profile.actions.iter().any(want);
+        if has(|a| matches!(a, Action::CarrierAggregation { .. }))
+            && has(|a| matches!(a, Action::CarrierPick { .. }))
+        {
+            return Err("carrier_pick replaces carrier_aggregation");
+        }
         for action in &profile.actions {
             if !kinds.insert(discriminant(action)) {
                 return Err("duplicate action");
@@ -105,6 +145,16 @@ impl Profile {
                     upload_kbit,
                     download_kbit,
                 } => (64..=50000).contains(upload_kbit) && (64..=250000).contains(download_kbit),
+                Action::CarrierPick {
+                    arms,
+                    survey_hours,
+                    window_utc,
+                    ul_weight,
+                    ul_sink,
+                } => {
+                    carrier_pick::validate(arms, *survey_hours, window_utc.as_deref(), *ul_weight)
+                        && ul_sink.is_none_or(unicast)
+                }
             };
             if !ok {
                 return Err("action outside supported range");
@@ -121,7 +171,30 @@ impl Profile {
                 cycle_hours,
                 nudge,
             } => Some((*carriers, *cycle_hours, *nudge)),
-            Action::Sqm { .. } => None,
+            Action::Sqm { .. } | Action::CarrierPick { .. } => None,
+        })
+    }
+
+    /// The carrier picker, when configured.
+    pub fn picker(&self) -> Option<Picker> {
+        self.actions.iter().find_map(|a| match a {
+            Action::CarrierPick {
+                arms,
+                survey_hours,
+                window_utc,
+                ul_weight,
+                ul_sink,
+            } => Some(Picker {
+                arms: arms.clone(),
+                ul_sink: *ul_sink,
+                survey_hours: survey_hours.unwrap_or(carrier_pick::DEFAULT_SURVEY_HOURS),
+                window: window_utc
+                    .as_deref()
+                    .and_then(carrier_pick::parse_window)
+                    .unwrap_or(carrier_pick::DEFAULT_WINDOW),
+                ul_weight: ul_weight.unwrap_or(carrier_pick::DEFAULT_UL_WEIGHT),
+            }),
+            _ => None,
         })
     }
 }
@@ -130,7 +203,7 @@ impl Action {
     pub fn query(&self) -> Option<&'static str> {
         match self {
             Self::CarrierAggregation { .. } => Some("AT%GCACTRL?"),
-            Self::Sqm { .. } => None,
+            Self::Sqm { .. } | Self::CarrierPick { .. } => None,
         }
     }
     pub fn command(&self, stock: bool) -> Option<String> {
@@ -140,7 +213,7 @@ impl Action {
                 (_, 1) => "AT%GCACTRL=0".into(),
                 _ => format!("AT%GCACTRL=3,{carriers}"),
             }),
-            Self::Sqm { .. } => None,
+            Self::Sqm { .. } | Self::CarrierPick { .. } => None,
         }
     }
 
@@ -157,7 +230,7 @@ impl Action {
                 let mode = if n == 1 { 0 } else { 3 };
                 matches!(fields(line,"%GCACTRL:").as_deref(),Some([m,_,_,count]) if *m==mode && *count==n)
             }
-            Self::Sqm { .. } => false,
+            Self::Sqm { .. } | Self::CarrierPick { .. } => false,
         }
     }
 }
@@ -365,6 +438,44 @@ mod tests {
             nudge: None,
         });
         assert!(Profile::parse(&serde_json::to_vec(&profile).unwrap()).is_err());
+    }
+
+    #[test]
+    fn the_picker_parses_with_defaults_and_replaces_the_cap() {
+        let pick = serde_json::json!({"kind":"carrier_pick","arms":[
+            {"earfcn":55440,"pci":199,"carriers":2},{"earfcn":56440,"pci":208,"carriers":3}]});
+        let p = parse_actions(serde_json::json!([pick.clone()])).unwrap();
+        let picker = p.picker().unwrap();
+        assert_eq!(picker.arms.len(), 2);
+        assert_eq!(picker.survey_hours, carrier_pick::DEFAULT_SURVEY_HOURS);
+        assert_eq!(picker.window, carrier_pick::DEFAULT_WINDOW);
+        assert_eq!(picker.ul_weight, carrier_pick::DEFAULT_UL_WEIGHT);
+        assert_eq!(p.carrier_cap(), None);
+        assert_eq!(p.actions[0].query(), None);
+        assert_eq!(p.actions[0].command(true), None);
+        let both = serde_json::json!([pick.clone(), {"kind":"carrier_aggregation","carriers":2}]);
+        assert_eq!(parse_actions(both), Err("carrier_pick replaces carrier_aggregation"));
+        let mut cpas = pick.clone();
+        cpas["window_utc"] = "06:00-08:00".into();
+        assert!(parse_actions(serde_json::json!([cpas])).is_err());
+        let mut tuned = pick;
+        tuned["window_utc"] = "19:00-23:30".into();
+        tuned["survey_hours"] = 24.into();
+        tuned["ul_weight"] = 8.into();
+        let t = parse_actions(serde_json::json!([tuned.clone()])).unwrap().picker().unwrap();
+        assert_eq!((t.window, t.survey_hours, t.ul_weight, t.ul_sink), ((1140, 1410), 24, 8, None));
+        tuned["ul_sink"] = "198.51.100.9".into();
+        let t = parse_actions(serde_json::json!([tuned.clone()])).unwrap().picker().unwrap();
+        assert_eq!(t.ul_sink, Some(Ipv4Addr::new(198, 51, 100, 9)));
+        for bad in ["127.0.0.1", "224.0.0.9", "255.255.255.255", "169.254.1.1", "0.0.0.0"] {
+            tuned["ul_sink"] = bad.into();
+            assert!(parse_actions(serde_json::json!([tuned.clone()])).is_err(), "{bad}");
+        }
+        assert_eq!(
+            Profile::parse(&serde_json::to_vec(&parse_actions(serde_json::json!([]))
+                .unwrap()).unwrap()).unwrap().picker(),
+            None
+        );
     }
 
     #[test]

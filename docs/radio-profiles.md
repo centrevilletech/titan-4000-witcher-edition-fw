@@ -46,13 +46,15 @@ prevents activation.
 | | `cycle_hours` 6 to 168, optional | Opt-in enforcement re-attach. See below. Absent: the radio is never cycled for the cap. |
 | | `nudge` `{earfcn, pci}`, optional | Band 48 primary cell held only during an enforcement re-attach. Needs `cycle_hours`. |
 | sqm | `upload_kbit` 64 to 50000, `download_kbit` 64 to 250000 | Bidirectional CAKE on the passthrough path. |
+| carrier_pick | `arms` (2 to 6 of `{earfcn, pci, carriers}`) | Surveys the arms and holds the best. Needs no server. Replaces `carrier_aggregation`. See [the carrier picker](#carrier-picker). |
+| | `survey_hours` 24 to 336 (72), `window_utc` `HH:MM-HH:MM` (`10:45-12:30`), `ul_weight` 0 to 20 (4), `ul_sink` IPv4 (`management_probe`) | Optional. |
 
 The keeper accepts each kind once. Version 1 permits 4096 bytes and rejects
 unknown fields and unknown kinds. The socket API uses one JSON document per
 Unix stream connection at `/tmp/titan-pd-keeper/radio.sock` in the root-owned
-mode 0700 directory. Send `{"op":"get"}`, `{"op":"status"}` or
-`{"op":"set","profile":...}`, then shut down the write half and read the JSON
-`result` or `error`. The native web listener has no radio-profile route.
+mode 0700 directory. Send `{"op":"get"}`, `{"op":"status"}`,
+`{"op":"set","profile":...}` or `{"op":"survey"}`, then shut down the write
+half and read the JSON `result` or `error`. The native web listener has no radio-profile route.
 
 ### Settings this firmware will not apply
 
@@ -97,6 +99,108 @@ cleared with `AT%GLOCKPCELL=1,0,0` as soon as the unit attaches, or after 90 s,
 attached or not. A lock that does not read back cleared fails the check and
 reverts the profile. Status shows the carrier count, the cap, how long the
 unit has been over it, and why enforcement is or is not due.
+
+## Carrier picker
+
+The `carrier_pick` action measures which combination of carriers serves this
+unit best and holds it. Each arm is a primary cell and a carrier cap:
+
+```json
+{
+  "version": 1,
+  "management_probe": "<management ping responder>",
+  "actions": [
+    {"kind": "carrier_pick",
+     "arms": [{"earfcn": 55440, "pci": 199, "carriers": 2},
+              {"earfcn": 56440, "pci": 208, "carriers": 3},
+              {"earfcn": 56638, "pci": 217, "carriers": 2}]}
+  ]
+}
+```
+
+A survey visits every arm once. A visit is one radio cycle through the same
+nudge as the enforcement re-attach. The radio goes off, the arm's cap and
+PCell lock are written, the radio comes on, and the lock is cleared as soon as
+the unit attaches, or after 90 s if it does not. The tower still chooses the
+secondary carriers. The arm the unit is already on is measured without a
+cycle. After each attach the picker waits up to 10 minutes for SAS grants that
+cover the new primary and uplink secondary carrier, then 15 s more, and
+scores the arm. It needs no server:
+
+- Download, estimated. The Titan cannot measure its own download without a
+  sender: its CPU caps a TCP download on the unit near 53 Mbps. Instead the
+  picker reads the SINR the modem reports for every serving carrier once a
+  second for 20 s, using each carrier's weaker receive branch because rank 2
+  runs at its pace. It takes each carrier's median and the median rank, and sums a
+  per-carrier capacity: Shannon with a 4.6 dB implementation gap, 256QAM at
+  most, over the downlink share of TDD configuration 2. There is no rate cap
+  beyond that. On the bench the estimate read 128 Mbps for c5 at 11 dB with c9
+  at 15 dB, where a UDP burst from the core measured 130.7, and 180 Mbps for
+  c6 at 10 dB with c9 and c5 at 15 and 12 dB, where the burst measured 176.8,
+  and 150 Mbps for c6 at 9 dB with c9 and c12 at 11 and 12 dB on their weaker
+  branches, where floods from the core measured 148 to 150.
+  At 17 dB on three carriers it gives about 270 Mbps. The estimate sees radio
+  quality, not how busy each carrier is, so it ranks arms rather than
+  promising rates.
+- Upload, measured. Over the same 20 s the unit sends a UDP burst offering
+  45 Mbps through the management bearer to the discard port (UDP 9) of
+  `management_probe`, or of `ul_sink` when the action sets one. Any host
+  works: nothing needs to listen, and a firewall that drops the packets is
+  fine. Set `ul_sink` when the management probe is a router, so the burst
+  stays off its control plane. The rate is the modem's own upload report
+  (`sqns_radio_ulThroughput`), which refreshes about every 6.5 s. On the bench
+  it read 13.8 Mbps where the far end counted 11.2 to 12.2 Mbps of payload.
+  Every arm carries the same bias, so the ranking holds. The burst only starts
+  while the customer is idle, and it stops at once when the customer bearer
+  carries 2 Mbps either way in a second. That arm is measured again once the
+  customer has been idle for 2 minutes.
+- Round trip: five pings to `management_probe`, before the burst.
+
+A visit sends about 35 to 75 MB to the sink. With three arms and
+the default 72-hour survey interval, that is at most about 75 MB a day per
+unit.
+
+Each arm scores `download + ul_weight x upload`. Only a visit that attached on
+its arm's primary cell, within its cap, counts. The arm the unit is on keeps
+its place unless another scores 5% higher. Within 2%, the lower round trip
+wins. The result goes to `/mnt/titan-api/radio/pick.json`. The keeper logs one
+line per visit and one per survey.
+
+A radio cycle starts only when all of these hold, read fresh each time:
+
+- The time is outside 06:30 to 10:30 UTC, which is CPAS with 30 minutes on
+  each side. No new SAS grants are issued in that window, and a carrier change
+  gives back every grant.
+- The time is inside `window_utc`. An operator request through `survey` lifts
+  this one rule.
+- The unit is attached and holds its SAS grant (`cbrs_mode_grant` 1,
+  `cbrs_grant_state` 2).
+- The customer bearer has carried under 2 Mbps each way for 2 minutes.
+- No keeper recovery is pending.
+
+A survey runs at most once per `survey_hours`. One that is still unfinished
+after 6 hours is dropped. When no covering grant arrives within 10 minutes of
+a visit, the survey stops and the unit stays where it is. If the unit leaves
+the held arm (a reboot, the tower), the picker returns to the arm with one
+cycle, at most every 6 hours, outside the survey window too. A failed cycle
+reverts the profile like a failed enforcement. Removing the action restores
+the stock cap and clears any lock, without a radio cycle.
+
+Every visit costs the customer one re-attach, 30 to 60 s, plus the wait for
+grants, which took 15 s on the bench at 19:00 UTC. That is why visits wait for
+an idle customer.
+
+### Status and requests
+
+Status shows the survey state and every visit under `pick`: the SINR of each
+carrier, the download estimate, the measured upload, the round trip, the
+score, and the modem's own download and upload high-water marks for the
+record. To survey now, outside the window:
+
+```sh
+/tmp/titan-pd-keeper/titan-pd-keeper radio-profile survey
+/tmp/titan-pd-keeper/titan-pd-keeper radio-profile status
+```
 
 ## Application and recovery
 
