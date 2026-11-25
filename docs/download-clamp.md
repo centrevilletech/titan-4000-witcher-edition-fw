@@ -1,7 +1,9 @@
 # Download clamp (titan_qctrl)
 
-Status: off by default. Since v1.0.15 the keeper loads the clamp only on a
-unit where an operator staged it and turned it on.
+Status: on by default since v1.0.17, in mode 3 (receive-window clamp plus
+ACK thinning). The module is in the firmware image. `clamp=off` in
+`/mnt/titan-api/latency/config`, or the **Download clamp** switch under
+**Network → Latency**, turns it off live (see [latency features](latency-switches.md)).
 
 ## Why
 
@@ -35,25 +37,35 @@ loads but sees no customer downloads.
 
 ## Where it comes from
 
-The module is not in the firmware image (the root filesystem has little
-room). Its source, a reproducible build and the binary are in
-[`device/qctrl`](../device/qctrl/README.md) under GPL-2.0-only. The keeper
-carries the binary's SHA-256 and loads nothing else.
+Since v1.0.17 the module is in the firmware image, at
+`/usr/lib/titan-api/modules/titan_qctrl.ko`. Its source, a reproducible build
+and the binary are in [`device/qctrl`](../device/qctrl/README.md) under
+GPL-2.0-only. The keeper carries the binary's SHA-256 and loads nothing else.
+A copy staged in `/mnt/titan-api/qctrl/` still takes precedence, but only
+when it has that same SHA-256; any other bytes are refused, and the image's
+copy loads instead.
 
-## Turning it on
+## Settings
 
-`scripts/stage-latency.sh` stages it together with the modem firmware
-image (see [the boot-time loader](tk-boot-loader.md)). To stage only the
-clamp, over the enrolled operator SSH login:
+With no `qctrl/config` the keeper runs `qctrl::DEFAULT_MODE`, which is 3, and
+the module's own knobs. That one constant in `userspace/pd-model/src/qctrl.rs`
+sets the default: 2 is the clamp alone, 0 leaves it off until an operator
+turns it on.
+
+The default stands aside, at mode 0, while `sch_cake` is loaded. Only a radio
+profile's `sqm` action loads it, and the two have not been tested together
+(below). An operator's `qctrl/config` overrides both the default and this
+rule. To set your own mode or knobs, stage a config. `scripts/stage-latency.sh`
+writes one together with the modem firmware image (see
+[the boot-time loader](tk-boot-loader.md)). For only the clamp, over the
+enrolled operator SSH login:
 
 ```sh
 ssh -p 2222 root@<unit> 'mkdir -p /mnt/titan-api/qctrl && chmod 700 /mnt/titan-api/qctrl'
-scp -P 2222 device/qctrl/payload/titan_qctrl.ko root@<unit>:/mnt/titan-api/qctrl/
-ssh -p 2222 root@<unit> 'printf "mode=2\n" > /mnt/titan-api/qctrl/config && sync'
+ssh -p 2222 root@<unit> 'printf "mode=2\ntrough_ms=8\n" > /mnt/titan-api/qctrl/config && sync'
 ```
 
-No reboot is needed. The keeper loads it within about 45 s once the customer
-port and LTE are up.
+No reboot is needed: the keeper applies a change within 15 s.
 
 `/mnt/titan-api/qctrl/config`:
 
@@ -74,17 +86,19 @@ one is logged. Mode 8 (drop UDP) is never set.
 
 ## What the keeper does
 
-Every 15 s, in every mode:
+Every 15 s, in every mode, and at once when the latency switches change:
 
-1. Reads `qctrl/config`. With no file or `mode=0` and no module loaded, it
-   does nothing.
+1. Works out the mode: 0 while `clamp=off` is in the latency switches; the
+   operator's `qctrl/config` when there is one; else the default (mode 3,
+   or 0 beside CAKE). With mode 0 and no module loaded, it does nothing.
 2. Waits until the customer port has carrier and the management bearer
    (`lte0pdn0`) has an address, both for 30 s.
 3. Refuses to load if any other module with `qctrl` in its name is loaded,
    or a `titan_qctrl` whose `/proc/titan_qctrl` shows another version.
-4. Copies `titan_qctrl.ko` into its RAM directory and checks the copy's
-   SHA-256 against the digest built into the keeper, then runs `insmod` on
-   that copy. The module starts in mode 0 (observe only).
+4. Copies `titan_qctrl.ko` (the staged copy, if it is the pinned one, else
+   the image's) into its RAM directory and checks the copy's SHA-256 against
+   the digest built into the keeper, then runs `insmod` on that copy. The
+   module starts in mode 0 (observe only).
 5. Writes any configured knobs (`trough_ms`, `target_ms`, `ack_adapt`,
    `ctrl_v3`, `ack_ms`, `ack_segs`, `ack_min_kbps`), then `mode`, to
    `/proc/titan_qctrl`, one line per write. Then it reads them back.
@@ -94,10 +108,11 @@ Every 15 s, in every mode:
 A failed load is not retried until the config changes or the unit reboots.
 
 Status: `/var/run/witcher-qctrl.status`, with `state` (`off`, `waiting`,
-`applied`, `failed`), `detail`, `mode`, `trough_ms`, `target_ms`, `ack_adapt`,
-`ctrl_v3`.
-`keeper.log` lines start with `download clamp`. A unit that never staged it
-logs none.
+`applied`, `failed`), `detail` (which says where the mode came from: the
+firmware default, `qctrl/config`, the switch, or standing aside for CAKE),
+`mode`, `trough_ms`, `target_ms`, `ack_adapt`, `ctrl_v3`.
+`keeper.log` lines start with `download clamp`. A clamp that is off from the
+start logs none.
 
 `cat /proc/titan_qctrl` shows the live controller: `w_kb` (the shared
 window), `rate100_kbps`, `q_owd_ms` (tower queue), `owd_ok` and `owd_bad`
@@ -107,12 +122,14 @@ window), `rate100_kbps`, `q_owd_ms` (tower queue), `owd_ok` and `owd_bad`
 
 | Level | Action | Result |
 | --- | --- | --- |
-| Off now | `mode=0` in `qctrl/config` | The keeper writes mode 0 within 15 s. The module stays loaded and passes everything. |
-| Off at boot | Delete `qctrl/config` (or keep `mode=0`) and reboot | Nothing is loaded. |
-| Unload now | `mode=0` first, then `rmmod titan_qctrl` | Gone until the config asks again. With `mode=2` still set, the keeper loads it again. |
+| Off now | `clamp=off` in `/mnt/titan-api/latency/config`, or the web switch | The keeper writes mode 0 within seconds. The module stays loaded and passes everything. |
+| Off now, operator config | `mode=0` in `qctrl/config` | The same, within 15 s. |
+| Off at boot | Keep `clamp=off` (or `mode=0`) and reboot | Nothing is loaded. |
+| Unload now | Turn it off first, then `rmmod titan_qctrl` | Gone until a non-zero mode asks for it again. |
 
 ## Not tested yet
 
-- Together with the radio profile's CAKE download shaping. Use one of them
-  for downloads.
+- Together with the radio profile's CAKE download shaping. The default clamp
+  stands aside while CAKE is loaded; an operator who sets both up in
+  `qctrl/config` runs both.
 - Hours of customer traffic. The bench runs were 20-second downloads.

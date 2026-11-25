@@ -143,15 +143,26 @@ each periodic router advertisement, go to a log in RAM, and the status file is
 rewritten on flash at most once a minute. Witcher's logs in `/tmp` stay under
 about 80 KB each. See [Long runs](docs/long-runs.md).
 
-Since v1.0.15 two latency fixes can be turned on per unit, both off by
-default. After a confirmed boot of a staged N4 modem firmware image, the
-keeper writes the image's uplink queue control and grant-hold flags from the
-operator's config and reads each one back (bench: ping during an upload about
-100 ms to 38 ms). A staged download clamp module keeps the tower's download
-queue short (bench: ping during a full download about 310 ms to 50 ms, for
-about 8 % less peak speed). `scripts/stage-latency.sh` stages both. See
-[modem feature flags](docs/tk-boot-loader.md#modem-feature-flags) and the
-[download clamp](docs/download-clamp.md).
+Since v1.0.17 Witcher's latency and upload improvements are on by default.
+A unit that is only flashed gets all of them; nothing needs SSH or staging.
+
+- **The modem.** On its first boot of v1.0.17 the unit builds a patched modem
+  image from its own stock modem firmware (about 20 s, once) and loads it.
+  After the boot confirm the keeper turns on the image's uplink queue
+  control, grant hold and Rust PIE uplink AQM. Bench: ping during an upload
+  went from about 100 ms to 38 ms, and CUBIC upload on two carriers from
+  about 7.4 to 14.9 Mbps.
+- **The download clamp** keeps the tower's download queue short. Bench:
+  ping during a full download went from about 310 ms to 50 ms.
+- **The fast path** gives back about 20 points of CPU at high speed in IP
+  passthrough.
+
+Each one turns off live, under **Network → Latency** or with one line in
+`/mnt/titan-api/latency/config`. An operator's own settings still win. An
+image that fails its boot confirm is quarantined, and the unit goes back to
+stock modem firmware by itself. See [latency features](docs/latency-switches.md),
+the [boot-time loader](docs/tk-boot-loader.md), the
+[download clamp](docs/download-clamp.md) and the [fast path](docs/fast-path.md).
 
 See [IPv4 recovery](docs/ipv4-recovery.md) and the
 [IPv6 implementation notes](docs/modem-ipv6-pd-patch.md) for the details.
@@ -196,9 +207,11 @@ components this repository builds from source.
 - [Ethernet flow control](docs/ethernet-flow-control.md)
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
-- [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
-- [Building the modem image on the unit (opt-in)](docs/tk-patch.md)
-- [Download clamp (off by default)](docs/download-clamp.md)
+- [Latency features: on by default, and how to turn each off](docs/latency-switches.md)
+- [Boot-time modem firmware loader](docs/tk-boot-loader.md)
+- [Building the modem image on the unit](docs/tk-patch.md)
+- [Download clamp](docs/download-clamp.md)
+- [Passthrough fast path](docs/fast-path.md)
 
 ## Learn LTE and build something
 

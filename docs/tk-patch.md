@@ -1,8 +1,10 @@
 # Building the modem image on the unit
 
-Status: opt-in. Nothing runs it but an operator. It builds one image, the
-v1.0.16 release image (below), and hands it to the
-[boot-time loader](tk-boot-loader.md), which stays off until then.
+Status: on by default since v1.0.17. The boot hook runs it on the first boot
+that needs it (`tk-build boot`, the [default image](tk-boot-loader.md#the-default-image)),
+and an operator can run it by hand (`check`, `stage`). It builds one image,
+the release image (below), and hands it to the
+[boot-time loader](tk-boot-loader.md).
 
 ## Why
 
@@ -31,6 +33,15 @@ the PIE selector of M1 block `0x20261126` (see
 [Modem feature flags](tk-boot-loader.md#modem-feature-flags)).
 
 ## Use
+
+At boot, with no operator files in `tk/`, the hook runs
+`titan-pd-keeper tk-build boot` (read-only: decide) and, when a build is due,
+`titan-pd-keeper tk-build boot --write` (build). That path builds only from
+the bank `/proc/cmdline` names active, writes a default `tk/config` with the
+latency profile's words, and records each build in `tk/default`
+([the default image](tk-boot-loader.md#the-default-image)).
+
+By hand:
 
 ```sh
 titan-pd-keeper tk-build check   # build in memory, check every hash, write nothing
@@ -85,7 +96,8 @@ says so and leaves the file alone:
 - `strikes` at 2: write `strikes=0` to try again;
 - the image's hash in `quarantine`: remove the line to try again.
 
-`enabled=1` is the opt-in. The keeper reads `tk/config` every 15 s, so on a
+`stage` makes `tk/config` an operator's config (it drops a default config's
+marker line), so later boots leave it alone. The keeper reads `tk/config` every 15 s, so on a
 running staged boot that was confirmed, `stage` also turns its `wm=` flags back
 on if `enabled` was 0.
 
@@ -186,10 +198,10 @@ not manage (`tk_flags::M1_VERSIONS`).
   trying every word, much as the VA already says which instruction it is.
 - **The deflate port** is a translation of zlib's code under the zlib license
   ([third-party notices](../THIRD_PARTY.md)).
-- The image the unit builds is still modified vendor baseband firmware. The
-  [regulatory note](tk-boot-loader.md#regulatory-note) applies: get counsel
-  review before customer units run it. This page describes the engineering,
-  not legal advice.
+- The image the unit builds is still modified vendor baseband firmware, and
+  since v1.0.17 units build and load it by default. The
+  [regulatory note](tk-boot-loader.md#regulatory-note) applies. This page
+  describes the engineering, not legal advice.
 
 ## Tests
 
@@ -223,3 +235,15 @@ not manage (`tk_flags::M1_VERSIONS`).
 
   The stand-ins have no bad block table, so the vendor kernel's MTD driver is
   for the bench to prove.
+- `scripts/test-tk-stage.py` runs the boot hook with the real keeper against
+  the same stand-in banks (`RealDefaultImage`, in the same CI job). It checks
+  that:
+  - the first boot builds and loads the image for the same `modprobe`;
+  - the next boot reuses it;
+  - the default config's words are what `stage-latency.sh --profile latency`
+    writes for the image;
+  - a bank that is not the stock image, or an inactive bank that is, builds
+    nothing;
+  - an operator config, or an image without a config, is left alone;
+  - a failed build keeps stock firmware and stops after 3 builds;
+  - what a killed build leaves is cleaned up and built again.

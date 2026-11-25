@@ -1,11 +1,14 @@
 # Passthrough bridge fast path (titan_k1fp 2.2)
 
-Status: off by default and not in the firmware image. An operator stages
-`titan_k1fp.ko` per unit in `/mnt/titan-api/fastpath/` with a `config` file;
-the keeper verifies its SHA-256 against
+Status: on by default since v1.0.17, in mode 2 (downlink fast path), which
+the bench has run for days. `titan_k1fp.ko` is in the firmware image
+(`/usr/lib/titan-api/modules/`). The keeper verifies its SHA-256 against
 [`device/fastpath/SHA256SUMS`](../device/fastpath/SHA256SUMS), loads it in IP
 passthrough once the links settle, and drives its SAS grant lease directly
 from the keeper's CBRS gate. On load the module starts in `mode 0` (off).
+`fastpath=off` in `/mnt/titan-api/latency/config`, or the **Fast path**
+switch under **Network → Latency**, turns it off live (see
+[latency features](latency-switches.md)).
 
 ## Why
 
@@ -134,31 +137,28 @@ per second forever (~18 lines/s, wrapping the 256 KB dmesg buffer every
 - Stop an active timer live: `kern ipc -st`
 - Take a one-shot IPC snapshot without starting a timer: `kern ipc i`
 
-## Keeper-managed staging and lifecycle
+## Keeper-managed lifecycle
 
-`scripts/stage-latency.sh` stages `titan_k1fp.ko` alongside the modem firmware
-and download clamp, or on its own:
-
-```sh
-scripts/stage-latency.sh --fastpath device/fastpath/payload/titan_k1fp.ko --fastpath-mode 2 <unit>
-```
-
-The script checks the local file's SHA-256 against `device/fastpath/SHA256SUMS`,
-copies it to `/mnt/titan-api/fastpath/titan_k1fp.ko`, verifies the SHA-256 on
-the unit, and writes `/mnt/titan-api/fastpath/config`:
+With no `/mnt/titan-api/fastpath/config` the keeper runs mode 2
+(`fastpath::DEFAULT_MODE`). An operator's config sets another mode:
 
 ```ini
-mode=2
+mode=3
 ```
 
 Allowed values are `mode=0`, `1`, `2`, or `3` (comments start with `#`; the
 last `mode=` line wins; an invalid `mode=` line resets to `mode=0` and is
-logged). With no config file or `mode=0` and no module loaded, the keeper loads
+logged). `scripts/stage-latency.sh --fastpath ... --fastpath-mode N <unit>`
+writes it from a workstation. A copy of `titan_k1fp.ko` staged in
+`/mnt/titan-api/fastpath/` still takes precedence over the image's, but only
+when it has the pinned SHA-256; any other bytes are refused, and the image's
+copy loads instead. With mode 0 and no module loaded, the keeper loads
 nothing and logs nothing.
 
-Every 15 s the keeper:
+Every 15 s, and at once when the latency switches change, the keeper:
 
-1. Reads `/mnt/titan-api/fastpath/config`.
+1. Works out the mode: 0 while `fastpath=off` is in the latency switches;
+   the operator's `fastpath/config` when there is one; else mode 2.
 2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
    `/proc/k1fp` reports a version string other than `titan_k1fp v2.2`. If
    `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
@@ -168,10 +168,10 @@ Every 15 s the keeper:
 3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and
    `lte0pdn2`, both have carrier for 30 s, and any configured download clamp
    (`titan_qctrl`) has finished loading first.
-4. Copies `/mnt/titan-api/fastpath/titan_k1fp.ko` into its private RAM
-   directory (`/tmp/titan-pd-keeper/fastpath/`), verifies the RAM copy's
-   SHA-256 against the digest pinned at build time (`device/fastpath/SHA256SUMS`),
-   and runs `insmod` on that RAM copy.
+4. Copies `titan_k1fp.ko` (the staged copy, if it is the pinned one, else the
+   image's) into its private RAM directory (`/tmp/titan-pd-keeper/fastpath/`),
+   verifies the RAM copy's SHA-256 against the digest pinned at build time
+   (`device/fastpath/SHA256SUMS`), and runs `insmod` on that RAM copy.
 5. Reads `/proc/k1fp` and checks `ports_ok=1`, `lan_hooked=1`, and
    `wan_hooked=1`. Anything else stays at `mode 0` and records why in the
    status file.
@@ -220,8 +220,8 @@ about 16 s after the vendor scripts finish rebuilding the bridge.
 Status lives in `/var/run/witcher-fastpath.status` (`state` is `off`,
 `waiting`, `applied`, `tripped`, or `failed`, along with `detail`, `mode`,
 `active_mode`, `gate`, `qctrl_present`, `wd_trips`, `wd_reason`, and
-`updated`). Keeper log lines start with `fast path`. A unit without
-`fastpath/config` logs none. `scripts/stage-latency.sh --status <unit>` prints
+`updated`; `detail` says where the mode came from). Keeper log lines start
+with `fast path`. A fast path that is off from the start logs none. `scripts/stage-latency.sh --status <unit>` prints
 the status file, the first lines of `/proc/k1fp`, and recent `fast path` log
 lines.
 
@@ -236,10 +236,8 @@ device/fastpath/test/run.sh
 
 | Level | Action | Result |
 | --- | --- | --- |
-| Off now (keeper-managed) | Write `mode=0` to `/mnt/titan-api/fastpath/config` | The keeper writes `mode 0` and `grant 0` within 15 s and sets `state=off`. |
-| Off immediately (manual) | `echo "mode 0" > /proc/k1fp` | Immediate pass-through; set `mode=0` in `fastpath/config` too so the keeper does not re-arm once. |
-| Unload now | Set `mode=0` in `fastpath/config`, wait for `state=off`, then `rmmod titan_k1fp` | Module unloaded cleanly (`modref=0`). |
-| Off at boot | Delete `/mnt/titan-api/fastpath/config` (or keep `mode=0`) and reboot | Nothing is loaded and nothing is logged. |
-
-Because `titan_k1fp.ko` is never packed into the firmware image, deleting
-`fastpath/config` and rebooting clears it completely.
+| Off now | `fastpath=off` in `/mnt/titan-api/latency/config`, or the web switch | The keeper writes `mode 0` and `grant 0` within seconds and sets `state=off`. |
+| Off now, operator config | Write `mode=0` to `/mnt/titan-api/fastpath/config` | The same, within 15 s. |
+| Off immediately (manual) | `echo "mode 0" > /proc/k1fp` | Immediate pass-through; turn it off as above too so the keeper does not re-arm once. |
+| Unload now | Turn it off, wait for `state=off`, then `rmmod titan_k1fp` | Module unloaded cleanly (`modref=0`). |
+| Off at boot | Keep `fastpath=off` (or `mode=0`) and reboot | Nothing is loaded and nothing is logged. |

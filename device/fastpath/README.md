@@ -7,9 +7,12 @@ through the stock bridge and netfilter path first. What it does, how it
 coexists with `titan_qctrl` and CBRS SAS gates, and how to test or roll
 it back: [docs/fast-path.md](../../docs/fast-path.md).
 
-It is not in the firmware image. An operator stages it per unit and loads
-it only after verifying its bytes against `SHA256SUMS`. It starts in
-`mode 0` (off) on `insmod`.
+Since Witcher v1.0.17 it is in the firmware image
+(`/usr/lib/titan-api/modules/titan_k1fp.ko`) and on by default in mode 2.
+The build copies this exact file after checking it against `SHA256SUMS`,
+which is also built into the keeper: the keeper loads only bytes that match
+it, whether the image's copy or one staged in `/mnt/titan-api/fastpath/`. It
+starts in `mode 0` (off) on `insmod`.
 
 ## License
 

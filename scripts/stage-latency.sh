@@ -2,6 +2,11 @@
 # Stage the latency fixes on one Titan over the enrolled operator SSH login
 # (port 2222). Run it from a checkout on a workstation.
 #
+# Since v1.0.17 a unit needs none of this: it builds the release modem image
+# at boot and runs the clamp and the fast path by default
+# (docs/latency-switches.md). Use this script for your own image or settings;
+# the files it writes are operator configs, which the defaults never touch.
+#
 #   scripts/stage-latency.sh [options] <unit> <tk.gz> <titan_qctrl.ko>
 #   scripts/stage-latency.sh [options] --fastpath <titan_k1fp.ko> <unit>
 #
@@ -100,7 +105,7 @@ while [ $# -gt 0 ]; do
     --user) SSH_USER=${2:?}; shift 2 ;;
     --status) STATUS_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,49p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,54p' "$0"; exit 0 ;;
     --) shift; ARGS+=("$@"); break ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -121,20 +126,23 @@ for f in /var/run/witcher-tk.status /var/run/witcher-tk.result /var/run/witcher-
          /var/run/witcher-qctrl.status /var/run/witcher-fastpath.status \
          /mnt/titan-api/tk/config /mnt/titan-api/tk/strikes \
          /mnt/titan-api/tk/quarantine /mnt/titan-api/tk/confirmed \
+         /mnt/titan-api/tk/default /var/run/witcher-tk.build \
+         /mnt/titan-api/latency/config \
          /mnt/titan-api/qctrl/config /mnt/titan-api/fastpath/config; do
   show "$f"
 done
 echo "== staged files"
-for f in /mnt/titan-api/tk/active.gz /mnt/titan-api/qctrl/titan_qctrl.ko /mnt/titan-api/fastpath/titan_k1fp.ko; do
+for f in /mnt/titan-api/tk/active.gz /mnt/titan-api/qctrl/titan_qctrl.ko /mnt/titan-api/fastpath/titan_k1fp.ko \
+         /usr/lib/titan-api/modules/titan_qctrl.ko /usr/lib/titan-api/modules/titan_k1fp.ko; do
   [ -f "$f" ] && sha256sum "$f" || echo "(no $f)"
 done
 echo "== /proc/titan_qctrl"
 if [ -r /proc/titan_qctrl ]; then head -n 4 /proc/titan_qctrl; else echo "(not loaded)"; fi
 echo "== /proc/k1fp"
 if [ -r /proc/k1fp ]; then head -n 9 /proc/k1fp; else echo "(not loaded)"; fi
-echo "== keeper.log (tk, flags, clamp, fast path)"
-{ grep -h -E 'tk boot|tk flags|download clamp|fast path' /tmp/titan-pd-keeper/keeper.log.1 /tmp/titan-pd-keeper/keeper.log 2>/dev/null ||
-  grep -h -E 'tk boot|tk flags|download clamp|fast path' /mnt/titan-api/pd/keeper.log 2>/dev/null; } | tail -n 15 || true
+echo "== keeper.log (tk, flags, clamp, fast path, switches)"
+{ grep -h -E 'tk boot|tk flags|download clamp|fast path|latency switches' /tmp/titan-pd-keeper/keeper.log.1 /tmp/titan-pd-keeper/keeper.log 2>/dev/null ||
+  grep -h -E 'tk boot|tk flags|download clamp|fast path|latency switches' /mnt/titan-api/pd/keeper.log 2>/dev/null; } | tail -n 15 || true
 EOS
 }
 

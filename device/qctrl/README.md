@@ -5,11 +5,13 @@
 the TCP receive window that customer devices advertise, and adds opt-in adaptive
 ACK thinning (`ack_adapt`) and low-burst window control (`ctrl_v3`) that are off
 by default so the default path matches v0.2-o1b. What it does, how the
-keeper loads it and how to turn it on: [docs/download-clamp.md](../../docs/download-clamp.md).
+keeper loads it and how to turn it off: [docs/download-clamp.md](../../docs/download-clamp.md).
 
-It is not in the firmware image. An operator stages it per unit in
-`/mnt/titan-api/qctrl/`, and the keeper loads it only when its bytes match
-the digest in `SHA256SUMS`, which is built into the keeper.
+Since Witcher v1.0.17 it is in the firmware image
+(`/usr/lib/titan-api/modules/titan_qctrl.ko`) and on by default. The build
+copies this exact file after checking it against `SHA256SUMS`, which is also
+built into the keeper: the keeper loads only bytes that match it, whether the
+image's copy or one staged in `/mnt/titan-api/qctrl/`.
 
 ## License
 

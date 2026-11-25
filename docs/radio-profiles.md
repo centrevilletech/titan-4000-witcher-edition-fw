@@ -259,6 +259,10 @@ during download p50 292 to 43 ms, during upload 103 to 32 ms. A fixed rate
 costs speed when the radio rate moves: download 113 to 97 Mbps, upload 14 to
 8 Mbps.
 
+The download clamp, on by default since v1.0.17, stands aside (mode 0) while
+`sch_cake` is loaded: the two have not been tested together. An operator's
+`qctrl/config` overrides that (see [the download clamp](download-clamp.md)).
+
 ## Qualification plan
 
 1. Run the locked Rust workspace tests and the firmware build and verifier.

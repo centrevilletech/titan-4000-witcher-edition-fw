@@ -1,21 +1,22 @@
 # Boot-time modem firmware loader
 
-Status: bench only, off by default. Nothing changes on a unit until an
-operator stages an image and turns it on. This firmware ships no modem
-firmware bytes. Since v1.0.15 the keeper writes modem feature flags, but only
-on a confirmed boot of a staged image and only the words `tk/config` lists
-(see [Modem feature flags](#modem-feature-flags)).
+Status: on by default since v1.0.17. On the first boot that needs it, the
+unit builds the release modem image from its own stock firmware and loads
+it ([the default image](#the-default-image)). After a confirmed boot the
+keeper writes the image's feature words
+([Modem feature flags](#modem-feature-flags)). An operator's own `tk/config`
+always wins, and `enabled=0` there keeps stock firmware. This firmware still
+ships no modem firmware bytes. See [latency features](latency-switches.md)
+for the switches.
 
-Since v1.0.16 a unit can build the release image itself from its own stock
-firmware: `titan-pd-keeper tk-build stage` writes `tk/active.gz` and
-`tk/config` (see [Building the modem image on the unit](tk-patch.md)). The
-release image is `n6h-r4-r1`:
+The release image is `n6h-r4-r1`:
 
 - N6H;
 - lane R4's Rust N4 uplink engine;
 - lane R1's hardened Rust PIE uplink AQM (M1 block version `0x20261126`).
 
 Its gzip SHA-256 is `3348aa361c4689c4ff18b647a03bfa55cea36bc6675059cd9995e591592e40bb`.
+[Building the modem image on the unit](tk-patch.md) describes the builder.
 
 ## Why
 
@@ -37,6 +38,7 @@ stay stock.
 | Stock `modem.ko` | `/lib/modules/3.10.0-uc0/extra/modem.ko` | Unchanged, byte for byte. Loads on every boot that does not stage an image. |
 | Gated copy | `/usr/lib/titan-api/tk/modem-tkfs.ko` | The stock module with one instruction changed (below). Loads only on a staged boot. |
 | Boot hook | `/etc/init.d/witcher-tk-stage` | `pre` runs right before `start_lte.sh`'s one `modprobe modem`, `post` right after it. |
+| Default image | `titan-pd-keeper tk-build boot` | Run by `pre`: builds the release image from the stock firmware when no operator files are in `tk/`. |
 | Boot confirm | `titan-pd-keeper` | Confirms a staged boot, or quarantines the image and reboots once onto stock. |
 
 `scripts/patch-modem-ko.py` makes the gated copy at build time. It refuses any
@@ -74,14 +76,60 @@ passed every check, binds nothing on any failure, and removes the image right
 after the modprobe. A later modem crash then reloads stock NAND firmware
 through the normal crash recovery.
 
-## Turning it on (bench only)
+## The default image
+
+With no operator files in `tk/`, `pre` asks the keeper (`titan-pd-keeper
+tk-build boot`) before its usual checks. The keeper first decides on the
+read-only mount and writes nothing:
+
+| `tk/` holds | The keeper says |
+| --- | --- |
+| A `config` whose first line is not `# witcher-default` | Nothing: the hook never asks. It is an operator's config. |
+| A `config` that starts with the marker but was edited since (its checksum fails) | `operator`: the hook's usual checks decide. |
+| `active.gz` with no `config` | `operator`. Either an operator's image, or one an operator turned off by deleting the config. Nothing is built over it. |
+| Anything in `quarantine`, or `strikes` at 2 or unreadable | `reason=quarantined`, `strikes` or `strikes-unreadable`: stock firmware, nothing built. |
+| The default config and `active.gz` holding exactly the release image | `cached`: the usual checks load it. |
+| Nothing, or a default config for another image | `build`, unless the build record stops it (below). |
+
+To build, the hook checks free memory (32 MiB), remounts the volume
+read-write and runs the keeper again with `--write`, under a 120 s limit. The
+keeper then:
+
+1. records the build in `tk/default` before it starts (`builds=N`,
+   `result=started`), so a build that dies still counts;
+2. removes what an earlier run left and the stale default image;
+3. reads the bank `/proc/cmdline` names active (`active=...,tk2`). Only that
+   bank serves, and it must inflate to the pinned stock image;
+4. builds the release image, reads it back from flash, renames it over
+   `active.gz`, and writes the default `tk/config`: the marker line with a
+   checksum, `enabled=1`, the image's `sha256=`, and the latency profile's
+   `wm=` lines (the same lines `scripts/stage-latency.sh --profile latency`
+   writes for this image, the PIE selector last);
+5. records `result=built`.
+
+The hook's usual checks then load the image for this same `modprobe`: the
+strike first, and stock firmware on any failure. The bench built and staged
+the image in 17.5 s.
+
+| Build outcome | Next boots |
+| --- | --- |
+| `built` | `cached`. |
+| `stock-mismatch` (the active bank is not the pinned stock image) | Recorded: nothing is built for this release image again. Stock firmware. |
+| A failure (`build`: read or write error, the time limit, a crash) | Stock firmware this boot; the next boot tries again, up to 3 builds of one release image (`build-limit` after that). |
+| `bank-unknown` (no `active=` tk bank on `/proc/cmdline`) | Stock firmware. |
+
+A firmware update with another release image builds again: the record counts
+builds per image. Deleting `tk/default` lets a unit try again.
+
+## Staging your own image
 
 Reboot only outside the SAS window when no new grants are issued (07:00 to
 10:00 UTC; avoid 06:45 to 10:15). Keep wired recovery connected.
 
-`scripts/stage-latency.sh` does all of the steps below from a workstation,
-checks every copy by SHA-256 on the unit, and also stages the download clamp
-(see [the download clamp](download-clamp.md)):
+An operator's `tk/config` replaces the default image. `scripts/stage-latency.sh`
+does all of the steps below from a workstation, checks every copy by SHA-256
+on the unit, and also stages the download clamp (see
+[the download clamp](download-clamp.md)):
 
 ```sh
 scripts/stage-latency.sh --target <ping responder> <unit> tk.gz device/qctrl/payload/titan_qctrl.ko
@@ -120,18 +168,21 @@ everything it set up itself. It never touches what it did not create.
 2. Checks that nothing is already bound over `/lib/firmware` or `modem.ko`,
    that `mtd20` is the `user` partition, and that no UBI device holds it yet.
 3. Attaches `mtd20` as `ubi1` and mounts the Witcher volume (`ubi1:data`)
-   **read-only** on a private directory. With no opt-in it unmounts,
-   detaches and stops here. Nothing is written.
-4. Reads `config`, `strikes` and `quarantine`. Checks the image size and
+   **read-only** on a private directory.
+4. Unless an operator's `config` is there, asks the keeper about
+   [the default image](#the-default-image), which may build it (the only
+   step that remounts read-write before the strike). With no image to load
+   it unmounts, detaches and stops here.
+5. Reads `config`, `strikes` and `quarantine`. Checks the image size and
    free memory.
-5. Copies the image into a private 8 MiB tmpfs and checks **that copy**: its
+6. Copies the image into a private 8 MiB tmpfs and checks **that copy**: its
    SHA-256 must be on the allow-list and not in quarantine, and its gzip header
    must be one the modem can read. Checks the gated module's SHA-256.
-6. Remounts the volume read-write and writes `strikes=N+1` (temporary file,
+7. Remounts the volume read-write and writes `strikes=N+1` (temporary file,
    sync, rename, sync), then reads it back. No recorded strike means no load.
-7. Unmounts the volume and detaches `mtd20`, so the vendor's own attach later
+8. Unmounts the volume and detaches `mtd20`, so the vendor's own attach later
    finds it as it would on any boot.
-8. Binds the gated module over `modem.ko` and the tmpfs over `/lib/firmware`.
+9. Binds the gated module over `modem.ko` and the tmpfs over `/lib/firmware`.
 
 `start_lte.sh` then runs its usual `modprobe modem`.
 
@@ -140,11 +191,14 @@ not work, the command does not run and the check after it keeps stock.
 
 | Reason | Meaning |
 | --- | --- |
-| `off` | No `config`, or `enabled` is not 1. The default. |
+| `off` | No `config`, or `enabled` is not 1: an operator turned it off. |
+| `stock-mismatch` | The active modem bank is not the stock image the release image is built from. Recorded; never retried for this image. |
+| `build`, `build-limit` | Building the default image failed this boot; or 3 builds of this image failed or died. |
+| `bank-unknown` | `/proc/cmdline` names no active `tk` bank. |
 | `no-volume` | No Witcher volume yet (first boot after flashing). |
 | `strikes` | Two staged boots without a boot confirm. |
 | `strikes-unreadable` | `strikes` exists but holds no count. |
-| `quarantined` | The keeper rolled this image back before. |
+| `quarantined` | The keeper rolled this image back before. With the default image: any quarantined hash. |
 | `not-allowed` | The image's SHA-256 is not on the allow-list. |
 | `header` | Not a gzip file the modem's reader accepts. |
 | `size`, `memory`, `no-image` | Image under 1 KiB or over 7.5 MiB, under 32 MiB free, or no `active.gz`. |
@@ -161,6 +215,10 @@ not work, the command does not run and the check after it keeps stock.
 3. If `pre` died before it finished, unmounts the volume and detaches `mtd20`.
 4. Records when the module loaded, whether the modem logged `read from fs` or
    `read from nand`, and whether `/lib/firmware` is clean again.
+
+With the default image, `pre` also records `build=` (`built`, `cached`,
+`operator`, or the reason it kept stock firmware) and `build_secs=`. The
+keeper's stderr from the build goes to `/var/run/witcher-tk.build`.
 
 ## Boot confirm and rollback
 
@@ -193,8 +251,12 @@ Neither layer can loop:
 ## Modem feature flags
 
 Patched modem images boot with every feature off, as this loader requires. The
-keeper manages an allow-listed table of words in modem RAM, keyed by each patch
-layer's magic word:
+keeper turns them on after the boot confirm, writing the `wm=` lines of
+`tk/config`: the default config's latency profile, or an operator's. `modem=off`
+in `/mnt/titan-api/latency/config` rolls every managed word back to its off
+value, live (see [latency features](latency-switches.md)). The keeper manages
+an allow-listed table of words in modem RAM, keyed by each patch layer's magic
+word:
 
 ### Managed word table
 
@@ -376,10 +438,15 @@ at the next check. Either set hands-off for manual bench work or edit
 
 ### Turning the flags off
 
-- **Now, no reboot:** remove the `wm=` lines (or set `enabled=0`) in
-  `/mnt/titan-api/tk/config`. Within about 15 s the keeper rolls every managed
-  word back to its documented off value (flags first) and reads them back.
+- **Now, no reboot:** write `modem=off` in `/mnt/titan-api/latency/config`
+  (or switch off **Upload latency and AQM** under **Network → Latency**).
+  Within about 5 s the keeper rolls every managed word back to its
+  documented off value (flags first) and reads them back. `modem=on`, or
+  deleting the line, writes them again. The default config stays as it is.
   Watch `/var/run/witcher-tk.flags`.
+- **In an operator config:** remove the `wm=` lines (or set `enabled=0`) in
+  `/mnt/titan-api/tk/config`. Within about 15 s the keeper rolls them back
+  the same way.
 - **Stock modem firmware:** `enabled=0` rolls back at once, and the next boot
   loads stock firmware.
 - **By hand**, with hands-off set (`touch /var/run/witcher-tk.hands-off`):
@@ -431,8 +498,9 @@ On the Witcher volume, `/mnt/titan-api/tk/` once mounted:
 
 | File | Written by | Content |
 | --- | --- | --- |
-| `config` | Operator | `enabled=1`, `sha256=` lines, optional `target=` and `wm=` lines |
-| `active.gz` | Operator | The staged image |
+| `config` | The keeper's default build, or an operator | `enabled=1`, `sha256=` lines, optional `target=` and `wm=` lines. The default config starts with `# witcher-default <image> <checksum>`. |
+| `active.gz` | The keeper's default build, or an operator | The staged image |
+| `default` | The keeper's default build | `gzip=` (the release image), `builds=`, `result=` (`started`, `built`, `failed`, `stock-mismatch`) |
 | `strikes` | Hook (+1 before each load), keeper (0 on confirm, 2 on rollback) | `strikes=N` |
 | `quarantine` | Keeper | One hash per line |
 | `confirmed` | Keeper | `sha256=<hash>` of the last confirmed image |
@@ -441,19 +509,21 @@ In RAM:
 
 | File | Content |
 | --- | --- |
-| `/var/run/witcher-tk.status` | `state=staged` or `state=stock`, `reason`, `sha256`, `strikes`, `loaded_at`, `source` (`fs`, `nand`, `unknown`), `firmware` (`clean`, `dirty`) |
+| `/var/run/witcher-tk.status` | `state=staged` or `state=stock`, `reason`, `sha256`, `strikes`, `loaded_at`, `source` (`fs`, `nand`, `unknown`), `firmware` (`clean`, `dirty`), and with the default image `build` and `build_secs` |
+| `/var/run/witcher-tk.build` | The keeper's messages from building the default image |
 | `/var/run/witcher-tk.result` | `confirmed=<hash>` or `rollback=<hash>` |
 | `/var/run/witcher-tk.flags` | The flag writes (see [Status](#status)) |
 | `/var/run/witcher-tk.m1` | The M1 selector and PIE counters (see [Status](#status)) |
 | `/var/run/witcher-tk.hands-off` | Optional operator marker file to pause all modem console sessions (`state=hands-off`) |
 
-`keeper.log` lines start with `tk boot` or `tk flags`. A default unit logs none.
+`keeper.log` lines start with `tk boot` or `tk flags`.
 
 ## Turning it off
 
 | Level | Action | Result |
 | --- | --- | --- |
-| Off | Write `enabled=0` in `config` (or delete it), then reboot. | Stock firmware and stock `modem.ko` from the next boot. The Witcher root filesystem stays. |
+| Words off | `modem=off` in `/mnt/titan-api/latency/config`, or the web switch. | The image stays loaded with every word at its off value: stock behaviour, live. |
+| Off | Write `enabled=0` in `config` and keep the file, then reboot. | Stock firmware and stock `modem.ko` from the next boot. With no `config` at all the default image applies again. The Witcher root filesystem stays. |
 | Automatic | None. | No confirm in 300 s: quarantine and one reboot onto stock. |
 | Bank | Firmware rollback (`/api/v1/actions/firmware.rollback` or the recovery page). | The other NAND bank: the previous Witcher or stock firmware. |
 
@@ -474,15 +544,25 @@ In RAM:
 - **One image built on the unit.** `tk-build` builds only the release image
   `n6h-r4-r1` (N6H + R4's Rust N4 + R1's PIE; [tk-patch.md](tk-patch.md)).
   Any other image is staged by hand.
-- **Not yet run on hardware.** The early attach of `mtd20` before the vendor's
-  `rcinit` is new. It runs on every boot of every unit with this firmware, opt
-  in or not, and the bench must prove it first.
+- **No retry after a rollback.** A boot that does not confirm in 300 s (the
+  modem never answers through the core, which also happens when the tower is
+  down at boot or the targets ignore ping) quarantines the image. Each such
+  unit then stays on stock modem firmware until an operator removes the line
+  from `quarantine` and writes `strikes=0`. Give the boot confirm `target=`
+  lines that answer ping if the bearer's DNS servers do not.
+- **The build at boot is new in v1.0.17.** The early attach of `mtd20` before
+  the vendor's `rcinit` has run on bench boots since v1.0.15. Building the
+  image inside `pre` has run only in tests until the bench proves it.
 
 ## Regulatory note
 
-The Titan 4000 is a certified CBRS device. The patches in view do not touch RF
-calibration, transmit power, MPR tables or band-edge filters, but they change
-baseband firmware. Keep patched modem firmware on bench units the operator
-owns, keep the loader off by default, and get counsel review before any
-customer unit runs it. Loading modified baseband firmware can also void the
-manufacturer's warranty.
+The Titan 4000 is a certified CBRS device. The release image changes how the
+modem queues and schedules uplink data. It does not touch RF calibration,
+transmit power, P-max, MPR tables, band-edge filters or which channels the
+unit may use, and SAS grant handling is unchanged. It is still modified
+baseband firmware. Up to v1.0.16 this loader was off by default and this note
+advised counsel review before any customer unit ran it; since v1.0.17 it
+loads by default. An operator who needs stock baseband firmware writes
+`enabled=0` in `tk/config`. Loading modified baseband firmware can also void
+the manufacturer's warranty. This page describes the engineering, not legal
+advice.

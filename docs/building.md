@@ -73,8 +73,11 @@ of the image. They live in `device/sqm/payload` with pinned SHA-256 digests,
 and an operator stages them on a unit's persistent volume. See
 [radio profiles and SQM](radio-profiles.md).
 
-The download clamp module (`titan_qctrl.ko`, 22 KB) also stays out of the
-image, for the same reason and so it can change without a reflash. Its
-source, a byte-for-byte rebuild script and the pinned binary are in
-`device/qctrl`, and CI rebuilds it on every push. See
-[the download clamp](download-clamp.md).
+The download clamp (`titan_qctrl.ko`, 26 KB) and the fast path
+(`titan_k1fp.ko`, 43 KB) are in the image since v1.0.17, at
+`/usr/lib/titan-api/modules/`, because both are on by default. The build
+installs the pinned payloads after checking `device/qctrl/SHA256SUMS` and
+`device/fastpath/SHA256SUMS`, and the verifier checks that the image holds
+exactly those bytes. Their sources and byte-for-byte rebuild scripts are in
+`device/qctrl` and `device/fastpath`, and CI rebuilds both on every push. See
+[the download clamp](download-clamp.md) and [the fast path](fast-path.md).
