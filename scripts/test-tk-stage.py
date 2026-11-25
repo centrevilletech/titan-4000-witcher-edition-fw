@@ -639,6 +639,83 @@ class StageLatencyProfiles(unittest.TestCase):
                 'wm=0x847ed604:0x15',
             ])
 
+    N6H_MAGICS = {
+        0x847ecfe8: 0x494d4734,
+        0x84489a64: 0x4e35464c,
+        0x8418ff00: 0x55324846,
+        0x8418ff04: 0x4e364803,
+    }
+    M1_MAGIC = 0x4d315049
+
+    def keeper_m1_versions(self) -> list[int]:
+        """M1_VERSIONS in the keeper's model, the list the script must match."""
+        source = (REPO / 'userspace/pd-model/src/tk_flags.rs').read_text()
+        found = re.search(r'pub const M1_VERSIONS: \[u32; \d+\] = \[([^\]]*)\];', source)
+        self.assertIsNotNone(found, 'no M1_VERSIONS in tk_flags.rs')
+        return [int(v.strip().replace('_', ''), 16) for v in found.group(1).split(',') if v.strip()]
+
+    def test_profile_latency_adds_the_m1_selector_for_an_accepted_build(self):
+        versions = self.keeper_m1_versions()
+        self.assertTrue(versions)
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            for version in versions:
+                m1 = self.make_tk(d, f'm1-{version:08x}.gz', {
+                    **self.N6H_MAGICS, 0x841b5900: self.M1_MAGIC, 0x841b5904: version,
+                })
+                r = self.run_dry(m1, '--profile', 'latency')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f'tk profile:  latency (detected N6H + M1 0x{version:08x})', r.stdout)
+                wms = self.wm_lines(r.stdout)
+                # The N6H set, then the selector last.
+                self.assertEqual(wms[:-1], [
+                    'wm=0x84f93008:0x140',
+                    'wm=0x847ed604:0x15',
+                    'wm=0x847ed548:0x1',
+                    'wm=0x847ed54c:0x1',
+                    'wm=0x847ed550:0x1',
+                    'wm=0x847ecf08:0x1',
+                    'wm=0x84489a84:0x2000',
+                    'wm=0x84489a88:0x3000',
+                    'wm=0x84489a6c:0x3',
+                    'wm=0x8418ff08:0x1',
+                ])
+                self.assertEqual(wms[-1], 'wm=0x841b5908:0x1')
+                self.assertIn('witcher-tk.m1', REPO.joinpath('scripts/stage-latency.sh').read_text())
+
+                # Without the N4 AQM v2 bits the PIE has nothing to replace: no selector.
+                r = self.run_dry(m1, '--profile', 'latency', '--flags', '0x10')
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertNotIn('wm=0x841b5908:0x1', self.wm_lines(r.stdout))
+                self.assertIn('no M1 selector line', r.stdout)
+
+                # The stock profile and the default write no selector.
+                for extra in (('--profile', 'stock'), ()):
+                    r = self.run_dry(m1, *extra)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertNotIn('wm=0x841b5908:0x1', self.wm_lines(r.stdout))
+
+    def test_profile_latency_leaves_out_the_selector_for_another_m1_build(self):
+        newer = max(self.keeper_m1_versions()) + 1
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            m1 = self.make_tk(d, 'm1-newer.gz', {
+                **self.N6H_MAGICS, 0x841b5900: self.M1_MAGIC, 0x841b5904: newer,
+            })
+            r = self.run_dry(m1, '--profile', 'latency')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn(f'(detected N6H + M1 0x{newer:08x}, not accepted)', r.stdout)
+            self.assertIn('which this keeper does not accept', r.stdout)
+            wms = self.wm_lines(r.stdout)
+            self.assertNotIn('wm=0x841b5908:0x1', wms)
+            self.assertEqual(wms[-1], 'wm=0x8418ff08:0x1')
+            # A version word with no M1 magic is no M1 block.
+            no_magic = self.make_tk(d, 'no-m1.gz', {**self.N6H_MAGICS, 0x841b5904: self.keeper_m1_versions()[0]})
+            r = self.run_dry(no_magic, '--profile', 'latency')
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn('tk profile:  latency (detected N6H)', r.stdout)
+            self.assertNotIn('wm=0x841b5908:0x1', self.wm_lines(r.stdout))
+
 
 if __name__ == '__main__':
     unittest.main()
