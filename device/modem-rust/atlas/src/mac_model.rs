@@ -389,12 +389,11 @@ impl MacUlModel {
     /// Exact mirror of `mac_bsr_pre_work` (`0x842d_a60c`) with optional N3 empty-ring guard.
     pub fn mac_bsr_pre_work(&mut self, queues: &[BearerQueue; MAX_LCIDS], guarded: bool) {
         self.lcg_pre_bo = [0; 4];
-        for lcid in 0..MAX_LCIDS {
+        for (lcid, &q) in queues.iter().enumerate() {
             let cfg = self.lc_cfg[lcid];
             if !cfg.active || cfg.rb_type != 0 || cfg.lcg_id >= 4 {
                 continue;
             }
-            let q = queues[lcid];
             let pending = if guarded && !q.rings_or_cipher_nonempty {
                 0
             } else {
@@ -412,12 +411,11 @@ impl MacUlModel {
         mode: BsrReportingMode,
     ) -> [u32; 4] {
         let mut lcg_bo = self.lcg_pre_bo;
-        for lcid in 0..MAX_LCIDS {
+        for (lcid, &q) in queues.iter().enumerate() {
             let cfg = self.lc_cfg[lcid];
             if !cfg.active || cfg.lcg_id >= 4 {
                 continue;
             }
-            let q = queues[lcid];
             let actual = q.rlc_actual_bo();
             let mut extra = 0u32;
             if self.include_hdr_and_margin {
@@ -956,7 +954,7 @@ impl TddCfg2HarqEntity {
                 p.harq_feedback_ack = false;
                 p.prev_ndi = ndi;
                 p.current_tx_nb = 0;
-                let rv = if mcs >= 29 && mcs <= 31 { mcs - 28 } else { 0 };
+                let rv = if (29..=31).contains(&mcs) { mcs - 28 } else { 0 };
                 p.rv = rv;
                 p.rv_idx = HARQ_RV_TO_IDX[rv as usize];
                 p.last_tx_tti = pusch_tti;
@@ -982,7 +980,7 @@ impl TddCfg2HarqEntity {
                     flushed: true,
                 });
             }
-            let rv = if mcs >= 29 && mcs <= 31 { mcs - 28 } else { 0 };
+            let rv = if (29..=31).contains(&mcs) { mcs - 28 } else { 0 };
             p.rv = rv;
             p.rv_idx = HARQ_RV_TO_IDX[rv as usize];
             p.harq_feedback_ack = false;
