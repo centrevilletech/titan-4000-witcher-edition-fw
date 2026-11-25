@@ -3,6 +3,9 @@
 //! staged on the persistent volume, which overrides it only when its bytes
 //! match the same digest. The keeper loads only bytes whose SHA-256 matches
 //! the digest built into it, from a copy in its private RAM directory.
+//!
+//! A load that fails is tried again after `retry_policy()`'s wait, for as
+//! long as it fails; a unit without the volume loads the image's copy.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
@@ -10,6 +13,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use titan_pd_model::retry::{self, Policy};
 use titan_pd_model::sha256;
 
 use crate::paths;
@@ -37,25 +41,20 @@ impl Staged {
         sha256::pinned(self.manifest, self.file)
     }
 
-    /// Stage the module from `dir` and load it.
-    pub fn load(&self, dir: &Path) -> Result<(), String> {
-        self.stage(dir).and_then(|path| insmod(&path))
-    }
-
     /// Load the module and say where it came from: the copy staged in `dir`
-    /// when there is one and it is the pinned module, else the firmware
-    /// image's copy. Bytes that are not the pinned module never load.
-    pub fn load_any(&self, dir: &Path) -> Result<&'static str, String> {
-        let refused = if dir.join(self.file).exists() {
-            match self.stage(dir) {
+    /// (`staged_dir()`, none without the volume) when there is one and it
+    /// is the pinned module, else the firmware image's copy. Bytes that are
+    /// not the pinned module never load.
+    pub fn load_any(&self, dir: Option<&Path>) -> Result<&'static str, String> {
+        let refused = match dir {
+            Some(dir) if dir.join(self.file).exists() => match self.stage(dir) {
                 Ok(path) => return insmod(&path).map(|()| "the staged copy"),
                 Err(why) => Some(why),
-            }
-        } else {
-            None
+            },
+            _ => None,
         };
-        let image = image_dir();
-        match (self.load(&image), refused) {
+        let image = self.stage(&image_dir()).and_then(|path| insmod(&path));
+        match (image, refused) {
             (Ok(()), None) => Ok("the firmware image"),
             (Ok(()), Some(_)) => Ok("the firmware image (the staged copy is not the pinned module)"),
             (Err(err), None) => Err(err),
@@ -134,6 +133,13 @@ pub fn image_dir() -> PathBuf {
 /// The kernel's module list (`TITAN_PROC_MODULES` in tests).
 pub fn modules_path() -> String {
     paths::env_or("TITAN_PROC_MODULES", "/proc/modules")
+}
+
+/// The waits before a failed module load, or the fast path after a watchdog
+/// trip, is tried again (`retry::MODULES`). Tests shorten the first one with
+/// `TITAN_RETRY_SECS`.
+pub fn retry_policy() -> Policy {
+    retry::MODULES.with_first(std::env::var("TITAN_RETRY_SECS").ok().as_deref())
 }
 
 fn short(sha: &str) -> &str {

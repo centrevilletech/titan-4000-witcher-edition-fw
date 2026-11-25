@@ -1,4 +1,4 @@
-# Passthrough bridge fast path (titan_k1fp 2.2)
+# Passthrough bridge fast path (titan_k1fp 2.2.1)
 
 Status: on by default since v1.0.17, in mode 2 (downlink fast path), which
 the bench has run for days. `titan_k1fp.ko` is in the firmware image
@@ -18,7 +18,7 @@ idle with 66 to 72 % softirq, backlog drops, and time squeezes in
 ebtables, `br_netfilter`, iptables, and conntrack before reaching
 `dev_queue_xmit`. Saturated softirq also adds queueing delay under load.
 
-`titan_k1fp` (v2.2) short-circuits steady-state unicast IPv4 and IPv6
+`titan_k1fp` (v2.2.1) short-circuits steady-state unicast IPv4 and IPv6
 TCP/UDP flows between `lte0pdn2` and `eth0` straight from the bridge port
 RX handler to `dev_queue_xmit`, after proving each flow through the full
 stock path first.
@@ -40,6 +40,9 @@ Control and telemetry live in `/proc/k1fp`. Write one command per write:
 | `sample_ms <2..50>` | Periodic stock-path re-proof interval (default `20` ms, capped at `50` ms). |
 | `wd_mod <0..10000>` | Watchdog `modified + wrongport` burst limit per window (default `20`, `0` disables). |
 | `wd_mod_win_ms <1000..60000>` | Sliding burst window (two half-windows) for `wd_mod` (default `10000` ms). |
+| `wd_mismatch <0..10000>` | Watchdog lease mismatch limit per second (default `64`, `0` disables). |
+| `wd_stall_ms <100..5000>` | Watchdog TX stall: how long the `eth0` TX tail may stay frozen with the ring full or the queue stopped (default `2000` ms). |
+| `wd_ringfull_ms <0, 100..5000>` | Watchdog: how long the ring may stay full while it drains (default `0`, off; for `txirq` tests). |
 | `flush` | Clear all flow leases and bump the epoch. |
 | `zero` | Zero counters, clear the diagnostic mismatch ring, and re-baseline the watchdog. |
 
@@ -102,9 +105,16 @@ bridge and netfilter path:
   While `mode >= 2`, a 100 ms timer and inline proof checks drop `mode` to
   `0` on `modified + wrongport` bursts (`wd_mod`, default 20 within a
   sliding `wd_mod_win_ms` window, default 10 s), lease mismatch storms
-  (`wd_mismatch`, default 64/s), persistent `eth0` TX ring full
-  (`wd_ringfull_ms`, default 500 ms), `eth0` TX stall (`wd_stall_ms`,
-  default 500 ms), or invalid TX ring state. The
+  (`wd_mismatch`, default 64/s), an `eth0` TX stall (a TX tail that stays
+  frozen with the ring full or the queue stopped, `wd_stall_ms`, default
+  2 s), or invalid TX ring state. Up to v2.2 it also tripped on a ring that
+  stayed full for 500 ms while it drained (`wd_ringfull_ms`), and on a
+  500 ms stall. A router port linked at 100 Mb/s under a faster download
+  keeps the ring full at line rate, and two 802.3x PAUSE frames from the
+  router at 100 Mb/s (up to 336 ms each; the driver obeys them) freeze the
+  tail for longer than 500 ms. Neither is the fast path's doing, so since
+  v2.2.1 `wd_ringfull_ms` is off by default and `wd_stall_ms` is 2 s
+  (`k1_wd_defaults` in `k1fp_core.h`). A frozen tail still trips. The
   last 16 mismatches are recorded in a bounded header-only ring (`diag:`
   in `/proc/k1fp`, at most `min(hdrlen, 64)` bytes before and after plus a
   field diff summary, with zero payload bytes beyond transport headers),
@@ -158,16 +168,22 @@ nothing and logs nothing.
 Every 15 s, and at once when the latency switches change, the keeper:
 
 1. Works out the mode: 0 while `fastpath=off` is in the latency switches;
-   the operator's `fastpath/config` when there is one; else mode 2.
+   the operator's `fastpath/config` when there is one; else mode 2. Without
+   the Witcher volume there is no operator file, so mode 2 loads from the
+   image; the file counts again as soon as the volume is mounted.
 2. Refuses to load if any other module with `k1fp` in its name is loaded, or if
-   `/proc/k1fp` reports a version string other than `titan_k1fp v2.2`. If
+   `/proc/k1fp` reports a version string other than `titan_k1fp v2.2.1`. If
    `titan_k1fp` is already loaded by hand and `/proc/k1fp` starts with the
-   exact pinned version line `titan_k1fp v2.2`, the keeper adopts it, logs
+   exact pinned version line `titan_k1fp v2.2.1`, the keeper adopts it, logs
    `fast path: adopted a loaded module`, and takes over its mode and grant
    lease without running `insmod`.
 3. Waits until the unit is in IP passthrough, `br0` holds exactly `eth0` and
    `lte0pdn2`, both have carrier for 30 s, and any configured download clamp
-   (`titan_qctrl`) has finished loading first.
+   (`titan_qctrl`) has finished loading first. A load that fails (the bridge
+   rebuilt under `insmod`, ENOMEM, a bad read of the image copy) is tried
+   again after 1 min, then 2, 4 ... up to an hour between tries, for as long
+   as it fails. Another config, or the switch turned off and on, tries at
+   once.
 4. Copies `titan_k1fp.ko` (the staged copy, if it is the pinned one, else the
    image's) into its private RAM directory (`/tmp/titan-pd-keeper/fastpath/`),
    verifies the RAM copy's SHA-256 against the digest pinned at build time
@@ -200,19 +216,23 @@ gate state (`cbrs_mode_grant=1` and `cbrs_grant_state=2`, fail closed):
 When the module's watchdog drops `mode` to `0` on an anomaly (or if the live
 mode in `/proc/k1fp` drifts from the applied config):
 
-- On the first drop in a boot, the keeper logs the reason (`wd_reason` and
-  `wd_trips`) once and re-arms the configured mode automatically.
-- On any second drop in the same boot, the keeper does not re-arm: it leaves
-  the module at `mode 0`, revokes the grant lease, logs once, and sets
-  `state=tripped` in `/var/run/witcher-fastpath.status` until
-  `/mnt/titan-api/fastpath/config` changes or the unit reboots.
+- The keeper leaves the module at `mode 0`, revokes the grant lease, logs the
+  reason (`wd_reason` and `wd_trips`) once and sets `state=tripped` in
+  `/var/run/witcher-fastpath.status`, with the wait in `detail`.
+- After the wait it writes the configured mode again (`fast path:
+  re-arming mode 2`). The wait is 1 min after the first drop and doubles
+  with each drop in a row, up to an hour, and the keeper never stops
+  re-arming. An hour at the mode without a drop forgets the earlier ones.
+- `fastpath/config` changing, or the **Fast path** switch turned off and on,
+  re-arms at once and starts the count over. Nothing of this is kept across
+  a keeper restart or a reboot. (Earlier releases held `mode 0` after the
+  second drop in a boot until the config changed or the unit rebooted.)
 
 A lost bridge device is not a drop in this sense. When `dev_gone` in
 `/proc/k1fp` has moved since the keeper's last look and `wd_trips` has
 not, the keeper logs it once and writes the configured mode again as soon
-as `ports_ok=1 lan_hooked=1 wan_hooked=1` read back. This does not use the
-re-arm budget, so any number of re-attaches in one boot leave the fast
-path on. The keeper checks every 15 s, so the fast path is back at most
+as `ports_ok=1 lan_hooked=1 wan_hooked=1` read back. This is not a drop,
+so any number of re-attaches in one boot leave the fast path on. The keeper checks every 15 s, so the fast path is back at most
 about 16 s after the vendor scripts finish rebuilding the bridge.
 
 ### Status and logs
@@ -238,6 +258,6 @@ device/fastpath/test/run.sh
 | --- | --- | --- |
 | Off now | `fastpath=off` in `/mnt/titan-api/latency/config`, or the web switch | The keeper writes `mode 0` and `grant 0` within seconds and sets `state=off`. |
 | Off now, operator config | Write `mode=0` to `/mnt/titan-api/fastpath/config` | The same, within 15 s. |
-| Off immediately (manual) | `echo "mode 0" > /proc/k1fp` | Immediate pass-through; turn it off as above too so the keeper does not re-arm once. |
+| Off immediately (manual) | `echo "mode 0" > /proc/k1fp` | Immediate pass-through; turn it off as above too, or the keeper takes it as a drop and re-arms after the wait. |
 | Unload now | Turn it off, wait for `state=off`, then `rmmod titan_k1fp` | Module unloaded cleanly (`modref=0`). |
 | Off at boot | Keep `fastpath=off` (or `mode=0`) and reboot | Nothing is loaded and nothing is logged. |

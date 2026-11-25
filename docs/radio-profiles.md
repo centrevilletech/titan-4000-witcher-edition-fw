@@ -260,8 +260,10 @@ costs speed when the radio rate moves: download 113 to 97 Mbps, upload 14 to
 8 Mbps.
 
 The download clamp, on by default since v1.0.17, stands aside (mode 0) while
-`sch_cake` is loaded: the two have not been tested together. An operator's
-`qctrl/config` overrides that (see [the download clamp](download-clamp.md)).
+the profile's CAKE qdiscs are installed (`sch_cake` in use), and comes back
+when a revert or a profile without `sqm` removes them: the two have not been
+tested together. An operator's `qctrl/config` overrides that (see
+[the download clamp](download-clamp.md)).
 
 ## Qualification plan
 

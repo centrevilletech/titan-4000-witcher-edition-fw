@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Copyright 2026 Centreville Tech, LLC. Kernel module for Titan 4000 Witcher Edition; see device/fastpath/README.md. */
 /*
- * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.2) for the Global
+ * titan_k1fp.c - Passthrough bridge fast path (k1fp 2.2.1) for the Global
  * Telecom Titan 4000 (GDM7243AP, Linux 3.10.0-uc0, UP ARMv7, PREEMPT_NONE).
  *
  * Built standalone against titan_k310_abi.h (no 3.10 kernel tree required).
@@ -34,8 +34,11 @@
  * Watchdog (no dependence on kernel log):
  *   Runs every 100 ms while mode >= 2 and checks modified/wrongport bursts
  *   in a sliding window (wd_mod per wd_mod_win_ms, default 20 per 10 s),
- *   lease mismatch storms, eth0 TX ring full persistence, TX stall, and bad
- *   ring state, dropping mode -> 0 atomically on any anomaly. Recent
+ *   lease mismatch storms, eth0 TX stall (a tail frozen for wd_stall_ms,
+ *   default 2 s, with the ring full or the queue stopped), and bad ring
+ *   state, dropping mode -> 0 atomically on any anomaly. A ring that stays
+ *   full while it drains (wd_ringfull_ms) trips only when an operator sets
+ *   it: since 2.2.1 it is off by default (k1_wd_defaults). Recent
  *   mismatches are captured in a bounded 16-entry header-only ring readable
  *   from /proc/k1fp after a trip and cleared by "zero".
  *
@@ -56,7 +59,7 @@
 #include "k1fp_core.h"
 #include "k1_fp.h"
 
-#define K1_VERSION "titan_k1fp v2.2"
+#define K1_VERSION "titan_k1fp v2.2.1"
 
 /* ---------- Module metadata matching stock 3.10.0-uc0 ELF ABI ---------- */
 int init_module(void);
@@ -1602,7 +1605,7 @@ static ssize_t k1_write(struct file *file, const char *ubuf, size_t len, loff_t 
 		local_bh_disable();
 		g.wd_cfg.stall_ms = v;
 		local_bh_enable();
-	} else if (!strcmp(buf, "wd_ringfull_ms") && v >= 100u && v <= 5000u) {
+	} else if (!strcmp(buf, "wd_ringfull_ms") && (v == 0u || (v >= 100u && v <= 5000u))) {
 		local_bh_disable();
 		g.wd_cfg.ringfull_ms = v;
 		local_bh_enable();
@@ -1659,11 +1662,7 @@ int init_module(void)
 	g.seed = (u32)jiffies * 2654435761u;
 	g.orig_rx = (rx_handler_func_t *)FP_BR_HANDLE_FRAME_HOOK_VA;
 	g.br_push_xmit = (int (*)(struct sk_buff *))FP_BR_DEV_QUEUE_PUSH_XMIT_VA;
-	g.wd_cfg.mod_limit = 20u;
-	g.wd_cfg.mod_win_ms = K1_WD_MOD_WIN_MS;
-	g.wd_cfg.mismatch_limit = 64u;
-	g.wd_cfg.stall_ms = 500u;
-	g.wd_cfg.ringfull_ms = 500u;
+	k1_wd_defaults(&g.wd_cfg);
 	k1_setup_timer(&g.txtimer, k1_txtimer_fn, 0);
 	k1_setup_timer(&g.wdtimer, k1_wdtimer_fn, 0);
 	k1_init_delayed_work(&hk_work, k1_hk);

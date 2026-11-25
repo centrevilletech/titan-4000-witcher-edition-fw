@@ -52,9 +52,15 @@ the module's own knobs. That one constant in `userspace/pd-model/src/qctrl.rs`
 sets the default: 2 is the clamp alone, 0 leaves it off until an operator
 turns it on.
 
-The default stands aside, at mode 0, while `sch_cake` is loaded. Only a radio
-profile's `sqm` action loads it, and the two have not been tested together
-(below). An operator's `qctrl/config` overrides both the default and this
+The default stands aside, at mode 0, while a CAKE qdisc is installed. Only a
+radio profile's `sqm` action installs one, and the two have not been tested
+together (below). The keeper reads it from `sch_cake`'s use count in
+`/proc/modules`: every qdisc holds a reference to its module, so the count is
+the number of CAKE qdiscs. When the profile is reverted or removed the count
+drops to 0, with the module still loaded, and the default clamp comes back
+within 15 s. (v1.0.17's first draft stood aside while the module was merely
+loaded, so after a revert the unit had neither CAKE nor the clamp until it
+rebooted.) An operator's `qctrl/config` overrides both the default and this
 rule. To set your own mode or knobs, stage a config. `scripts/stage-latency.sh`
 writes one together with the modem firmware image (see
 [the boot-time loader](tk-boot-loader.md)). For only the clamp, over the
@@ -91,8 +97,13 @@ Every 15 s, in every mode, and at once when the latency switches change:
 1. Works out the mode: 0 while `clamp=off` is in the latency switches; the
    operator's `qctrl/config` when there is one; else the default (mode 3,
    or 0 beside CAKE). With mode 0 and no module loaded, it does nothing.
-2. Waits until the customer port has carrier and the management bearer
-   (`lte0pdn0`) has an address, both for 30 s.
+   Without the Witcher volume there is no operator file, so the default
+   loads from the image; the file counts again as soon as the volume is
+   mounted.
+2. Waits until the customer port (`eth0`) and the customer bearer (the LTE
+   port in the bridge in passthrough, else the vendor's data bearer) have
+   carrier, both for 30 s. The clamp sits between those two; it does not
+   wait for the management bearer.
 3. Refuses to load if any other module with `qctrl` in its name is loaded,
    or a `titan_qctrl` whose `/proc/titan_qctrl` shows another version.
 4. Copies `titan_qctrl.ko` (the staged copy, if it is the pinned one, else
@@ -105,7 +116,10 @@ Every 15 s, in every mode, and at once when the latency switches change:
 6. On later rounds it reads `/proc/titan_qctrl` again and writes the config
    again if they differ, so a config change applies within 15 s.
 
-A failed load is not retried until the config changes or the unit reboots.
+A failed load (the module refused, ENOMEM, a bad read of the image copy) is
+tried again after 1 min, then 2, 4 ... up to an hour between tries, for as
+long as it fails; the status says when. Another config, or the switch turned
+off and on, tries at once.
 
 Status: `/var/run/witcher-qctrl.status`, with `state` (`off`, `waiting`,
 `applied`, `failed`), `detail` (which says where the mode came from: the
@@ -130,6 +144,6 @@ window), `rate100_kbps`, `q_owd_ms` (tower queue), `owd_ok` and `owd_bad`
 ## Not tested yet
 
 - Together with the radio profile's CAKE download shaping. The default clamp
-  stands aside while CAKE is loaded; an operator who sets both up in
-  `qctrl/config` runs both.
+  stands aside while a CAKE qdisc is installed; an operator who sets both up
+  in `qctrl/config` runs both.
 - Hours of customer traffic. The bench runs were 20-second downloads.

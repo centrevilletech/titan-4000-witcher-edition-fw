@@ -13,8 +13,8 @@
 //! feature flags, building that image on the unit and its default build at
 //! boot and whether its rollbacks were the image's or the network's, the
 //! download clamp module, the passthrough bridge fast path, the
-//! off switches for those latency features, the carrier picker, and the
-//! opt-in CPU trims.
+//! off switches for those latency features, the carrier picker, the
+//! opt-in CPU trims, and the waits of retries that never give up.
 #![forbid(unsafe_code)]
 
 pub mod carrier_pick;
@@ -41,6 +41,7 @@ pub mod prefix;
 pub mod qctrl;
 pub mod ra;
 pub mod reboots;
+pub mod retry;
 pub mod sas_nat;
 pub mod sha256;
 pub mod switches;

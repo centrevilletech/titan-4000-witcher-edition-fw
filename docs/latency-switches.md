@@ -171,9 +171,11 @@ replaces the default for that feature:
 
 `scripts/stage-latency.sh` still writes these files from a workstation.
 
-The default clamp stands aside (mode 0) while `sch_cake` is loaded. Only a
-radio profile's `sqm` action loads it, and CAKE download shaping and the clamp
-have not been tested together. An operator's `qctrl/config` overrides that.
+The default clamp stands aside (mode 0) while a CAKE qdisc is installed
+(`sch_cake` in use), and comes back once a reverted or removed radio profile
+has taken it away. Only a radio profile's `sqm` action installs one, and CAKE
+download shaping and the clamp have not been tested together. An operator's
+`qctrl/config` overrides that.
 
 ## Status
 

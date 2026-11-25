@@ -18,6 +18,7 @@ use titan_pd_model::pace::Pace;
 use titan_pd_model::fastpath::{
     self, Config, LeaseAction, LeaseState, Loaded, Proc, StatusView, TripAction, TripWatch,
 };
+use titan_pd_model::retry::Backoff;
 
 use crate::files::read_file;
 use crate::netdev::{bridge_ports, carrier_up};
@@ -85,10 +86,13 @@ pub struct Watch {
     /// rewritten whenever state, detail, mode, active_mode, gate, qctrl_present,
     /// wd_trips, or wd_reason changes.
     status: StatusFile,
-    /// A load failed for this config; not retried until config changes or reboot.
+    /// The config the last load failed for. It is tried again when
+    /// `load_retry` is ready, and at once for another config or after the
+    /// fast path was off.
     failed_for: Option<Config>,
+    load_retry: Backoff,
     refused_logged: Vec<String>,
-    /// True while our `titan_k1fp v2.2` module is loaded.
+    /// True while the pinned `titan_k1fp` module is loaded.
     module_loaded: bool,
     /// True once `maintain()` has loaded or adopted the currently loaded module.
     managed: bool,
@@ -163,24 +167,17 @@ impl Watch {
             return;
         }
 
-        let Some(dir) = MODULE.staged_dir() else {
-            self.module_loaded = false;
-            self.managed = false;
-            self.active_for_lease = false;
-            self.publish(
-                "off",
-                "the persistent volume is not mounted",
-                &Config::default(),
-                None,
-                false,
-                now,
-                &mut note,
-            );
-            return;
-        };
-
-        let (config, source) = fastpath::effective(switch_on, staged::operator_config(&dir).as_deref());
+        // The operator's files live on the Witcher volume. Without it the
+        // default loads from the image; the files count again once it is mounted.
+        let dir = MODULE.staged_dir();
+        let (config, source) =
+            fastpath::effective(switch_on, dir.as_deref().and_then(staged::operator_config).as_deref());
         let from = source.describe("fastpath", "fastpath/config");
+        if self.failed_for.as_ref().is_some_and(|failed| *failed != config) {
+            // Another config, or the switch turned off and on: try at once.
+            self.failed_for = None;
+            self.load_retry.reset();
+        }
         if config.refused != self.refused_logged {
             for line in &config.refused {
                 note(&format!(
@@ -295,16 +292,21 @@ impl Watch {
                     );
                     return;
                 }
-                if self.failed_for.as_ref() == Some(&config) {
+                if !self.load_retry.ready(now) {
                     return;
                 }
-                let origin = match MODULE.load_any(&dir) {
-                    Ok(origin) => origin,
+                let origin = match MODULE.load_any(dir.as_deref()) {
+                    Ok(origin) => {
+                        self.failed_for = None;
+                        self.load_retry.reset();
+                        origin
+                    }
                     Err(err) => {
+                        let wait = self.load_retry.failed(now, staged::retry_policy());
                         self.failed_for = Some(config.clone());
                         self.publish(
                             "failed",
-                            &format!("not loaded: {err}"),
+                            &format!("not loaded: {err}; trying again in {wait} s"),
                             &config,
                             None,
                             false,
@@ -325,6 +327,7 @@ impl Watch {
                 self.module_loaded = true;
                 self.managed = true;
                 self.failed_for = None;
+                self.load_retry.reset();
                 if first {
                     note("fast path: adopted a loaded module");
                 }
@@ -396,7 +399,7 @@ impl Watch {
             return;
         }
 
-        let action = self.trip.evaluate(&config, &proc);
+        let action = self.trip.evaluate(&config, &proc, staged::retry_policy(), now);
         if self.trip.take_device_event() {
             note(&format!(
                 "fast path: a bridge device was recreated (dev_gone={}, reacq={}); the module is at mode 0 and the keeper applies mode {} again",
@@ -467,7 +470,7 @@ impl Watch {
                     );
                     return;
                 }
-                self.trip.note_applied(config.mode, &proc);
+                self.trip.note_applied(config.mode, &proc, now);
                 self.active_for_lease = config.mode > 0;
                 if config.mode == 0 {
                     if self.revoke_if_open() {
@@ -494,12 +497,10 @@ impl Watch {
                     &mut note,
                 );
             }
-            TripAction::Rearm { reason } => {
+            TripAction::Rearm { reason, drops } => {
                 note(&format!(
-                    "fast path: {reason}; re-arming mode {} (automatic re-arm {} of {})",
-                    config.mode,
-                    self.trip.rearms(),
-                    fastpath::MAX_AUTO_REARMS
+                    "fast path: re-arming mode {} (drop {drops} in a row: {reason})",
+                    config.mode
                 ));
                 if let Err(err) = write_proc_cmd(&format!("mode {}\n", config.mode)) {
                     self.active_for_lease = false;
@@ -531,7 +532,7 @@ impl Watch {
                     );
                     return;
                 }
-                self.trip.note_applied(config.mode, &proc);
+                self.trip.note_applied(config.mode, &proc, now);
                 self.active_for_lease = true;
                 if self.renew_if_grant_held(nvram_cache_path) {
                     proc = read_proc_until(&|proc| proc.gate_open == Some(true));
@@ -549,6 +550,7 @@ impl Watch {
             TripAction::Tripped {
                 reason,
                 first_notice,
+                wait,
             } => {
                 self.active_for_lease = false;
                 let revoked = self.revoke_if_open();
@@ -560,7 +562,7 @@ impl Watch {
                 } else {
                     proc
                 };
-                let detail = format!("{reason}; staying at mode 0 until config changes or reboot");
+                let detail = format!("{reason}; at mode 0, trying mode {} again after {wait} s", config.mode);
                 self.publish(
                     "tripped",
                     &detail,
