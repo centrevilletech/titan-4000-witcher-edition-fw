@@ -51,6 +51,9 @@ The API broker (`titan-api --device-broker`) and its web sampler ship as the
 pinned binary in `docs/native-api-build.json`. Their polling cuts need a change
 in that binary's source and a new pin. They are not part of this firmware.
 
+Two more opt-in trims of vendor background work (pacing the vendor LED loop
+and `ksoftirqd/0` priority) are in [CPU trims](cpu-trims.md).
+
 ## Bench qualification
 
 Use a cabled test router, an independent management connection and a known-good

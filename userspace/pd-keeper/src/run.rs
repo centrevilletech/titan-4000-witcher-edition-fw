@@ -58,7 +58,7 @@ use titan_pd_model::tk_boot::{self, Action as TkAction};
 use titan_pd_model::tk_flags;
 use titan_pd_model::wear::{self, Route};
 
-use crate::{carrier_watch_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
+use crate::{carrier_watch_io, cpu_trims_io, fastpath_io, log, log_ram, qctrl_io, tk_flags_io};
 
 const CUSTOMER: &str = "eth0";
 const BRIDGE: &str = "br0";
@@ -273,6 +273,8 @@ struct Keeper {
     qctrl: QctrlWatch,
     /// The staged passthrough bridge fast path (see `titan_pd_model::fastpath`).
     fastpath: fastpath_io::Watch,
+    /// The opt-in CPU trims (see `titan_pd_model::cpu_trims`).
+    cpu_trims: cpu_trims_io::Watch,
 }
 
 /// Carrier-watch state and incremental `/mnt/cbrslog0.txt` reader.
@@ -543,6 +545,7 @@ impl Keeper {
             modem_restart_seen: false,
             qctrl: QctrlWatch::default(),
             fastpath: fastpath_io::Watch::default(),
+            cpu_trims: cpu_trims_io::Watch::default(),
         }
     }
 
@@ -683,6 +686,7 @@ impl Keeper {
         self.maintain_tk_flags();
         self.maintain_qctrl();
         self.maintain_fastpath();
+        self.maintain_cpu_trims();
         self.maintain_mgmt_v6();
         if !self.passthrough {
             self.sockets = None;
@@ -2791,6 +2795,20 @@ impl Keeper {
             .maintain(now, passthrough, qctrl_waiting, &cache, |line| {
                 lines.push(line.to_owned());
             });
+        for line in lines {
+            self.note(&line);
+        }
+    }
+
+    /// Pace the vendor LED loop and set `ksoftirqd/0`'s priority as
+    /// `cpu-trims/config` says. Runs in every mode, once a second.
+    fn maintain_cpu_trims(&mut self) {
+        let now = self.now;
+        let cache = nvram_cache();
+        let mut lines = Vec::new();
+        self.cpu_trims.maintain(now, &cache, |line| {
+            lines.push(line.to_owned());
+        });
         for line in lines {
             self.note(&line);
         }

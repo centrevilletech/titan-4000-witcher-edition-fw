@@ -74,6 +74,8 @@ stop() {
  while [ -n "$(keeper)" ] && [ "$waited" -lt 10 ]; do sleep 1; waited=$((waited + 1)); done
  pid=$(keeper) && kill -9 "$pid" 2> /dev/null
  rm -f "$runtime/supervisor.pid" "$runtime/keeper.pid"
+ # The CPU trims may have the vendor LED and reset-button loop paused.
+ killall -CONT child_gp 2> /dev/null
  return 0
 }
 start() {
