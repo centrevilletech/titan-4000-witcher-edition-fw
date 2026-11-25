@@ -1,0 +1,9 @@
+[package]
+name = "witcher-tk-patch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Build the patched Titan modem firmware image from the stock image and a manifest of Witcher's bytes and hashes"
+
+# No dependencies: the keeper links this on the unit, and the rootfs has little room.
+[dependencies]

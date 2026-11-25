@@ -3,10 +3,10 @@
 //! Small, typed, safe wrappers over the Linux calls the keeper and the
 //! first-boot service make and std does not offer: packet and raw sockets,
 //! interface addresses, `poll`, signals, priorities, reaping, the hooks a
-//! child runs between `fork` and `exec`, the kernel log ring, device nodes
-//! and the monotonic clock. This is the only crate in the workspace that may
-//! use `unsafe`: `titan-pd-keeper`, `titan-pd-model` and `witcher-firstboot`
-//! are `#![forbid(unsafe_code)]`.
+//! child runs between `fork` and `exec`, the kernel log ring, device nodes,
+//! the monotonic clock and a flash partition's bad block table. This is the
+//! only crate in the workspace that may use `unsafe`: `titan-pd-keeper`,
+//! `titan-pd-model` and `witcher-firstboot` are `#![forbid(unsafe_code)]`.
 //!
 //! Every wrapper turns a failed call into the `io::Error` for `errno`, takes
 //! Rust types (`OwnedFd`, `BorrowedFd`, slices, addresses) and hands the
@@ -20,6 +20,7 @@ use std::io;
 
 pub mod ifaddrs;
 pub mod kernel;
+pub mod mtd;
 pub mod poll;
 pub mod process;
 pub mod socket;

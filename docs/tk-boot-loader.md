@@ -6,6 +6,10 @@ firmware bytes. Since v1.0.15 the keeper writes modem feature flags, but only
 on a confirmed boot of a staged image and only the words `tk/config` lists
 (see [Modem feature flags](#modem-feature-flags)).
 
+Since v1.0.16 a unit can build the release image itself from its own stock
+firmware: `titan-pd-keeper tk-build stage` writes `tk/active.gz` and
+`tk/config` (see [Building the modem image on the unit](tk-patch.md)).
+
 ## Why
 
 The modem firmware (`tk`) runs on the Titan's second CPU. Bench tests load
@@ -460,7 +464,8 @@ In RAM:
   change and its own bench test.
 - **No crash quarantine.** A modem crash after a confirmed boot reloads stock
   NAND firmware without a reboot, but the next boot loads the image again.
-- **No on-device patcher** (Phase 2). Each unit needs the image staged by hand.
+- **One image built on the unit.** `tk-build` builds the release image the
+  keeper carries ([tk-patch.md](tk-patch.md)). Any other image is staged by hand.
 - **Not yet run on hardware.** The early attach of `mtd20` before the vendor's
   `rcinit` is new. It runs on every boot of every unit with this firmware, opt
   in or not, and the bench must prove it first.

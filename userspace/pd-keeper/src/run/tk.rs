@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
 
 use titan_pd_model::deaf;
 use titan_pd_model::tk_boot::{self, Action as TkAction};
@@ -12,7 +11,7 @@ use titan_pd_model::tk_flags;
 
 use crate::tk_flags_io;
 use crate::files::{read_file, write_durably};
-use crate::paths::{env_or, state_dir, volume_dir};
+use crate::paths::{env_or, state_dir, tk_dir};
 
 use super::Keeper;
 use super::mgmt_v6::mgmt_address_up;
@@ -354,11 +353,6 @@ fn tk_flags_status_path() -> String {
 /// sessions until removed.
 fn tk_flags_hands_off_path() -> String {
     env_or("TITAN_TK_HANDS_OFF", "/var/run/witcher-tk.hands-off")
-}
-
-/// The boot hook's files on the persistent volume, only while it is mounted.
-fn tk_dir() -> Option<PathBuf> {
-    volume_dir("TITAN_TK_DIR", "tk")
 }
 
 /// Write through a synced temporary file, then sync the directory, so a power

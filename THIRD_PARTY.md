@@ -49,9 +49,41 @@ it also writes a second copy of the vendor `modem.ko` with one 4-byte
 instruction changed. The stock `modem.ko` stays in the image unchanged.
 
 Neither this repository nor the image carries modem firmware (`tk`) bytes,
-stock or patched. The image keeps the stock modem payload byte for byte. An
-operator stages any patched modem firmware on a unit by hand. Do not publish
-such images: they are modified vendor firmware.
+stock or patched. The image keeps the stock modem payload byte for byte. The
+keeper carries a patch manifest (`userspace/tk-patch/manifests/`) of Witcher's
+replacement bytes, SHA-256 values of the stock bytes they replace, and
+references to stock bytes elsewhere in the image. A unit builds the patched
+image from the stock firmware in its own NAND ([how](docs/tk-patch.md)); an
+operator can also stage an image by hand. Do not publish built images: they
+are modified vendor firmware.
+
+## zlib (deflate port)
+
+`userspace/tk-patch/src/deflate.rs` and `trees.rs` are a Rust translation of
+the level-9 path of zlib 1.3's `deflate.c` (Copyright (C) 1995-2023 Jean-loup
+Gailly and Mark Adler) and `trees.c` (Copyright (C) 1995-2021 Jean-loup
+Gailly), altered for one configuration, so that the unit writes the same modem
+image bytes zlib does. The zlib license applies to those files:
+
+> This software is provided 'as-is', without any express or implied
+> warranty. In no event will the authors be held liable for any damages
+> arising from the use of this software.
+>
+> Permission is granted to anyone to use this software for any purpose,
+> including commercial applications, and to alter it and redistribute it
+> freely, subject to the following restrictions:
+>
+> 1. The origin of this software must not be misrepresented; you must not
+>    claim that you wrote the original software. If you use this software
+>    in a product, an acknowledgment in the product documentation would be
+>    appreciated but is not required.
+> 2. Altered source versions must be plainly marked as such, and must not be
+>    misrepresented as being the original software.
+> 3. This notice may not be removed or altered from any source distribution.
+
+The decoder in `userspace/tk-patch/src/inflate.rs` is written from RFC 1951
+and decodes Huffman codes by the method of Mark Adler's `puff.c`; it copies no
+zlib code.
 
 ## Images and screenshots
 

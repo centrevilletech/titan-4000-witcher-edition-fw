@@ -197,6 +197,7 @@ components this repository builds from source.
 - [Long runs: flash writes, logs and clocks](docs/long-runs.md)
 - [IPv6 router health and the customer port](docs/ipv6-health.md)
 - [Boot-time modem firmware loader (bench only, off by default)](docs/tk-boot-loader.md)
+- [Building the modem image on the unit (opt-in)](docs/tk-patch.md)
 - [Download clamp (off by default)](docs/download-clamp.md)
 
 ## Learn LTE and build something

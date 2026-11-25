@@ -16,6 +16,12 @@ pub fn write_durably(path: &Path, temp: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(temp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
+    replace_durably(temp, path)
+}
+
+/// The end of a durable write, for a file written and synced some other way
+/// (streamed, say): rename `temp` over `path`, then sync the directory.
+pub fn replace_durably(temp: &Path, path: &Path) -> io::Result<()> {
     fs::rename(temp, path)?;
     match path.parent() {
         Some(dir) => fs::File::open(dir)?.sync_all(),
