@@ -126,7 +126,7 @@ mod tests {
     use super::*;
     use titan_pd_model::mgmt;
 
-    use crate::run::addrs_global_text;
+    use crate::run::mgmt_v6::addrs_global_text;
     use crate::run::packet::dhcp_client_mac;
 
     #[test]

@@ -8,7 +8,8 @@ use crate::qctrl_io;
 use crate::files::read_file;
 use crate::netdev::carrier_up;
 
-use super::{CUSTOMER, Keeper, mgmt_address_up};
+use super::{CUSTOMER, Keeper};
+use super::mgmt_v6::mgmt_address_up;
 
 /// The download clamp's progress this boot.
 #[derive(Default)]
