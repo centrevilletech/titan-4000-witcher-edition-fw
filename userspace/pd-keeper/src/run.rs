@@ -62,6 +62,7 @@ use titan_sys::process::SpawnExt;
 use titan_sys::socket::{Socket, SocketExt};
 
 use crate::clock::{monotonic, unix_now};
+use crate::command::{command_stdout, run_status};
 use crate::files::read_file;
 use crate::nvram;
 use crate::paths::state_dir;
@@ -3966,19 +3967,6 @@ fn addrs_global_text(dump: &str) -> Option<String> {
     })
 }
 
-fn run_status(program: &str, args: &[&str]) -> Result<(), String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .map_err(|err| err.to_string())?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("{program} {}: {}", args.join(" "), err.trim()))
-    }
-}
-
 /// Diagnostic: one router solicitation on the management bearer, from the
 /// core-assigned link-local. Changes no setting.
 pub fn solicit_once() -> Result<Ipv6Addr, String> {
@@ -4028,14 +4016,6 @@ fn kernel_messages() -> String {
         }
     }
     command_stdout("dmesg", &[])
-}
-
-fn command_stdout(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
 }
 
 /// Whether the customer bearer can carry delegated traffic: carrier, and
