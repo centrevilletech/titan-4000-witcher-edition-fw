@@ -54,7 +54,13 @@ before rebooting. Keep power connected throughout the operation.
 
 There are two firmware banks, but an intact alternate image is not proof of
 automatic rollback. Browser bank switching and recovery require working Linux
-and networking. `http://DEVICE_IP:8081/` offers password-authenticated recovery
+and networking. **Switch firmware bank** first checks the whole alternate bank
+against the records the vendor writer keeps for it: the kernel and modem
+firmware byte for byte (Adler-32), and the root filesystem byte for byte if it
+has never booted, or as one consistent UBI image if it has. An install that was
+cut short, or damaged flash, is refused instead of selected. **Restore factory
+defaults** clears settings only, as the vendor restore does; the unit keeps the
+firmware it runs. (Before v1.0.17 it also switched banks.) `http://DEVICE_IP:8081/` offers password-authenticated recovery
 while those services are reachable; it cannot repair a failure before init.
 Do not infer that an unresponsive device is safe to power-cycle mid-write.
 
