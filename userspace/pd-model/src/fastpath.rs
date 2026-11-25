@@ -401,8 +401,9 @@ pub struct TripWatch {
     observed: bool,
     /// Mode last confirmed in `/proc/k1fp` (only when > 0).
     applied_mode: Option<u32>,
-    /// When that mode was written or adopted (monotonic seconds).
-    applied_at: Option<u64>,
+    /// When the mode first ran after the last drop (monotonic seconds).
+    /// Writing it again after a lost bridge device does not move it.
+    clean_since: Option<u64>,
     /// Last observed `wd_trips` count from `/proc/k1fp`.
     last_wd_trips: u32,
     /// Held at mode 0 after a drop, until `rearm` is ready.
@@ -479,6 +480,7 @@ impl TripWatch {
         if config.mode == 0 {
             // Off, by config or by the switch: turning it on again starts afresh.
             self.applied_mode = None;
+            self.clean_since = None;
             self.held = None;
             self.rearm.reset();
             self.seen_trips(proc);
@@ -509,13 +511,14 @@ impl TripWatch {
             // Config changed: apply it at once, with no drops counted.
             self.rearm.reset();
             self.applied_mode = None;
+            self.clean_since = None;
         }
 
         if self.applied_mode == Some(config.mode) {
             if proc.mode == Some(config.mode) {
                 self.seen_trips(proc);
                 if self
-                    .applied_at
+                    .clean_since
                     .is_some_and(|at| now.saturating_sub(at) >= CLEAN_SECS)
                 {
                     self.rearm.reset();
@@ -543,7 +546,7 @@ impl TripWatch {
         if proc.mode == Some(config.mode) {
             // Adopted at the configured mode.
             self.applied_mode = Some(config.mode);
-            self.applied_at = Some(now);
+            self.clean_since.get_or_insert(now);
             TripAction::Normal
         } else {
             TripAction::Apply
@@ -559,6 +562,7 @@ impl TripWatch {
     /// A drop at `now`: hold mode 0 for the next wait in `policy`.
     fn hold(&mut self, config: &Config, reason: String, policy: Policy, now: u64) -> TripAction {
         self.applied_mode = None;
+        self.clean_since = None;
         let wait = self.rearm.failed(now, policy);
         self.held = Some(Held {
             config: config.clone(),
@@ -575,7 +579,9 @@ impl TripWatch {
     /// Record that `mode` was written and read back from `/proc/k1fp` at `now`.
     pub fn note_applied(&mut self, mode: u32, proc: &Proc, now: u64) {
         self.applied_mode = (mode > 0).then_some(mode);
-        self.applied_at = Some(now);
+        if mode > 0 {
+            self.clean_since.get_or_insert(now);
+        }
         self.seen_trips(proc);
     }
 
@@ -1114,6 +1120,20 @@ fast_dl=242513 fast_ul=0 fast_dl_KiB=230594 fast_ul_KiB=0 would_fast=0 gate_clos
         ));
         assert!(watch.is_tripped());
         assert!(matches!(watch.evaluate(&cfg, &at, P, 260), TripAction::Rearm { drops: 1, .. }));
+        at.mode = Some(2);
+        watch.note_applied(2, &at, 260);
+        // Re-attaches every 20 minutes write the mode again; they do not
+        // restart the clean hour, which counts from the re-arm.
+        for t in [260 + 1200, 260 + 2400] {
+            at.mode = Some(0);
+            at.dev_gone = Some(at.dev_gone.unwrap_or(0) + 2);
+            assert_eq!(watch.evaluate(&cfg, &at, P, t), TripAction::Apply);
+            at.mode = Some(2);
+            watch.note_applied(2, &at, t);
+        }
+        assert_eq!(watch.drops(), 1);
+        assert_eq!(watch.evaluate(&cfg, &at, P, 260 + CLEAN_SECS), TripAction::Normal);
+        assert_eq!(watch.drops(), 0, "an hour since the re-arm forgets the drop");
 
         // A keeper that starts after a device loss sees no watchdog trip and
         // simply applies the mode.
