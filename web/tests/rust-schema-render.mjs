@@ -22,7 +22,7 @@ try{
   if(path.startsWith('/api/v1/settings/'))return route.fulfill({json:schemas[path.split('/').at(-1)]});
   return route.continue();
  });
- const cases=[['Radio','APN profiles','apn'],['Radio','Band & selection','selection'],['Radio','PCI lock','lock'],['Radio','Cell scan','scan'],['Network','Operating mode','mode'],['Network','LAN & DHCP','lan'],['Network','Firewall','firewall'],['Network','Port forwards','forwards'],['Network','Routes','routes'],['System','Device','device'],['System','Access','access'],['System','SSH keys','ssh'],['System','ACS','services'],['System','SAS','sas'],['System','CPI','cpi'],['System','CBSD status','sasStatus'],['System','Backup','backup'],['System','Firmware','firmware'],['System','Restart','restart'],['Diagnostics','Ping','ping'],['Diagnostics','Network status','status']];
+ const cases=[['Radio','APN profiles','apn'],['Radio','Band & selection','selection'],['Radio','PCI lock','lock'],['Radio','Cell scan','scan'],['Network','Operating mode','mode'],['Network','LAN & DHCP','lan'],['Network','Firewall','firewall'],['Network','Port forwards','forwards'],['Network','Routes','routes'],['Network','Latency','latency'],['System','Device','device'],['System','Access','access'],['System','SSH keys','ssh'],['System','ACS','services'],['System','SAS','sas'],['System','CPI','cpi'],['System','CBSD status','sasStatus'],['System','Backup','backup'],['System','Firmware','firmware'],['System','Restart','restart'],['Diagnostics','Ping','ping'],['Diagnostics','Network status','status']];
  await page.goto('http://127.0.0.1:4194/ui/');await expect(page.locator('h1')).toHaveText('Overview');
  for(const [section,tab,id]of cases){
   await page.setViewportSize({width:1440,height:1000});await page.locator('.side-nav').getByText(section,{exact:true}).click();
@@ -37,5 +37,5 @@ try{
   console.log(id+': '+(await page.locator('[data-settings-ready] h2').allTextContents()).join(', '));
  }
  assert.deepEqual(errors,[]);assert.deepEqual(forbidden,[]);
- console.log('PASS: all 21 actual Rust schemas render on desktop/phone with no legacy requests, frames or writes.');
+ console.log('PASS: all 22 actual Rust schemas render on desktop/phone with no legacy requests, frames or writes.');
 }finally{await browser.close();await server.close();}
